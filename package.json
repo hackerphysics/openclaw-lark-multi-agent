@@ -1,0 +1,19 @@
+{
+  "name": "lark-multi-agent",
+  "version": "0.1.0",
+  "description": "Multi Feishu bot proxy to OpenClaw - each bot bound to a specific model",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.62.1"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "@types/node": "^22.0.0"
+  }
+}
