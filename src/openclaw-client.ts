@@ -256,30 +256,25 @@ export class OpenClawClient {
       const handler = (payload: any) => {
         if (payload.runId !== runId) return;
 
-        if (payload.state === "delta" && payload.message) {
-          // Accumulate streaming deltas
-          if (typeof payload.message === "string") {
-            fullMessage += payload.message;
-          } else if (payload.message.content) {
-            fullMessage += payload.message.content;
+        if (payload.stream === "assistant" && payload.data) {
+          // Accumulate streaming text
+          if (payload.data.delta) {
+            fullMessage += payload.data.delta;
           }
-        } else if (payload.state === "final") {
+        } else if (
+          payload.stream === "lifecycle" &&
+          payload.data?.phase === "end"
+        ) {
           cleanup();
-          // Final message may contain the complete text
-          if (payload.message) {
-            const finalText =
-              typeof payload.message === "string"
-                ? payload.message
-                : payload.message.content || payload.message.text || "";
-            resolve(finalText || fullMessage);
-          } else {
-            resolve(fullMessage);
-          }
-        } else if (payload.state === "error" || payload.state === "aborted") {
+          resolve(fullMessage);
+        } else if (
+          payload.stream === "lifecycle" &&
+          payload.data?.phase === "error"
+        ) {
           cleanup();
           reject(
             new Error(
-              `Chat ${payload.state}: ${payload.errorMessage || "unknown"}`
+              `Chat error: ${payload.data?.error || "unknown"}`
             )
           );
         }
