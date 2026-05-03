@@ -196,6 +196,17 @@ export class OpenClawClient {
     return this.rpc("sessions.list", {});
   }
 
+  async resetSession(key: string): Promise<any> {
+    return this.rpc("sessions.reset", { key });
+  }
+
+  async deleteSession(
+    key: string,
+    deleteTranscript = true
+  ): Promise<any> {
+    return this.rpc("sessions.delete", { key, deleteTranscript });
+  }
+
   // --- Chat ---
 
   /**
