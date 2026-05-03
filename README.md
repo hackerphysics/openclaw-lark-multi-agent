@@ -1,46 +1,88 @@
-# Feishu Multi-Bot Proxy
+# Lark Multi-Agent
 
-多个飞书机器人连接同一个 OpenClaw，每个机器人绑定固定模型。
+Multiple Feishu/Lark bots connected to one OpenClaw instance, each bound to a specific AI model with full agent capabilities.
 
-## 架构
+## Architecture
 
 ```
-飞书机器人A (Claude) ─┐
-飞书机器人B (GPT)   ──┤──→ Multi-Bot Proxy ──→ OpenClaw Local API
-飞书机器人C (Gemini) ─┘
+Feishu Bot A (Claude) ─┐
+Feishu Bot B (GPT)   ──┤──→ Lark Multi-Agent ──WS──→ OpenClaw Gateway
+Feishu Bot C (Gemini) ─┘         │
+                            SQLite (message log)
 ```
 
-## 消息路由规则
+Each bot owns a dedicated OpenClaw **session** connected via the Gateway WebSocket protocol. This means every bot has:
 
-- **私聊**：直接回复
-- **群聊 - 用户 @了某个机器人**：只有被 @ 的机器人回复
-- **群聊 - 用户没 @ 任何机器人**：所有机器人都回复
-- **群聊 - 机器人的消息**：只有被 @ 的机器人回复，未被 @ 的不回复
+- Full agent pipeline (tools, memory, skills, system prompt)
+- Persistent conversation history managed by OpenClaw
+- Same capabilities as a native OpenClaw channel
 
-## 配置
+Messages from other participants (humans and other bots) are **injected** into each bot's session as context via `chat.inject`, so every bot is aware of the full conversation.
 
-复制 `config.example.json` 为 `config.json`，填入：
+## Message Routing Rules
 
-1. OpenClaw Gateway 地址和 token
-2. 每个飞书机器人的 App ID / App Secret
-3. 每个机器人绑定的模型
+- **Private chat**: Bot always responds
+- **Group chat — user @'s a bot**: Only the mentioned bot responds
+- **Group chat — user sends without @**: All bots respond
+- **Group chat — bot message @'s another bot**: Only the mentioned bot responds
+- **Group chat — bot message without @**: No bot responds (prevents loops)
+- **Anti-loop**: After 10 consecutive bot messages without a human message, all bots stop and wait
+
+## Setup
+
+### 1. Create Feishu Apps
+
+Create multiple self-built apps on [Feishu Open Platform](https://open.feishu.cn):
+
+1. Enable "Bot" capability for each app
+2. Set event subscription to **WebSocket** mode
+3. Add event: `im.message.receive_v1`
+4. Note down each app's App ID and App Secret
+
+### 2. Configure
 
 ```bash
 cp config.example.json config.json
-# 编辑 config.json
+# Edit config.json with your settings
 ```
 
-## 运行
+### 3. Enable OpenClaw Gateway Auth
+
+Ensure your OpenClaw gateway has auth configured (`gateway.auth.mode: "token"`).
+
+### 4. Run
 
 ```bash
 npm install
-npm run dev        # 开发模式
-npm run build && npm start  # 生产模式
+npm run dev        # Development
+npm run build && npm start  # Production
 ```
 
-## 前置条件
+## Config Reference
 
-1. OpenClaw Gateway 已启动，且开启了 HTTP API（chatCompletions endpoint）
-2. 在飞书开放平台创建多个自建应用，每个应用开启机器人能力
-3. 每个应用的事件订阅选择 WebSocket 模式
-4. 添加事件：`im.message.receive_v1`
+```jsonc
+{
+  "openclaw": {
+    "baseUrl": "http://127.0.0.1:18789",  // Gateway address
+    "token": "your-gateway-token"           // gateway.auth.token
+  },
+  "bots": [
+    {
+      "name": "Claude",                     // Display name
+      "appId": "cli_xxx",                   // Feishu App ID
+      "appSecret": "xxx",                   // Feishu App Secret
+      "model": "anthropic/claude-opus-4",   // Model for this bot
+      "systemPrompt": "You are Claude..."   // Optional system prompt
+    }
+  ]
+}
+```
+
+## Data
+
+- `data/messages.db` — SQLite database storing all messages for anti-loop tracking
+- OpenClaw manages conversation history per session (in `~/.openclaw/sessions/`)
+
+## License
+
+MIT

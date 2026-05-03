@@ -1,13 +1,16 @@
 import * as lark from "@larksuiteoapi/node-sdk";
 import { BotConfig } from "./config.js";
 import { OpenClawClient } from "./openclaw-client.js";
-import { MessageStore, ChatMessage } from "./message-store.js";
+import { MessageStore } from "./message-store.js";
 
 const MAX_BOT_STREAK = 10;
-const MAX_CONTEXT_MESSAGES = 50;
 
 /**
- * Manages a single Feishu bot instance: handles websocket connection and message routing.
+ * Manages a single Feishu bot instance.
+ *
+ * Each bot owns an OpenClaw session (full agent pipeline).
+ * Non-responding messages are injected as context via chat.inject.
+ * When the bot needs to respond, chat.send triggers a full agent run.
  */
 export class FeishuBot {
   readonly config: BotConfig;
@@ -17,6 +20,7 @@ export class FeishuBot {
   private openclawClient: OpenClawClient;
   private store: MessageStore;
   private botOpenId: string | null = null;
+  private sessionKey: string;
 
   // All active bots, shared reference for @-mention routing
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -29,6 +33,7 @@ export class FeishuBot {
     this.config = config;
     this.openclawClient = openclawClient;
     this.store = store;
+    this.sessionKey = `lma-${config.name.toLowerCase()}`;
 
     this.client = new lark.Client({
       appId: config.appId,
@@ -51,8 +56,41 @@ export class FeishuBot {
     FeishuBot.allBots.set(this.config.appId, this);
   }
 
+  /**
+   * Initialize the OpenClaw session for this bot and start WS connection.
+   */
   async start() {
     this.register();
+
+    // Create or ensure session exists with the right model
+    try {
+      await this.openclawClient.createSession({
+        key: this.sessionKey,
+        model: this.config.model,
+        label: `LMA: ${this.config.name}`,
+      });
+      console.log(
+        `[${this.config.name}] Session created: ${this.sessionKey} (${this.config.model})`
+      );
+    } catch (err: any) {
+      // Session may already exist; try patching the model
+      try {
+        await this.openclawClient.patchSession({
+          key: this.sessionKey,
+          model: this.config.model,
+          label: `LMA: ${this.config.name}`,
+        });
+        console.log(
+          `[${this.config.name}] Session patched: ${this.sessionKey} (${this.config.model})`
+        );
+      } catch (patchErr: any) {
+        console.error(
+          `[${this.config.name}] Failed to create/patch session:`,
+          patchErr.message
+        );
+      }
+    }
+
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
     console.log(
       `[${this.config.name}] Bot started (appId: ${this.config.appId})`
@@ -80,7 +118,7 @@ export class FeishuBot {
       const sender = event.sender;
 
       const chatId: string = message.chat_id;
-      const chatType: string = message.chat_type; // "p2p" or "group"
+      const chatType: string = message.chat_type;
       const messageType: string = message.message_type;
       const messageId: string = message.message_id;
       const isBot = sender?.sender_type === "app";
@@ -99,94 +137,102 @@ export class FeishuBot {
       if (messageType !== "text") return;
 
       const content = JSON.parse(message.content);
-      let text: string = content.text || "";
-      const cleanText = this.cleanMentions(text);
+      const rawText: string = content.text || "";
+      const cleanText = this.cleanMentions(rawText);
+      if (!cleanText.trim()) return;
 
-      // --- Record ALL messages to store (regardless of whether we respond) ---
+      // --- Record to local store (all messages, for anti-loop tracking) ---
       const senderName = isBot
         ? this.resolveBotName(sender) || "UnknownBot"
-        : sender?.sender_id?.open_id || "Unknown";
-      
+        : this.resolveHumanName(sender) || "User";
+
       this.store.insert({
         chatId,
         messageId,
         senderType: isBot ? "bot" : "human",
-        senderName: isBot ? senderName : (this.resolveHumanName(sender) || senderName),
+        senderName,
         content: cleanText,
         timestamp: Date.now(),
       });
 
-      // Skip bot messages for response logic (already recorded above)
-      if (isBot) return;
-
       // --- Determine if this bot should respond ---
-      if (chatType === "group") {
-        if (!this.shouldRespondInGroup(message)) return;
-      }
+      const shouldRespond = this.shouldRespond(chatType, message, isBot);
 
-      if (!cleanText.trim()) return;
+      if (shouldRespond) {
+        // Anti-loop check
+        const streak = this.store.getBotStreak(chatId);
+        if (streak >= MAX_BOT_STREAK) {
+          console.log(
+            `[${this.config.name}] Anti-loop: ${streak} consecutive bot msgs in ${chatId}`
+          );
+          return;
+        }
 
-      // --- Anti-loop check ---
-      const streak = this.store.getBotStreak(chatId);
-      if (streak >= MAX_BOT_STREAK) {
         console.log(
-          `[${this.config.name}] Anti-loop: ${streak} consecutive bot messages in ${chatId}, waiting for human`
+          `[${this.config.name}] Responding to: "${cleanText.substring(0, 80)}..."`
         );
-        return;
+
+        // Send to OpenClaw session → full agent pipeline
+        const reply = await this.openclawClient.chatSend({
+          sessionKey: this.sessionKey,
+          message: this.formatIncomingMessage(senderName, cleanText, isBot),
+          deliver: false, // We handle delivery ourselves
+        });
+
+        // Record bot reply
+        this.store.insert({
+          chatId,
+          messageId: `self-${this.config.name}-${Date.now()}`,
+          senderType: "bot",
+          senderName: this.config.name,
+          content: reply,
+          timestamp: Date.now(),
+        });
+
+        // Send reply to Feishu
+        await this.replyMessage(messageId, reply);
+        console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
+      } else {
+        // Not responding, but inject the message as context into our session
+        // so the bot knows what's happening when it does respond next time
+        const label = isBot ? `[${senderName}]` : `[User: ${senderName}]`;
+        await this.openclawClient.chatInject({
+          sessionKey: this.sessionKey,
+          message: `${label}: ${cleanText}`,
+          label: `context from ${senderName}`,
+        });
       }
-
-      console.log(
-        `[${this.config.name}] Processing: "${cleanText.substring(0, 80)}..."`
-      );
-
-      // --- Build context from store and call OpenClaw ---
-      const history = this.store.getRecent(chatId, MAX_CONTEXT_MESSAGES);
-      const sessionKey = `lma-${this.config.name}-${chatId}`;
-
-      const reply = await this.openclawClient.chat({
-        botName: this.config.name,
-        sessionKey,
-        model: this.config.model,
-        history,
-        systemPrompt: this.config.systemPrompt,
-      });
-
-      // Record bot's own reply
-      // (messageId will be filled after sending; use a synthetic one for now)
-      const replyMsgId = `self-${this.config.name}-${Date.now()}`;
-      this.store.insert({
-        chatId,
-        messageId: replyMsgId,
-        senderType: "bot",
-        senderName: this.config.name,
-        content: reply,
-        timestamp: Date.now(),
-      });
-
-      // Send reply
-      await this.replyMessage(messageId, reply);
-      console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
     } catch (err) {
       console.error(`[${this.config.name}] Error handling message:`, err);
     }
   }
 
   /**
-   * Determine if this bot should respond in a group chat.
-   *
-   * Rules:
-   * 1. User message @-mentions any bot(s) → only mentioned bot(s) respond
-   * 2. User message has no @-mention → all bots respond
+   * Determine if this bot should respond.
    */
-  private shouldRespondInGroup(message: any): boolean {
+  private shouldRespond(
+    chatType: string,
+    message: any,
+    isBot: boolean
+  ): boolean {
+    // In p2p, always respond (unless from a bot)
+    if (chatType === "p2p") return !isBot;
+
+    // Group chat rules
     const mentions: any[] = message.mentions || [];
 
+    if (isBot) {
+      // Bot message: only respond if this bot is explicitly @-mentioned
+      return this.isMentioned(mentions);
+    }
+
+    // Human message
     if (mentions.length === 0) {
       // No mentions → all bots respond
       return true;
     }
 
-    // Check if ANY mention targets a known bot
+    // Check if any mention targets a known bot
     const anyBotMentioned = mentions.some((m: any) => {
       for (const bot of FeishuBot.allBots.values()) {
         if (m.id?.app_id === bot.config.appId) return true;
@@ -201,6 +247,10 @@ export class FeishuBot {
     }
 
     // Some bot is mentioned → only respond if THIS bot is mentioned
+    return this.isMentioned(mentions);
+  }
+
+  private isMentioned(mentions: any[]): boolean {
     return mentions.some((m: any) => {
       if (m.id?.app_id === this.config.appId) return true;
       if (this.botOpenId && m.id?.open_id === this.botOpenId) return true;
@@ -209,8 +259,19 @@ export class FeishuBot {
   }
 
   /**
-   * Try to resolve bot name from sender info by matching against known bots.
+   * Format the incoming message for the agent session.
    */
+  private formatIncomingMessage(
+    senderName: string,
+    text: string,
+    isBot: boolean
+  ): string {
+    if (isBot) {
+      return `[${senderName} (AI)]: ${text}`;
+    }
+    return text;
+  }
+
   private resolveBotName(sender: any): string | null {
     const openId = sender?.sender_id?.open_id;
     if (openId) {
@@ -220,23 +281,15 @@ export class FeishuBot {
     return null;
   }
 
-  /**
-   * Resolve human display name from sender.
-   */
   private resolveHumanName(sender: any): string | null {
+    // TODO: resolve actual user name via Feishu API
     return sender?.sender_id?.open_id || null;
   }
 
-  /**
-   * Remove @mention tags from text.
-   */
   private cleanMentions(text: string): string {
     return text.replace(/@_user_\d+/g, "").trim();
   }
 
-  /**
-   * Reply to a message in Feishu.
-   */
   private async replyMessage(messageId: string, text: string) {
     await this.client.im.message.reply({
       path: { message_id: messageId },

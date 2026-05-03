@@ -11,7 +11,9 @@ async function main() {
 
   console.log("=== Lark Multi-Agent ===");
   console.log(`OpenClaw: ${config.openclaw.baseUrl}`);
-  console.log(`Bots: ${config.bots.map((b) => `${b.name}(${b.model})`).join(", ")}`);
+  console.log(
+    `Bots: ${config.bots.map((b) => `${b.name}(${b.model})`).join(", ")}`
+  );
   console.log("");
 
   // Init data dir & store
@@ -19,7 +21,9 @@ async function main() {
   mkdirSync(dataDir, { recursive: true });
   const store = new MessageStore(resolve(dataDir, "messages.db"));
 
+  // Connect to OpenClaw Gateway via WebSocket
   const openclawClient = new OpenClawClient(config.openclaw);
+  await openclawClient.connect();
 
   // Start all bots
   const bots: FeishuBot[] = [];
@@ -34,6 +38,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = () => {
     console.log("\nShutting down...");
+    openclawClient.disconnect();
     store.close();
     process.exit(0);
   };
