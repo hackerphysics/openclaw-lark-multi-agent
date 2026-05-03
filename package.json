@@ -10,7 +10,9 @@
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.62.1",
-    "better-sqlite3": "^12.9.0"
+    "@types/ws": "^8.18.1",
+    "better-sqlite3": "^12.9.0",
+    "ws": "^8.20.0"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

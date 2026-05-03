@@ -37,38 +37,58 @@ export class MessageStore {
         timestamp INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
+
+      -- Tracks which messages have been synced to each bot's OpenClaw session.
+      -- If a message id is NOT in this table for a given bot, it hasn't been seen by that session yet.
+      CREATE TABLE IF NOT EXISTS sync_state (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        last_synced_msg_id INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bot_name, chat_id)
+      );
     `);
   }
 
   /**
-   * Insert a message. Returns false if duplicate (message_id already exists).
+   * Insert a message. Returns the auto-increment id, or -1 if duplicate.
    */
-  insert(msg: ChatMessage): boolean {
+  insert(msg: ChatMessage): number {
     try {
-      this.db.prepare(`
+      const result = this.db.prepare(`
         INSERT INTO messages (chat_id, message_id, sender_type, sender_name, content, timestamp)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(msg.chatId, msg.messageId, msg.senderType, msg.senderName, msg.content, msg.timestamp);
-      return true;
+      return Number(result.lastInsertRowid);
     } catch (err: any) {
-      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") return false;
+      if (err.code === "SQLITE_CONSTRAINT_UNIQUE") return -1;
       throw err;
     }
   }
 
   /**
-   * Get recent messages for a chat, ordered by timestamp ascending.
-   * @param maxCount Maximum number of messages to return.
+   * Get messages that haven't been synced to a bot's session yet.
+   * Returns messages ordered by timestamp ascending.
    */
-  getRecent(chatId: string, maxCount: number = 50): ChatMessage[] {
+  getUnsyncedMessages(
+    botName: string,
+    chatId: string,
+    maxCount: number = 50
+  ): ChatMessage[] {
+    const row = this.db.prepare(`
+      SELECT last_synced_msg_id FROM sync_state
+      WHERE bot_name = ? AND chat_id = ?
+    `).get(botName, chatId) as any;
+
+    const lastId = row?.last_synced_msg_id || 0;
+
     const rows = this.db.prepare(`
       SELECT * FROM messages
-      WHERE chat_id = ?
-      ORDER BY timestamp DESC
+      WHERE chat_id = ? AND id > ?
+      ORDER BY timestamp ASC
       LIMIT ?
-    `).all(chatId, maxCount) as any[];
+    `).all(chatId, lastId, maxCount) as any[];
 
-    return rows.reverse().map((r) => ({
+    return rows.map((r: any) => ({
       id: r.id,
       chatId: r.chat_id,
       messageId: r.message_id,
@@ -80,7 +100,40 @@ export class MessageStore {
   }
 
   /**
-   * Count consecutive bot messages at the tail of a chat (no human in between).
+   * Mark all messages up to (and including) the given id as synced for a bot.
+   */
+  markSynced(botName: string, chatId: string, upToId: number): void {
+    this.db.prepare(`
+      INSERT INTO sync_state (bot_name, chat_id, last_synced_msg_id)
+      VALUES (?, ?, ?)
+      ON CONFLICT (bot_name, chat_id) DO UPDATE SET last_synced_msg_id = excluded.last_synced_msg_id
+    `).run(botName, chatId, upToId);
+  }
+
+  /**
+   * Get recent messages for a chat, ordered by timestamp ascending.
+   */
+  getRecent(chatId: string, maxCount: number = 50): ChatMessage[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM messages
+      WHERE chat_id = ?
+      ORDER BY timestamp DESC
+      LIMIT ?
+    `).all(chatId, maxCount) as any[];
+
+    return rows.reverse().map((r: any) => ({
+      id: r.id,
+      chatId: r.chat_id,
+      messageId: r.message_id,
+      senderType: r.sender_type,
+      senderName: r.sender_name,
+      content: r.content,
+      timestamp: r.timestamp,
+    }));
+  }
+
+  /**
+   * Count consecutive bot messages at the tail of a chat.
    */
   getBotStreak(chatId: string): number {
     const rows = this.db.prepare(`
@@ -92,7 +145,7 @@ export class MessageStore {
 
     let count = 0;
     for (const r of rows) {
-      if (r.sender_type === "bot") count++;
+      if ((r as any).sender_type === "bot") count++;
       else break;
     }
     return count;

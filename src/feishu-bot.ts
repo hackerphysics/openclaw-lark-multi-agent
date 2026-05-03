@@ -4,14 +4,14 @@ import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 
 const MAX_BOT_STREAK = 10;
-const MAX_CONTEXT_MESSAGES = 50;
 
 /**
  * Manages a single Feishu bot instance.
  *
- * All messages (human + bot) are stored locally in SQLite.
- * When responding, full conversation context is assembled from local store
- * and sent to OpenClaw HTTP API.
+ * Each bot owns an OpenClaw session (full agent pipeline).
+ * All messages are recorded locally in SQLite.
+ * When this bot needs to respond, unsynced messages are batched into
+ * a single context catch-up + the actual message → one agent run.
  */
 export class FeishuBot {
   readonly config: BotConfig;
@@ -21,8 +21,8 @@ export class FeishuBot {
   private openclawClient: OpenClawClient;
   private store: MessageStore;
   private botOpenId: string | null = null;
+  readonly sessionKey: string;
 
-  // All active bots, shared reference for @-mention routing
   private static allBots: Map<string, FeishuBot> = new Map();
 
   constructor(
@@ -33,6 +33,7 @@ export class FeishuBot {
     this.config = config;
     this.openclawClient = openclawClient;
     this.store = store;
+    this.sessionKey = `lma-${config.name.toLowerCase()}`;
 
     this.client = new lark.Client({
       appId: config.appId,
@@ -55,11 +56,32 @@ export class FeishuBot {
     FeishuBot.allBots.set(this.config.appId, this);
   }
 
+  /**
+   * Create/patch the OpenClaw session and start Feishu WS.
+   */
   async start() {
     this.register();
+
+    // Ensure session exists with correct model
+    try {
+      await this.openclawClient.createSession({
+        key: this.sessionKey,
+        model: this.config.model,
+        label: `LMA: ${this.config.name}`,
+      });
+      console.log(`[${this.config.name}] Session created: ${this.sessionKey}`);
+    } catch {
+      await this.openclawClient.patchSession({
+        key: this.sessionKey,
+        model: this.config.model,
+        label: `LMA: ${this.config.name}`,
+      });
+      console.log(`[${this.config.name}] Session patched: ${this.sessionKey}`);
+    }
+
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
     console.log(
-      `[${this.config.name}] Bot started (appId: ${this.config.appId}, model: ${this.config.model})`
+      `[${this.config.name}] Bot started (model: ${this.config.model})`
     );
   }
 
@@ -74,9 +96,6 @@ export class FeishuBot {
     return undefined;
   }
 
-  /**
-   * Handle incoming message from Feishu.
-   */
   private async handleMessage(data: any) {
     try {
       const event = data as any;
@@ -99,7 +118,6 @@ export class FeishuBot {
         }
       }
 
-      // Only handle text messages for now
       if (messageType !== "text") return;
 
       const content = JSON.parse(message.content);
@@ -107,12 +125,12 @@ export class FeishuBot {
       const cleanText = this.cleanMentions(rawText);
       if (!cleanText.trim()) return;
 
-      // --- Record ALL messages to local store ---
+      // --- Record to local store (ALL messages) ---
       const senderName = isBot
         ? this.resolveBotName(sender) || "Bot"
         : this.resolveHumanName(sender) || "User";
 
-      this.store.insert({
+      const insertId = this.store.insert({
         chatId,
         messageId,
         senderType: isBot ? "bot" : "human",
@@ -121,14 +139,14 @@ export class FeishuBot {
         timestamp: Date.now(),
       });
 
-      // --- Determine if this bot should respond ---
+      // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot)) return;
 
-      // Anti-loop check
+      // Anti-loop
       const streak = this.store.getBotStreak(chatId);
       if (streak >= MAX_BOT_STREAK) {
         console.log(
-          `[${this.config.name}] Anti-loop: ${streak} consecutive bot msgs in ${chatId}`
+          `[${this.config.name}] Anti-loop: ${streak} consecutive bot msgs`
         );
         return;
       }
@@ -137,18 +155,30 @@ export class FeishuBot {
         `[${this.config.name}] Responding to: "${cleanText.substring(0, 80)}..."`
       );
 
-      // --- Build context from local store and call OpenClaw ---
-      const history = this.store.getRecent(chatId, MAX_CONTEXT_MESSAGES);
+      // --- Get unsynced messages (excluding the current one) ---
+      const allUnsynced = this.store.getUnsyncedMessages(
+        this.config.name,
+        chatId
+      );
+      // The current message is in allUnsynced too (just inserted).
+      // Separate it: everything before current = context, current = the actual message.
+      const contextMsgs = allUnsynced.filter((m) => m.id !== insertId);
 
-      const reply = await this.openclawClient.chat({
-        botName: this.config.name,
-        model: this.config.model,
-        history,
-        systemPrompt: this.config.systemPrompt,
+      // --- Send to OpenClaw with context catch-up ---
+      const reply = await this.openclawClient.chatSendWithContext({
+        sessionKey: this.sessionKey,
+        unsyncedMessages: contextMsgs,
+        currentMessage: cleanText,
+        currentSenderName: senderName,
+        deliver: false,
       });
 
-      // Record bot's own reply to local store
-      this.store.insert({
+      // Mark everything up to now as synced (including the current message)
+      const maxId = Math.max(insertId, ...allUnsynced.map((m) => m.id || 0));
+      this.store.markSynced(this.config.name, chatId, maxId);
+
+      // Record bot reply to local store
+      const replyId = this.store.insert({
         chatId,
         messageId: `self-${this.config.name}-${Date.now()}`,
         senderType: "bot",
@@ -156,41 +186,32 @@ export class FeishuBot {
         content: reply,
         timestamp: Date.now(),
       });
+      // The reply is already in the session (agent wrote it), so mark synced
+      this.store.markSynced(this.config.name, chatId, replyId);
 
       // Send reply to Feishu
       await this.replyMessage(messageId, reply);
       console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
     } catch (err) {
-      console.error(`[${this.config.name}] Error handling message:`, err);
+      console.error(`[${this.config.name}] Error:`, err);
     }
   }
 
-  /**
-   * Determine if this bot should respond.
-   */
   private shouldRespond(
     chatType: string,
     message: any,
     isBot: boolean
   ): boolean {
-    // In p2p, always respond (unless from a bot)
     if (chatType === "p2p") return !isBot;
 
-    // Group chat rules
     const mentions: any[] = message.mentions || [];
 
     if (isBot) {
-      // Bot message: only respond if this bot is explicitly @-mentioned
       return this.isMentioned(mentions);
     }
 
-    // Human message
-    if (mentions.length === 0) {
-      // No mentions → all bots respond
-      return true;
-    }
+    if (mentions.length === 0) return true;
 
-    // Check if any mention targets a known bot
     const anyBotMentioned = mentions.some((m: any) => {
       for (const bot of FeishuBot.allBots.values()) {
         if (m.id?.app_id === bot.config.appId) return true;
@@ -199,12 +220,7 @@ export class FeishuBot {
       return false;
     });
 
-    if (!anyBotMentioned) {
-      // Mentions exist but none target a known bot → all bots respond
-      return true;
-    }
-
-    // Some bot is mentioned → only respond if THIS bot is mentioned
+    if (!anyBotMentioned) return true;
     return this.isMentioned(mentions);
   }
 

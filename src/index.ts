@@ -21,7 +21,9 @@ async function main() {
   mkdirSync(dataDir, { recursive: true });
   const store = new MessageStore(resolve(dataDir, "messages.db"));
 
+  // Connect to OpenClaw Gateway via WebSocket
   const openclawClient = new OpenClawClient(config.openclaw);
+  await openclawClient.connect();
 
   // Start all bots
   const bots: FeishuBot[] = [];
@@ -36,6 +38,7 @@ async function main() {
   // Graceful shutdown
   const shutdown = () => {
     console.log("\nShutting down...");
+    openclawClient.disconnect();
     store.close();
     process.exit(0);
   };
