@@ -165,10 +165,13 @@ export class OpenClawClient {
 
   /**
    * Collect agent reply by polling accumulated events.
+   * Matches by initial runId OR sessionKey to handle multi-turn tool calling
+   * where OpenClaw creates new runIds for each tool-call round.
    */
   private collectReply(runId: string, timeoutMs = 180000): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = "";
+      let sessionKey = ""; // Will be set from first matching event
       const timer = setTimeout(() => {
         clearInterval(poller);
         reject(new Error("Agent reply timeout"));
@@ -177,15 +180,28 @@ export class OpenClawClient {
       const poller = setInterval(() => {
         while (this.agentEvents.length > 0) {
           const ev = this.agentEvents.shift()!;
-          if (ev.runId !== runId) continue;
+          
+          // Match by runId or sessionKey (for multi-turn tool calling)
+          if (ev.runId === runId) {
+            if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
+          } else if (sessionKey && ev.sessionKey === sessionKey) {
+            // Same session, different run (tool-calling continuation)
+          } else {
+            continue;
+          }
+
           if (ev.stream === "assistant" && ev.data?.delta) {
             text += ev.data.delta;
           }
           if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
-            clearTimeout(timer);
-            clearInterval(poller);
-            resolve(text);
-            return;
+            // Only resolve if we have collected some text
+            // (intermediate tool-call rounds end without text)
+            if (text) {
+              clearTimeout(timer);
+              clearInterval(poller);
+              resolve(text);
+              return;
+            }
           }
           if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
             clearTimeout(timer);
@@ -269,6 +285,7 @@ export class OpenClawClient {
       deliver: params.deliver ?? false,
       idempotencyKey: randomUUID(),
     });
+    console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
     return this.collectReply(result.runId, params.timeoutMs || 180000);
   }
 
