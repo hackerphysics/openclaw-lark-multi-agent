@@ -133,12 +133,15 @@ export class FeishuBot {
     this.openclawClient.onToolEvent(sessionKey, async (toolName, toolInput, toolOutput) => {
       const chatInfo = this.store.getChatInfo(chatId);
       if (!chatInfo?.verbose) return;
+      console.log(`[${this.config.name}] [${new Date().toISOString()}] Tool event received: ${toolName}`);
       const sendPromise = (async () => {
         try {
           const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
           const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
           const msg = `🔧 Tool: ${toolName}\n📥 ${inputPreview}${toolOutput ? `\n📤 ${outputPreview}` : ""}`;
+          console.log(`[${this.config.name}] [${new Date().toISOString()}] Sending tool msg to Feishu...`);
           await this.sendMessage(chatId, msg);
+          console.log(`[${this.config.name}] [${new Date().toISOString()}] Tool msg sent OK`);
         } catch (err) {
           console.warn(`[${this.config.name}] Failed to send tool event:`, (err as Error).message);
         }
@@ -421,7 +424,7 @@ export class FeishuBot {
         if (lastHuman.messageId) {
           await this.replyMessage(lastHuman.messageId, reply);
         }
-        console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
+        console.log(`[${this.config.name}] [${new Date().toISOString()}] Replied (${reply.length} chars)`);
 
         // Replace ack reactions with DONE for all pending messages in this chat
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];

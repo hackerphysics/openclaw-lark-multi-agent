@@ -117,41 +117,20 @@ export class OpenClawClient {
             if (cb) cb(content);
           }
 
-          // Tool calls in assistant messages (verbose mode)
-          if (role === "assistant" && Array.isArray(content)) {
-            const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
-            if (toolCb) {
-              for (const item of content) {
-                if (item.type === "toolCall") {
-                  const toolName = item.name || item.toolName || "unknown";
-                  const toolInput = typeof item.arguments === "string"
-                    ? item.arguments
-                    : JSON.stringify(item.arguments || item.input || {});
-                  toolCb(toolName, toolInput, "");
-                }
-              }
-            }
-          }
-
-          // Tool results
-          if (role === "toolResult" || role === "tool") {
-            const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
-            if (toolCb) {
-              const toolName = msg.toolName || msg.name || "result";
-              const output = Array.isArray(content)
-                ? content.map((c: any) => c.text || "").join("")
-                : typeof content === "string" ? content : JSON.stringify(content || "");
-              toolCb(toolName, "", output);
-            }
-          }
+          // Tool calls in assistant messages — skip, using agent item events instead
+          // (session.message toolCall events are batched, not real-time)
         }
 
-        // Also catch agent stream "item" events with tool: prefix
+        // Agent item events — real-time tool call tracking for verbose mode
         if (frame.event === "agent" && frame.payload?.stream === "item") {
-          const itemId = frame.payload?.data?.itemId || "";
-          if (itemId.startsWith("tool:")) {
-            // These are streamed tool events, but they're encrypted/encoded
-            // The session.message events have the readable content, so we skip these
+          const data = frame.payload.data || {};
+          const rawKey = frame.payload.sessionKey || "";
+          const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+          const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
+
+          if (toolCb && data.kind === "tool" && data.phase === "start" && data.name) {
+            const meta = data.meta || "";
+            toolCb(data.name, meta, "");
           }
         }
       });
