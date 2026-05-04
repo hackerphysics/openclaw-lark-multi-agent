@@ -167,8 +167,10 @@ export class OpenClawClient {
    * Collect agent reply by polling accumulated events.
    * Matches by initial runId OR sessionKey to handle multi-turn tool calling
    * where OpenClaw creates new runIds for each tool-call round.
+   * No aggressive timeout — waits for lifecycle end as the source of truth.
+   * 30-minute safety net only for catastrophic WS disconnection.
    */
-  private collectReply(runId: string, timeoutMs = 180000): Promise<string> {
+  private collectReply(runId: string, timeoutMs = 1800000): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = "";
       let sessionKey = ""; // Will be set from first matching event
@@ -286,7 +288,7 @@ export class OpenClawClient {
       idempotencyKey: randomUUID(),
     });
     console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
-    return this.collectReply(result.runId, params.timeoutMs || 600000);
+    return this.collectReply(result.runId, params.timeoutMs || 1800000);
   }
 
   /**
