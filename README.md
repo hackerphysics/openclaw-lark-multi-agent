@@ -66,13 +66,22 @@ Lark Multi-Agent 就是这个中间层：
 
 ### 1. 创建飞书应用
 
-在[飞书开放平台](https://open.feishu.cn/)为每个模型创建一个自建应用：
+在[飞书开放平台](https://open.feishu.cn/)为每个模型创建一个自建应用。
 
-1. 开启「机器人」能力
+> 💡 如果你已经配置过 OpenClaw 的飞书机器人，新建的应用需要**与 OpenClaw 机器人具有相同的权限配置**。
+
+**快速配置：**
+
+1. 创建自建应用，开启「机器人」能力
 2. 事件订阅方式选择 **WebSocket（长连接）**
 3. 添加事件：`im.message.receive_v1`
-4. 添加权限：`im:message`（读写消息）、`im:message.reactions:write_only`（表情回复）
+4. 添加权限（与 OpenClaw 飞书机器人一致）：
+   - `im:message` — 读写消息（收发消息必需）
+   - `im:message.reactions:write_only` — 发送表情回复（消息确认反馈）
+   - `im:chat:readonly` — 读取群信息（获取群名称和成员列表）
 5. 记下 App ID 和 App Secret
+
+详细步骤参考[飞书官方文档：创建自建应用](https://open.feishu.cn/document/home/introduction-to-custom-app-development/self-built-application-development-process)。
 
 ### 2. 克隆 & 安装
 
