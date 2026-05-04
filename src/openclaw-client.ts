@@ -102,24 +102,54 @@ export class OpenClawClient {
           console.log(`[OpenClaw] Event: ${frame.event}`, JSON.stringify(frame.payload || {}).substring(0, 200));
         }
 
-        // Session message events (agent-initiated / proactive)
+        // Session message events (agent-initiated / proactive + tool calls for verbose)
         if (frame.event === "session.message" && frame.payload) {
           const sessionKey = frame.payload.sessionKey;
-          const cb = this.sessionMessageCallbacks.get(sessionKey);
-          if (cb && frame.payload.role === "assistant" && frame.payload.text) {
-            cb(frame.payload.text);
+          const msg = frame.payload.message || frame.payload;
+          const role = msg.role;
+          const content = msg.content;
+
+          // Proactive assistant text messages
+          if (role === "assistant" && typeof content === "string") {
+            const cb = this.sessionMessageCallbacks.get(sessionKey);
+            if (cb) cb(content);
+          }
+
+          // Tool calls in assistant messages (verbose mode)
+          if (role === "assistant" && Array.isArray(content)) {
+            const toolCb = this.toolEventCallbacks.get(sessionKey);
+            if (toolCb) {
+              for (const item of content) {
+                if (item.type === "toolCall") {
+                  const toolName = item.name || "unknown";
+                  const toolInput = typeof item.arguments === "string"
+                    ? item.arguments
+                    : JSON.stringify(item.arguments || item.input || {});
+                  toolCb(toolName, toolInput, "");
+                }
+              }
+            }
+          }
+
+          // Tool results
+          if (role === "toolResult" || role === "tool") {
+            const toolCb = this.toolEventCallbacks.get(sessionKey);
+            if (toolCb) {
+              const toolName = msg.toolName || msg.name || "result";
+              const output = Array.isArray(content)
+                ? content.map((c: any) => c.text || "").join("")
+                : typeof content === "string" ? content : JSON.stringify(content || "");
+              toolCb(toolName, "", output);
+            }
           }
         }
 
-        // Session tool events (for verbose mode)
-        if (frame.event === "session.tool" && frame.payload) {
-          const sessionKey = frame.payload.sessionKey;
-          const cb = this.toolEventCallbacks.get(sessionKey);
-          if (cb) {
-            const toolName = frame.payload.toolName || frame.payload.name || "unknown";
-            const toolInput = JSON.stringify(frame.payload.input || frame.payload.arguments || "").substring(0, 500);
-            const toolOutput = (frame.payload.output || frame.payload.result || "").toString().substring(0, 500);
-            cb(toolName, toolInput, toolOutput);
+        // Also catch agent stream "item" events with tool: prefix
+        if (frame.event === "agent" && frame.payload?.stream === "item") {
+          const itemId = frame.payload?.data?.itemId || "";
+          if (itemId.startsWith("tool:")) {
+            // These are streamed tool events, but they're encrypted/encoded
+            // The session.message events have the readable content, so we skip these
           }
         }
       });
