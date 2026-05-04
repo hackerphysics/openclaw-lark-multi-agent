@@ -186,9 +186,56 @@ journalctl -u lark-multi-agent -f
 #### 方案三：launchd（macOS）
 
 ```bash
-# 复制 plist 文件（需要根据实际路径修改）
-cp lark-multi-agent.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/lark-multi-agent.plist
+# 修改 plist 中的路径（WorkingDirectory 和 node 路径）
+vim lark-multi-agent.plist
+
+# 安装并启动
+cp lark-multi-agent.plist ~/Library/LaunchAgents/com.hackerphysics.lark-multi-agent.plist
+launchctl load ~/Library/LaunchAgents/com.hackerphysics.lark-multi-agent.plist
+
+# 查看状态
+launchctl list | grep lark-multi-agent
+
+# 停止
+launchctl unload ~/Library/LaunchAgents/com.hackerphysics.lark-multi-agent.plist
+
+# 日志
+tail -f /tmp/lark-multi-agent.log
+```
+
+特性：`KeepAlive: true` 崩溃自动重启，`RunAtLoad: true` 登录时自动启动。
+
+#### 方案四：Windows 服务（NSSM）
+
+使用 [NSSM](https://nssm.cc/download)（Non-Sucking Service Manager）注册为 Windows 服务：
+
+```powershell
+# 1. 下载 NSSM，解压后将 nssm.exe 放入 PATH
+
+# 2. 修改 install-windows-service.bat 中的路径
+
+# 3. 以管理员身份运行
+install-windows-service.bat
+
+# 常用命令
+nssm status lark-multi-agent     # 查看状态
+nssm restart lark-multi-agent    # 重启
+nssm stop lark-multi-agent       # 停止
+nssm remove lark-multi-agent     # 卸载服务
+```
+
+特性：崩溃自动重启、开机自启、日志自动轮转。
+
+#### 方案五：pm2（跨平台通用）
+
+如果不想折腾平台原生方案，pm2 三个系统都能用：
+
+```bash
+npm install -g pm2
+npm run build
+pm2 start dist/index.js --name lark-multi-agent -- config.json
+pm2 startup   # 按提示设置开机自启
+pm2 save
 ```
 
 ### 用 OpenClaw 配置（推荐）
