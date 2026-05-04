@@ -1,5 +1,5 @@
 import * as lark from "@larksuiteoapi/node-sdk";
-import { BotConfig } from "./config.js";
+import { BotConfig, AppConfig } from "./config.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 
@@ -21,19 +21,25 @@ export class FeishuBot {
   private openclawClient: OpenClawClient;
   private store: MessageStore;
   private botOpenId: string | null = null;
-  readonly sessionKey: string;
+  /** Tracks which chatId sessions have been initialized */
+  private initializedSessions: Set<string> = new Set();
+  /** Dedup: track recently processed message IDs */
+  private processedMessages: Set<string> = new Set();
+  private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
 
   constructor(
     config: BotConfig,
     openclawClient: OpenClawClient,
-    store: MessageStore
+    store: MessageStore,
+    adminOpenId?: string
   ) {
     this.config = config;
     this.openclawClient = openclawClient;
     this.store = store;
-    this.sessionKey = `lma-${config.name.toLowerCase()}`;
+    this.adminOpenId = adminOpenId || null;
+    // Session keys are now per-chat: lma-<botname>-<chatId>
 
     this.client = new lark.Client({
       appId: config.appId,
@@ -57,28 +63,65 @@ export class FeishuBot {
   }
 
   /**
-   * Create/patch the OpenClaw session and start Feishu WS.
+   * Get the session key for a specific chat.
+   * Format: lma-<botname>-<chatId>
+   */
+  getSessionKey(chatId: string): string {
+    return `lma-${this.config.name.toLowerCase()}-${chatId}`;
+  }
+
+  /**
+   * Ensure the session for a given chatId exists with the correct model.
+   * Lazy: only creates on first message in that chat.
+   */
+  private async ensureSession(chatId: string): Promise<string> {
+    const sessionKey = this.getSessionKey(chatId);
+    if (this.initializedSessions.has(sessionKey)) {
+      // Already initialized this process lifetime, just ensure model
+      const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
+      if (corrected) {
+        console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
+        await this.notifyModelDrift(chatId, sessionKey);
+      }
+      return sessionKey;
+    }
+
+    try {
+      await this.openclawClient.createSession({
+        key: sessionKey,
+        model: this.config.model,
+        label: `LMA: ${this.config.name} [${chatId.slice(-8)}]`,
+      });
+      console.log(`[${this.config.name}] Session created: ${sessionKey}`);
+    } catch {
+      // Session already exists, patch model
+      const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
+      if (corrected) {
+        console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
+        await this.notifyModelDrift(chatId, sessionKey);
+      }
+    }
+
+    this.initializedSessions.add(sessionKey);
+
+    // Subscribe to agent-initiated messages for this session
+    await this.openclawClient.subscribeSession(sessionKey, async (text) => {
+      try {
+        console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
+        await this.sendMessage(chatId, text);
+      } catch (err) {
+        console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
+      }
+    });
+
+    return sessionKey;
+  }
+
+  /**
+   * Start the Feishu WS connection. Sessions are created lazily per chat.
    */
   async start() {
     this.register();
-
-    // Ensure session exists with correct model
-    try {
-      await this.openclawClient.createSession({
-        key: this.sessionKey,
-        model: this.config.model,
-        label: `LMA: ${this.config.name}`,
-      });
-      console.log(`[${this.config.name}] Session created: ${this.sessionKey}`);
-    } catch {
-      await this.openclawClient.patchSession({
-        key: this.sessionKey,
-        model: this.config.model,
-        label: `LMA: ${this.config.name}`,
-      });
-      console.log(`[${this.config.name}] Session patched: ${this.sessionKey}`);
-    }
-
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
     console.log(
       `[${this.config.name}] Bot started (model: ${this.config.model})`
@@ -120,10 +163,49 @@ export class FeishuBot {
 
       if (messageType !== "text") return;
 
+      // --- Dedup: skip if already processed (memory + DB) ---
+      if (this.processedMessages.has(messageId)) return;
+      // Also check DB in case of process restart
+      const existingMsg = this.store.hasMessage(messageId);
+      if (existingMsg) {
+        this.processedMessages.add(messageId);
+        return;
+      }
+      this.processedMessages.add(messageId);
+      // Keep set bounded
+      if (this.processedMessages.size > 1000) {
+        const first = this.processedMessages.values().next().value;
+        if (first) this.processedMessages.delete(first);
+      }
+
+      // --- Cache chat info (lazy, at most once per hour) ---
+      await this.fetchAndCacheChatInfo(chatId, chatType);
+
       const content = JSON.parse(message.content);
       const rawText: string = content.text || "";
       const cleanText = this.cleanMentions(rawText);
       if (!cleanText.trim()) return;
+
+      // --- Handle /status command (always respond, regardless of mention rules) ---
+      if (cleanText.trim().startsWith("/status")) {
+        await this.ensureSession(chatId);
+        await this.handleStatusCommand(chatId, chatType, messageId);
+        return;
+      }
+
+      // --- Handle /compact command ---
+      if (cleanText.trim().startsWith("/compact")) {
+        await this.ensureSession(chatId);
+        await this.handleCompactCommand(chatId, messageId);
+        return;
+      }
+
+      // --- Handle /reset command ---
+      if (cleanText.trim().startsWith("/reset")) {
+        await this.ensureSession(chatId);
+        await this.handleResetCommand(chatId, messageId);
+        return;
+      }
 
       // --- Record to local store (ALL messages) ---
       const senderName = isBot
@@ -142,6 +224,12 @@ export class FeishuBot {
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot)) return;
 
+      // --- Acknowledge receipt: random reaction to show message received ---
+      // OK=OK, 👍=THUMBSUP, 💪=MUSCLE, 👏=APPLAUSE, ✅=DONE
+      const ACK_REACTIONS = ["OK", "THUMBSUP", "MUSCLE", "APPLAUSE", "JIAYI"];
+      const ackEmoji = ACK_REACTIONS[Math.floor(Math.random() * ACK_REACTIONS.length)];
+      await this.addReaction(messageId, ackEmoji).catch(() => {});
+
       // Anti-loop
       const streak = this.store.getBotStreak(chatId);
       if (streak >= MAX_BOT_STREAK) {
@@ -155,6 +243,9 @@ export class FeishuBot {
         `[${this.config.name}] Responding to: "${cleanText.substring(0, 80)}..."`
       );
 
+      // --- Ensure session exists with correct model (lazy init per chat) ---
+      const sessionKey = await this.ensureSession(chatId);
+
       // --- Get unsynced messages (excluding the current one) ---
       const allUnsynced = this.store.getUnsyncedMessages(
         this.config.name,
@@ -166,7 +257,7 @@ export class FeishuBot {
 
       // --- Send to OpenClaw with context catch-up ---
       const reply = await this.openclawClient.chatSendWithContext({
-        sessionKey: this.sessionKey,
+        sessionKey,
         unsyncedMessages: contextMsgs,
         currentMessage: cleanText,
         currentSenderName: senderName,
@@ -192,6 +283,10 @@ export class FeishuBot {
       // Send reply to Feishu
       await this.replyMessage(messageId, reply);
       console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
+
+      // Replace ack reaction with "done"
+      await this.removeReaction(messageId, ackEmoji).catch(() => {});
+      await this.addReaction(messageId, "DONE").catch(() => {});
     } catch (err) {
       console.error(`[${this.config.name}] Error:`, err);
     }
@@ -257,5 +352,248 @@ export class FeishuBot {
         msg_type: "text",
       },
     });
+  }
+
+  /**
+   * Send a proactive message to a chat (not a reply).
+   */
+  private async sendMessage(chatId: string, text: string) {
+    await this.client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: chatId,
+        content: JSON.stringify({ text }),
+        msg_type: "text",
+      },
+    });
+  }
+
+  /**
+   * Add a reaction (emoji) to a message.
+   */
+  private async addReaction(messageId: string, emojiType: string): Promise<string | undefined> {
+    const resp = await this.client.im.messageReaction.create({
+      path: { message_id: messageId },
+      data: {
+        reaction_type: { emoji_type: emojiType },
+      },
+    });
+    return (resp.data as any)?.reaction_id;
+  }
+
+  /**
+   * Remove a reaction by emoji type from a message.
+   * Finds the bot's own reaction of that type and deletes it.
+   */
+  private async removeReaction(messageId: string, emojiType: string): Promise<void> {
+    try {
+      const resp = await this.client.im.messageReaction.list({
+        path: { message_id: messageId },
+        params: { reaction_type: emojiType },
+      });
+      const items = (resp.data as any)?.items || [];
+      for (const item of items) {
+        if (item.reaction_id) {
+          await this.client.im.messageReaction.delete({
+            path: { message_id: messageId, reaction_id: item.reaction_id },
+          });
+          break;
+        }
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  /**
+   * Check token usage and auto-compact if needed.
+   * Returns true if compaction was triggered.
+   */
+  private async checkAndCompact(sessionKey: string): Promise<boolean> {
+    try {
+      const resp = await this.openclawClient.getSessionInfo(sessionKey);
+      const session = resp?.session;
+      if (!session) return false;
+
+      const totalTokens = session.totalTokens || 0;
+      const contextTokens = session.contextTokens || 0;
+      if (contextTokens === 0) return false;
+
+      const usagePct = totalTokens / contextTokens;
+      // Compact when usage exceeds 70%
+      if (usagePct > 0.7) {
+        console.log(`[${this.config.name}] Context ${Math.round(usagePct * 100)}% full, compacting...`);
+        await this.openclawClient.compactSession(sessionKey);
+        console.log(`[${this.config.name}] Compaction done`);
+        return true;
+      }
+    } catch (err) {
+      console.warn(`[${this.config.name}] checkAndCompact failed:`, (err as Error).message);
+    }
+    return false;
+  }
+
+  /**
+   * Handle /status command: show current session info.
+   */
+  private async handleStatusCommand(chatId: string, chatType: string, messageId: string): Promise<void> {
+    const sessionKey = this.getSessionKey(chatId);
+    const chatInfo = this.store.getChatInfo(chatId);
+    const msgCount = this.store.getMessageCount(chatId);
+
+    let session: any = null;
+    try {
+      const resp = await this.openclawClient.getSessionInfo(sessionKey);
+      session = resp?.session;
+    } catch {
+      // session may not exist yet
+    }
+
+    const model = session?.model ? `${session.modelProvider || ""}/${session.model}` : this.config.model;
+    const totalTokens = session?.totalTokens || 0;
+    const contextTokens = session?.contextTokens || 0;
+    const inputTokens = session?.inputTokens || 0;
+    const outputTokens = session?.outputTokens || 0;
+    const usedPct = contextTokens > 0 ? Math.round((totalTokens / contextTokens) * 100) : 0;
+
+    const fmtK = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
+
+    const chatLabel = chatInfo?.chatName || (chatType === "p2p" ? "私聊" : chatId.slice(-8));
+    const sessionExists = session ? "✅ 活跃" : "⏳ 未初始化";
+    const status = session?.status || "unknown";
+
+    const statusText = [
+      `📊 ${this.config.name} Bot Status`,
+      `━━━━━━━━━━━━━━━━━━`,
+      `🤖 Bot: ${this.config.name}`,
+      `🧠 模型: ${model}`,
+      `💬 会话: ${chatLabel} (${chatType === "p2p" ? "私聊" : "群聊"})`,
+      `📋 Session: ${sessionExists} | ${status}`,
+      `🔑 Key: ${sessionKey}`,
+      `━━━━━━━━━━━━━━━━━━`,
+      `📝 本地消息: ${msgCount} 条`,
+      `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)`,
+      `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
+    ].join("\n");
+
+    await this.replyMessage(messageId, statusText);
+  }
+
+  /**
+   * Handle /compact command: compress session context.
+   */
+  private async handleCompactCommand(chatId: string, messageId: string): Promise<void> {
+    const sessionKey = this.getSessionKey(chatId);
+    try {
+      await this.openclawClient.compactSession(sessionKey);
+      await this.replyMessage(messageId, `✅ Session 已压缩\nKey: ${sessionKey}`);
+    } catch (err) {
+      await this.replyMessage(messageId, `❌ 压缩失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Handle /reset command: fire sessions.reset and confirm.
+   * sessions.reset doesn't return a WS response, so we fire-and-forget
+   * then verify via describe.
+   */
+  private async handleResetCommand(chatId: string, messageId: string): Promise<void> {
+    const sessionKey = this.getSessionKey(chatId);
+    try {
+      // Fire reset (no response expected)
+      this.openclawClient.resetSession(sessionKey).catch(() => {});
+      // Wait a moment for it to take effect
+      await new Promise((r) => setTimeout(r, 2000));
+      // Re-init session
+      this.initializedSessions.delete(sessionKey);
+      await this.ensureSession(chatId);
+      await this.replyMessage(messageId, `✅ Session 已重置\n模型: ${this.config.model}`);
+    } catch (err) {
+      await this.replyMessage(messageId, `❌ 重置失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Fetch chat info (name, type, members) via Feishu API and cache in SQLite.
+   * Called once per chat on first message.
+   */
+  private async fetchAndCacheChatInfo(chatId: string, chatType: string): Promise<void> {
+    const existing = this.store.getChatInfo(chatId);
+    // Refresh at most once per hour
+    if (existing && Date.now() - existing.updatedAt < 3600_000) return;
+
+    try {
+      if (chatType === "p2p") {
+        // For p2p, we don't have a group name or member list from chat API
+        this.store.upsertChatInfo({
+          chatId,
+          chatType: "p2p",
+          chatName: "私聊",
+          members: "",
+          memberNames: "",
+          updatedAt: Date.now(),
+        });
+        return;
+      }
+
+      // Fetch group info
+      const chatResp = await this.client.im.chat.get({
+        path: { chat_id: chatId },
+      });
+      const chatName = (chatResp.data as any)?.name || "";
+
+      // Fetch members
+      let members: string[] = [];
+      let memberNames: string[] = [];
+      try {
+        const membersResp = await this.client.im.chatMembers.get({
+          path: { chat_id: chatId },
+          params: { member_id_type: "open_id", page_size: 100 },
+        });
+        const items = (membersResp.data as any)?.items || [];
+        for (const item of items) {
+          if (item.member_id) members.push(item.member_id);
+          if (item.name) memberNames.push(item.name);
+        }
+      } catch {
+        // Some bots may lack permission to list members
+      }
+
+      this.store.upsertChatInfo({
+        chatId,
+        chatType: "group",
+        chatName,
+        members: members.join(","),
+        memberNames: memberNames.join(","),
+        updatedAt: Date.now(),
+      });
+      console.log(`[${this.config.name}] Cached chat info: ${chatName} (${chatId.slice(-8)})`);
+    } catch (err) {
+      console.warn(`[${this.config.name}] Failed to fetch chat info:`, (err as Error).message);
+    }
+  }
+
+  /**
+   * Send a model-drift notification to the affected chat.
+   */
+  private async notifyModelDrift(chatId: string, _sessionKey: string): Promise<void> {
+    try {
+      const chatInfo = this.store.getChatInfo(chatId);
+      const chatLabel = chatInfo?.chatName || chatId.slice(-8);
+
+      await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({
+            text: `⚠️ 模型漂移已自动纠正\n期望: ${this.config.model}\n已恢复`,
+          }),
+          msg_type: "text",
+        },
+      });
+      console.log(`[${this.config.name}] Drift notification sent to ${chatLabel}`);
+    } catch (err) {
+      console.warn(`[${this.config.name}] Failed to notify drift:`, (err as Error).message);
+    }
   }
 }

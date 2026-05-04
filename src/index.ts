@@ -28,7 +28,7 @@ async function main() {
   // Start all bots
   const bots: FeishuBot[] = [];
   for (const botConfig of config.bots) {
-    const bot = new FeishuBot(botConfig, openclawClient, store);
+    const bot = new FeishuBot(botConfig, openclawClient, store, config.adminOpenId);
     bots.push(bot);
     await bot.start();
   }

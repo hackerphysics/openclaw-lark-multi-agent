@@ -17,6 +17,8 @@ export interface OpenClawConfig {
 export interface AppConfig {
   openclaw: OpenClawConfig;
   bots: BotConfig[];
+  /** Stephen's open_id for model-drift notifications */
+  adminOpenId?: string;
 }
 
 export function loadConfig(path?: string): AppConfig {
@@ -35,5 +37,16 @@ export function loadConfig(path?: string): AppConfig {
       throw new Error(`Bot "${bot.name}" missing appId, appSecret, or model`);
     }
   }
+
+  // Validate uniqueness
+  const names = config.bots.map((b) => b.name);
+  const appIds = config.bots.map((b) => b.appId);
+  if (new Set(names).size !== names.length) {
+    throw new Error(`Duplicate bot names detected: ${names.join(", ")}`);
+  }
+  if (new Set(appIds).size !== appIds.length) {
+    throw new Error(`Duplicate bot appIds detected`);
+  }
+
   return config;
 }

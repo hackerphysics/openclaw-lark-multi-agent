@@ -20,6 +20,8 @@ export class OpenClawClient {
   private connected = false;
   private connectPromise: Promise<void> | null = null;
   private agentEvents: any[] = [];
+  /** Callbacks for unsolicited session messages (agent-initiated) */
+  private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -92,6 +94,20 @@ export class OpenClawClient {
         // Agent events — store for polling
         if (frame.event === "agent") {
           this.agentEvents.push(frame.payload);
+        }
+
+        // Log all events for debugging
+        if (frame.type === "event" && frame.event !== "tick") {
+          console.log(`[OpenClaw] Event: ${frame.event}`, JSON.stringify(frame.payload || {}).substring(0, 200));
+        }
+
+        // Session message events (agent-initiated / proactive)
+        if (frame.event === "session.message" && frame.payload) {
+          const sessionKey = frame.payload.sessionKey;
+          const cb = this.sessionMessageCallbacks.get(sessionKey);
+          if (cb && frame.payload.role === "assistant" && frame.payload.text) {
+            cb(frame.payload.text);
+          }
         }
       });
 
@@ -168,12 +184,47 @@ export class OpenClawClient {
     return this.rpc("sessions.patch", params);
   }
 
+  async getSessionStatus(key: string): Promise<any> {
+    return this.rpc("sessions.describe", { key });
+  }
+
+  /**
+   * Get session info (model, tokens, etc.) for status display.
+   */
+  async getSessionInfo(sessionKey: string): Promise<any> {
+    return this.rpc("sessions.describe", { key: sessionKey });
+  }
+
+  /**
+   * Ensure session is using the expected model. If not, patch it back.
+   * Returns true if a correction was made.
+   */
+  async ensureModel(sessionKey: string, expectedModel: string): Promise<boolean> {
+    try {
+      const status = await this.getSessionStatus(sessionKey);
+      const currentModel = status?.model || status?.sessionModel;
+      if (currentModel && currentModel !== expectedModel) {
+        console.log(`[OpenClaw] Model drift detected: ${currentModel} → ${expectedModel}`);
+        await this.patchSession({ key: sessionKey, model: expectedModel });
+        return true;
+      }
+    } catch (err) {
+      console.warn(`[OpenClaw] ensureModel check failed:`, (err as Error).message);
+    }
+    return false;
+  }
+
   async deleteSession(key: string, deleteTranscript = true): Promise<any> {
     return this.rpc("sessions.delete", { key, deleteTranscript });
   }
 
   async resetSession(key: string): Promise<any> {
-    return this.rpc("sessions.reset", { key });
+    // sessions.reset may not return a response; use short timeout
+    return this.rpc("sessions.reset", { key }, 5000).catch(() => {});
+  }
+
+  async compactSession(key: string): Promise<any> {
+    return this.rpc("sessions.compact", { key });
   }
 
   // --- Chat ---
@@ -258,6 +309,33 @@ export class OpenClawClient {
       this.ws.close();
       this.ws = null;
       this.connected = false;
+    }
+  }
+
+  // --- Session event subscription ---
+
+  /**
+   * Subscribe to message events for a session.
+   * When the agent proactively produces a message, the callback fires.
+   */
+  async subscribeSession(
+    sessionKey: string,
+    onMessage: (text: string) => void
+  ): Promise<void> {
+    this.sessionMessageCallbacks.set(sessionKey, onMessage);
+    try {
+      await this.rpc("sessions.messages.subscribe", { key: sessionKey });
+    } catch (err) {
+      console.warn(`[OpenClaw] Failed to subscribe ${sessionKey}:`, (err as Error).message);
+    }
+  }
+
+  async unsubscribeSession(sessionKey: string): Promise<void> {
+    this.sessionMessageCallbacks.delete(sessionKey);
+    try {
+      await this.rpc("sessions.messages.unsubscribe", { key: sessionKey });
+    } catch {
+      // ignore
     }
   }
 }

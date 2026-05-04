@@ -2,6 +2,17 @@ import Database from "better-sqlite3";
 import { resolve } from "path";
 import { mkdirSync } from "fs";
 
+export interface ChatInfo {
+  chatId: string;
+  chatType: "p2p" | "group";
+  chatName: string;
+  /** Comma-separated member open_ids */
+  members: string;
+  /** Comma-separated member names */
+  memberNames: string;
+  updatedAt: number;
+}
+
 export interface ChatMessage {
   id?: number;
   chatId: string;
@@ -37,6 +48,15 @@ export class MessageStore {
         timestamp INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
+
+      CREATE TABLE IF NOT EXISTS chat_info (
+        chat_id TEXT PRIMARY KEY,
+        chat_type TEXT NOT NULL DEFAULT 'group',
+        chat_name TEXT NOT NULL DEFAULT '',
+        members TEXT NOT NULL DEFAULT '',
+        member_names TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL DEFAULT 0
+      );
 
       -- Tracks which messages have been synced to each bot's OpenClaw session.
       -- If a message id is NOT in this table for a given bot, it hasn't been seen by that session yet.
@@ -149,6 +169,62 @@ export class MessageStore {
       else break;
     }
     return count;
+  }
+
+  // --- Chat info ---
+
+  upsertChatInfo(info: ChatInfo): void {
+    this.db.prepare(`
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT (chat_id) DO UPDATE SET
+        chat_type = excluded.chat_type,
+        chat_name = excluded.chat_name,
+        members = excluded.members,
+        member_names = excluded.member_names,
+        updated_at = excluded.updated_at
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.updatedAt);
+  }
+
+  getChatInfo(chatId: string): ChatInfo | null {
+    const row = this.db.prepare(`SELECT * FROM chat_info WHERE chat_id = ?`).get(chatId) as any;
+    if (!row) return null;
+    return {
+      chatId: row.chat_id,
+      chatType: row.chat_type,
+      chatName: row.chat_name,
+      members: row.members,
+      memberNames: row.member_names,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  getAllChatInfo(): ChatInfo[] {
+    const rows = this.db.prepare(`SELECT * FROM chat_info ORDER BY updated_at DESC`).all() as any[];
+    return rows.map((r: any) => ({
+      chatId: r.chat_id,
+      chatType: r.chat_type,
+      chatName: r.chat_name,
+      members: r.members,
+      memberNames: r.member_names,
+      updatedAt: r.updated_at,
+    }));
+  }
+
+  /**
+   * Check if a message already exists in the store.
+   */
+  hasMessage(messageId: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM messages WHERE message_id = ?`).get(messageId);
+    return !!row;
+  }
+
+  /**
+   * Get total message count for a chat.
+   */
+  getMessageCount(chatId: string): number {
+    const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ?`).get(chatId) as any;
+    return row?.cnt || 0;
   }
 
   close() {
