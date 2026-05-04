@@ -20,7 +20,8 @@ export class OpenClawClient {
   private connected = false;
   private connectPromise: Promise<void> | null = null;
   private agentEvents: any[] = [];
-  /** Callbacks for unsolicited session messages (agent-initiated) */
+  /** Callbacks for tool events (verbose mode) */
+  private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
 
   constructor(config: OpenClawConfig) {
@@ -107,6 +108,18 @@ export class OpenClawClient {
           const cb = this.sessionMessageCallbacks.get(sessionKey);
           if (cb && frame.payload.role === "assistant" && frame.payload.text) {
             cb(frame.payload.text);
+          }
+        }
+
+        // Session tool events (for verbose mode)
+        if (frame.event === "session.tool" && frame.payload) {
+          const sessionKey = frame.payload.sessionKey;
+          const cb = this.toolEventCallbacks.get(sessionKey);
+          if (cb) {
+            const toolName = frame.payload.toolName || frame.payload.name || "unknown";
+            const toolInput = JSON.stringify(frame.payload.input || frame.payload.arguments || "").substring(0, 500);
+            const toolOutput = (frame.payload.output || frame.payload.result || "").toString().substring(0, 500);
+            cb(toolName, toolInput, toolOutput);
           }
         }
       });
@@ -332,10 +345,21 @@ export class OpenClawClient {
 
   async unsubscribeSession(sessionKey: string): Promise<void> {
     this.sessionMessageCallbacks.delete(sessionKey);
+    this.toolEventCallbacks.delete(sessionKey);
     try {
       await this.rpc("sessions.messages.unsubscribe", { key: sessionKey });
     } catch {
       // ignore
     }
+  }
+
+  /**
+   * Register a callback for tool call events on a session.
+   */
+  onToolEvent(
+    sessionKey: string,
+    callback: (toolName: string, toolInput: string, toolOutput: string) => void
+  ): void {
+    this.toolEventCallbacks.set(sessionKey, callback);
   }
 }

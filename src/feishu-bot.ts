@@ -29,6 +29,8 @@ export class FeishuBot {
   private busyChats: Map<string, number> = new Map();
   /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
   private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
+  /** Per-chat verbose mode: show tool calls */
+  private verboseChats: Set<string> = new Set();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -117,13 +119,26 @@ export class FeishuBot {
 
     this.initializedSessions.add(sessionKey);
 
-    // Subscribe to agent-initiated messages for this session
+    // Subscribe to session events (proactive messages + tool calls)
     await this.openclawClient.subscribeSession(sessionKey, async (text) => {
       try {
         console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
         await this.sendMessage(chatId, text);
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
+      }
+    });
+
+    // Subscribe to tool events for verbose mode
+    this.openclawClient.onToolEvent(sessionKey, async (toolName, toolInput, toolOutput) => {
+      if (!this.verboseChats.has(chatId)) return;
+      try {
+        const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
+        const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
+        const msg = `🔧 Tool: ${toolName}\n📥 ${inputPreview}${toolOutput ? `\n📤 ${outputPreview}` : ""}`;
+        await this.sendMessage(chatId, msg);
+      } catch (err) {
+        console.warn(`[${this.config.name}] Failed to send tool event:`, (err as Error).message);
       }
     });
 
@@ -241,6 +256,19 @@ export class FeishuBot {
       if (cleanText.trim().startsWith("/reset")) {
         await this.ensureSession(chatId);
         await this.handleResetCommand(chatId, messageId);
+        return;
+      }
+
+      // --- Handle /verbose command ---
+      if (cleanText.trim().startsWith("/verbose")) {
+        const isOn = this.verboseChats.has(chatId);
+        if (isOn) {
+          this.verboseChats.delete(chatId);
+          await this.replyMessage(messageId, "🔇 Verbose 已关闭\nTool call 详情不再显示");
+        } else {
+          this.verboseChats.add(chatId);
+          await this.replyMessage(messageId, "🔊 Verbose 已开启\nTool call 执行过程将实时显示");
+        }
         return;
       }
 
