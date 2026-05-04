@@ -25,8 +25,8 @@ export class FeishuBot {
   private initializedSessions: Set<string> = new Set();
   /** Dedup: track recently processed message IDs */
   private processedMessages: Set<string> = new Set();
-  /** Per-chat busy lock: true = agent is running, don't send yet */
-  private busyChats: Map<string, boolean> = new Map();
+  /** Per-chat busy lock: timestamp when became busy (0 = not busy) */
+  private busyChats: Map<string, number> = new Map();
   /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
   private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
   private adminOpenId: string | null;
@@ -130,6 +130,30 @@ export class FeishuBot {
     console.log(
       `[${this.config.name}] Bot started (model: ${this.config.model})`
     );
+
+    // Drain any unsynced messages left from previous run
+    this.drainOnStartup();
+  }
+
+  /**
+   * On startup, check all known chats for unsynced messages and process them.
+   */
+  private async drainOnStartup(): Promise<void> {
+    try {
+      const chats = this.store.getAllChatInfo();
+      for (const chat of chats) {
+        const unsynced = this.store.getUnsyncedMessages(this.config.name, chat.chatId);
+        const humanUnsynced = unsynced.filter((m) => m.senderType === "human");
+        if (humanUnsynced.length > 0) {
+          console.log(
+            `[${this.config.name}] Startup drain: ${humanUnsynced.length} unsynced message(s) in ${chat.chatName || chat.chatId.slice(-8)}`
+          );
+          await this.processQueue(chat.chatId);
+        }
+      }
+    } catch (err) {
+      console.warn(`[${this.config.name}] Startup drain failed:`, (err as Error).message);
+    }
   }
 
   static getAllBots(): Map<string, FeishuBot> {
@@ -248,11 +272,23 @@ export class FeishuBot {
       }
 
       // --- Queue-based sending: if agent is busy, just accumulate ---
-      if (this.busyChats.get(chatId)) {
+      const busySince = this.busyChats.get(chatId) || 0;
+      const BUSY_TIMEOUT_MS = 180_000; // 3 minutes max
+      const isBusy = busySince > 0 && (Date.now() - busySince) < BUSY_TIMEOUT_MS;
+
+      if (isBusy) {
         console.log(
           `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, queuing: "${cleanText.substring(0, 50)}..."`
         );
         return; // Message is in DB, will be picked up when agent finishes
+      }
+
+      if (busySince > 0) {
+        // Busy timeout expired — force unlock and proceed
+        console.warn(
+          `[${this.config.name}] Busy timeout expired for ${chatId.slice(-8)} (${Math.round((Date.now() - busySince) / 1000)}s), force unlocking`
+        );
+        this.busyChats.set(chatId, 0);
       }
 
       // --- Not busy, send now (with any accumulated messages) ---
@@ -273,7 +309,7 @@ export class FeishuBot {
       const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human");
       if (humanUnsynced.length === 0) break;
 
-      this.busyChats.set(chatId, true);
+      this.busyChats.set(chatId, Date.now());
 
       // The last human message is the "current" one, everything else is context
       const lastHuman = humanUnsynced[humanUnsynced.length - 1];
@@ -326,7 +362,7 @@ export class FeishuBot {
         console.error(`[${this.config.name}] processQueue error:`, err);
         break;
       } finally {
-        this.busyChats.set(chatId, false);
+        this.busyChats.set(chatId, 0);
       }
 
       // Check if more messages arrived while we were busy
