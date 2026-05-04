@@ -160,11 +160,17 @@ export class FeishuBot {
 
   /**
    * On startup, check all known chats for unsynced messages and process them.
+   * Also re-subscribe to known sessions for tool events.
    */
   private async drainOnStartup(): Promise<void> {
     try {
       const chats = this.store.getAllChatInfo();
       for (const chat of chats) {
+        // Re-subscribe to existing sessions
+        const sessionKey = this.getSessionKey(chat.chatId);
+        await this.ensureSession(chat.chatId);
+
+        // Drain unsynced messages
         const unsynced = this.store.getUnsyncedMessages(this.config.name, chat.chatId);
         const humanUnsynced = unsynced.filter((m) => m.senderType === "human");
         if (humanUnsynced.length > 0) {
