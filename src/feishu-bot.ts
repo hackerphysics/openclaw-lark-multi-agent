@@ -29,6 +29,8 @@ export class FeishuBot {
   private busyChats: Map<string, number> = new Map();
   /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
   private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
+  /** Per-chat pending tool message sends (to await before final reply) */
+  private pendingToolSends: Map<string, Promise<void>[]> = new Map();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -131,14 +133,20 @@ export class FeishuBot {
     this.openclawClient.onToolEvent(sessionKey, async (toolName, toolInput, toolOutput) => {
       const chatInfo = this.store.getChatInfo(chatId);
       if (!chatInfo?.verbose) return;
-      try {
-        const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
-        const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
-        const msg = `🔧 Tool: ${toolName}\n📥 ${inputPreview}${toolOutput ? `\n📤 ${outputPreview}` : ""}`;
-        await this.sendMessage(chatId, msg);
-      } catch (err) {
-        console.warn(`[${this.config.name}] Failed to send tool event:`, (err as Error).message);
-      }
+      const sendPromise = (async () => {
+        try {
+          const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
+          const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
+          const msg = `🔧 Tool: ${toolName}\n📥 ${inputPreview}${toolOutput ? `\n📤 ${outputPreview}` : ""}`;
+          await this.sendMessage(chatId, msg);
+        } catch (err) {
+          console.warn(`[${this.config.name}] Failed to send tool event:`, (err as Error).message);
+        }
+      })();
+      // Track the send promise so processQueue can await it before final reply
+      const pending = this.pendingToolSends.get(chatId) || [];
+      pending.push(sendPromise);
+      this.pendingToolSends.set(chatId, pending);
     });
 
     return sessionKey;
@@ -401,6 +409,13 @@ export class FeishuBot {
           timestamp: Date.now(),
         });
         this.store.markSynced(this.config.name, chatId, replyId);
+
+        // Wait for all pending tool event messages to be delivered first
+        const toolSends = this.pendingToolSends.get(chatId) || [];
+        if (toolSends.length > 0) {
+          await Promise.allSettled(toolSends);
+          this.pendingToolSends.set(chatId, []);
+        }
 
         // Reply to the last human message on Feishu
         if (lastHuman.messageId) {
