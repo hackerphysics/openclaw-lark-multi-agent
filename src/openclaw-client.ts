@@ -123,7 +123,7 @@ export class OpenClawClient {
             if (toolCb) {
               for (const item of content) {
                 if (item.type === "toolCall") {
-                  const toolName = item.name || "unknown";
+                  const toolName = item.name || item.toolName || "unknown";
                   const toolInput = typeof item.arguments === "string"
                     ? item.arguments
                     : JSON.stringify(item.arguments || item.input || {});
@@ -371,7 +371,9 @@ export class OpenClawClient {
     this.sessionMessageCallbacks.set(sessionKey, onMessage);
     this.sessionMessageCallbacks.set(`agent:main:${sessionKey}`, onMessage);
     try {
-      await this.rpc("sessions.messages.subscribe", { key: sessionKey });
+      // Try subscribing with short key first, then full key
+      await this.rpc("sessions.messages.subscribe", { key: sessionKey }).catch(() => {});
+      await this.rpc("sessions.messages.subscribe", { key: `agent:main:${sessionKey}` }).catch(() => {});
     } catch (err) {
       console.warn(`[OpenClaw] Failed to subscribe ${sessionKey}:`, (err as Error).message);
     }
