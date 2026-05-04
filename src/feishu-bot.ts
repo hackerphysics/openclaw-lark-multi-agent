@@ -633,6 +633,8 @@ export class FeishuBot {
     const sessionExists = session ? "✅ 活跃" : "⏳ 未初始化";
     const status = session?.status || "unknown";
 
+    const verboseStatus = chatInfo?.verbose ? "🔊 开启" : "🔇 关闭";
+
     const statusText = [
       `📊 ${this.config.name} Bot Status`,
       `━━━━━━━━━━━━━━━━━━`,
@@ -645,6 +647,7 @@ export class FeishuBot {
       `📝 本地消息: ${msgCount} 条`,
       `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)${tokenNote}`,
       `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
+      `🔧 Verbose: ${verboseStatus}`,
     ].join("\n");
 
     await this.replyMessage(messageId, statusText);
