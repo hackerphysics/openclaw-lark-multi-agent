@@ -534,6 +534,7 @@ export class FeishuBot {
     const inputTokens = session?.inputTokens || 0;
     const outputTokens = session?.outputTokens || 0;
     const usedPct = contextTokens > 0 ? Math.round((totalTokens / contextTokens) * 100) : 0;
+    const tokenNote = !session?.totalTokensFresh ? " (待首次对话后更新)" : "";
 
     const fmtK = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : `${n}`;
 
@@ -551,7 +552,7 @@ export class FeishuBot {
       `🔑 Key: ${sessionKey}`,
       `━━━━━━━━━━━━━━━━━━`,
       `📝 本地消息: ${msgCount} 条`,
-      `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)`,
+      `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)${tokenNote}`,
       `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
     ].join("\n");
 
