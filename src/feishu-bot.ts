@@ -31,6 +31,8 @@ export class FeishuBot {
   private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
   /** Per-chat pending tool message sends (to await before final reply) */
   private pendingToolSends: Map<string, Promise<void>[]> = new Map();
+  /** Per-chat serial send queue to guarantee message order */
+  private sendQueue: Map<string, Promise<void>> = new Map();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -134,7 +136,7 @@ export class FeishuBot {
       const chatInfo = this.store.getChatInfo(chatId);
       if (!chatInfo?.verbose) return;
       console.log(`[${this.config.name}] [${new Date().toISOString()}] Tool event received: ${toolName}`);
-      const sendPromise = (async () => {
+      const sendPromise = this.sendOrdered(chatId, async () => {
         try {
           const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
           const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
@@ -145,7 +147,7 @@ export class FeishuBot {
         } catch (err) {
           console.warn(`[${this.config.name}] Failed to send tool event:`, (err as Error).message);
         }
-      })();
+      });
       // Track the send promise so processQueue can await it before final reply
       const pending = this.pendingToolSends.get(chatId) || [];
       pending.push(sendPromise);
@@ -420,9 +422,11 @@ export class FeishuBot {
           this.pendingToolSends.set(chatId, []);
         }
 
-        // Reply to the last human message on Feishu
+        // Reply to the last human message on Feishu (ordered after tool msgs)
         if (lastHuman.messageId) {
-          await this.replyMessage(lastHuman.messageId, reply);
+          await this.sendOrdered(chatId, async () => {
+            await this.replyMessage(lastHuman.messageId, reply);
+          });
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] Replied (${reply.length} chars)`);
 
@@ -560,6 +564,17 @@ export class FeishuBot {
         },
       });
     }
+  }
+
+  /**
+   * Enqueue a message send to guarantee ordering per chat.
+   * All sends for a chat are serialized through this.
+   */
+  private sendOrdered(chatId: string, fn: () => Promise<void>): Promise<void> {
+    const prev = this.sendQueue.get(chatId) || Promise.resolve();
+    const next = prev.then(fn, fn); // run even if previous failed
+    this.sendQueue.set(chatId, next);
+    return next;
   }
 
   /**
