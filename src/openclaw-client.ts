@@ -286,7 +286,7 @@ export class OpenClawClient {
       idempotencyKey: randomUUID(),
     });
     console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
-    return this.collectReply(result.runId, params.timeoutMs || 180000);
+    return this.collectReply(result.runId, params.timeoutMs || 600000);
   }
 
   /**
