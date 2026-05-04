@@ -476,27 +476,67 @@ export class FeishuBot {
   }
 
   private async replyMessage(messageId: string, text: string) {
-    await this.client.im.message.reply({
-      path: { message_id: messageId },
-      data: {
-        content: JSON.stringify({ text }),
-        msg_type: "text",
-      },
-    });
+    // Use interactive card for markdown rendering
+    const card = {
+      elements: [
+        {
+          tag: "markdown",
+          content: text,
+        },
+      ],
+    };
+    try {
+      await this.client.im.message.reply({
+        path: { message_id: messageId },
+        data: {
+          content: JSON.stringify(card),
+          msg_type: "interactive",
+        },
+      });
+    } catch {
+      // Fallback to plain text if card fails
+      await this.client.im.message.reply({
+        path: { message_id: messageId },
+        data: {
+          content: JSON.stringify({ text }),
+          msg_type: "text",
+        },
+      });
+    }
   }
 
   /**
    * Send a proactive message to a chat (not a reply).
    */
   private async sendMessage(chatId: string, text: string) {
-    await this.client.im.message.create({
-      params: { receive_id_type: "chat_id" },
-      data: {
-        receive_id: chatId,
-        content: JSON.stringify({ text }),
-        msg_type: "text",
-      },
-    });
+    const card = {
+      elements: [
+        {
+          tag: "markdown",
+          content: text,
+        },
+      ],
+    };
+    try {
+      await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify(card),
+          msg_type: "interactive",
+        },
+      });
+    } catch {
+      // Fallback to plain text
+      await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ text }),
+          msg_type: "text",
+        },
+      });
+    }
   }
 
   /**
