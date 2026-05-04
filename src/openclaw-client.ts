@@ -104,20 +104,22 @@ export class OpenClawClient {
 
         // Session message events (agent-initiated / proactive + tool calls for verbose)
         if (frame.event === "session.message" && frame.payload) {
-          const sessionKey = frame.payload.sessionKey;
+          const rawKey = frame.payload.sessionKey || "";
+          // Try both raw key and without agent:main: prefix
+          const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
           const msg = frame.payload.message || frame.payload;
           const role = msg.role;
           const content = msg.content;
 
           // Proactive assistant text messages
           if (role === "assistant" && typeof content === "string") {
-            const cb = this.sessionMessageCallbacks.get(sessionKey);
+            const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
             if (cb) cb(content);
           }
 
           // Tool calls in assistant messages (verbose mode)
           if (role === "assistant" && Array.isArray(content)) {
-            const toolCb = this.toolEventCallbacks.get(sessionKey);
+            const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
             if (toolCb) {
               for (const item of content) {
                 if (item.type === "toolCall") {
@@ -133,7 +135,7 @@ export class OpenClawClient {
 
           // Tool results
           if (role === "toolResult" || role === "tool") {
-            const toolCb = this.toolEventCallbacks.get(sessionKey);
+            const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
             if (toolCb) {
               const toolName = msg.toolName || msg.name || "result";
               const output = Array.isArray(content)
@@ -365,7 +367,9 @@ export class OpenClawClient {
     sessionKey: string,
     onMessage: (text: string) => void
   ): Promise<void> {
+    // Register under both the short key and the full key with agent:main: prefix
     this.sessionMessageCallbacks.set(sessionKey, onMessage);
+    this.sessionMessageCallbacks.set(`agent:main:${sessionKey}`, onMessage);
     try {
       await this.rpc("sessions.messages.subscribe", { key: sessionKey });
     } catch (err) {
@@ -391,5 +395,6 @@ export class OpenClawClient {
     callback: (toolName: string, toolInput: string, toolOutput: string) => void
   ): void {
     this.toolEventCallbacks.set(sessionKey, callback);
+    this.toolEventCallbacks.set(`agent:main:${sessionKey}`, callback);
   }
 }
