@@ -91,19 +91,28 @@ export class FeishuBot {
     }
 
     try {
-      await this.openclawClient.createSession({
-        key: sessionKey,
-        model: this.config.model,
-        label: `LMA: ${this.config.name} [${chatId.slice(-8)}]`,
-      });
-      console.log(`[${this.config.name}] Session created: ${sessionKey}`);
-    } catch {
-      // Session already exists, patch model
-      const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
-      if (corrected) {
-        console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
-        await this.notifyModelDrift(chatId, sessionKey);
+      // Check if session already exists in OpenClaw
+      const existing = await this.openclawClient.getSessionInfo(sessionKey).catch(() => null);
+
+      if (existing?.session) {
+        // Session exists — preserve it, only ensure model is correct
+        console.log(`[${this.config.name}] Session exists: ${sessionKey} (tokens: ${existing.session.totalTokens || 0})`);
+        const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
+        if (corrected) {
+          console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
+          await this.notifyModelDrift(chatId, sessionKey);
+        }
+      } else {
+        // Session doesn't exist — create new
+        await this.openclawClient.createSession({
+          key: sessionKey,
+          model: this.config.model,
+          label: `LMA: ${this.config.name} [${chatId.slice(-8)}]`,
+        });
+        console.log(`[${this.config.name}] Session created: ${sessionKey}`);
       }
+    } catch (err) {
+      console.warn(`[${this.config.name}] ensureSession error:`, (err as Error).message);
     }
 
     this.initializedSessions.add(sessionKey);
