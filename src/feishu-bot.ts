@@ -238,6 +238,21 @@ export class FeishuBot {
       const cleanText = this.cleanMentions(rawText);
       if (!cleanText.trim()) return;
 
+      // --- Handle /help command ---
+      if (cleanText.trim().startsWith("/help")) {
+        const helpText = [
+          `📚 ${this.config.name} Bot 命令列表`,
+          `━━━━━━━━━━━━━━━━━━`,
+          `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
+          `🧹 /compact — 压缩上下文（保留摘要，释放 token）`,
+          `🔄 /reset   — 重置会话（清空历史，从头开始）`,
+          `🔊 /verbose — 开关 Tool Call 显示（查看 AI 调用了哪些工具）`,
+          `❓ /help    — 显示此帮助信息`,
+        ].join("\n");
+        await this.replyMessage(messageId, helpText);
+        return;
+      }
+
       // --- Handle /status command (always respond, regardless of mention rules) ---
       if (cleanText.trim().startsWith("/status")) {
         await this.ensureSession(chatId);
