@@ -25,12 +25,15 @@ async function main() {
   const openclawClient = new OpenClawClient(config.openclaw);
   await openclawClient.connect();
 
-  // Start all bots
+  // Two-phase startup: register all bots first, then start WS connections
   const bots: FeishuBot[] = [];
   for (const botConfig of config.bots) {
     const bot = new FeishuBot(botConfig, openclawClient, store, config.adminOpenId);
     bots.push(bot);
-    await bot.start();
+    bot.register(); // Phase 1: register to allBots map
+  }
+  for (const bot of bots) {
+    await bot.start(); // Phase 2: start WS connections
   }
 
   console.log(`\nAll ${bots.length} bots started. Waiting for messages...`);

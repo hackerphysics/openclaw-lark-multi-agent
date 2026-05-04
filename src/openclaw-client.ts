@@ -28,6 +28,8 @@ export class OpenClawClient {
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
   /** Session keys that should be re-subscribed on reconnect */
   private subscribedKeys: Set<string> = new Set();
+  /** Session keys with active chatSend — suppress proactive message delivery */
+  private suppressedSessions: Set<string> = new Set();
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -126,10 +128,14 @@ export class OpenClawClient {
           const role = msg.role;
           const content = msg.content;
 
-          // Proactive assistant text messages
+          // Proactive assistant text messages (suppress during active chatSend)
           if (role === "assistant" && typeof content === "string") {
-            const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-            if (cb) cb(content);
+            if (this.suppressedSessions.has(rawKey) || this.suppressedSessions.has(shortKey)) {
+              console.log(`[OpenClaw] Suppressing proactive msg for ${shortKey} (active chatSend)`);
+            } else {
+              const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
+              if (cb) cb(content);
+            }
           }
 
           // Tool calls in assistant messages — skip, using agent item events instead
@@ -331,14 +337,22 @@ export class OpenClawClient {
     deliver?: boolean;
     timeoutMs?: number;
   }): Promise<string> {
-    const result = await this.rpc("chat.send", {
-      sessionKey: params.sessionKey,
-      message: params.message,
-      deliver: params.deliver ?? false,
-      idempotencyKey: randomUUID(),
-    });
-    console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
-    return this.collectReply(result.runId, params.timeoutMs || 1800000);
+    const sk = params.sessionKey;
+    this.suppressedSessions.add(sk);
+    this.suppressedSessions.add(`agent:main:${sk}`);
+    try {
+      const result = await this.rpc("chat.send", {
+        sessionKey: sk,
+        message: params.message,
+        deliver: params.deliver ?? false,
+        idempotencyKey: randomUUID(),
+      });
+      console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
+      return await this.collectReply(result.runId, params.timeoutMs || 1800000);
+    } finally {
+      this.suppressedSessions.delete(sk);
+      this.suppressedSessions.delete(`agent:main:${sk}`);
+    }
   }
 
   /**

@@ -1,5 +1,5 @@
 import * as lark from "@larksuiteoapi/node-sdk";
-import { BotConfig, AppConfig } from "./config.js";
+import { BotConfig } from "./config.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 
@@ -159,7 +159,6 @@ export class FeishuBot {
    * Start the Feishu WS connection. Sessions are created lazily per chat.
    */
   async start() {
-    this.register();
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
     console.log(
       `[${this.config.name}] Bot started (model: ${this.config.model})`
@@ -336,7 +335,7 @@ export class FeishuBot {
 
       // --- Queue-based sending: if agent is busy, just accumulate ---
       const busySince = this.busyChats.get(chatId) || 0;
-      const BUSY_TIMEOUT_MS = 180_000; // 3 minutes max
+      const BUSY_TIMEOUT_MS = 1_800_000; // 30 minutes, matches collectReply safety timeout
       const isBusy = busySince > 0 && (Date.now() - busySince) < BUSY_TIMEOUT_MS;
 
       if (isBusy) {
@@ -347,11 +346,13 @@ export class FeishuBot {
       }
 
       if (busySince > 0) {
-        // Busy timeout expired — force unlock and proceed
+        // Busy timeout expired — unlock but don't processQueue here;
+        // let the next new message trigger it naturally to avoid concurrent runs
         console.warn(
-          `[${this.config.name}] Busy timeout expired for ${chatId.slice(-8)} (${Math.round((Date.now() - busySince) / 1000)}s), force unlocking`
+          `[${this.config.name}] Busy timeout expired for ${chatId.slice(-8)} (${Math.round((Date.now() - busySince) / 1000)}s), unlocking (will process on next message)`
         );
         this.busyChats.set(chatId, 0);
+        return;
       }
 
       // --- Not busy, send now (with any accumulated messages) ---
@@ -613,34 +614,6 @@ export class FeishuBot {
     } catch {
       // ignore
     }
-  }
-
-  /**
-   * Check token usage and auto-compact if needed.
-   * Returns true if compaction was triggered.
-   */
-  private async checkAndCompact(sessionKey: string): Promise<boolean> {
-    try {
-      const resp = await this.openclawClient.getSessionInfo(sessionKey);
-      const session = resp?.session;
-      if (!session) return false;
-
-      const totalTokens = session.totalTokens || 0;
-      const contextTokens = session.contextTokens || 0;
-      if (contextTokens === 0) return false;
-
-      const usagePct = totalTokens / contextTokens;
-      // Compact when usage exceeds 70%
-      if (usagePct > 0.7) {
-        console.log(`[${this.config.name}] Context ${Math.round(usagePct * 100)}% full, compacting...`);
-        await this.openclawClient.compactSession(sessionKey);
-        console.log(`[${this.config.name}] Compaction done`);
-        return true;
-      }
-    } catch (err) {
-      console.warn(`[${this.config.name}] checkAndCompact failed:`, (err as Error).message);
-    }
-    return false;
   }
 
   /**
