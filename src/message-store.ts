@@ -67,6 +67,13 @@ export class MessageStore {
         last_synced_msg_id INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (bot_name, chat_id)
       );
+
+      -- Tracks which messages have been processed by each bot (multi-bot dedup).
+      CREATE TABLE IF NOT EXISTS processed_events (
+        bot_name TEXT NOT NULL,
+        message_id TEXT NOT NULL,
+        PRIMARY KEY (bot_name, message_id)
+      );
     `);
 
     // Migration: add verbose column if missing
@@ -242,6 +249,21 @@ export class MessageStore {
   getMessageCount(chatId: string): number {
     const row = this.db.prepare(`SELECT COUNT(*) as cnt FROM messages WHERE chat_id = ?`).get(chatId) as any;
     return row?.cnt || 0;
+  }
+
+  /**
+   * Check if a specific bot has already processed a message.
+   */
+  hasBotProcessed(botName: string, messageId: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM processed_events WHERE bot_name = ? AND message_id = ?`).get(botName, messageId);
+    return !!row;
+  }
+
+  /**
+   * Mark a message as processed by a specific bot.
+   */
+  markBotProcessed(botName: string, messageId: string): void {
+    this.db.prepare(`INSERT OR IGNORE INTO processed_events (bot_name, message_id) VALUES (?, ?)`).run(botName, messageId);
   }
 
   close() {

@@ -19,7 +19,10 @@ export class OpenClawClient {
   private pending: Map<string, PendingReq> = new Map();
   private connected = false;
   private connectPromise: Promise<void> | null = null;
-  private agentEvents: any[] = [];
+  private agentEvents: Map<string, any[]> = new Map();
+  private reconnectDelay = 1000;
+  private maxReconnectDelay = 30000;
+  private shouldReconnect = true;
   /** Callbacks for tool events (verbose mode) */
   private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
@@ -92,9 +95,11 @@ export class OpenClawClient {
           }
         }
 
-        // Agent events — store for polling
+        // Agent events — store per session key
         if (frame.event === "agent") {
-          this.agentEvents.push(frame.payload);
+          const sk = frame.payload?.sessionKey || "__default__";
+          if (!this.agentEvents.has(sk)) this.agentEvents.set(sk, []);
+          this.agentEvents.get(sk)!.push(frame.payload);
         }
 
         // Log all events for debugging
@@ -142,16 +147,40 @@ export class OpenClawClient {
 
       this.ws.on("close", () => {
         this.connected = false;
+        this.connectPromise = null;
         console.log("[OpenClaw] WS disconnected");
+        if (this.shouldReconnect) {
+          this.scheduleReconnect();
+        }
       });
     });
   }
 
+  private scheduleReconnect(): void {
+    const delay = this.reconnectDelay;
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, this.maxReconnectDelay);
+    console.log(`[OpenClaw] Reconnecting in ${delay}ms...`);
+    setTimeout(async () => {
+      try {
+        await this.connect();
+        this.reconnectDelay = 1000; // reset on success
+        console.log("[OpenClaw] Reconnected successfully");
+      } catch (err) {
+        console.error("[OpenClaw] Reconnect failed:", (err as Error).message);
+        if (this.shouldReconnect) this.scheduleReconnect();
+      }
+    }, delay);
+  }
+
   private rpc(method: string, params: any, timeoutMs = 120000): Promise<any> {
-    return new Promise((resolve, reject) => {
+    return new Promise(async (resolve, reject) => {
       if (!this.ws || !this.connected) {
-        reject(new Error("Not connected"));
-        return;
+        try {
+          await this.connect();
+        } catch (err) {
+          reject(new Error("Not connected and reconnect failed"));
+          return;
+        }
       }
       const id = randomUUID();
       const timer = setTimeout(() => {
@@ -159,7 +188,7 @@ export class OpenClawClient {
         reject(new Error(`RPC timeout: ${method}`));
       }, timeoutMs);
       this.pending.set(id, { resolve, reject, timer });
-      this.ws.send(JSON.stringify({ type: "req", id, method, params }));
+      this.ws!.send(JSON.stringify({ type: "req", id, method, params }));
     });
   }
 
@@ -180,36 +209,49 @@ export class OpenClawClient {
       }, timeoutMs);
 
       const poller = setInterval(() => {
-        while (this.agentEvents.length > 0) {
-          const ev = this.agentEvents.shift()!;
-          
-          // Match by runId or sessionKey (for multi-turn tool calling)
-          if (ev.runId === runId) {
-            if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
-          } else if (sessionKey && ev.sessionKey === sessionKey) {
-            // Same session, different run (tool-calling continuation)
-          } else {
-            continue;
-          }
+        // Scan all buckets to find our runId first, then lock onto sessionKey
+        const bucketsToScan = sessionKey
+          ? [sessionKey]
+          : Array.from(this.agentEvents.keys());
 
-          if (ev.stream === "assistant" && ev.data?.delta) {
-            text += ev.data.delta;
-          }
-          if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
-            // Only resolve if we have collected some text
-            // (intermediate tool-call rounds end without text)
-            if (text) {
+        for (const bucketKey of bucketsToScan) {
+          const bucket = this.agentEvents.get(bucketKey);
+          if (!bucket) continue;
+
+          let i = 0;
+          while (i < bucket.length) {
+            const ev = bucket[i];
+
+            // Match by runId or sessionKey (for multi-turn tool calling)
+            if (ev.runId === runId) {
+              if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
+            } else if (sessionKey && ev.sessionKey === sessionKey) {
+              // Same session, different run (tool-calling continuation)
+            } else {
+              i++;
+              continue;
+            }
+
+            // Consume this event
+            bucket.splice(i, 1);
+
+            if (ev.stream === "assistant" && ev.data?.delta) {
+              text += ev.data.delta;
+            }
+            if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
+              if (text) {
+                clearTimeout(timer);
+                clearInterval(poller);
+                resolve(text);
+                return;
+              }
+            }
+            if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
               clearTimeout(timer);
               clearInterval(poller);
-              resolve(text);
+              reject(new Error(`Agent error: ${ev.data?.error || "unknown"}`));
               return;
             }
-          }
-          if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
-            clearTimeout(timer);
-            clearInterval(poller);
-            reject(new Error(`Agent error: ${ev.data?.error || "unknown"}`));
-            return;
           }
         }
       }, 50);
@@ -348,6 +390,7 @@ export class OpenClawClient {
   }
 
   async disconnect() {
+    this.shouldReconnect = false;
     if (this.ws) {
       this.ws.close();
       this.ws = null;

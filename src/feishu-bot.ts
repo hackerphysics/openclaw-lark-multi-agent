@@ -23,8 +23,6 @@ export class FeishuBot {
   private botOpenId: string | null = null;
   /** Tracks which chatId sessions have been initialized */
   private initializedSessions: Set<string> = new Set();
-  /** Dedup: track recently processed message IDs */
-  private processedMessages: Set<string> = new Set();
   /** Per-chat busy lock: timestamp when became busy (0 = not busy) */
   private busyChats: Map<string, number> = new Map();
   /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
@@ -233,20 +231,9 @@ export class FeishuBot {
 
       if (messageType !== "text") return;
 
-      // --- Dedup: skip if already processed (memory + DB) ---
-      if (this.processedMessages.has(messageId)) return;
-      // Also check DB in case of process restart
-      const existingMsg = this.store.hasMessage(messageId);
-      if (existingMsg) {
-        this.processedMessages.add(messageId);
-        return;
-      }
-      this.processedMessages.add(messageId);
-      // Keep set bounded
-      if (this.processedMessages.size > 1000) {
-        const first = this.processedMessages.values().next().value;
-        if (first) this.processedMessages.delete(first);
-      }
+      // --- Dedup: skip if this bot already processed this message ---
+      if (this.store.hasBotProcessed(this.config.name, messageId)) return;
+      this.store.markBotProcessed(this.config.name, messageId);
 
       // --- Cache chat info (lazy, at most once per hour) ---
       await this.fetchAndCacheChatInfo(chatId, chatType);
@@ -256,56 +243,7 @@ export class FeishuBot {
       const cleanText = this.cleanMentions(rawText);
       if (!cleanText.trim()) return;
 
-      // --- Handle /help command ---
-      if (cleanText.trim().startsWith("/help")) {
-        const helpText = [
-          `📚 ${this.config.name} Bot 命令列表`,
-          `━━━━━━━━━━━━━━━━━━`,
-          `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
-          `🧹 /compact — 压缩上下文（保留摘要，释放 token）`,
-          `🔄 /reset   — 重置会话（清空历史，从头开始）`,
-          `🔊 /verbose — 开关 Tool Call 显示（查看 AI 调用了哪些工具）`,
-          `❓ /help    — 显示此帮助信息`,
-        ].join("\n");
-        await this.replyMessage(messageId, helpText);
-        return;
-      }
-
-      // --- Handle /status command (always respond, regardless of mention rules) ---
-      if (cleanText.trim().startsWith("/status")) {
-        await this.ensureSession(chatId);
-        await this.handleStatusCommand(chatId, chatType, messageId);
-        return;
-      }
-
-      // --- Handle /compact command ---
-      if (cleanText.trim().startsWith("/compact")) {
-        await this.ensureSession(chatId);
-        await this.handleCompactCommand(chatId, messageId);
-        return;
-      }
-
-      // --- Handle /reset command ---
-      if (cleanText.trim().startsWith("/reset")) {
-        await this.ensureSession(chatId);
-        await this.handleResetCommand(chatId, messageId);
-        return;
-      }
-
-      // --- Handle /verbose command ---
-      if (cleanText.trim().startsWith("/verbose")) {
-        const chatInfo = this.store.getChatInfo(chatId);
-        const isOn = chatInfo?.verbose || false;
-        this.store.setVerbose(chatId, !isOn);
-        if (isOn) {
-          await this.replyMessage(messageId, "🔇 Verbose 已关闭\nTool call 详情不再显示");
-        } else {
-          await this.replyMessage(messageId, "🔊 Verbose 已开启\nTool call 执行过程将实时显示");
-        }
-        return;
-      }
-
-      // --- Record to local store (ALL messages) ---
+      // --- Record to local store (ALL messages, before command/response checks) ---
       const senderName = isBot
         ? this.resolveBotName(sender) || "Bot"
         : this.resolveHumanName(sender) || "User";
@@ -318,6 +256,53 @@ export class FeishuBot {
         content: cleanText,
         timestamp: Date.now(),
       });
+
+      // --- Commands: in p2p always respond; in group, check shouldRespond first ---
+      const isCommand = /^\/(help|status|compact|reset|verbose)/.test(cleanText.trim());
+      if (isCommand) {
+        // In group chats, commands also require mention/shouldRespond
+        if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot)) return;
+
+        if (cleanText.trim().startsWith("/help")) {
+          const helpText = [
+            `📚 ${this.config.name} Bot 命令列表`,
+            `━━━━━━━━━━━━━━━━━━`,
+            `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
+            `🧹 /compact — 压缩上下文（保留摘要，释放 token）`,
+            `🔄 /reset   — 重置会话（清空历史，从头开始）`,
+            `🔊 /verbose — 开关 Tool Call 显示（查看 AI 调用了哪些工具）`,
+            `❓ /help    — 显示此帮助信息`,
+          ].join("\n");
+          await this.replyMessage(messageId, helpText);
+          return;
+        }
+        if (cleanText.trim().startsWith("/status")) {
+          await this.ensureSession(chatId);
+          await this.handleStatusCommand(chatId, chatType, messageId);
+          return;
+        }
+        if (cleanText.trim().startsWith("/compact")) {
+          await this.ensureSession(chatId);
+          await this.handleCompactCommand(chatId, messageId);
+          return;
+        }
+        if (cleanText.trim().startsWith("/reset")) {
+          await this.ensureSession(chatId);
+          await this.handleResetCommand(chatId, messageId);
+          return;
+        }
+        if (cleanText.trim().startsWith("/verbose")) {
+          const chatInfo = this.store.getChatInfo(chatId);
+          const isOn = chatInfo?.verbose || false;
+          this.store.setVerbose(chatId, !isOn);
+          if (isOn) {
+            await this.replyMessage(messageId, "🔇 Verbose 已关闭\nTool call 详情不再显示");
+          } else {
+            await this.replyMessage(messageId, "🔊 Verbose 已开启\nTool call 执行过程将实时显示");
+          }
+          return;
+        }
+      }
 
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot)) return;
