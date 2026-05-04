@@ -141,16 +141,39 @@ npm start
 
 ### 5. 安装为系统服务（推荐）
 
-像 OpenClaw Gateway 一样做成 systemd 服务，崩溃自动重启、开机自启：
+#### 方案一：pm2（跨平台，推荐）
+
+适用于 Linux / macOS / Windows，最简单的方式：
 
 ```bash
-# 复制 service 文件
+# 安装 pm2
+npm install -g pm2
+
+# 先编译
+npm run build
+
+# 启动
+pm2 start dist/index.js --name lark-multi-agent -- config.json
+
+# 设置开机自启
+pm2 startup    # 按提示执行输出的命令
+pm2 save
+
+# 常用命令
+pm2 status                    # 查看状态
+pm2 logs lark-multi-agent     # 查看日志
+pm2 restart lark-multi-agent  # 重启
+pm2 stop lark-multi-agent     # 停止
+```
+
+#### 方案二：systemd（Linux）
+
+```bash
 sudo cp lark-multi-agent.service /etc/systemd/system/
 
-# 根据实际情况修改 service 文件中的 User 和 WorkingDirectory
+# 根据实际情况修改 User 和 WorkingDirectory
 sudo vim /etc/systemd/system/lark-multi-agent.service
 
-# 启用并启动
 sudo systemctl daemon-reload
 sudo systemctl enable lark-multi-agent
 sudo systemctl start lark-multi-agent
@@ -158,6 +181,14 @@ sudo systemctl start lark-multi-agent
 # 查看状态和日志
 sudo systemctl status lark-multi-agent
 journalctl -u lark-multi-agent -f
+```
+
+#### 方案三：launchd（macOS）
+
+```bash
+# 复制 plist 文件（需要根据实际路径修改）
+cp lark-multi-agent.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/lark-multi-agent.plist
 ```
 
 ### 用 OpenClaw 配置（推荐）
