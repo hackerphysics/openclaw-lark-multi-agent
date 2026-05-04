@@ -10,6 +10,7 @@ export interface ChatInfo {
   members: string;
   /** Comma-separated member names */
   memberNames: string;
+  verbose: boolean;
   updatedAt: number;
 }
 
@@ -55,11 +56,11 @@ export class MessageStore {
         chat_name TEXT NOT NULL DEFAULT '',
         members TEXT NOT NULL DEFAULT '',
         member_names TEXT NOT NULL DEFAULT '',
+        verbose INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0
       );
 
       -- Tracks which messages have been synced to each bot's OpenClaw session.
-      -- If a message id is NOT in this table for a given bot, it hasn't been seen by that session yet.
       CREATE TABLE IF NOT EXISTS sync_state (
         bot_name TEXT NOT NULL,
         chat_id TEXT NOT NULL,
@@ -67,6 +68,13 @@ export class MessageStore {
         PRIMARY KEY (bot_name, chat_id)
       );
     `);
+
+    // Migration: add verbose column if missing
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN verbose INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
   }
 
   /**
@@ -175,15 +183,22 @@ export class MessageStore {
 
   upsertChatInfo(info: ChatInfo): void {
     this.db.prepare(`
-      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = excluded.chat_type,
         chat_name = excluded.chat_name,
         members = excluded.members,
         member_names = excluded.member_names,
+        verbose = excluded.verbose,
         updated_at = excluded.updated_at
-    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.updatedAt);
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.updatedAt);
+  }
+
+  setVerbose(chatId: string, verbose: boolean): void {
+    this.db.prepare(`
+      UPDATE chat_info SET verbose = ? WHERE chat_id = ?
+    `).run(verbose ? 1 : 0, chatId);
   }
 
   getChatInfo(chatId: string): ChatInfo | null {
@@ -195,6 +210,7 @@ export class MessageStore {
       chatName: row.chat_name,
       members: row.members,
       memberNames: row.member_names,
+      verbose: !!row.verbose,
       updatedAt: row.updated_at,
     };
   }
@@ -207,6 +223,7 @@ export class MessageStore {
       chatName: r.chat_name,
       members: r.members,
       memberNames: r.member_names,
+      verbose: !!r.verbose,
       updatedAt: r.updated_at,
     }));
   }

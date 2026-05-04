@@ -29,8 +29,6 @@ export class FeishuBot {
   private busyChats: Map<string, number> = new Map();
   /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
   private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
-  /** Per-chat verbose mode: show tool calls */
-  private verboseChats: Set<string> = new Set();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -131,7 +129,8 @@ export class FeishuBot {
 
     // Subscribe to tool events for verbose mode
     this.openclawClient.onToolEvent(sessionKey, async (toolName, toolInput, toolOutput) => {
-      if (!this.verboseChats.has(chatId)) return;
+      const chatInfo = this.store.getChatInfo(chatId);
+      if (!chatInfo?.verbose) return;
       try {
         const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
         const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
@@ -276,12 +275,12 @@ export class FeishuBot {
 
       // --- Handle /verbose command ---
       if (cleanText.trim().startsWith("/verbose")) {
-        const isOn = this.verboseChats.has(chatId);
+        const chatInfo = this.store.getChatInfo(chatId);
+        const isOn = chatInfo?.verbose || false;
+        this.store.setVerbose(chatId, !isOn);
         if (isOn) {
-          this.verboseChats.delete(chatId);
           await this.replyMessage(messageId, "🔇 Verbose 已关闭\nTool call 详情不再显示");
         } else {
-          this.verboseChats.add(chatId);
           await this.replyMessage(messageId, "🔊 Verbose 已开启\nTool call 执行过程将实时显示");
         }
         return;
@@ -703,6 +702,7 @@ export class FeishuBot {
           chatName: "私聊",
           members: "",
           memberNames: "",
+          verbose: this.store.getChatInfo(chatId)?.verbose || false,
           updatedAt: Date.now(),
         });
         return;
@@ -737,6 +737,7 @@ export class FeishuBot {
         chatName,
         members: members.join(","),
         memberNames: memberNames.join(","),
+        verbose: this.store.getChatInfo(chatId)?.verbose || false,
         updatedAt: Date.now(),
       });
       console.log(`[${this.config.name}] Cached chat info: ${chatName} (${chatId.slice(-8)})`);
