@@ -141,7 +141,7 @@ export class MessageStore {
     this.db.prepare(`
       INSERT INTO sync_state (bot_name, chat_id, last_synced_msg_id)
       VALUES (?, ?, ?)
-      ON CONFLICT (bot_name, chat_id) DO UPDATE SET last_synced_msg_id = excluded.last_synced_msg_id
+      ON CONFLICT (bot_name, chat_id) DO UPDATE SET last_synced_msg_id = MAX(sync_state.last_synced_msg_id, excluded.last_synced_msg_id)
     `).run(botName, chatId, upToId);
   }
 

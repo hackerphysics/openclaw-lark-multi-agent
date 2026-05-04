@@ -233,12 +233,17 @@ export class FeishuBot {
 
       // --- Dedup: skip if this bot already processed this message ---
       if (this.store.hasBotProcessed(this.config.name, messageId)) return;
-      this.store.markBotProcessed(this.config.name, messageId);
 
       // --- Cache chat info (lazy, at most once per hour) ---
       await this.fetchAndCacheChatInfo(chatId, chatType);
 
-      const content = JSON.parse(message.content);
+      let content: any;
+      try {
+        content = JSON.parse(message.content);
+      } catch {
+        console.warn(`[${this.config.name}] Failed to parse message content, skipping`);
+        return;
+      }
       const rawText: string = content.text || "";
       const cleanText = this.cleanMentions(rawText);
       if (!cleanText.trim()) return;
@@ -248,7 +253,7 @@ export class FeishuBot {
         ? this.resolveBotName(sender) || "Bot"
         : this.resolveHumanName(sender) || "User";
 
-      const insertId = this.store.insert({
+      this.store.insert({
         chatId,
         messageId,
         senderType: isBot ? "bot" : "human",
@@ -256,6 +261,9 @@ export class FeishuBot {
         content: cleanText,
         timestamp: Date.now(),
       });
+
+      // Mark as processed only after successful parse + insert
+      this.store.markBotProcessed(this.config.name, messageId);
 
       // --- Commands: in p2p always respond; in group, check shouldRespond first ---
       const isCommand = /^\/(help|status|compact|reset|verbose)/.test(cleanText.trim());
@@ -362,7 +370,15 @@ export class FeishuBot {
       const allUnsynced = this.store.getUnsyncedMessages(this.config.name, chatId);
       // Only proceed if there are unsynced human messages
       const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human");
-      if (humanUnsynced.length === 0) break;
+      if (humanUnsynced.length === 0) {
+        // No human messages in this batch — mark all as synced and continue
+        if (allUnsynced.length > 0) {
+          const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
+          this.store.markSynced(this.config.name, chatId, maxId);
+          continue;
+        }
+        break;
+      }
 
       this.busyChats.set(chatId, Date.now());
 

@@ -26,6 +26,8 @@ export class OpenClawClient {
   /** Callbacks for tool events (verbose mode) */
   private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
+  /** Session keys that should be re-subscribed on reconnect */
+  private subscribedKeys: Set<string> = new Set();
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -34,9 +36,12 @@ export class OpenClawClient {
   async connect(): Promise<void> {
     if (this.connected) return;
     if (this.connectPromise) return this.connectPromise;
-    this.connectPromise = this._doConnect();
-    await this.connectPromise;
-    this.connectPromise = null;
+    try {
+      this.connectPromise = this._doConnect();
+      await this.connectPromise;
+    } finally {
+      this.connectPromise = null;
+    }
   }
 
   private _doConnect(): Promise<void> {
@@ -77,6 +82,11 @@ export class OpenClawClient {
             handshakeDone = true;
             this.connected = true;
             console.log("[OpenClaw] Connected to Gateway WS");
+            // Re-subscribe all previously subscribed sessions
+            for (const key of this.subscribedKeys) {
+              this.rpc("sessions.messages.subscribe", { key }).catch(() => {});
+              this.rpc("sessions.messages.subscribe", { key: `agent:main:${key}` }).catch(() => {});
+            }
             resolve();
           } else if (frame.type === "res" && !frame.ok) {
             reject(new Error(`Handshake failed: ${JSON.stringify(frame.error)}`));
@@ -239,12 +249,10 @@ export class OpenClawClient {
               text += ev.data.delta;
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
-              if (text) {
-                clearTimeout(timer);
-                clearInterval(poller);
-                resolve(text);
-                return;
-              }
+              clearTimeout(timer);
+              clearInterval(poller);
+              resolve(text);
+              return;
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
               clearTimeout(timer);
@@ -411,6 +419,7 @@ export class OpenClawClient {
     // Register under both the short key and the full key with agent:main: prefix
     this.sessionMessageCallbacks.set(sessionKey, onMessage);
     this.sessionMessageCallbacks.set(`agent:main:${sessionKey}`, onMessage);
+    this.subscribedKeys.add(sessionKey);
     try {
       // Try subscribing with short key first, then full key
       await this.rpc("sessions.messages.subscribe", { key: sessionKey }).catch(() => {});
@@ -422,7 +431,10 @@ export class OpenClawClient {
 
   async unsubscribeSession(sessionKey: string): Promise<void> {
     this.sessionMessageCallbacks.delete(sessionKey);
+    this.sessionMessageCallbacks.delete(`agent:main:${sessionKey}`);
     this.toolEventCallbacks.delete(sessionKey);
+    this.toolEventCallbacks.delete(`agent:main:${sessionKey}`);
+    this.subscribedKeys.delete(sessionKey);
     try {
       await this.rpc("sessions.messages.unsubscribe", { key: sessionKey });
     } catch {
