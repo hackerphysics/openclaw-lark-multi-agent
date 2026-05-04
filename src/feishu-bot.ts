@@ -25,6 +25,10 @@ export class FeishuBot {
   private initializedSessions: Set<string> = new Set();
   /** Dedup: track recently processed message IDs */
   private processedMessages: Set<string> = new Set();
+  /** Per-chat busy lock: true = agent is running, don't send yet */
+  private busyChats: Map<string, boolean> = new Map();
+  /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
+  private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -225,10 +229,14 @@ export class FeishuBot {
       if (!this.shouldRespond(chatType, message, isBot)) return;
 
       // --- Acknowledge receipt: random reaction to show message received ---
-      // OK=OK, 👍=THUMBSUP, 💪=MUSCLE, 👏=APPLAUSE, ✅=DONE
       const ACK_REACTIONS = ["OK", "THUMBSUP", "MUSCLE", "APPLAUSE", "JIAYI"];
       const ackEmoji = ACK_REACTIONS[Math.floor(Math.random() * ACK_REACTIONS.length)];
       await this.addReaction(messageId, ackEmoji).catch(() => {});
+
+      // Track this message for later DONE ack
+      const pending = this.pendingAckMessages.get(chatId) || [];
+      pending.push({ messageId, emoji: ackEmoji });
+      this.pendingAckMessages.set(chatId, pending);
 
       // Anti-loop
       const streak = this.store.getBotStreak(chatId);
@@ -239,56 +247,91 @@ export class FeishuBot {
         return;
       }
 
-      console.log(
-        `[${this.config.name}] Responding to: "${cleanText.substring(0, 80)}..."`
-      );
+      // --- Queue-based sending: if agent is busy, just accumulate ---
+      if (this.busyChats.get(chatId)) {
+        console.log(
+          `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, queuing: "${cleanText.substring(0, 50)}..."`
+        );
+        return; // Message is in DB, will be picked up when agent finishes
+      }
 
-      // --- Ensure session exists with correct model (lazy init per chat) ---
-      const sessionKey = await this.ensureSession(chatId);
-
-      // --- Get unsynced messages (excluding the current one) ---
-      const allUnsynced = this.store.getUnsyncedMessages(
-        this.config.name,
-        chatId
-      );
-      // The current message is in allUnsynced too (just inserted).
-      // Separate it: everything before current = context, current = the actual message.
-      const contextMsgs = allUnsynced.filter((m) => m.id !== insertId);
-
-      // --- Send to OpenClaw with context catch-up ---
-      const reply = await this.openclawClient.chatSendWithContext({
-        sessionKey,
-        unsyncedMessages: contextMsgs,
-        currentMessage: cleanText,
-        currentSenderName: senderName,
-        deliver: false,
-      });
-
-      // Mark everything up to now as synced (including the current message)
-      const maxId = Math.max(insertId, ...allUnsynced.map((m) => m.id || 0));
-      this.store.markSynced(this.config.name, chatId, maxId);
-
-      // Record bot reply to local store
-      const replyId = this.store.insert({
-        chatId,
-        messageId: `self-${this.config.name}-${Date.now()}`,
-        senderType: "bot",
-        senderName: this.config.name,
-        content: reply,
-        timestamp: Date.now(),
-      });
-      // The reply is already in the session (agent wrote it), so mark synced
-      this.store.markSynced(this.config.name, chatId, replyId);
-
-      // Send reply to Feishu
-      await this.replyMessage(messageId, reply);
-      console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
-
-      // Replace ack reaction with "done"
-      await this.removeReaction(messageId, ackEmoji).catch(() => {});
-      await this.addReaction(messageId, "DONE").catch(() => {});
+      // --- Not busy, send now (with any accumulated messages) ---
+      await this.processQueue(chatId);
     } catch (err) {
       console.error(`[${this.config.name}] Error:`, err);
+    }
+  }
+
+  /**
+   * Process queued messages for a chat: batch all unsynced messages and send to OpenClaw.
+   * Loops until no more unsynced human messages remain.
+   */
+  private async processQueue(chatId: string): Promise<void> {
+    while (true) {
+      const allUnsynced = this.store.getUnsyncedMessages(this.config.name, chatId);
+      // Only proceed if there are unsynced human messages
+      const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human");
+      if (humanUnsynced.length === 0) break;
+
+      this.busyChats.set(chatId, true);
+
+      // The last human message is the "current" one, everything else is context
+      const lastHuman = humanUnsynced[humanUnsynced.length - 1];
+      const contextMsgs = allUnsynced.filter((m) => m.id !== lastHuman.id);
+
+      const sessionKey = await this.ensureSession(chatId);
+
+      console.log(
+        `[${this.config.name}] Sending ${humanUnsynced.length} message(s) to OpenClaw for ${chatId.slice(-8)}`
+      );
+
+      try {
+        const reply = await this.openclawClient.chatSendWithContext({
+          sessionKey,
+          unsyncedMessages: contextMsgs,
+          currentMessage: lastHuman.content,
+          currentSenderName: lastHuman.senderName,
+          deliver: false,
+        });
+
+        // Mark everything up to now as synced
+        const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
+        this.store.markSynced(this.config.name, chatId, maxId);
+
+        // Record bot reply
+        const replyId = this.store.insert({
+          chatId,
+          messageId: `self-${this.config.name}-${Date.now()}`,
+          senderType: "bot",
+          senderName: this.config.name,
+          content: reply,
+          timestamp: Date.now(),
+        });
+        this.store.markSynced(this.config.name, chatId, replyId);
+
+        // Reply to the last human message on Feishu
+        if (lastHuman.messageId) {
+          await this.replyMessage(lastHuman.messageId, reply);
+        }
+        console.log(`[${this.config.name}] Replied (${reply.length} chars)`);
+
+        // Replace ack reactions with DONE for all pending messages in this chat
+        const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+        for (const ack of pendingAcks) {
+          await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+          await this.addReaction(ack.messageId, "DONE").catch(() => {});
+        }
+        this.pendingAckMessages.set(chatId, []);
+      } catch (err) {
+        console.error(`[${this.config.name}] processQueue error:`, err);
+        break;
+      } finally {
+        this.busyChats.set(chatId, false);
+      }
+
+      // Check if more messages arrived while we were busy
+      // Small delay to let any in-flight messages settle
+      await new Promise((r) => setTimeout(r, 200));
     }
   }
 
