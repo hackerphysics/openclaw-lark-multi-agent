@@ -494,12 +494,15 @@ export class FeishuBot {
         }
 
         // Reply to the last human message on Feishu (ordered after tool msgs)
-        if (lastHuman.messageId) {
+        // Skip empty replies and NO_REPLY responses
+        const trimmedReply = reply.trim();
+        const shouldReply = trimmedReply.length > 0 && trimmedReply !== "NO_REPLY";
+        if (shouldReply && lastHuman.messageId) {
           await this.sendOrdered(chatId, async () => {
             await this.replyMessage(lastHuman.messageId, reply);
           });
         }
-        console.log(`[${this.config.name}] [${new Date().toISOString()}] Replied (${reply.length} chars)`);
+        console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars)`);
 
         // Replace ack reactions with DONE for all pending messages in this chat
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
