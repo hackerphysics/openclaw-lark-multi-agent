@@ -323,10 +323,10 @@ export class FeishuBot {
       this.store.markBotProcessed(this.config.name, messageId);
 
       // --- Commands: in p2p always respond; in group, check shouldRespond first ---
-      const isCommand = /^\/(help|status|compact|reset|verbose)/.test(cleanText.trim());
+      const isCommand = /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
       if (isCommand) {
         // In group chats, commands also require mention/shouldRespond
-        if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot)) return;
+        if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot, chatId)) return;
 
         if (cleanText.trim().startsWith("/help")) {
           const helpText = [
@@ -336,6 +336,7 @@ export class FeishuBot {
             `🧹 /compact — 压缩上下文（保留摘要，释放 token）`,
             `🔄 /reset   — 重置会话（清空历史，从头开始）`,
             `🔊 /verbose — 开关 Tool Call 显示（查看 AI 调用了哪些工具）`,
+            `🔓 /free    — 开关 Free Discussion（群聊中无需 @ 即可回复）`,
             `❓ /help    — 显示此帮助信息`,
           ].join("\n");
           await this.replyMessage(messageId, helpText);
@@ -367,10 +368,25 @@ export class FeishuBot {
           }
           return;
         }
+        if (cleanText.trim().startsWith("/free")) {
+          if (chatType === "p2p") {
+            await this.replyMessage(messageId, "❌ Free Discussion 只在群聊中可用");
+            return;
+          }
+          const chatInfo = this.store.getChatInfo(chatId);
+          const isOn = chatInfo?.freeDiscussion || false;
+          this.store.setFreeDiscussion(chatId, !isOn);
+          if (isOn) {
+            await this.replyMessage(messageId, "🔒 Free Discussion 已关闭\n群聊中需要 @ 指定 Bot 才会回复");
+          } else {
+            await this.replyMessage(messageId, "🔓 Free Discussion 已开启\n所有 Bot 可以自由参与讨论（连续 Bot 回复超过 " + MAX_BOT_STREAK + " 轮将暂停，等待人类发言）");
+          }
+          return;
+        }
       }
 
       // --- Should this bot respond? ---
-      if (!this.shouldRespond(chatType, message, isBot)) return;
+      if (!this.shouldRespond(chatType, message, isBot, chatId)) return;
 
       // Track this message for reaction status updates
       const pending = this.pendingAckMessages.get(chatId) || [];
@@ -527,18 +543,22 @@ export class FeishuBot {
   private shouldRespond(
     chatType: string,
     message: any,
-    isBot: boolean
+    isBot: boolean,
+    chatId?: string
   ): boolean {
     if (chatType === "p2p") return !isBot;
 
     const mentions: any[] = message.mentions || [];
 
+    // Bot messages: only respond if this bot is mentioned
     if (isBot) {
       return this.isMentioned(mentions);
     }
 
-    if (mentions.length === 0) return true;
+    // Check if this bot is explicitly mentioned
+    if (this.isMentioned(mentions)) return true;
 
+    // Check if any other bot is mentioned (not us) — don't respond
     const anyBotMentioned = mentions.some((m: any) => {
       for (const bot of FeishuBot.allBots.values()) {
         if (m.id?.app_id === bot.config.appId) return true;
@@ -546,9 +566,16 @@ export class FeishuBot {
       }
       return false;
     });
+    if (anyBotMentioned) return false;
 
-    if (!anyBotMentioned) return true;
-    return this.isMentioned(mentions);
+    // No bot mentioned: check free discussion mode
+    if (chatId) {
+      const chatInfo = this.store.getChatInfo(chatId);
+      if (chatInfo?.freeDiscussion) return true;
+    }
+
+    // Default: don't respond without @
+    return false;
   }
 
   private isMentioned(mentions: any[]): boolean {
@@ -720,6 +747,7 @@ export class FeishuBot {
     const status = session?.status || "unknown";
 
     const verboseStatus = chatInfo?.verbose ? "🔊 开启" : "🔇 关闭";
+    const freeStatus = chatInfo?.freeDiscussion ? "🔓 开启" : "🔒 关闭";
 
     const statusText = [
       `📊 ${this.config.name} Bot Status`,
@@ -733,6 +761,7 @@ export class FeishuBot {
       `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)${tokenNote}`,
       `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
       `🔧 Verbose: ${verboseStatus}`,
+      `💬 Free Discussion: ${freeStatus}`,
     ].join("\n");
 
     await this.replyMessage(messageId, statusText);
@@ -791,6 +820,7 @@ export class FeishuBot {
           members: "",
           memberNames: "",
           ownerBot: this.config.name,
+          freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
           verbose: this.store.getChatInfo(chatId)?.verbose || false,
           updatedAt: Date.now(),
         });
@@ -827,6 +857,7 @@ export class FeishuBot {
         members: members.join(","),
         memberNames: memberNames.join(","),
         ownerBot: "",  // group chats are shared, no owner
+        freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
         verbose: this.store.getChatInfo(chatId)?.verbose || false,
         updatedAt: Date.now(),
       });

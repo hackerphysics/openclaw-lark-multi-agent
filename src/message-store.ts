@@ -12,6 +12,8 @@ export interface ChatInfo {
   memberNames: string;
   /** Which bot owns this chat (for p2p isolation) */
   ownerBot: string;
+  /** Free discussion mode (group chat: all bots respond without @) */
+  freeDiscussion: boolean;
   verbose: boolean;
   updatedAt: number;
 }
@@ -88,6 +90,13 @@ export class MessageStore {
     // Migration: add owner_bot column if missing
     try {
       this.db.exec(`ALTER TABLE chat_info ADD COLUMN owner_bot TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+
+    // Migration: add free_discussion column if missing
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN free_discussion INTEGER NOT NULL DEFAULT 0`);
     } catch {
       // Column already exists
     }
@@ -199,17 +208,22 @@ export class MessageStore {
 
   upsertChatInfo(info: ChatInfo): void {
     this.db.prepare(`
-      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, owner_bot, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = excluded.chat_type,
         chat_name = excluded.chat_name,
         members = excluded.members,
         member_names = excluded.member_names,
         verbose = excluded.verbose,
+        free_discussion = excluded.free_discussion,
         owner_bot = CASE WHEN excluded.owner_bot != '' THEN excluded.owner_bot ELSE chat_info.owner_bot END,
         updated_at = excluded.updated_at
-    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.ownerBot || '', info.updatedAt);
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.updatedAt);
+  }
+
+  setFreeDiscussion(chatId: string, on: boolean): void {
+    this.db.prepare(`UPDATE chat_info SET free_discussion = ? WHERE chat_id = ?`).run(on ? 1 : 0, chatId);
   }
 
   setVerbose(chatId: string, verbose: boolean): void {
@@ -228,6 +242,7 @@ export class MessageStore {
       members: row.members,
       memberNames: row.member_names,
       ownerBot: row.owner_bot || '',
+      freeDiscussion: !!row.free_discussion,
       verbose: !!row.verbose,
       updatedAt: row.updated_at,
     };
@@ -242,6 +257,7 @@ export class MessageStore {
       members: r.members,
       memberNames: r.member_names,
       ownerBot: r.owner_bot || '',
+      freeDiscussion: !!r.free_discussion,
       verbose: !!r.verbose,
       updatedAt: r.updated_at,
     }));
