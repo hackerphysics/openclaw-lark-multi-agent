@@ -507,6 +507,9 @@ export class FeishuBot {
           currentMessage: lastHuman.content,
           currentSenderName: lastHuman.senderName,
           deliver: false,
+          // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
+          // instead of leaving reactions stuck forever.
+          timeoutMs: 600000,
         });
 
         // Mark everything up to now as synced
