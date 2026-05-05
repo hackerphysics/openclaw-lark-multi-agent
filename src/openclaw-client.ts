@@ -282,9 +282,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           while (i < bucket.length) {
             const ev = bucket[i];
 
-            const matchesSession = sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
-            const matchesRun = ev.runId === runId;
-            if (matchesSession || matchesRun) {
+            const evRunId = typeof ev.runId === "string" ? ev.runId : "";
+            const matchesRun = evRunId ? evRunId === runId : false;
+            // Agent/chat events carry runId. Never match those by sessionKey alone,
+            // otherwise a new run can consume stale final text from a previous run in
+            // the same session (e.g. previous "ok" reply reused for a later task).
+            const matchesSessionWithoutRun = !evRunId && sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
+            if (matchesRun || matchesSessionWithoutRun) {
               if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
             } else {
               i++;
