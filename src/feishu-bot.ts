@@ -227,6 +227,7 @@ export class FeishuBot {
 
       // Extract bot open_id from mentions
       if (message.mentions) {
+        console.log(`[${this.config.name}] Mentions:`, JSON.stringify(message.mentions));
         for (const m of message.mentions) {
           const bot = FeishuBot.allBots.get(m.id?.app_id || "");
           if (bot && m.id?.open_id) {
@@ -580,8 +581,11 @@ export class FeishuBot {
 
   private isMentioned(mentions: any[]): boolean {
     return mentions.some((m: any) => {
+      // @ this specific bot
       if (m.id?.app_id === this.config.appId) return true;
       if (this.botOpenId && m.id?.open_id === this.botOpenId) return true;
+      // @all / @ 所有人
+      if (m.key === "all" || m.id?.user_id === "all" || m.id?.open_id === "all" || m.name === "所有人") return true;
       return false;
     });
   }
