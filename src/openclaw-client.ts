@@ -280,7 +280,12 @@ export class OpenClawClient {
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
               clearTimeout(timer);
               clearInterval(poller);
-              resolve(text);
+              // If abandoned/failed with no text, provide a fallback message
+              if (!text && ev.data?.livenessState === "abandoned") {
+                resolve("⚠️ 请求处理超时，请重试");
+              } else {
+                resolve(text);
+              }
               return;
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
