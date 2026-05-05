@@ -328,6 +328,13 @@ export class FeishuBot {
 
       if (!cleanText.trim()) return;
 
+      // Escape hatch: //command means send /command through to OpenClaw,
+      // while /command remains a bridge-level lark-multi-agent command.
+      const trimmedCleanText = cleanText.trim();
+      if (trimmedCleanText.startsWith("//")) {
+        cleanText = "/" + trimmedCleanText.slice(2);
+      }
+
       // --- Record to local store (ALL messages, before command/response checks) ---
       const senderName = isBot
         ? this.resolveBotName(sender) || "Bot"
@@ -347,7 +354,10 @@ export class FeishuBot {
       this.store.markBotProcessed(this.config.name, messageId);
 
       // --- Commands: in p2p always respond; in group, check shouldRespond first ---
-      const isCommand = /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
+      // Single slash commands are handled by the bridge. Double slash commands were
+      // already unescaped above and should pass through to OpenClaw instead.
+      const isBridgeCommand = !trimmedCleanText.startsWith("//");
+      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
       if (isCommand) {
         // In group chats, commands also require mention/shouldRespond
         if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
