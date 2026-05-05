@@ -557,7 +557,7 @@ export class FeishuBot {
     }
 
     // @all in text: all bots respond
-    if (rawText && rawText.includes("@_all")) return true;
+    if (rawText && (rawText.includes("@_all") || rawText.includes("@all"))) return true;
 
     // Check if this bot is explicitly mentioned
     if (this.isMentioned(mentions)) return true;

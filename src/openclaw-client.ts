@@ -115,19 +115,27 @@ export class OpenClawClient {
           if (frame.event === "chat") {
             const state = frame.payload?.state;
             const msg = frame.payload?.message;
-            if (state === "final" && msg?.content) {
+            if (state === "final") {
               // Extract text from final chat message content array
-              const textParts: string[] = [];
-              for (const part of (Array.isArray(msg.content) ? msg.content : [])) {
-                if (part.type === "text" && part.text) textParts.push(part.text);
+              if (msg?.content) {
+                const textParts: string[] = [];
+                for (const part of (Array.isArray(msg.content) ? msg.content : [])) {
+                  if (part.type === "text" && part.text) textParts.push(part.text);
+                }
+                if (textParts.length > 0) {
+                  this.agentEvents.get(sk)!.push({
+                    ...frame.payload,
+                    stream: "assistant",
+                    data: { delta: textParts.join("\n"), text: textParts.join("\n") },
+                  });
+                }
               }
-              if (textParts.length > 0) {
-                this.agentEvents.get(sk)!.push({
-                  ...frame.payload,
-                  stream: "assistant",
-                  data: { delta: textParts.join("\n"), text: textParts.join("\n") },
-                });
-              }
+              // Also inject a synthetic lifecycle end so collectReply resolves
+              this.agentEvents.get(sk)!.push({
+                ...frame.payload,
+                stream: "lifecycle",
+                data: { phase: "end", livenessState: "working" },
+              });
             }
           } else {
             this.agentEvents.get(sk)!.push(frame.payload);
