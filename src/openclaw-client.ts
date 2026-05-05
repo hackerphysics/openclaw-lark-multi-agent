@@ -282,6 +282,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             bucket.splice(i, 1);
 
             if (ev.stream === "assistant" && ev.data?.delta) {
+              if (ev.data.delta === "NO_REPLY") { chatFinalText = "NO_REPLY"; }
               text += ev.data.delta;
             }
             if (ev.stream === "chatFinal") {
@@ -290,12 +291,16 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               if (!chatFinalTimer) {
                 chatFinalTimer = setTimeout(() => {
                   console.warn(`[OpenClaw] collectReply: lifecycle end missing, using chatFinal fallback`);
-                  finish(text || chatFinalText);
+                  // Prefer final chat message over accumulated deltas: some providers may
+                  // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
+                  finish(chatFinalText || text);
                 }, 5000);
               }
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
-              const finalText = text || chatFinalText;
+              // Prefer final chat message over accumulated deltas: some providers may
+              // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
+              const finalText = chatFinalText || text;
               if (!finalText && ev.data?.livenessState !== "working") {
                 const state = ev.data?.livenessState || "unknown";
                 const reason = ev.data?.stopReason || "";

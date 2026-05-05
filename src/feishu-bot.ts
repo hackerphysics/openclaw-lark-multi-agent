@@ -501,14 +501,10 @@ export class FeishuBot {
       }
 
       try {
-        // Append instruction to ensure bot replies (override NO_REPLY behavior from agent pipeline)
-        const messageWithInstruction = lastHuman.content + 
-          `\n\n[System: You are ${this.config.name} bot (model: ${this.config.model}). The user is talking to you directly. You MUST reply with a helpful response. Do NOT reply with NO_REPLY or empty content.]`;
-
         const reply = await this.openclawClient.chatSendWithContext({
           sessionKey,
           unsyncedMessages: contextMsgs,
-          currentMessage: messageWithInstruction,
+          currentMessage: lastHuman.content,
           currentSenderName: lastHuman.senderName,
           deliver: false,
         });
@@ -538,7 +534,8 @@ export class FeishuBot {
         // Reply to the last human message on Feishu (ordered after tool msgs)
         // Skip empty replies and NO_REPLY responses
         const trimmedReply = reply.trim();
-        const shouldReply = trimmedReply.length > 0 && trimmedReply !== "NO_REPLY";
+        const noReplyPrefixes = new Set(["N", "NO", "NO_", "NO_R", "NO_RE", "NO_REP", "NO_REPL", "NO_REPLY"]);
+        const shouldReply = trimmedReply.length > 0 && !noReplyPrefixes.has(trimmedReply.toUpperCase());
         if (shouldReply && lastHuman.messageId) {
           await this.sendOrdered(chatId, async () => {
             await this.replyMessage(lastHuman.messageId, reply);
