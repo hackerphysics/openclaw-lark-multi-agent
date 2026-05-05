@@ -1,7 +1,16 @@
 import WebSocket from "ws";
 import { randomUUID } from "crypto";
+import { readFileSync } from "fs";
+import { basename, extname } from "path";
 import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
+
+export type ChatAttachment = {
+  type?: string;
+  mimeType?: string;
+  fileName?: string;
+  content: string;
+};
 
 type PendingReq = {
   resolve: (data: any) => void;
@@ -400,6 +409,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   async chatSend(params: {
     sessionKey: string;
     message: string;
+    attachments?: ChatAttachment[];
     deliver?: boolean;
     timeoutMs?: number;
   }): Promise<string> {
@@ -410,6 +420,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       const result = await this.rpc("chat.send", {
         sessionKey: sk,
         message: params.message,
+        attachments: params.attachments,
         deliver: params.deliver ?? false,
         idempotencyKey: randomUUID(),
       });
@@ -442,11 +453,19 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     deliver?: boolean;
     timeoutMs?: number;
   }): Promise<string> {
+    const attachments = this.extractImageAttachments([
+      ...params.unsyncedMessages.map((m) => m.content),
+      params.currentMessage,
+    ]);
+    const mediaInstruction = attachments.length > 0
+      ? "\n\n[Media note: Image attachments are included with this message. If your model can inspect images directly, use the attached image input. If it cannot, use the image tool on the provided media/attachment path; do not try unrelated network or model-provider workarounds.]"
+      : "";
     if (params.unsyncedMessages.length === 0) {
       // No context to catch up, send directly
       return this.chatSend({
         sessionKey: params.sessionKey,
-        message: params.currentMessage,
+        message: params.currentMessage + mediaInstruction,
+        attachments,
         deliver: params.deliver,
         timeoutMs: params.timeoutMs,
       });
@@ -471,10 +490,37 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
     return this.chatSend({
       sessionKey: params.sessionKey,
-      message: combined,
+      message: combined + mediaInstruction,
+      attachments,
       deliver: params.deliver,
       timeoutMs: params.timeoutMs,
     });
+  }
+
+  private extractImageAttachments(contents: string[]): ChatAttachment[] {
+    const attachments: ChatAttachment[] = [];
+    const seen = new Set<string>();
+    const imagePattern = /\[Image: ([^\]\n]+)\]/g;
+    for (const content of contents) {
+      for (const match of content.matchAll(imagePattern)) {
+        const imagePath = match[1]?.trim();
+        if (!imagePath || imagePath.startsWith("download failed") || seen.has(imagePath)) continue;
+        seen.add(imagePath);
+        try {
+          const ext = extname(imagePath).toLowerCase();
+          const mimeType = ext === ".png" ? "image/png" : ext === ".webp" ? "image/webp" : ext === ".gif" ? "image/gif" : "image/jpeg";
+          attachments.push({
+            type: "image",
+            mimeType,
+            fileName: basename(imagePath),
+            content: readFileSync(imagePath).toString("base64"),
+          });
+        } catch (err) {
+          console.warn(`[OpenClaw] failed to attach image ${imagePath}:`, (err as Error).message);
+        }
+      }
+    }
+    return attachments;
   }
 
   async disconnect() {
