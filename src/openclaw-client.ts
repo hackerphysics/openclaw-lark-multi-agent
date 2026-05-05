@@ -280,9 +280,11 @@ export class OpenClawClient {
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
               clearTimeout(timer);
               clearInterval(poller);
-              // If abandoned/failed with no text, provide a fallback message
-              if (!text && ev.data?.livenessState === "abandoned") {
-                resolve("⚠️ 请求处理超时，请重试");
+              if (!text && ev.data?.livenessState !== "working") {
+                const state = ev.data?.livenessState || "unknown";
+                const reason = ev.data?.stopReason || "";
+                const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
+                resolve(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? `\n原因: ${reason}` : ""}\n请重试，或用 /reset 重置会话`);
               } else {
                 resolve(text);
               }
