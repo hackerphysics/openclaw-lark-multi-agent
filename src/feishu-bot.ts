@@ -532,13 +532,20 @@ export class FeishuBot {
         }
 
         // Reply to the last human message on Feishu (ordered after tool msgs)
-        // Skip empty replies and NO_REPLY responses
+        // Skip empty replies and explicit NO_REPLY responses
         const trimmedReply = reply.trim();
-        const noReplyPrefixes = new Set(["N", "NO", "NO_", "NO_R", "NO_RE", "NO_REP", "NO_REPL", "NO_REPLY"]);
-        const shouldReply = trimmedReply.length > 0 && !noReplyPrefixes.has(trimmedReply.toUpperCase());
+        const shouldReply = trimmedReply.length > 0 && trimmedReply.toUpperCase() !== "NO_REPLY";
         if (shouldReply && lastHuman.messageId) {
           await this.sendOrdered(chatId, async () => {
-            await this.replyMessage(lastHuman.messageId, reply);
+            try {
+              await this.replyMessage(lastHuman.messageId, reply);
+            } catch (err) {
+              // Reply can fail for historical messages sent before this bot joined the chat
+              // (Feishu 230002: Bot/User can NOT be out of the chat). Fall back to a normal
+              // chat message so queue processing still completes.
+              console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
+              await this.sendMessage(chatId, reply);
+            }
           });
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars)`);
