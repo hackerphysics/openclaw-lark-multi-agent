@@ -116,25 +116,18 @@ export class OpenClawClient {
             const state = frame.payload?.state;
             const msg = frame.payload?.message;
             if (state === "final") {
-              // Extract text from final chat message content array
+              // Store chat final text as fallback (only used if agent stream had no text)
+              const textParts: string[] = [];
               if (msg?.content) {
-                const textParts: string[] = [];
                 for (const part of (Array.isArray(msg.content) ? msg.content : [])) {
                   if (part.type === "text" && part.text) textParts.push(part.text);
                 }
-                if (textParts.length > 0) {
-                  this.agentEvents.get(sk)!.push({
-                    ...frame.payload,
-                    stream: "assistant",
-                    data: { delta: textParts.join("\n"), text: textParts.join("\n") },
-                  });
-                }
               }
-              // Also inject a synthetic lifecycle end so collectReply resolves
+              // Store as a special chatFinal event (not assistant delta to avoid double-counting)
               this.agentEvents.get(sk)!.push({
                 ...frame.payload,
-                stream: "lifecycle",
-                data: { phase: "end", livenessState: "working" },
+                stream: "chatFinal",
+                data: { text: textParts.join("\n") },
               });
             }
           } else {
@@ -243,20 +236,28 @@ export class OpenClawClient {
    * No aggressive timeout — waits for lifecycle end as the source of truth.
    * 30-minute safety net only for catastrophic WS disconnection.
    */
-  private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string): Promise<string> {
+private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = "";
-      // Use provided sessionKey for matching; fall back to runId-based discovery
+      let chatFinalText = "";
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
+      let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
+
       const timer = setTimeout(() => {
         clearInterval(poller);
+        if (chatFinalTimer) clearTimeout(chatFinalTimer);
         console.warn(`[OpenClaw] collectReply timeout for runId=${runId} sessionKey=${sessionKey}`);
-        // Return whatever text we collected so far instead of rejecting
-        resolve(text || "(timeout: no reply received)");
+        resolve(text || chatFinalText || "(timeout: no reply received)");
       }, timeoutMs);
 
+      const finish = (finalText: string) => {
+        clearTimeout(timer);
+        clearInterval(poller);
+        if (chatFinalTimer) clearTimeout(chatFinalTimer);
+        resolve(finalText);
+      };
+
       const poller = setInterval(() => {
-        // Scan buckets by sessionKey first, fall back to scanning all
         const bucketsToScan = sessionKey
           ? [sessionKey]
           : Array.from(this.agentEvents.keys());
@@ -269,7 +270,6 @@ export class OpenClawClient {
           while (i < bucket.length) {
             const ev = bucket[i];
 
-            // Match by sessionKey (primary) or runId (fallback)
             const matchesSession = sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
             const matchesRun = ev.runId === runId;
             if (matchesSession || matchesRun) {
@@ -279,28 +279,37 @@ export class OpenClawClient {
               continue;
             }
 
-            // Consume this event
             bucket.splice(i, 1);
 
             if (ev.stream === "assistant" && ev.data?.delta) {
               text += ev.data.delta;
             }
+            if (ev.stream === "chatFinal") {
+              chatFinalText = ev.data?.text || "";
+              // Fallback: if lifecycle end doesn't arrive within 5s, resolve
+              if (!chatFinalTimer) {
+                chatFinalTimer = setTimeout(() => {
+                  console.warn(`[OpenClaw] collectReply: lifecycle end missing, using chatFinal fallback`);
+                  finish(text || chatFinalText);
+                }, 5000);
+              }
+            }
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
-              clearTimeout(timer);
-              clearInterval(poller);
-              if (!text && ev.data?.livenessState !== "working") {
+              const finalText = text || chatFinalText;
+              if (!finalText && ev.data?.livenessState !== "working") {
                 const state = ev.data?.livenessState || "unknown";
                 const reason = ev.data?.stopReason || "";
                 const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
-                resolve(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? `\n原因: ${reason}` : ""}\n请重试，或用 /reset 重置会话`);
+                finish(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`);
               } else {
-                resolve(text);
+                finish(finalText);
               }
               return;
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
               clearTimeout(timer);
               clearInterval(poller);
+              if (chatFinalTimer) clearTimeout(chatFinalTimer);
               reject(new Error(`Agent error: ${ev.data?.error || "unknown"}`));
               return;
             }
@@ -309,6 +318,7 @@ export class OpenClawClient {
       }, 50);
     });
   }
+
 
   // --- Session management ---
 

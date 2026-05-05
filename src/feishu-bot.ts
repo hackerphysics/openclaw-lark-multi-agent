@@ -161,13 +161,35 @@ export class FeishuBot {
    * Start the Feishu WS connection. Sessions are created lazily per chat.
    */
   async start() {
+    await this.probeBotIdentity();
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
     console.log(
-      `[${this.config.name}] Bot started (model: ${this.config.model})`
+      `[${this.config.name}] Bot started (model: ${this.config.model}, open_id: ${this.botOpenId || "unknown"})`
     );
 
     // Drain any unsynced messages left from previous run
     this.drainOnStartup();
+  }
+
+  /** Resolve this bot's open_id at startup so direct @bot mentions work even
+   * when Feishu mention payloads omit app_id and only contain open_id/name. */
+  private async probeBotIdentity(): Promise<void> {
+    try {
+      const res: any = await this.client.request({
+        method: "POST",
+        url: "/open-apis/bot/v1/openclaw_bot/ping",
+        data: { needBotInfo: true },
+      } as any);
+      const botInfo = res?.data?.pingBotInfo;
+      if (botInfo?.botID) {
+        this.botOpenId = botInfo.botID;
+        console.log(`[${this.config.name}] Bot identity resolved: ${botInfo.botName || this.config.name} (${this.botOpenId})`);
+      } else {
+        console.warn(`[${this.config.name}] Bot identity probe returned no botID`);
+      }
+    } catch (err) {
+      console.warn(`[${this.config.name}] Bot identity probe failed:`, (err as Error).message);
+    }
   }
 
   /**
@@ -570,7 +592,7 @@ export class FeishuBot {
       }
       return false;
     });
-    if (anyBotMentioned) return false;
+    if (anyBotMentioned && !this.isMentioned(mentions)) return false;
 
     // No bot mentioned: check free discussion mode
     if (chatId) {
@@ -587,8 +609,15 @@ export class FeishuBot {
       // @ this specific bot
       if (m.id?.app_id === this.config.appId) return true;
       if (this.botOpenId && m.id?.open_id === this.botOpenId) return true;
-      // @all / @ 所有人
-      if (m.key === "all" || m.id?.user_id === "all" || m.id?.open_id === "all" || m.name === "所有人") return true;
+      // Feishu may provide only a display name in some mention payloads.
+      // Use this only as a fallback; open_id/app_id checks above remain primary.
+      if (typeof m.name === "string") {
+        const normalizedName = m.name.toLowerCase();
+        const normalizedConfigName = this.config.name.toLowerCase();
+        if (normalizedName === normalizedConfigName || normalizedName.includes(`（${normalizedConfigName}）`) || normalizedName.includes(`(${normalizedConfigName})`)) return true;
+      }
+      // @all / @ 所有人 is handled by raw text gating, not by direct-bot mention matching.
+      if (m.key === "all" || m.key === "@_all" || m.id?.user_id === "all" || m.id?.open_id === "all" || m.name === "所有人") return false;
       return false;
     });
   }
