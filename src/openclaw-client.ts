@@ -108,10 +108,30 @@ export class OpenClawClient {
         }
 
         // Agent events — store per session key
-        if (frame.event === "agent") {
+        if (frame.event === "agent" || frame.event === "chat") {
           const sk = frame.payload?.sessionKey || "__default__";
           if (!this.agentEvents.has(sk)) this.agentEvents.set(sk, []);
-          this.agentEvents.get(sk)!.push(frame.payload);
+          // Normalize chat events to look like agent events for collectReply
+          if (frame.event === "chat") {
+            const state = frame.payload?.state;
+            const msg = frame.payload?.message;
+            if (state === "final" && msg?.content) {
+              // Extract text from final chat message content array
+              const textParts: string[] = [];
+              for (const part of (Array.isArray(msg.content) ? msg.content : [])) {
+                if (part.type === "text" && part.text) textParts.push(part.text);
+              }
+              if (textParts.length > 0) {
+                this.agentEvents.get(sk)!.push({
+                  ...frame.payload,
+                  stream: "assistant",
+                  data: { delta: textParts.join("\n"), text: textParts.join("\n") },
+                });
+              }
+            }
+          } else {
+            this.agentEvents.get(sk)!.push(frame.payload);
+          }
         }
 
         // Log all events for debugging
