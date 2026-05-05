@@ -480,8 +480,14 @@ export class FeishuBot {
 
       this.busyChats.set(chatId, Date.now());
 
-      // The last human message is the "current" one, everything else is context
+      // The last trigger message is the "current" one, everything else is context
       const lastHuman = humanUnsynced[humanUnsynced.length - 1];
+      const triggerId = lastHuman.id || 0;
+      if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
+        console.warn(`[${this.config.name}] Duplicate trigger skipped for ${chatId.slice(-8)} msgId=${triggerId}`);
+        this.store.clearPendingTriggers(this.config.name, chatId, triggerId);
+        continue;
+      }
       const contextMsgs = allUnsynced.filter((m) => m.id !== lastHuman.id);
 
       const sessionKey = await this.ensureSession(chatId);
@@ -540,17 +546,22 @@ export class FeishuBot {
         const trimmedReply = reply.trim();
         const shouldReply = trimmedReply.length > 0 && trimmedReply.toUpperCase() !== "NO_REPLY";
         if (shouldReply && lastHuman.messageId) {
-          await this.sendOrdered(chatId, async () => {
-            try {
-              await this.replyMessage(lastHuman.messageId, reply);
-            } catch (err) {
-              // Reply can fail for historical messages sent before this bot joined the chat
-              // (Feishu 230002: Bot/User can NOT be out of the chat). Fall back to a normal
-              // chat message so queue processing still completes.
-              console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
-              await this.sendMessage(chatId, reply);
-            }
-          });
+          if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
+            console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
+          } else {
+            await this.sendOrdered(chatId, async () => {
+              try {
+                await this.replyMessage(lastHuman.messageId, reply);
+              } catch (err) {
+                // Reply can fail for historical messages sent before this bot joined the chat
+                // (Feishu 230002: Bot/User can NOT be out of the chat). Fall back to a normal
+                // chat message so queue processing still completes.
+                console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
+                await this.sendMessage(chatId, reply);
+              }
+              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+            });
+          }
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars)`);
 

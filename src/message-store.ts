@@ -87,6 +87,17 @@ export class MessageStore {
         message_row_id INTEGER NOT NULL,
         PRIMARY KEY (bot_name, chat_id, message_row_id)
       );
+
+      -- Tracks replies already delivered for a trigger message.
+      -- Prevents duplicate user-visible replies after restarts/race conditions.
+      CREATE TABLE IF NOT EXISTS delivered_replies (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        trigger_message_row_id INTEGER NOT NULL,
+        delivered_at INTEGER NOT NULL,
+        reply_message_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (bot_name, chat_id, trigger_message_row_id)
+      );
     `);
 
     // Migration: add verbose column if missing
@@ -153,6 +164,21 @@ export class MessageStore {
       DELETE FROM pending_triggers
       WHERE bot_name = ? AND chat_id = ? AND message_row_id <= ?
     `).run(botName, chatId, upToId);
+  }
+
+  hasDeliveredReply(botName: string, chatId: string, triggerMessageRowId: number): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM delivered_replies
+      WHERE bot_name = ? AND chat_id = ? AND trigger_message_row_id = ?
+    `).get(botName, chatId, triggerMessageRowId);
+    return !!row;
+  }
+
+  markDeliveredReply(botName: string, chatId: string, triggerMessageRowId: number, replyMessageId: string = ''): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO delivered_replies (bot_name, chat_id, trigger_message_row_id, delivered_at, reply_message_id)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(botName, chatId, triggerMessageRowId, Date.now(), replyMessageId);
   }
 
   /**
