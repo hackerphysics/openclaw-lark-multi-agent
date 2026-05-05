@@ -85,7 +85,7 @@ export class OpenClawClient {
                   role: "operator",
                   scopes: ["operator.read", "operator.write", "operator.admin"],
                   auth: { token: this.config.token },
-                  userAgent: "lark-multi-agent/1.0.0",
+                  userAgent: "openclaw-lark-multi-agent/1.0.0",
                 },
               })
             );

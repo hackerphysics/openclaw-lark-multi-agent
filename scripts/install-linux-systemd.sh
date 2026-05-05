@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="lark-multi-agent"
+APP_NAME="openclaw-lark-multi-agent"
 SERVICE_NAME="${APP_NAME}.service"
 MODE="user"
 DEPLOY_DIR="${LMA_DEPLOY_DIR:-$HOME/.local/lib/$APP_NAME}"
 STATE_DIR="${LMA_STATE_DIR:-$HOME/.openclaw/$APP_NAME}"
 RESTART="1"
+SUDO_CMD="${SUDO_CMD:-sudo}"
 
 usage() {
   cat <<USAGE
@@ -84,7 +85,7 @@ echo "==> Installing production dependencies in deploy dir"
 (cd "$DEPLOY_DIR" && "$NPM_BIN" ci --omit=dev)
 
 UNIT_CONTENT="[Unit]
-Description=Lark Multi-Agent - Multi-bot bridge for OpenClaw
+Description=OpenClaw Lark Multi-Agent - Multi-bot bridge for OpenClaw
 After=network.target
 Wants=network-online.target
 
@@ -111,12 +112,15 @@ WantedBy=multi-user.target
 "
   UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}"
   echo "==> Installing system service: ${UNIT_PATH}"
-  printf '%s' "$UNIT_CONTENT" | sudo tee "$UNIT_PATH" >/dev/null
-  sudo systemctl daemon-reload
-  sudo systemctl enable "$SERVICE_NAME"
+  tmp_unit="$(mktemp)"
+  printf '%s' "$UNIT_CONTENT" > "$tmp_unit"
+  ${SUDO_CMD} install -m 0644 "$tmp_unit" "$UNIT_PATH"
+  rm -f "$tmp_unit"
+  ${SUDO_CMD} systemctl daemon-reload
+  ${SUDO_CMD} systemctl enable "$SERVICE_NAME"
   if [[ "$RESTART" == "1" ]]; then
-    sudo systemctl restart "$SERVICE_NAME"
-    sudo systemctl status "$SERVICE_NAME" --no-pager --lines=8 || true
+    ${SUDO_CMD} systemctl restart "$SERVICE_NAME"
+    ${SUDO_CMD} systemctl status "$SERVICE_NAME" --no-pager --lines=8 || true
   fi
 else
   UNIT_CONTENT+="

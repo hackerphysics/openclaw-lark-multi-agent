@@ -1,5 +1,5 @@
 {
-  "name": "lark-multi-agent",
+  "name": "openclaw-lark-multi-agent",
   "version": "0.1.0",
   "description": "Multi Feishu bot proxy to OpenClaw - each bot bound to a specific model",
   "type": "module",

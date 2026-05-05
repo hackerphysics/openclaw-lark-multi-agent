@@ -9,7 +9,7 @@ async function main() {
   const configPath = process.argv[2];
   const config = loadConfig(configPath);
 
-  console.log("=== Lark Multi-Agent ===");
+  console.log("=== OpenClaw Lark Multi-Agent ===");
   console.log(`OpenClaw: ${config.openclaw.baseUrl}`);
   console.log(
     `Bots: ${config.bots.map((b) => `${b.name}(${b.model})`).join(", ")}`

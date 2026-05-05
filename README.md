@@ -1,4 +1,4 @@
-# Lark Multi-Agent
+# OpenClaw Lark Multi-Agent
 
 多个飞书机器人接入同一个 OpenClaw 实例，每个机器人绑定不同 AI 模型，共享完整的 Agent 能力。
 
@@ -6,7 +6,7 @@
 
 飞书原生只支持一个机器人对应一个 AI 服务。如果你想在同一个群里同时和 GPT、Claude、Gemini 对话，或者给不同群分配不同模型，就需要一个中间层来路由。
 
-Lark Multi-Agent 就是这个中间层：
+OpenClaw Lark Multi-Agent 就是这个中间层：
 
 - **一个 OpenClaw 实例** 提供所有 Agent 能力（工具、记忆、Skills）
 - **多个飞书机器人** 各自绑定不同模型
@@ -16,7 +16,7 @@ Lark Multi-Agent 就是这个中间层：
 
 ```
 飞书 Bot A (Claude) ─┐
-飞书 Bot B (GPT)   ──┤──→ Lark Multi-Agent ──WebSocket──→ OpenClaw Gateway
+飞书 Bot B (GPT)   ──┤──→ OpenClaw Lark Multi-Agent ──WebSocket──→ OpenClaw Gateway
 飞书 Bot C (Gemini) ─┘         │
                           SQLite (消息缓存)
 ```
@@ -86,8 +86,8 @@ Lark Multi-Agent 就是这个中间层：
 ### 2. 克隆 & 安装
 
 ```bash
-git clone https://github.com/hackerphysics/lark-multi-agent.git
-cd lark-multi-agent
+git clone https://github.com/hackerphysics/openclaw-lark-multi-agent.git
+cd openclaw-lark-multi-agent
 npm install
 ```
 
@@ -153,7 +153,7 @@ npm install -g pm2
 npm run build
 
 # 启动
-pm2 start dist/index.js --name lark-multi-agent -- config.json
+pm2 start dist/index.js --name openclaw-lark-multi-agent -- config.json
 
 # 设置开机自启
 pm2 startup    # 按提示执行输出的命令
@@ -161,46 +161,46 @@ pm2 save
 
 # 常用命令
 pm2 status                    # 查看状态
-pm2 logs lark-multi-agent     # 查看日志
-pm2 restart lark-multi-agent  # 重启
-pm2 stop lark-multi-agent     # 停止
+pm2 logs openclaw-lark-multi-agent     # 查看日志
+pm2 restart openclaw-lark-multi-agent  # 重启
+pm2 stop openclaw-lark-multi-agent     # 停止
 ```
 
 #### 方案二：systemd（Linux）
 
 ```bash
-sudo cp lark-multi-agent.service /etc/systemd/system/
+sudo cp openclaw-lark-multi-agent.service /etc/systemd/system/
 
 # 根据实际情况修改 User 和 WorkingDirectory
-sudo vim /etc/systemd/system/lark-multi-agent.service
+sudo vim /etc/systemd/system/openclaw-lark-multi-agent.service
 
 sudo systemctl daemon-reload
-sudo systemctl enable lark-multi-agent
-sudo systemctl start lark-multi-agent
+sudo systemctl enable openclaw-lark-multi-agent
+sudo systemctl start openclaw-lark-multi-agent
 
 # 查看状态和日志
-sudo systemctl status lark-multi-agent
-journalctl -u lark-multi-agent -f
+sudo systemctl status openclaw-lark-multi-agent
+journalctl -u openclaw-lark-multi-agent -f
 ```
 
 #### 方案三：launchd（macOS）
 
 ```bash
 # 修改 plist 中的路径（WorkingDirectory 和 node 路径）
-vim lark-multi-agent.plist
+vim openclaw-lark-multi-agent.plist
 
 # 安装并启动
-cp lark-multi-agent.plist ~/Library/LaunchAgents/com.hackerphysics.lark-multi-agent.plist
-launchctl load ~/Library/LaunchAgents/com.hackerphysics.lark-multi-agent.plist
+cp openclaw-lark-multi-agent.plist ~/Library/LaunchAgents/com.hackerphysics.openclaw-lark-multi-agent.plist
+launchctl load ~/Library/LaunchAgents/com.hackerphysics.openclaw-lark-multi-agent.plist
 
 # 查看状态
-launchctl list | grep lark-multi-agent
+launchctl list | grep openclaw-lark-multi-agent
 
 # 停止
-launchctl unload ~/Library/LaunchAgents/com.hackerphysics.lark-multi-agent.plist
+launchctl unload ~/Library/LaunchAgents/com.hackerphysics.openclaw-lark-multi-agent.plist
 
 # 日志
-tail -f /tmp/lark-multi-agent.log
+tail -f /tmp/openclaw-lark-multi-agent.log
 ```
 
 特性：`KeepAlive: true` 崩溃自动重启，`RunAtLoad: true` 登录时自动启动。
@@ -218,10 +218,10 @@ tail -f /tmp/lark-multi-agent.log
 install-windows-service.bat
 
 # 常用命令
-nssm status lark-multi-agent     # 查看状态
-nssm restart lark-multi-agent    # 重启
-nssm stop lark-multi-agent       # 停止
-nssm remove lark-multi-agent     # 卸载服务
+nssm status openclaw-lark-multi-agent     # 查看状态
+nssm restart openclaw-lark-multi-agent    # 重启
+nssm stop openclaw-lark-multi-agent       # 停止
+nssm remove openclaw-lark-multi-agent     # 卸载服务
 ```
 
 特性：崩溃自动重启、开机自启、日志自动轮转。
@@ -233,7 +233,7 @@ nssm remove lark-multi-agent     # 卸载服务
 ```bash
 npm install -g pm2
 npm run build
-pm2 start dist/index.js --name lark-multi-agent -- config.json
+pm2 start dist/index.js --name openclaw-lark-multi-agent -- config.json
 pm2 startup   # 按提示设置开机自启
 pm2 save
 ```
@@ -242,7 +242,7 @@ pm2 save
 
 如果你已经有一个 OpenClaw 实例在运行，最简单的方式是直接告诉它：
 
-> 帮我配置 lark-multi-agent。GPT bot 的 App ID 是 cli_xxx，Secret 是 yyy，用 gpt-5.5 模型。
+> 帮我配置 openclaw-lark-multi-agent。GPT bot 的 App ID 是 cli_xxx，Secret 是 yyy，用 gpt-5.5 模型。
 
 OpenClaw 会自动克隆仓库、写配置、启动服务。
 

@@ -1,9 +1,9 @@
 @echo off
-REM Install lark-multi-agent as a Windows Service using NSSM
+REM Install openclaw-lark-multi-agent as a Windows Service using NSSM
 REM Download NSSM from https://nssm.cc/download
 REM Place nssm.exe in your PATH or same directory
 
-SET SERVICE_NAME=lark-multi-agent
+SET SERVICE_NAME=openclaw-lark-multi-agent
 SET NODE_PATH=C:\Program Files\nodejs\node.exe
 SET APP_DIR=%~dp0
 SET APP_SCRIPT=%APP_DIR%dist\index.js

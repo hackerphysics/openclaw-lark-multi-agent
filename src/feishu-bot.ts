@@ -329,7 +329,7 @@ export class FeishuBot {
       if (!cleanText.trim()) return;
 
       // Escape hatch: //command means send /command through to OpenClaw,
-      // while /command remains a bridge-level lark-multi-agent command.
+      // while /command remains a bridge-level openclaw-lark-multi-agent command.
       const trimmedCleanText = cleanText.trim();
       if (trimmedCleanText.startsWith("//")) {
         cleanText = "/" + trimmedCleanText.slice(2);

@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenClaw Lark Multi-Agent - Multi-bot bridge for OpenClaw
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=haipw
+WorkingDirectory=%h/.local/lib/openclaw-lark-multi-agent
+ExecStart=/usr/bin/node dist/index.js %h/.openclaw/openclaw-lark-multi-agent/config.json
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=LMA_DATA_DIR=%h/.openclaw/openclaw-lark-multi-agent/data
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openclaw-lark-multi-agent
+
+[Install]
+WantedBy=multi-user.target

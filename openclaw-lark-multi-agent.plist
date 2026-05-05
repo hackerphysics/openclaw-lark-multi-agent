@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.hackerphysics.lark-multi-agent</string>
+    <string>com.hackerphysics.openclaw-lark-multi-agent</string>
     <key>ProgramArguments</key>
     <array>
         <string>/usr/local/bin/node</string>
@@ -11,15 +11,15 @@
         <string>config.json</string>
     </array>
     <key>WorkingDirectory</key>
-    <string>/Users/YOUR_USERNAME/lark-multi-agent</string>
+    <string>/Users/YOUR_USERNAME/openclaw-lark-multi-agent</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/tmp/lark-multi-agent.log</string>
+    <string>/tmp/openclaw-lark-multi-agent.log</string>
     <key>StandardErrorPath</key>
-    <string>/tmp/lark-multi-agent.err</string>
+    <string>/tmp/openclaw-lark-multi-agent.err</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>NODE_ENV</key>
