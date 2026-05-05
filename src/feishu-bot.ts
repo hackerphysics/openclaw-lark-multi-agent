@@ -501,10 +501,14 @@ export class FeishuBot {
       }
 
       try {
+        // Append instruction to ensure bot replies (override NO_REPLY behavior from agent pipeline)
+        const messageWithInstruction = lastHuman.content + 
+          `\n\n[System: You are ${this.config.name} bot (model: ${this.config.model}). The user is talking to you directly. You MUST reply with a helpful response. Do NOT reply with NO_REPLY or empty content.]`;
+
         const reply = await this.openclawClient.chatSendWithContext({
           sessionKey,
           unsyncedMessages: contextMsgs,
-          currentMessage: lastHuman.content,
+          currentMessage: messageWithInstruction,
           currentSenderName: lastHuman.senderName,
           deliver: false,
         });
