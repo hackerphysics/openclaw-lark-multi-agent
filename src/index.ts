@@ -3,7 +3,7 @@ import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 import { FeishuBot } from "./feishu-bot.js";
 import { mkdirSync } from "fs";
-import { resolve } from "path";
+import { dirname, resolve } from "path";
 
 async function main() {
   const configPath = process.argv[2];
@@ -16,9 +16,14 @@ async function main() {
   );
   console.log("");
 
-  // Init data dir & store
-  const dataDir = resolve(process.cwd(), "data");
+  // Init data dir & store. Runtime state should live next to config by default,
+  // not next to deployable program files. Override with LMA_DATA_DIR if needed.
+  const resolvedConfigPath = configPath ? resolve(configPath) : resolve(process.cwd(), "config.json");
+  const dataDir = process.env.LMA_DATA_DIR
+    ? resolve(process.env.LMA_DATA_DIR)
+    : resolve(dirname(resolvedConfigPath), "data");
   mkdirSync(dataDir, { recursive: true });
+  console.log(`Data dir: ${dataDir}`);
   const store = new MessageStore(resolve(dataDir, "messages.db"));
 
   // Connect to OpenClaw Gateway via WebSocket

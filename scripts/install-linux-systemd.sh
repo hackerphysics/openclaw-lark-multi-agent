@@ -4,7 +4,8 @@ set -euo pipefail
 APP_NAME="lark-multi-agent"
 SERVICE_NAME="${APP_NAME}.service"
 MODE="user"
-DEPLOY_DIR="${LMA_DEPLOY_DIR:-$HOME/.openclaw/$APP_NAME}"
+DEPLOY_DIR="${LMA_DEPLOY_DIR:-$HOME/.local/lib/$APP_NAME}"
+STATE_DIR="${LMA_STATE_DIR:-$HOME/.openclaw/$APP_NAME}"
 RESTART="1"
 
 usage() {
@@ -15,12 +16,13 @@ Build and deploy ${APP_NAME} to a runtime directory, then install a systemd serv
 
 Defaults:
   mode:       --user
-  deploy dir: ~/.openclaw/${APP_NAME}
+  deploy dir: ~/.local/lib/${APP_NAME}
+  state dir:  ~/.openclaw/${APP_NAME}
 
 Examples:
   $0
   $0 --system
-  $0 --deploy-dir ~/.openclaw/${APP_NAME}-prod
+  $0 --deploy-dir ~/.local/lib/${APP_NAME}-prod
 USAGE
 }
 
@@ -50,13 +52,13 @@ echo "==> Building ${APP_NAME} from ${ROOT_DIR}"
 "$NPM_BIN" ci
 "$NPM_BIN" run build
 
-mkdir -p "$DEPLOY_DIR/dist" "$DEPLOY_DIR/data"
+mkdir -p "$DEPLOY_DIR/dist" "$STATE_DIR/data"
 
-# First install convenience: migrate existing local runtime data if the deploy dir
-# does not already have a database. Future installs preserve deploy data in place.
-if [[ ! -f "$DEPLOY_DIR/data/messages.db" && -d "$ROOT_DIR/data" ]]; then
-  echo "==> Migrating existing data/ to deploy dir"
-  cp -a "$ROOT_DIR/data/." "$DEPLOY_DIR/data/"
+# First install convenience: migrate existing local runtime data if the state dir
+# does not already have a database. Future installs preserve state data in place.
+if [[ ! -f "$STATE_DIR/data/messages.db" && -d "$ROOT_DIR/data" ]]; then
+  echo "==> Migrating existing data/ to state dir"
+  cp -a "$ROOT_DIR/data/." "$STATE_DIR/data/"
 fi
 
 echo "==> Deploying runtime files to ${DEPLOY_DIR}"
@@ -65,14 +67,14 @@ rsync -a --delete "$ROOT_DIR/dist/" "$DEPLOY_DIR/dist/"
 cp "$ROOT_DIR/package.json" "$DEPLOY_DIR/package.json"
 cp "$ROOT_DIR/package-lock.json" "$DEPLOY_DIR/package-lock.json"
 
-if [[ -f "$DEPLOY_DIR/config.json" ]]; then
-  echo "==> Keeping existing config: ${DEPLOY_DIR}/config.json"
+if [[ -f "$STATE_DIR/config.json" ]]; then
+  echo "==> Keeping existing config: ${STATE_DIR}/config.json"
 elif [[ -f "$ROOT_DIR/config.json" ]]; then
-  echo "==> Copying config.json to deploy dir"
-  cp "$ROOT_DIR/config.json" "$DEPLOY_DIR/config.json"
+  echo "==> Copying config.json to state dir"
+  cp "$ROOT_DIR/config.json" "$STATE_DIR/config.json"
 elif [[ -f "$ROOT_DIR/config.example.json" ]]; then
   echo "==> Creating config.json from config.example.json (edit before use)"
-  cp "$ROOT_DIR/config.example.json" "$DEPLOY_DIR/config.json"
+  cp "$ROOT_DIR/config.example.json" "$STATE_DIR/config.json"
 else
   echo "WARNING: no config.json or config.example.json found" >&2
 fi
@@ -89,10 +91,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=${DEPLOY_DIR}
-ExecStart=${NODE_BIN} dist/index.js config.json
+ExecStart=${NODE_BIN} dist/index.js ${STATE_DIR}/config.json
 Restart=always
 RestartSec=5
 Environment=NODE_ENV=production
+Environment=LMA_DATA_DIR=${STATE_DIR}/data
 
 # Logging
 StandardOutput=journal
@@ -135,4 +138,5 @@ fi
 
 echo "==> Done"
 echo "Deploy dir: ${DEPLOY_DIR}"
+echo "State dir:  ${STATE_DIR}"
 echo "Mode: ${MODE}"
