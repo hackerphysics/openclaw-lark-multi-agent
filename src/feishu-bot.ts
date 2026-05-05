@@ -29,6 +29,8 @@ export class FeishuBot {
   private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
   /** Per-chat pending tool message sends (to await before final reply) */
   private pendingToolSends: Map<string, Promise<void>[]> = new Map();
+  /** Per-chat processQueue lock to avoid duplicate concurrent chat.send runs */
+  private queueRuns: Map<string, Promise<void>> = new Map();
   /** Per-chat serial send queue to guarantee message order */
   private sendQueue: Map<string, Promise<void>> = new Map();
   private adminOpenId: string | null;
@@ -208,12 +210,12 @@ export class FeishuBot {
         const sessionKey = this.getSessionKey(chat.chatId);
         await this.ensureSession(chat.chatId);
 
-        // Drain unsynced messages
-        const unsynced = this.store.getUnsyncedMessages(this.config.name, chat.chatId);
-        const humanUnsynced = unsynced.filter((m) => m.senderType === "human");
-        if (humanUnsynced.length > 0) {
+        // Drain only messages that were explicitly marked as reply triggers.
+        // Context-only messages should not start an OpenClaw run after restart.
+        const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chat.chatId);
+        if (pendingTriggerIds.size > 0) {
           console.log(
-            `[${this.config.name}] Startup drain: ${humanUnsynced.length} unsynced message(s) in ${chat.chatName || chat.chatId.slice(-8)}`
+            `[${this.config.name}] Startup drain: ${pendingTriggerIds.size} pending trigger(s) in ${chat.chatName || chat.chatId.slice(-8)}`
           );
           await this.processQueue(chat.chatId);
         }
@@ -466,6 +468,19 @@ export class FeishuBot {
    * Loops until no more unsynced human messages remain.
    */
   private async processQueue(chatId: string): Promise<void> {
+    const existing = this.queueRuns.get(chatId);
+    if (existing) {
+      console.log(`[${this.config.name}] processQueue already running for ${chatId.slice(-8)}, joining existing run`);
+      return existing;
+    }
+    const run = this.processQueueInner(chatId).finally(() => {
+      this.queueRuns.delete(chatId);
+    });
+    this.queueRuns.set(chatId, run);
+    return run;
+  }
+
+  private async processQueueInner(chatId: string): Promise<void> {
     while (true) {
       const allUnsynced = this.store.getUnsyncedMessages(this.config.name, chatId);
       const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chatId);
@@ -488,10 +503,11 @@ export class FeishuBot {
       }
       const contextMsgs = allUnsynced.filter((m) => m.id !== lastHuman.id);
 
+      const queueStartedAt = Date.now();
       const sessionKey = await this.ensureSession(chatId);
 
       console.log(
-        `[${this.config.name}] Sending ${humanUnsynced.length} message(s) to OpenClaw for ${chatId.slice(-8)}`
+        `[${this.config.name}] Sending ${humanUnsynced.length} trigger(s) to OpenClaw for ${chatId.slice(-8)} (context=${contextMsgs.length})`
       );
 
       // Update reactions: queued messages → sent (GET/了解)
@@ -515,6 +531,7 @@ export class FeishuBot {
           // instead of leaving reactions stuck forever.
           timeoutMs: 600000,
         });
+        console.log(`[${this.config.name}] OpenClaw reply collected for ${chatId.slice(-8)} in ${Date.now() - queueStartedAt}ms`);
 
         // Mark everything up to now as synced
         const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));

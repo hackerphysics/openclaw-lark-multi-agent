@@ -252,6 +252,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
+      const collectStartedAt = Date.now();
+      let lifecycleStartedLogged = false;
 
       const timer = setTimeout(() => {
         clearInterval(poller);
@@ -300,6 +302,10 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
             bucket.splice(i, 1);
 
+            if (ev.stream === "lifecycle" && ev.data?.phase === "start" && !lifecycleStartedLogged) {
+              lifecycleStartedLogged = true;
+              console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
+            }
             if (ev.stream === "assistant" && ev.data?.delta) {
               text += ev.data.delta;
             }
@@ -432,6 +438,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     this.suppressedSessions.add(sk);
     this.suppressedSessions.add(`agent:main:${sk}`);
     try {
+      const sendStartedAt = Date.now();
       const result = await this.rpc("chat.send", {
         sessionKey: sk,
         message: params.message,
@@ -439,7 +446,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         deliver: params.deliver ?? false,
         idempotencyKey: randomUUID(),
       });
-      console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
+      console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk);
     } finally {
       this.suppressedSessions.delete(sk);
