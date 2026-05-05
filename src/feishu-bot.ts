@@ -352,6 +352,13 @@ export class FeishuBot {
         // In group chats, commands also require mention/shouldRespond
         if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
 
+        const markCommandSynced = () => {
+          if (insertedId > 0) {
+            this.store.markSynced(this.config.name, chatId, insertedId);
+            this.store.clearPendingTriggers(this.config.name, chatId, insertedId);
+          }
+        };
+
         if (cleanText.trim().startsWith("/help")) {
           const helpText = [
             `📚 ${this.config.name} Bot 命令列表`,
@@ -364,21 +371,25 @@ export class FeishuBot {
             `❓ /help    — 显示此帮助信息`,
           ].join("\n");
           await this.replyMessage(messageId, helpText);
+          markCommandSynced();
           return;
         }
         if (cleanText.trim().startsWith("/status")) {
           await this.ensureSession(chatId);
           await this.handleStatusCommand(chatId, chatType, messageId);
+          markCommandSynced();
           return;
         }
         if (cleanText.trim().startsWith("/compact")) {
           await this.ensureSession(chatId);
           await this.handleCompactCommand(chatId, messageId);
+          markCommandSynced();
           return;
         }
         if (cleanText.trim().startsWith("/reset")) {
           await this.ensureSession(chatId);
           await this.handleResetCommand(chatId, messageId);
+          markCommandSynced();
           return;
         }
         if (cleanText.trim().startsWith("/verbose")) {
@@ -389,11 +400,13 @@ export class FeishuBot {
           } else {
             await this.replyMessage(messageId, `🔊 ${this.config.name} Verbose 已开启\n只影响当前 Bot 在当前会话的 Tool call 显示`);
           }
+          markCommandSynced();
           return;
         }
         if (cleanText.trim().startsWith("/free")) {
           if (chatType === "p2p") {
             await this.replyMessage(messageId, "❌ Free Discussion 只在群聊中可用");
+            markCommandSynced();
             return;
           }
           const chatInfo = this.store.getChatInfo(chatId);
@@ -404,6 +417,7 @@ export class FeishuBot {
           } else {
             await this.replyMessage(messageId, "🔓 Free Discussion 已开启\n所有 Bot 可以自由参与讨论（连续 Bot 回复超过 " + MAX_BOT_STREAK + " 轮将暂停，等待人类发言）");
           }
+          markCommandSynced();
           return;
         }
       }
@@ -538,16 +552,21 @@ export class FeishuBot {
         this.store.markSynced(this.config.name, chatId, maxId);
         this.store.clearPendingTriggers(this.config.name, chatId, maxId);
 
-        // Record bot reply
-        const replyId = this.store.insert({
-          chatId,
-          messageId: `self-${this.config.name}-${Date.now()}`,
-          senderType: "bot",
-          senderName: this.config.name,
-          content: reply,
-          timestamp: Date.now(),
-        });
-        this.store.markSynced(this.config.name, chatId, replyId);
+        const trimmedReply = reply.trim();
+        const shouldReply = trimmedReply.length > 0 && trimmedReply.toUpperCase() !== "NO_REPLY";
+
+        // Record bot reply only if it is user-visible/context-worthy.
+        if (shouldReply) {
+          const replyId = this.store.insert({
+            chatId,
+            messageId: `self-${this.config.name}-${Date.now()}`,
+            senderType: "bot",
+            senderName: this.config.name,
+            content: reply,
+            timestamp: Date.now(),
+          });
+          if (replyId > 0) this.store.markSynced(this.config.name, chatId, replyId);
+        }
 
         // Wait for all pending tool event messages to be delivered first
         const toolSends = this.pendingToolSends.get(chatId) || [];
@@ -558,8 +577,6 @@ export class FeishuBot {
 
         // Reply to the last human message on Feishu (ordered after tool msgs)
         // Skip empty replies and explicit NO_REPLY responses
-        const trimmedReply = reply.trim();
-        const shouldReply = trimmedReply.length > 0 && trimmedReply.toUpperCase() !== "NO_REPLY";
         if (shouldReply && lastHuman.messageId) {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
