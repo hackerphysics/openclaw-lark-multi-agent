@@ -258,6 +258,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         console.warn(`[OpenClaw] collectReply timeout for runId=${runId} sessionKey=${sessionKey}`);
+        this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
+          console.warn(`[OpenClaw] abort after collectReply timeout failed:`, (err as Error).message);
+        });
         resolve(text || chatFinalText || "(timeout: no reply received)");
       }, timeoutMs);
 
@@ -306,6 +309,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               if (!chatFinalTimer) {
                 chatFinalTimer = setTimeout(() => {
                   console.warn(`[OpenClaw] collectReply: lifecycle end missing, using chatFinal fallback`);
+                  this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
+                    console.warn(`[OpenClaw] abort after chatFinal fallback failed:`, (err as Error).message);
+                  });
                   // Prefer final chat message over accumulated deltas: some providers may
                   // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
                   finish(chatFinalText || text);
@@ -410,6 +416,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    * Send a message to a session and get the agent reply.
    * deliver=false prevents OpenClaw from auto-posting to channels.
    */
+  async abortChat(sessionKey: string, runId: string): Promise<any> {
+    const key = sessionKey.startsWith("agent:main:") ? sessionKey.slice("agent:main:".length) : sessionKey;
+    return this.rpc("chat.abort", { sessionKey: key, runId }, 5000).catch(() => {});
+  }
+
   async chatSend(params: {
     sessionKey: string;
     message: string;
