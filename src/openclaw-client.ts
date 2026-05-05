@@ -289,11 +289,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
             const evRunId = typeof ev.runId === "string" ? ev.runId : "";
             const matchesRun = evRunId ? evRunId === runId : false;
-            // Agent/chat events carry runId. Never match those by sessionKey alone,
-            // otherwise a new run can consume stale final text from a previous run in
-            // the same session (e.g. previous "ok" reply reused for a later task).
-            const matchesSessionWithoutRun = !evRunId && sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
-            if (matchesRun || matchesSessionWithoutRun) {
+            // OpenClaw chat.send may emit the user-facing chat runId while the actual
+            // agent lifecycle uses an internal runId. We clear this session's event buffer
+            // immediately before chat.send, so matching by sessionKey here is safe and
+            // necessary to collect the real agent output.
+            const matchesSession = sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
+            if (matchesRun || matchesSession) {
               if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
             } else {
               i++;
@@ -435,9 +436,15 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     timeoutMs?: number;
   }): Promise<string> {
     const sk = params.sessionKey;
+    const fullSessionKey = `agent:main:${sk}`;
     this.suppressedSessions.add(sk);
-    this.suppressedSessions.add(`agent:main:${sk}`);
+    this.suppressedSessions.add(fullSessionKey);
     try {
+      // Drop stale buffered events for this session before starting a new run.
+      // This prevents an old final text (e.g. previous "ok") from being consumed by
+      // the next message while still allowing sessionKey matching for internal runIds.
+      this.agentEvents.set(fullSessionKey, []);
+      this.agentEvents.set(sk, []);
       const sendStartedAt = Date.now();
       const result = await this.rpc("chat.send", {
         sessionKey: sk,
@@ -450,7 +457,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk);
     } finally {
       this.suppressedSessions.delete(sk);
-      this.suppressedSessions.delete(`agent:main:${sk}`);
+      this.suppressedSessions.delete(fullSessionKey);
     }
   }
 
