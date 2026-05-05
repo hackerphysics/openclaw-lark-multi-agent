@@ -133,8 +133,7 @@ export class FeishuBot {
 
     // Subscribe to tool events for verbose mode
     this.openclawClient.onToolEvent(sessionKey, async (toolName, toolInput, toolOutput) => {
-      const chatInfo = this.store.getChatInfo(chatId);
-      if (!chatInfo?.verbose) return;
+      if (!this.store.getBotVerbose(this.config.name, chatId)) return;
       console.log(`[${this.config.name}] [${new Date().toISOString()}] Tool event received: ${toolName}`);
       const sendPromise = this.sendOrdered(chatId, async () => {
         try {
@@ -381,13 +380,12 @@ export class FeishuBot {
           return;
         }
         if (cleanText.trim().startsWith("/verbose")) {
-          const chatInfo = this.store.getChatInfo(chatId);
-          const isOn = chatInfo?.verbose || false;
-          this.store.setVerbose(chatId, !isOn);
+          const isOn = this.store.getBotVerbose(this.config.name, chatId);
+          this.store.setBotVerbose(this.config.name, chatId, !isOn);
           if (isOn) {
-            await this.replyMessage(messageId, "🔇 Verbose 已关闭\nTool call 详情不再显示");
+            await this.replyMessage(messageId, `🔇 ${this.config.name} Verbose 已关闭\n只影响当前 Bot 在当前会话的 Tool call 显示`);
           } else {
-            await this.replyMessage(messageId, "🔊 Verbose 已开启\nTool call 执行过程将实时显示");
+            await this.replyMessage(messageId, `🔊 ${this.config.name} Verbose 已开启\n只影响当前 Bot 在当前会话的 Tool call 显示`);
           }
           return;
         }
@@ -805,7 +803,7 @@ export class FeishuBot {
     const sessionExists = session ? "✅ 活跃" : "⏳ 未初始化";
     const status = session?.status || "unknown";
 
-    const verboseStatus = chatInfo?.verbose ? "🔊 开启" : "🔇 关闭";
+    const verboseStatus = this.store.getBotVerbose(this.config.name, chatId) ? "🔊 开启" : "🔇 关闭";
     const freeStatus = chatInfo?.freeDiscussion ? "🔓 开启" : "🔒 关闭";
 
     const statusText = [

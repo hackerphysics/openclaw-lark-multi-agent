@@ -98,6 +98,16 @@ export class MessageStore {
         reply_message_id TEXT NOT NULL DEFAULT '',
         PRIMARY KEY (bot_name, chat_id, trigger_message_row_id)
       );
+
+      -- Per-bot, per-chat settings. A group can contain multiple bots, so settings
+      -- like verbose must not be shared globally at chat level.
+      CREATE TABLE IF NOT EXISTS bot_chat_settings (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        verbose INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (bot_name, chat_id)
+      );
     `);
 
     // Migration: add verbose column if missing
@@ -293,6 +303,24 @@ export class MessageStore {
     this.db.prepare(`
       UPDATE chat_info SET verbose = ? WHERE chat_id = ?
     `).run(verbose ? 1 : 0, chatId);
+  }
+
+  setBotVerbose(botName: string, chatId: string, verbose: boolean): void {
+    this.db.prepare(`
+      INSERT INTO bot_chat_settings (bot_name, chat_id, verbose, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (bot_name, chat_id) DO UPDATE SET
+        verbose = excluded.verbose,
+        updated_at = excluded.updated_at
+    `).run(botName, chatId, verbose ? 1 : 0, Date.now());
+  }
+
+  getBotVerbose(botName: string, chatId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT verbose FROM bot_chat_settings
+      WHERE bot_name = ? AND chat_id = ?
+    `).get(botName, chatId) as any;
+    return !!row?.verbose;
   }
 
   getChatInfo(chatId: string): ChatInfo | null {
