@@ -242,10 +242,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let chatFinalText = "";
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
+      let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
 
       const timer = setTimeout(() => {
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
+        if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         console.warn(`[OpenClaw] collectReply timeout for runId=${runId} sessionKey=${sessionKey}`);
         resolve(text || chatFinalText || "(timeout: no reply received)");
       }, timeoutMs);
@@ -254,6 +256,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         clearTimeout(timer);
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
+        if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         resolve(finalText);
       };
 
@@ -282,7 +285,6 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             bucket.splice(i, 1);
 
             if (ev.stream === "assistant" && ev.data?.delta) {
-              if (ev.data.delta === "NO_REPLY") { chatFinalText = "NO_REPLY"; }
               text += ev.data.delta;
             }
             if (ev.stream === "chatFinal") {
@@ -301,13 +303,24 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               // Prefer final chat message over accumulated deltas: some providers may
               // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
               const finalText = chatFinalText || text;
-              if (!finalText && ev.data?.livenessState !== "working") {
-                const state = ev.data?.livenessState || "unknown";
-                const reason = ev.data?.stopReason || "";
-                const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
-                finish(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`);
+              const finishFromLifecycle = () => {
+                const latestFinalText = chatFinalText || text;
+                if (!latestFinalText && ev.data?.livenessState !== "working") {
+                  const state = ev.data?.livenessState || "unknown";
+                  const reason = ev.data?.stopReason || "";
+                  const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
+                  finish(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`);
+                } else {
+                  finish(latestFinalText);
+                }
+              };
+
+              // If lifecycle end beats chat final, a short delta like "N" can be a truncated
+              // final reply. Wait briefly for chatFinal before resolving.
+              if (!chatFinalText && text.length <= 1) {
+                lifecycleEndTimer = setTimeout(finishFromLifecycle, 800);
               } else {
-                finish(finalText);
+                finishFromLifecycle();
               }
               return;
             }
@@ -315,6 +328,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               clearTimeout(timer);
               clearInterval(poller);
               if (chatFinalTimer) clearTimeout(chatFinalTimer);
+              if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
               reject(new Error(`Agent error: ${ev.data?.error || "unknown"}`));
               return;
             }

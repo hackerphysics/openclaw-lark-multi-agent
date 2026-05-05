@@ -78,6 +78,15 @@ export class MessageStore {
         message_id TEXT NOT NULL,
         PRIMARY KEY (bot_name, message_id)
       );
+
+      -- Tracks messages that should actively trigger a bot reply.
+      -- Other unsynced messages remain local context and are sent only when a trigger arrives.
+      CREATE TABLE IF NOT EXISTS pending_triggers (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        message_row_id INTEGER NOT NULL,
+        PRIMARY KEY (bot_name, chat_id, message_row_id)
+      );
     `);
 
     // Migration: add verbose column if missing
@@ -116,6 +125,34 @@ export class MessageStore {
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") return -1;
       throw err;
     }
+  }
+
+  getMessageId(messageId: string): number | null {
+    const row = this.db.prepare(`SELECT id FROM messages WHERE message_id = ?`).get(messageId) as any;
+    return row?.id || null;
+  }
+
+  markPendingTrigger(botName: string, chatId: string, messageRowId: number): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO pending_triggers (bot_name, chat_id, message_row_id)
+      VALUES (?, ?, ?)
+    `).run(botName, chatId, messageRowId);
+  }
+
+  getPendingTriggerIds(botName: string, chatId: string): Set<number> {
+    const rows = this.db.prepare(`
+      SELECT message_row_id FROM pending_triggers
+      WHERE bot_name = ? AND chat_id = ?
+      ORDER BY message_row_id ASC
+    `).all(botName, chatId) as any[];
+    return new Set(rows.map((r) => Number(r.message_row_id)));
+  }
+
+  clearPendingTriggers(botName: string, chatId: string, upToId: number): void {
+    this.db.prepare(`
+      DELETE FROM pending_triggers
+      WHERE bot_name = ? AND chat_id = ? AND message_row_id <= ?
+    `).run(botName, chatId, upToId);
   }
 
   /**

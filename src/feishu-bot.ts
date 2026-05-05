@@ -332,7 +332,7 @@ export class FeishuBot {
         ? this.resolveBotName(sender) || "Bot"
         : this.resolveHumanName(sender) || "User";
 
-      this.store.insert({
+      let insertedId = this.store.insert({
         chatId,
         messageId,
         senderType: isBot ? "bot" : "human",
@@ -340,6 +340,7 @@ export class FeishuBot {
         content: cleanText,
         timestamp: Date.now(),
       });
+      if (insertedId < 0) insertedId = this.store.getMessageId(messageId) || -1;
 
       // Mark as processed only after successful parse + insert
       this.store.markBotProcessed(this.config.name, messageId);
@@ -409,6 +410,9 @@ export class FeishuBot {
 
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
+      if (!isBot && insertedId > 0) {
+        this.store.markPendingTrigger(this.config.name, chatId, insertedId);
+      }
 
       // Track this message for reaction status updates
       const pending = this.pendingAckMessages.get(chatId) || [];
@@ -466,15 +470,11 @@ export class FeishuBot {
   private async processQueue(chatId: string): Promise<void> {
     while (true) {
       const allUnsynced = this.store.getUnsyncedMessages(this.config.name, chatId);
-      // Only proceed if there are unsynced human messages
-      const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human");
+      const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chatId);
+      // Only proceed if there are unsynced human messages that should actively trigger this bot.
+      // Other unsynced messages remain as context for the next trigger.
+      const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id));
       if (humanUnsynced.length === 0) {
-        // No human messages in this batch — mark all as synced and continue
-        if (allUnsynced.length > 0) {
-          const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
-          this.store.markSynced(this.config.name, chatId, maxId);
-          continue;
-        }
         break;
       }
 
@@ -512,6 +512,7 @@ export class FeishuBot {
         // Mark everything up to now as synced
         const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
         this.store.markSynced(this.config.name, chatId, maxId);
+        this.store.clearPendingTriggers(this.config.name, chatId, maxId);
 
         // Record bot reply
         const replyId = this.store.insert({
