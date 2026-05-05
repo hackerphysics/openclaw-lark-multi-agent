@@ -215,17 +215,20 @@ export class OpenClawClient {
    * No aggressive timeout — waits for lifecycle end as the source of truth.
    * 30-minute safety net only for catastrophic WS disconnection.
    */
-  private collectReply(runId: string, timeoutMs = 1800000): Promise<string> {
+  private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = "";
-      let sessionKey = ""; // Will be set from first matching event
+      // Use provided sessionKey for matching; fall back to runId-based discovery
+      let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
       const timer = setTimeout(() => {
         clearInterval(poller);
-        reject(new Error("Agent reply timeout"));
+        console.warn(`[OpenClaw] collectReply timeout for runId=${runId} sessionKey=${sessionKey}`);
+        // Return whatever text we collected so far instead of rejecting
+        resolve(text || "(timeout: no reply received)");
       }, timeoutMs);
 
       const poller = setInterval(() => {
-        // Scan all buckets to find our runId first, then lock onto sessionKey
+        // Scan buckets by sessionKey first, fall back to scanning all
         const bucketsToScan = sessionKey
           ? [sessionKey]
           : Array.from(this.agentEvents.keys());
@@ -238,11 +241,11 @@ export class OpenClawClient {
           while (i < bucket.length) {
             const ev = bucket[i];
 
-            // Match by runId or sessionKey (for multi-turn tool calling)
-            if (ev.runId === runId) {
+            // Match by sessionKey (primary) or runId (fallback)
+            const matchesSession = sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
+            const matchesRun = ev.runId === runId;
+            if (matchesSession || matchesRun) {
               if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
-            } else if (sessionKey && ev.sessionKey === sessionKey) {
-              // Same session, different run (tool-calling continuation)
             } else {
               i++;
               continue;
@@ -279,7 +282,7 @@ export class OpenClawClient {
   }
 
   async patchSession(params: { key: string; model?: string; label?: string }): Promise<any> {
-    return this.rpc("sessions.patch", params);
+    return this.rpc("sessions.patch", params, 10000);
   }
 
   async getSessionStatus(key: string): Promise<any> {
@@ -299,15 +302,14 @@ export class OpenClawClient {
    */
   async ensureModel(sessionKey: string, expectedModel: string): Promise<boolean> {
     try {
-      const status = await this.getSessionStatus(sessionKey);
-      const currentModel = status?.model || status?.sessionModel;
-      if (currentModel && currentModel !== expectedModel) {
-        console.log(`[OpenClaw] Model drift detected: ${currentModel} → ${expectedModel}`);
-        await this.patchSession({ key: sessionKey, model: expectedModel });
-        return true;
-      }
+      // Always patch to ensure model is correct — describe may return internal model names
+      // Use short timeout as sessions.patch may not return a response
+      await this.patchSession({ key: sessionKey, model: expectedModel }).catch(() => {});
+      // Also try with full key prefix
+      await this.patchSession({ key: `agent:main:${sessionKey}`, model: expectedModel }).catch(() => {});
+      console.log(`[OpenClaw] Model ensured: ${sessionKey} → ${expectedModel}`);
     } catch (err) {
-      console.warn(`[OpenClaw] ensureModel check failed:`, (err as Error).message);
+      console.warn(`[OpenClaw] ensureModel patch failed:`, (err as Error).message);
     }
     return false;
   }
@@ -348,7 +350,7 @@ export class OpenClawClient {
         idempotencyKey: randomUUID(),
       });
       console.log(`[OpenClaw] chat.send runId: ${result.runId}`);
-      return await this.collectReply(result.runId, params.timeoutMs || 1800000);
+      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk);
     } finally {
       this.suppressedSessions.delete(sk);
       this.suppressedSessions.delete(`agent:main:${sk}`);

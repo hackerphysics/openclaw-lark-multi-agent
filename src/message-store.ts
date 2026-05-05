@@ -10,6 +10,8 @@ export interface ChatInfo {
   members: string;
   /** Comma-separated member names */
   memberNames: string;
+  /** Which bot owns this chat (for p2p isolation) */
+  ownerBot: string;
   verbose: boolean;
   updatedAt: number;
 }
@@ -79,6 +81,13 @@ export class MessageStore {
     // Migration: add verbose column if missing
     try {
       this.db.exec(`ALTER TABLE chat_info ADD COLUMN verbose INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+
+    // Migration: add owner_bot column if missing
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN owner_bot TEXT NOT NULL DEFAULT ''`);
     } catch {
       // Column already exists
     }
@@ -190,16 +199,17 @@ export class MessageStore {
 
   upsertChatInfo(info: ChatInfo): void {
     this.db.prepare(`
-      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, owner_bot, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = excluded.chat_type,
         chat_name = excluded.chat_name,
         members = excluded.members,
         member_names = excluded.member_names,
         verbose = excluded.verbose,
+        owner_bot = CASE WHEN excluded.owner_bot != '' THEN excluded.owner_bot ELSE chat_info.owner_bot END,
         updated_at = excluded.updated_at
-    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.updatedAt);
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.ownerBot || '', info.updatedAt);
   }
 
   setVerbose(chatId: string, verbose: boolean): void {
@@ -217,6 +227,7 @@ export class MessageStore {
       chatName: row.chat_name,
       members: row.members,
       memberNames: row.member_names,
+      ownerBot: row.owner_bot || '',
       verbose: !!row.verbose,
       updatedAt: row.updated_at,
     };
@@ -230,6 +241,7 @@ export class MessageStore {
       chatName: r.chat_name,
       members: r.members,
       memberNames: r.member_names,
+      ownerBot: r.owner_bot || '',
       verbose: !!r.verbose,
       updatedAt: r.updated_at,
     }));

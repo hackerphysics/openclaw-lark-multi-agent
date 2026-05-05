@@ -111,7 +111,9 @@ export class FeishuBot {
           model: this.config.model,
           label: `LMA: ${this.config.name} [${chatId.slice(-8)}]`,
         });
-        console.log(`[${this.config.name}] Session created: ${sessionKey}`);
+        // Always patch model after create to ensure it takes effect
+        await this.openclawClient.patchSession({ key: sessionKey, model: this.config.model });
+        console.log(`[${this.config.name}] Session created: ${sessionKey} (model: ${this.config.model})`);
       }
     } catch (err) {
       console.warn(`[${this.config.name}] ensureSession error:`, (err as Error).message);
@@ -176,6 +178,11 @@ export class FeishuBot {
     try {
       const chats = this.store.getAllChatInfo();
       for (const chat of chats) {
+        // Skip p2p chats that belong to other bots
+        if (chat.chatType === "p2p" && chat.ownerBot && chat.ownerBot !== this.config.name) {
+          continue;
+        }
+
         // Re-subscribe to existing sessions
         const sessionKey = this.getSessionKey(chat.chatId);
         await this.ensureSession(chat.chatId);
@@ -228,13 +235,21 @@ export class FeishuBot {
         }
       }
 
-      if (messageType !== "text") return;
+      if (messageType !== "text" && messageType !== "image" && messageType !== "file" && messageType !== "audio" && messageType !== "sticker" && messageType !== "post") return;
 
       // --- Dedup: skip if this bot already processed this message ---
       if (this.store.hasBotProcessed(this.config.name, messageId)) return;
 
       // --- Cache chat info (lazy, at most once per hour) ---
       await this.fetchAndCacheChatInfo(chatId, chatType);
+
+      // --- P2P isolation: only the owning bot processes p2p messages ---
+      if (chatType === "p2p") {
+        const chatInfo = this.store.getChatInfo(chatId);
+        if (chatInfo?.ownerBot && chatInfo.ownerBot !== this.config.name) {
+          return; // This p2p chat belongs to another bot
+        }
+      }
 
       let content: any;
       try {
@@ -243,8 +258,51 @@ export class FeishuBot {
         console.warn(`[${this.config.name}] Failed to parse message content, skipping`);
         return;
       }
-      const rawText: string = content.text || "";
-      const cleanText = this.cleanMentions(rawText);
+
+      // --- Extract text content based on message type ---
+      let cleanText = "";
+      if (messageType === "text") {
+        const rawText: string = content.text || "";
+        cleanText = this.cleanMentions(rawText);
+      } else if (messageType === "image") {
+        // Download image and pass local path
+        const imageKey = content.image_key;
+        if (imageKey) {
+          try {
+            const imgPath = await this.downloadResource(messageId, imageKey, "image");
+            cleanText = `[Image: ${imgPath}]`;
+          } catch (err) {
+            cleanText = `[Image: download failed - ${(err as Error).message}]`;
+          }
+        }
+      } else if (messageType === "file") {
+        const fileKey = content.file_key;
+        const fileName = content.file_name || "unknown";
+        if (fileKey) {
+          try {
+            const filePath = await this.downloadResource(messageId, fileKey, "file");
+            cleanText = `[File: ${fileName} -> ${filePath}]`;
+          } catch (err) {
+            cleanText = `[File: ${fileName} - download failed]`;
+          }
+        }
+      } else if (messageType === "audio") {
+        const fileKey = content.file_key;
+        if (fileKey) {
+          try {
+            const audioPath = await this.downloadResource(messageId, fileKey, "file");
+            cleanText = `[Audio: ${audioPath}]`;
+          } catch (err) {
+            cleanText = `[Audio: download failed]`;
+          }
+        }
+      } else if (messageType === "post") {
+        // Rich text post - extract all text content
+        cleanText = this.extractPostText(content);
+      } else if (messageType === "sticker") {
+        cleanText = `[Sticker: ${content.file_key || "unknown"}]`;
+      }
+
       if (!cleanText.trim()) return;
 
       // --- Record to local store (ALL messages, before command/response checks) ---
@@ -314,15 +372,8 @@ export class FeishuBot {
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot)) return;
 
-      // --- Acknowledge receipt: random reaction to show message received ---
-      const ACK_REACTIONS = ["OK", "THUMBSUP", "MUSCLE", "APPLAUSE", "JIAYI"];
-      const ackEmoji = ACK_REACTIONS[Math.floor(Math.random() * ACK_REACTIONS.length)];
-      await this.addReaction(messageId, ackEmoji).catch(() => {});
-
-      // Track this message for later DONE ack
+      // Track this message for reaction status updates
       const pending = this.pendingAckMessages.get(chatId) || [];
-      pending.push({ messageId, emoji: ackEmoji });
-      this.pendingAckMessages.set(chatId, pending);
 
       // Anti-loop
       const streak = this.store.getBotStreak(chatId);
@@ -339,6 +390,10 @@ export class FeishuBot {
       const isBusy = busySince > 0 && (Date.now() - busySince) < BUSY_TIMEOUT_MS;
 
       if (isBusy) {
+        // Queued: show waiting reaction
+        await this.addReaction(messageId, "Typing").catch(() => {});
+        pending.push({ messageId, emoji: "Typing" });
+        this.pendingAckMessages.set(chatId, pending);
         console.log(
           `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, queuing: "${cleanText.substring(0, 50)}..."`
         );
@@ -356,6 +411,10 @@ export class FeishuBot {
       }
 
       // --- Not busy, send now (with any accumulated messages) ---
+      // Acknowledge receipt: sent to OpenClaw (GET/了解)
+      await this.addReaction(messageId, "Get").catch(() => {});
+      pending.push({ messageId, emoji: "Get" });
+      this.pendingAckMessages.set(chatId, pending);
       await this.processQueue(chatId);
     } catch (err) {
       console.error(`[${this.config.name}] Error:`, err);
@@ -392,6 +451,16 @@ export class FeishuBot {
       console.log(
         `[${this.config.name}] Sending ${humanUnsynced.length} message(s) to OpenClaw for ${chatId.slice(-8)}`
       );
+
+      // Update reactions: queued messages → sent (GET/了解)
+      const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+      for (const ack of pendingAcks) {
+        if (ack.emoji !== "Get") {
+          await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+          await this.addReaction(ack.messageId, "Get").catch(() => {});
+          ack.emoji = "Get";
+        }
+      }
 
       try {
         const reply = await this.openclawClient.chatSendWithContext({
@@ -632,7 +701,8 @@ export class FeishuBot {
       // session may not exist yet
     }
 
-    const model = session?.model ? `${session.modelProvider || ""}/${session.model}` : this.config.model;
+    // Always show the configured model — session.model may show gateway-injected internal name
+    const model = this.config.model;
     const totalTokens = session?.totalTokens || 0;
     const contextTokens = session?.contextTokens || 0;
     const inputTokens = session?.inputTokens || 0;
@@ -655,7 +725,6 @@ export class FeishuBot {
       `🧠 模型: ${model}`,
       `💬 会话: ${chatLabel} (${chatType === "p2p" ? "私聊" : "群聊"})`,
       `📋 Session: ${sessionExists} | ${status}`,
-      `🔑 Key: ${sessionKey}`,
       `━━━━━━━━━━━━━━━━━━`,
       `📝 本地消息: ${msgCount} 条`,
       `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)${tokenNote}`,
@@ -673,7 +742,7 @@ export class FeishuBot {
     const sessionKey = this.getSessionKey(chatId);
     try {
       await this.openclawClient.compactSession(sessionKey);
-      await this.replyMessage(messageId, `✅ Session 已压缩\nKey: ${sessionKey}`);
+      await this.replyMessage(messageId, `✅ Session 已压缩`);
     } catch (err) {
       await this.replyMessage(messageId, `❌ 压缩失败: ${(err as Error).message}`);
     }
@@ -718,6 +787,7 @@ export class FeishuBot {
           chatName: "私聊",
           members: "",
           memberNames: "",
+          ownerBot: this.config.name,
           verbose: this.store.getChatInfo(chatId)?.verbose || false,
           updatedAt: Date.now(),
         });
@@ -753,6 +823,7 @@ export class FeishuBot {
         chatName,
         members: members.join(","),
         memberNames: memberNames.join(","),
+        ownerBot: "",  // group chats are shared, no owner
         verbose: this.store.getChatInfo(chatId)?.verbose || false,
         updatedAt: Date.now(),
       });
@@ -765,6 +836,63 @@ export class FeishuBot {
   /**
    * Send a model-drift notification to the affected chat.
    */
+  /**
+   * Download a resource (image/file/audio) from a Feishu message.
+   * Returns the local file path.
+   */
+  private async downloadResource(messageId: string, fileKey: string, type: "image" | "file"): Promise<string> {
+    const { mkdirSync, writeFileSync } = await import("fs");
+    const { resolve } = await import("path");
+    const dir = resolve(process.cwd(), "data", "media");
+    mkdirSync(dir, { recursive: true });
+
+    const resp = await this.client.im.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type },
+    });
+
+    const result = resp as any;
+    const ext = type === "image" ? ".png" : "";
+    const filePath = resolve(dir, `${fileKey}${ext}`);
+
+    // SDK v1.62+ returns { writeFile, getReadableStream, headers }
+    if (result.writeFile) {
+      await result.writeFile(filePath);
+    } else if (result.data && Buffer.isBuffer(result.data)) {
+      writeFileSync(filePath, result.data);
+    } else {
+      throw new Error("Unsupported response format");
+    }
+
+    return filePath;
+  }
+
+  /**
+   * Extract text content from a rich text (post) message.
+   */
+  private extractPostText(content: any): string {
+    const parts: string[] = [];
+    const title = content.title;
+    if (title) parts.push(title);
+
+    const body = content.content || [];
+    for (const paragraph of body) {
+      if (!Array.isArray(paragraph)) continue;
+      for (const element of paragraph) {
+        if (element.tag === "text" && element.text) {
+          parts.push(element.text);
+        } else if (element.tag === "a" && element.text) {
+          parts.push(`${element.text}(${element.href || ''})`);
+        } else if (element.tag === "at" && element.user_name) {
+          parts.push(`@${element.user_name}`);
+        } else if (element.tag === "img" && element.image_key) {
+          parts.push(`[Image: ${element.image_key}]`);
+        }
+      }
+    }
+    return this.cleanMentions(parts.join(" "));
+  }
+
   private async notifyModelDrift(chatId: string, _sessionKey: string): Promise<void> {
     try {
       const chatInfo = this.store.getChatInfo(chatId);
