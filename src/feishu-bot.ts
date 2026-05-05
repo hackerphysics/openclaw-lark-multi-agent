@@ -227,7 +227,6 @@ export class FeishuBot {
 
       // Extract bot open_id from mentions
       if (message.mentions) {
-        console.log(`[${this.config.name}] Mentions:`, JSON.stringify(message.mentions));
         for (const m of message.mentions) {
           const bot = FeishuBot.allBots.get(m.id?.app_id || "");
           if (bot && m.id?.open_id) {
@@ -327,7 +326,7 @@ export class FeishuBot {
       const isCommand = /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
       if (isCommand) {
         // In group chats, commands also require mention/shouldRespond
-        if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot, chatId)) return;
+        if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
 
         if (cleanText.trim().startsWith("/help")) {
           const helpText = [
@@ -387,7 +386,7 @@ export class FeishuBot {
       }
 
       // --- Should this bot respond? ---
-      if (!this.shouldRespond(chatType, message, isBot, chatId)) return;
+      if (!this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
 
       // Track this message for reaction status updates
       const pending = this.pendingAckMessages.get(chatId) || [];
@@ -545,7 +544,8 @@ export class FeishuBot {
     chatType: string,
     message: any,
     isBot: boolean,
-    chatId?: string
+    chatId?: string,
+    rawText?: string
   ): boolean {
     if (chatType === "p2p") return !isBot;
 
@@ -555,6 +555,9 @@ export class FeishuBot {
     if (isBot) {
       return this.isMentioned(mentions);
     }
+
+    // @all in text: all bots respond
+    if (rawText && rawText.includes("@_all")) return true;
 
     // Check if this bot is explicitly mentioned
     if (this.isMentioned(mentions)) return true;
