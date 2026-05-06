@@ -328,11 +328,17 @@ export class FeishuBot {
 
       if (!cleanText.trim()) return;
 
+      // Commands may be prefixed by @all / @bot in group chats. Strip those
+      // leading routing mentions before deciding whether this is a bridge command
+      // or an escaped OpenClaw command.
+      const trimmedCleanText = cleanText.trim();
+      const commandText = this.stripLeadingCommandMentions(trimmedCleanText);
       // Escape hatch: //command means send /command through to OpenClaw,
       // while /command remains a bridge-level openclaw-lark-multi-agent command.
-      const trimmedCleanText = cleanText.trim();
-      if (trimmedCleanText.startsWith("//")) {
-        cleanText = "/" + trimmedCleanText.slice(2);
+      if (commandText.startsWith("//")) {
+        cleanText = "/" + commandText.slice(2).trimStart();
+      } else if (commandText.startsWith("/")) {
+        cleanText = commandText;
       }
 
       // --- Record to local store (ALL messages, before command/response checks) ---
@@ -356,7 +362,7 @@ export class FeishuBot {
       // --- Commands: in p2p always respond; in group, check shouldRespond first ---
       // Single slash commands are handled by the bridge. Double slash commands were
       // already unescaped above and should pass through to OpenClaw instead.
-      const isBridgeCommand = !trimmedCleanText.startsWith("//");
+      const isBridgeCommand = !commandText.startsWith("//");
       const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
       if (isCommand) {
         // In group chats, commands also require mention/shouldRespond
@@ -702,6 +708,19 @@ export class FeishuBot {
 
   private cleanMentions(text: string): string {
     return text.replace(/@_user_\d+/g, "").trim();
+  }
+
+  private stripLeadingCommandMentions(text: string): string {
+    let s = text.trim();
+    let prev = "";
+    while (s !== prev) {
+      prev = s;
+      s = s
+        .replace(/^(@_all|@all|@所有人|所有人)\s*/i, "")
+        .replace(/^@\S+\s*/u, "")
+        .trimStart();
+    }
+    return s;
   }
 
   private async replyMessage(messageId: string, text: string) {

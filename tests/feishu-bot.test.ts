@@ -107,10 +107,29 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("handles @all-prefixed bridge commands locally", async () => {
+    const h = makeHarness();
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /reset", messageId: "cmd-reset" }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-reset", expect.stringContaining("Session 已重置"));
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
   it("passes double-slash commands through to OpenClaw as single-slash commands", async () => {
     const h = makeHarness();
     try {
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "//status", messageId: "m1" }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("/status");
+    } finally { h.cleanup(); }
+  });
+
+  it("passes @all-prefixed double-slash commands through to OpenClaw", async () => {
+    const h = makeHarness();
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all //status", messageId: "m1" }));
       expect(h.openclaw.chatCalls).toHaveLength(1);
       expect(h.openclaw.chatCalls[0].currentMessage).toBe("/status");
     } finally { h.cleanup(); }
