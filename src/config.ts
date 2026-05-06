@@ -6,7 +6,6 @@ export interface BotConfig {
   appId: string;
   appSecret: string;
   model: string;
-  systemPrompt?: string;
 }
 
 export interface OpenClawConfig {

@@ -8,22 +8,19 @@
       "name": "Claude",
       "appId": "cli_xxx1",
       "appSecret": "xxx1",
-      "model": "github-copilot/claude-opus-4.6-1m",
-      "systemPrompt": "You are Claude, an AI assistant by Anthropic."
+      "model": "github-copilot/claude-opus-4.6-1m"
     },
     {
       "name": "GPT",
       "appId": "cli_xxx2",
       "appSecret": "xxx2",
-      "model": "github-copilot/gpt-5.5",
-      "systemPrompt": "You are GPT, an AI assistant by OpenAI."
+      "model": "github-copilot/gpt-5.5"
     },
     {
       "name": "Gemini",
       "appId": "cli_xxx3",
       "appSecret": "xxx3",
-      "model": "github-copilot/gemini-3.1-pro-preview",
-      "systemPrompt": "You are Gemini, an AI assistant by Google."
+      "model": "github-copilot/gemini-3.1-pro-preview"
     }
   ]
 }
