@@ -100,11 +100,12 @@ export class MessageStore {
       );
 
       -- Per-bot, per-chat settings. A group can contain multiple bots, so settings
-      -- like verbose must not be shared globally at chat level.
+      -- like verbose/free discussion must not be shared globally at chat level.
       CREATE TABLE IF NOT EXISTS bot_chat_settings (
         bot_name TEXT NOT NULL,
         chat_id TEXT NOT NULL,
         verbose INTEGER NOT NULL DEFAULT 0,
+        free_discussion INTEGER NOT NULL DEFAULT 0,
         updated_at INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (bot_name, chat_id)
       );
@@ -127,6 +128,13 @@ export class MessageStore {
     // Migration: add free_discussion column if missing
     try {
       this.db.exec(`ALTER TABLE chat_info ADD COLUMN free_discussion INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+
+    // Migration: make free discussion per-bot per-chat.
+    try {
+      this.db.exec(`ALTER TABLE bot_chat_settings ADD COLUMN free_discussion INTEGER NOT NULL DEFAULT 0`);
     } catch {
       // Column already exists
     }
@@ -321,6 +329,24 @@ export class MessageStore {
       WHERE bot_name = ? AND chat_id = ?
     `).get(botName, chatId) as any;
     return !!row?.verbose;
+  }
+
+  setBotFreeDiscussion(botName: string, chatId: string, on: boolean): void {
+    this.db.prepare(`
+      INSERT INTO bot_chat_settings (bot_name, chat_id, free_discussion, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (bot_name, chat_id) DO UPDATE SET
+        free_discussion = excluded.free_discussion,
+        updated_at = excluded.updated_at
+    `).run(botName, chatId, on ? 1 : 0, Date.now());
+  }
+
+  getBotFreeDiscussion(botName: string, chatId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT free_discussion FROM bot_chat_settings
+      WHERE bot_name = ? AND chat_id = ?
+    `).get(botName, chatId) as any;
+    return !!row?.free_discussion;
   }
 
   getChatInfo(chatId: string): ChatInfo | null {

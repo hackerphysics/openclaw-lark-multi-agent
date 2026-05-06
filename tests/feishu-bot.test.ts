@@ -117,6 +117,18 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("toggles free discussion per bot per chat", async () => {
+    const gpt = makeHarness("GPT");
+    const gemini = makeHarness("Gemini");
+    try {
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free on", messageId: "free-on" }));
+      expect(gpt.store.getBotFreeDiscussion("GPT", "chat1")).toBe(true);
+      expect(gpt.store.getBotFreeDiscussion("Gemini", "chat1")).toBe(false);
+      expect(gemini.store.getBotFreeDiscussion("Gemini", "chat1")).toBe(false);
+      expect((gpt.bot as any).replyMessage).toHaveBeenCalledWith("free-on", expect.stringContaining("GPT Free Discussion 已开启"));
+    } finally { gpt.cleanup(); gemini.cleanup(); }
+  });
+
   it("passes double-slash commands through to OpenClaw as single-slash commands", async () => {
     const h = makeHarness();
     try {

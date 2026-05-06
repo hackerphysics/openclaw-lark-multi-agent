@@ -50,6 +50,14 @@ describe("MessageStore", () => {
     expect(store.getBotVerbose("GPT", "group")).toBe(false);
   }));
 
+  it("stores free discussion per bot per chat", () => withStore((store) => {
+    store.setBotFreeDiscussion("GPT", "group", true);
+    expect(store.getBotFreeDiscussion("GPT", "group")).toBe(true);
+    expect(store.getBotFreeDiscussion("Gemini", "group")).toBe(false);
+    store.setBotFreeDiscussion("GPT", "group", false);
+    expect(store.getBotFreeDiscussion("GPT", "group")).toBe(false);
+  }));
+
   it("preserves p2p owner when upserting chat info without owner", () => withStore((store) => {
     store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm", members: "", memberNames: "", ownerBot: "GPT", freeDiscussion: false, verbose: false, updatedAt: 1 });
     store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm2", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, updatedAt: 2 });

@@ -384,7 +384,7 @@ export class FeishuBot {
             `🧹 /compact — 压缩当前 bot 的 OpenClaw session`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
-            `🔓 /free    — 开关群聊 Free Discussion（无需 @ 即可回复）`,
+            `🔓 /free [on|off|status] — 开关当前 bot 在当前群聊的 Free Discussion`,
             `❓ /help    — 显示此帮助信息`,
             ``,
             `OpenClaw 原生命令（双斜杠，会转成单斜杠发给 OpenClaw）`,
@@ -446,13 +446,21 @@ export class FeishuBot {
             markCommandSynced();
             return;
           }
-          const chatInfo = this.store.getChatInfo(chatId);
-          const isOn = chatInfo?.freeDiscussion || false;
-          this.store.setFreeDiscussion(chatId, !isOn);
-          if (isOn) {
-            await this.replyMessage(messageId, "🔒 Free Discussion 已关闭\n群聊中需要 @ 指定 Bot 才会回复");
+          const parts = cleanText.trim().split(/\s+/);
+          const arg = (parts[1] || "").toLowerCase();
+          const isOn = this.store.getBotFreeDiscussion(this.config.name, chatId);
+          const next = arg === "on" || arg === "true" || arg === "1"
+            ? true
+            : arg === "off" || arg === "false" || arg === "0"
+              ? false
+              : arg === "status"
+                ? isOn
+                : !isOn;
+          if (arg !== "status") this.store.setBotFreeDiscussion(this.config.name, chatId, next);
+          if (next) {
+            await this.replyMessage(messageId, `🔓 ${this.config.name} Free Discussion 已开启\n只影响当前 Bot 在当前群聊的自由发言（连续 Bot 回复超过 ${MAX_BOT_STREAK} 轮将暂停，等待人类发言）`);
           } else {
-            await this.replyMessage(messageId, "🔓 Free Discussion 已开启\n所有 Bot 可以自由参与讨论（连续 Bot 回复超过 " + MAX_BOT_STREAK + " 轮将暂停，等待人类发言）");
+            await this.replyMessage(messageId, `🔒 ${this.config.name} Free Discussion 已关闭\n只影响当前 Bot；群聊中需要 @ 指定 Bot 才会回复`);
           }
           markCommandSynced();
           return;
@@ -688,8 +696,7 @@ export class FeishuBot {
 
     // No bot mentioned: check free discussion mode
     if (chatId) {
-      const chatInfo = this.store.getChatInfo(chatId);
-      if (chatInfo?.freeDiscussion) return true;
+      if (this.store.getBotFreeDiscussion(this.config.name, chatId)) return true;
     }
 
     // Default: don't respond without @
@@ -888,7 +895,7 @@ export class FeishuBot {
     const status = session?.status || "unknown";
 
     const verboseStatus = this.store.getBotVerbose(this.config.name, chatId) ? "🔊 开启" : "🔇 关闭";
-    const freeStatus = chatInfo?.freeDiscussion ? "🔓 开启" : "🔒 关闭";
+    const freeStatus = this.store.getBotFreeDiscussion(this.config.name, chatId) ? "🔓 开启" : "🔒 关闭";
 
     const statusText = [
       `📊 ${this.config.name} Bot Status`,
