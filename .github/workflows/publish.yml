@@ -34,7 +34,4 @@ jobs:
             echo "Tag $TAG does not match package version $VERSION" >&2
             exit 1
           fi
-      # Keep provenance off while the GitHub repository is private. npm provenance
-      # currently requires a public source repository. Once the repo is public,
-      # change this back to: npm publish --access public --provenance
-      - run: npm publish --access public
+      - run: npm publish --access public --provenance
