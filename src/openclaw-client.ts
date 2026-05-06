@@ -252,6 +252,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
+      let replayInvalidTimer: ReturnType<typeof setTimeout> | null = null;
       const collectStartedAt = Date.now();
       let lifecycleStartedLogged = false;
 
@@ -259,6 +260,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+        if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
         console.warn(`[OpenClaw] collectReply timeout for runId=${runId} sessionKey=${sessionKey}`);
         this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
           console.warn(`[OpenClaw] abort after collectReply timeout failed:`, (err as Error).message);
@@ -271,6 +273,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+        if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
         resolve(finalText);
       };
 
@@ -302,6 +305,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             }
 
             bucket.splice(i, 1);
+            // If more events arrive after a replay-invalid lifecycle end, that lifecycle
+            // was not terminal for the user-visible run. Keep waiting for the real final.
+            if (replayInvalidTimer) {
+              clearTimeout(replayInvalidTimer);
+              replayInvalidTimer = null;
+            }
 
             if (ev.stream === "lifecycle" && ev.data?.phase === "start" && !lifecycleStartedLogged) {
               lifecycleStartedLogged = true;
@@ -335,7 +344,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                   const state = ev.data?.livenessState || "unknown";
                   const reason = ev.data?.stopReason || "";
                   const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
-                  finish(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`);
+                  const failureText = `⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`;
+                  if (ev.data?.replayInvalid) {
+                    console.warn(`[OpenClaw] replayInvalid lifecycle observed for runId=${evRunId || runId}; waiting for subsequent events before surfacing failure`);
+                    replayInvalidTimer = setTimeout(() => finish(failureText), 120000);
+                    return;
+                  }
+                  finish(failureText);
                 } else {
                   finish(latestFinalText);
                 }
