@@ -3,12 +3,13 @@ import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
+import { homedir } from "node:os";
 import { startApp } from "./index.js";
 
 const APP_NAME = "openclaw-lark-multi-agent";
-const DEFAULT_STATE_DIR = resolve(process.env.HOME || process.cwd(), ".openclaw", APP_NAME);
+const HOME_DIR = homedir() || process.env.HOME || process.cwd();
+const DEFAULT_STATE_DIR = resolve(HOME_DIR, ".openclaw", APP_NAME);
 const DEFAULT_CONFIG_PATH = resolve(DEFAULT_STATE_DIR, "config.json");
-const DEFAULT_DATA_DIR = resolve(DEFAULT_STATE_DIR, "data");
 
 function usage(exitCode = 0): never {
   console.log(`OpenClaw Lark Multi-Agent
@@ -17,6 +18,7 @@ Usage:
   ${APP_NAME} start [config]
   ${APP_NAME} init [--state-dir DIR] [--force]
   ${APP_NAME} install-systemd [--user|--system] [--state-dir DIR] [--no-restart]
+  ${APP_NAME} install-windows-service [--state-dir DIR] [--no-start]
   ${APP_NAME} doctor [--state-dir DIR]
   ${APP_NAME} --help
 
@@ -24,6 +26,7 @@ Examples:
   ${APP_NAME} init
   ${APP_NAME} start ~/.openclaw/${APP_NAME}/config.json
   ${APP_NAME} install-systemd --user
+  ${APP_NAME} install-windows-service
 `);
   process.exit(exitCode);
 }
@@ -67,10 +70,7 @@ function sampleConfig(): string {
   }, null, 2) + "\n";
 }
 
-function cmdInit(args: string[]) {
-  const stateDir = resolve(takeOption(args, "--state-dir") || DEFAULT_STATE_DIR);
-  const force = hasFlag(args, "--force");
-  if (args.length > 0) throw new Error(`Unknown init arguments: ${args.join(" ")}`);
+function ensureState(stateDir: string, force = false) {
   const configPath = resolve(stateDir, "config.json");
   const dataDir = resolve(stateDir, "data");
   mkdirSync(dataDir, { recursive: true });
@@ -81,10 +81,18 @@ function cmdInit(args: string[]) {
     console.log(`Created config: ${configPath}`);
   }
   console.log(`Data dir: ${dataDir}`);
+  return { configPath, dataDir };
+}
+
+function cmdInit(args: string[]) {
+  const stateDir = resolve(takeOption(args, "--state-dir") || DEFAULT_STATE_DIR);
+  const force = hasFlag(args, "--force");
+  if (args.length > 0) throw new Error(`Unknown init arguments: ${args.join(" ")}`);
+  ensureState(stateDir, force);
   console.log("Next: edit config.json and fill in your OpenClaw token and Lark app credentials.");
 }
 
-function buildUnit(params: { mode: "user" | "system"; configPath: string; stateDir: string; noRestart: boolean }) {
+function buildUnit(params: { mode: "user" | "system"; configPath: string; stateDir: string }) {
   const nodeBin = process.execPath;
   const cliPath = fileURLToPath(import.meta.url);
   const userLine = params.mode === "system" ? `User=${process.env.USER || "YOUR_USERNAME"}\n` : "";
@@ -124,15 +132,8 @@ function cmdInstallSystemd(args: string[]) {
   const stateDir = resolve(takeOption(args, "--state-dir") || DEFAULT_STATE_DIR);
   if (args.length > 0) throw new Error(`Unknown install-systemd arguments: ${args.join(" ")}`);
 
-  mkdirSync(resolve(stateDir, "data"), { recursive: true });
-  const configPath = resolve(stateDir, "config.json");
-  if (!existsSync(configPath)) {
-    writeFileSync(configPath, sampleConfig(), { mode: 0o600 });
-    console.log(`Created config: ${configPath}`);
-    console.log("Edit this config before expecting the service to work.");
-  }
-
-  const unit = buildUnit({ mode, configPath, stateDir, noRestart });
+  const { configPath } = ensureState(stateDir, false);
+  const unit = buildUnit({ mode, configPath, stateDir });
   if (mode === "system") {
     const tmp = `/tmp/${APP_NAME}.service`;
     writeFileSync(tmp, unit);
@@ -142,7 +143,7 @@ function cmdInstallSystemd(args: string[]) {
     if (!noRestart) runSudo(["systemctl", "restart", `${APP_NAME}.service`]);
     console.log(`Installed system service: ${APP_NAME}.service`);
   } else {
-    const unitDir = resolve(process.env.HOME || process.cwd(), ".config", "systemd", "user");
+    const unitDir = resolve(HOME_DIR, ".config", "systemd", "user");
     mkdirSync(unitDir, { recursive: true });
     const unitPath = resolve(unitDir, `${APP_NAME}.service`);
     writeFileSync(unitPath, unit);
@@ -153,6 +154,27 @@ function cmdInstallSystemd(args: string[]) {
   }
 }
 
+function cmdInstallWindowsService(args: string[]) {
+  const noStart = hasFlag(args, "--no-start");
+  const stateDir = resolve(takeOption(args, "--state-dir") || DEFAULT_STATE_DIR);
+  if (args.length > 0) throw new Error(`Unknown install-windows-service arguments: ${args.join(" ")}`);
+  if (process.platform !== "win32") {
+    console.log("install-windows-service is intended for Windows. On Linux, use install-systemd.");
+  }
+  const { configPath, dataDir } = ensureState(stateDir, false);
+  const cliPath = fileURLToPath(import.meta.url);
+  run("nssm", ["install", APP_NAME, process.execPath, cliPath, "start", configPath]);
+  run("nssm", ["set", APP_NAME, "AppDirectory", dirname(cliPath)]);
+  run("nssm", ["set", APP_NAME, "AppEnvironmentExtra", `NODE_ENV=production`, `LMA_DATA_DIR=${dataDir}`]);
+  run("nssm", ["set", APP_NAME, "AppStdout", resolve(stateDir, "stdout.log")]);
+  run("nssm", ["set", APP_NAME, "AppStderr", resolve(stateDir, "stderr.log")]);
+  run("nssm", ["set", APP_NAME, "AppRotateFiles", "1"]);
+  run("nssm", ["set", APP_NAME, "AppRotateBytes", "10485760"]);
+  run("nssm", ["set", APP_NAME, "Start", "SERVICE_AUTO_START"]);
+  if (!noStart) run("nssm", ["start", APP_NAME]);
+  console.log(`Installed Windows service: ${APP_NAME}`);
+}
+
 function cmdDoctor(args: string[]) {
   const stateDir = resolve(takeOption(args, "--state-dir") || DEFAULT_STATE_DIR);
   if (args.length > 0) throw new Error(`Unknown doctor arguments: ${args.join(" ")}`);
@@ -161,6 +183,7 @@ function cmdDoctor(args: string[]) {
   console.log(`Config:     ${configPath} ${existsSync(configPath) ? "OK" : "MISSING"}`);
   console.log(`Data dir:   ${resolve(stateDir, "data")} ${existsSync(resolve(stateDir, "data")) ? "OK" : "MISSING"}`);
   console.log(`Node:       ${process.version}`);
+  console.log(`Platform:   ${process.platform}`);
   console.log(`CLI:        ${fileURLToPath(import.meta.url)}`);
 }
 
@@ -169,6 +192,7 @@ async function main() {
   if (cmd === "--help" || cmd === "-h") usage(0);
   if (cmd === "init") return cmdInit(args);
   if (cmd === "install-systemd") return cmdInstallSystemd(args);
+  if (cmd === "install-windows-service") return cmdInstallWindowsService(args);
   if (cmd === "doctor") return cmdDoctor(args);
   if (cmd === "start") {
     const configPath = args[0] ? resolve(args[0]) : DEFAULT_CONFIG_PATH;

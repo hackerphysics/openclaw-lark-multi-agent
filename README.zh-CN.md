@@ -77,6 +77,12 @@ openclaw-lark-multi-agent start
 openclaw-lark-multi-agent install-systemd --user
 ```
 
+Windows 下先安装 [NSSM](https://nssm.cc/download)，确保 `nssm.exe` 在 `PATH`，然后用管理员权限打开 PowerShell 或命令提示符：
+
+```powershell
+openclaw-lark-multi-agent install-windows-service
+```
+
 常用 CLI 命令：
 
 ```bash
@@ -167,6 +173,30 @@ systemctl status openclaw-lark-multi-agent
 journalctl -u openclaw-lark-multi-agent -f
 sudo systemctl restart openclaw-lark-multi-agent
 ```
+
+
+## Windows 部署
+
+npm CLI 也支持 Windows。默认状态目录是 `%USERPROFILE%\.openclaw\openclaw-lark-multi-agent`。
+
+```powershell
+npm install -g openclaw-lark-multi-agent
+openclaw-lark-multi-agent init
+notepad $env:USERPROFILE\.openclaw\openclaw-lark-multi-agent\config.json
+openclaw-lark-multi-agent start
+```
+
+如果要作为 Windows Service 运行，安装 [NSSM](https://nssm.cc/download)，把 `nssm.exe` 放进 `PATH`，用管理员权限打开终端，然后运行：
+
+```powershell
+openclaw-lark-multi-agent install-windows-service
+```
+
+兼容用的 bat 脚本也保留在 `scripts/install-windows-service.bat`。
+
+## macOS launchd
+
+示例 launchd plist 放在 `scripts/openclaw-lark-multi-agent.plist`。多数用户用 npm CLI 配合进程管理器会更简单。
 
 ## Lark/飞书应用配置
 

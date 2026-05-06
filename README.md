@@ -77,6 +77,12 @@ Install as a systemd user service:
 openclaw-lark-multi-agent install-systemd --user
 ```
 
+On Windows, install [NSSM](https://nssm.cc/download), make sure `nssm.exe` is in `PATH`, then run PowerShell or Command Prompt as Administrator:
+
+```powershell
+openclaw-lark-multi-agent install-windows-service
+```
+
 Useful CLI commands:
 
 ```bash
@@ -167,6 +173,30 @@ systemctl status openclaw-lark-multi-agent
 journalctl -u openclaw-lark-multi-agent -f
 sudo systemctl restart openclaw-lark-multi-agent
 ```
+
+
+## Windows deployment
+
+The npm CLI works on Windows as well. It uses `%USERPROFILE%\.openclaw\openclaw-lark-multi-agent` as the default state directory.
+
+```powershell
+npm install -g openclaw-lark-multi-agent
+openclaw-lark-multi-agent init
+notepad $env:USERPROFILE\.openclaw\openclaw-lark-multi-agent\config.json
+openclaw-lark-multi-agent start
+```
+
+To run as a Windows service, install [NSSM](https://nssm.cc/download), put `nssm.exe` in `PATH`, open an elevated terminal, then run:
+
+```powershell
+openclaw-lark-multi-agent install-windows-service
+```
+
+A legacy helper script is also available at `scripts/install-windows-service.bat`.
+
+## macOS launchd
+
+A sample launchd plist is available at `scripts/openclaw-lark-multi-agent.plist`. For most users, npm CLI + a process manager is simpler.
 
 ## Lark/Feishu app setup
 
