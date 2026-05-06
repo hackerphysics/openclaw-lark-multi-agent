@@ -158,13 +158,28 @@ export class OpenClawClient {
           const role = msg.role;
           const content = msg.content;
 
-          // Proactive assistant text messages (suppress during active chatSend)
-          if (role === "assistant" && typeof content === "string") {
+          // Proactive assistant text messages (suppress during active chatSend).
+          // Cron/session-targeted runs often emit structured content arrays rather
+          // than a plain string. Extract only visible text parts and ignore thinking
+          // / tool blocks so the bridge can deliver final cron results via the bot.
+          let proactiveText = "";
+          if (role === "assistant") {
+            if (typeof content === "string") {
+              proactiveText = content;
+            } else if (Array.isArray(content)) {
+              proactiveText = content
+                .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+                .map((part: any) => part.text)
+                .join("\n")
+                .trim();
+            }
+          }
+          if (proactiveText) {
             if (this.suppressedSessions.has(rawKey) || this.suppressedSessions.has(shortKey)) {
               console.log(`[OpenClaw] Suppressing proactive msg for ${shortKey} (active chatSend)`);
             } else {
               const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-              if (cb) cb(content);
+              if (cb) cb(proactiveText);
             }
           }
 
