@@ -5,7 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=haipw
+# For a system service, replace YOUR_USERNAME with the user that owns the state directory.
+# Prefer scripts/install-linux-systemd.sh because it generates this value automatically.
+User=YOUR_USERNAME
 WorkingDirectory=%h/.local/lib/openclaw-lark-multi-agent
 ExecStart=/usr/bin/node dist/index.js %h/.openclaw/openclaw-lark-multi-agent/config.json
 Restart=always

@@ -1,296 +1,232 @@
 # OpenClaw Lark Multi-Agent
 
-多个飞书机器人接入同一个 OpenClaw 实例，每个机器人绑定不同 AI 模型，共享完整的 Agent 能力。
+Run multiple Lark/Feishu bots against one OpenClaw Gateway, with each bot bound to its own model and isolated conversation state.
 
-## 为什么需要这个？
+This project is a bridge layer for OpenClaw. It does **not** implement an agent runtime itself; messages are forwarded into normal OpenClaw sessions so every bot still uses the full OpenClaw pipeline, tools, memory, slash commands, and delivery behavior.
 
-飞书原生只支持一个机器人对应一个 AI 服务。如果你想在同一个群里同时和 GPT、Claude、Gemini 对话，或者给不同群分配不同模型，就需要一个中间层来路由。
+## Why this exists
 
-OpenClaw Lark Multi-Agent 就是这个中间层：
+Lark/Feishu gives each bot its own app identity, but OpenClaw normally exposes one assistant identity per channel account. This bridge lets you create several Lark bots such as:
 
-- **一个 OpenClaw 实例** 提供所有 Agent 能力（工具、记忆、Skills）
-- **多个飞书机器人** 各自绑定不同模型
-- **本地消息缓存** 实现智能消息批量发送，避免重复回复
+- `GPT Bot` → `github-copilot/gpt-5.5`
+- `Gemini Bot` → `github-copilot/gemini-3.1-pro-preview`
+- `Claude Bot` → `github-copilot/claude-opus-4.7`
 
-## 架构
+All of them connect to the same OpenClaw Gateway while keeping sessions, queues, and private chats isolated.
 
+## Features
+
+- Multiple Lark/Feishu bot apps in one process
+- Per-bot model binding via OpenClaw session model override
+- Per-chat OpenClaw sessions: `lma-<bot>-<chatId>`
+- Private chat isolation: a p2p chat belongs to exactly one bot
+- Group chat routing:
+  - reply when directly mentioned
+  - reply to `@all` / `@_all`
+  - optional Free Discussion mode
+- Local SQLite message store for context, trigger tracking, and duplicate prevention
+- `pending_triggers` queue so restart recovery does not replay every context message
+- `delivered_replies` table so one trigger message gets at most one delivered reply per bot
+- Feishu image download and OpenClaw multimodal attachment forwarding
+- Bridge-level slash commands and escaped OpenClaw slash commands
+- Linux systemd installer with separate runtime and state directories
+
+## Architecture
+
+```text
+Lark Bot App A ┐
+Lark Bot App B ├─ WebSocket events ─→ openclaw-lark-multi-agent ─→ OpenClaw Gateway
+Lark Bot App C ┘                                              └─ SQLite state
 ```
-飞书 Bot A (Claude) ─┐
-飞书 Bot B (GPT)   ──┤──→ OpenClaw Lark Multi-Agent ──WebSocket──→ OpenClaw Gateway
-飞书 Bot C (Gemini) ─┘         │
-                          SQLite (消息缓存)
-```
 
-## 核心特性
+The bridge stores every message as local context, but only messages that should trigger a bot response are inserted into `pending_triggers`. This distinction prevents startup drains from accidentally replaying unrelated history.
 
-### 🔀 消息路由
-- **私聊**：机器人直接回复
-- **群聊 @ 某个机器人**：只有被 @ 的机器人回复
-- **群聊无 @**：所有机器人都回复
-- **防死循环**：连续 10 条机器人消息后自动暂停，等人类发言
+## Requirements
 
-### 🧠 独立会话
-- 每个机器人 × 每个聊天 = 独立的 OpenClaw Session
-- Session Key 格式：`lma-<bot名>-<chatId>`
-- 模型绑定、上下文、记忆完全隔离
+- Node.js 22+
+- npm
+- An OpenClaw Gateway reachable over HTTP/WebSocket
+- One or more Lark/Feishu self-built apps with WebSocket event subscription enabled
+- Linux systemd for the provided installer, or another process manager such as pm2
 
-### 📦 智能消息批量
-- Agent 处理中时，新消息自动排队
-- Agent 完成后，所有积压消息**打包一起发送**
-- 像跟人说话一样自然——连续发的多条消息会被当作一个整体理解
-- 3 分钟超时保护，防止队列永远卡死
-
-### ✅ 消息确认
-- 收到消息立即加 Reaction（随机表情）
-- 回复完成后替换为 ✅ DONE
-- 让你知道机器人收到了消息、正在处理
-
-### 🛡️ 模型漂移检测
-- 每次对话前自动检查 Session 当前模型
-- 如果被篡改，自动修复并在对话中通知
-
-### 🔧 管理命令
-| 命令 | 说明 |
-|------|------|
-| `/status` | 显示当前 Bot、模型、Token 用量、Session 状态 |
-| `/compact` | 手动压缩 Session 上下文 |
-| `/reset` | 重置 Session（清空对话历史） |
-
-## 快速开始
-
-### 前置条件
-
-- [Node.js](https://nodejs.org/) >= 18
-- 运行中的 [OpenClaw](https://github.com/openclaw/openclaw) Gateway
-- 一个或多个[飞书自建应用](https://open.feishu.cn/)
-
-### 1. 创建飞书应用
-
-在[飞书开放平台](https://open.feishu.cn/)为每个模型创建一个自建应用。
-
-> 💡 如果你已经配置过 OpenClaw 的飞书机器人，新建的应用需要**与 OpenClaw 机器人具有相同的权限配置**。
-
-**快速配置：**
-
-1. 创建自建应用，开启「机器人」能力
-2. 事件订阅方式选择 **WebSocket（长连接）**
-3. 添加事件：`im.message.receive_v1`
-4. 添加权限（与 OpenClaw 飞书机器人一致）：
-   - `im:message` — 读写消息（收发消息必需）
-   - `im:message.reactions:write_only` — 发送表情回复（消息确认反馈）
-   - `im:chat:readonly` — 读取群信息（获取群名称和成员列表）
-5. 记下 App ID 和 App Secret
-
-详细步骤参考[飞书官方文档：创建自建应用](https://open.feishu.cn/document/home/introduction-to-custom-app-development/self-built-application-development-process)。
-
-### 2. 克隆 & 安装
+## Quick start
 
 ```bash
 git clone https://github.com/hackerphysics/openclaw-lark-multi-agent.git
 cd openclaw-lark-multi-agent
-npm install
-```
-
-### 3. 配置
-
-```bash
+npm ci
 cp config.example.json config.json
 ```
 
-编辑 `config.json`：
+Edit `config.json`:
 
-```jsonc
+```json
 {
   "openclaw": {
-    "baseUrl": "http://127.0.0.1:18789",   // OpenClaw Gateway 地址
-    "token": "your-gateway-token"            // gateway.auth.token
+    "baseUrl": "http://127.0.0.1:18789",
+    "token": "YOUR_OPENCLAW_GATEWAY_TOKEN"
   },
   "bots": [
     {
-      "name": "GPT",                         // 显示名称（需唯一）
-      "appId": "cli_xxx",                    // 飞书 App ID
-      "appSecret": "xxx",                    // 飞书 App Secret
-      "model": "openai/gpt-5.5"             // OpenClaw 模型标识
-    },
-    {
-      "name": "Claude",
-      "appId": "cli_yyy",
-      "appSecret": "yyy",
-      "model": "anthropic/claude-opus-4-6"
+      "name": "GPT",
+      "appId": "cli_xxx",
+      "appSecret": "YOUR_LARK_APP_SECRET",
+      "model": "github-copilot/gpt-5.5"
     },
     {
       "name": "Gemini",
-      "appId": "cli_zzz",
-      "appSecret": "zzz",
-      "model": "google/gemini-3.1-pro-preview"
+      "appId": "cli_yyy",
+      "appSecret": "YOUR_LARK_APP_SECRET",
+      "model": "github-copilot/gemini-3.1-pro-preview"
     }
   ]
 }
 ```
 
-### 4. 运行
+Build and run locally:
 
 ```bash
-# 开发模式
-npm run dev
-
-# 生产模式
 npm run build
-npm start
+npm start -- config.json
 ```
 
-### 5. 安装为系统服务（推荐）
+> `config.json` contains secrets and is ignored by git. Do not commit it.
 
-#### 方案一：pm2（跨平台，推荐）
+## Recommended Linux deployment
 
-适用于 Linux / macOS / Windows，最简单的方式：
+Use the installer:
 
 ```bash
-# 安装 pm2
-npm install -g pm2
-
-# 先编译
-npm run build
-
-# 启动
-pm2 start dist/index.js --name openclaw-lark-multi-agent -- config.json
-
-# 设置开机自启
-pm2 startup    # 按提示执行输出的命令
-pm2 save
-
-# 常用命令
-pm2 status                    # 查看状态
-pm2 logs openclaw-lark-multi-agent     # 查看日志
-pm2 restart openclaw-lark-multi-agent  # 重启
-pm2 stop openclaw-lark-multi-agent     # 停止
+./scripts/install-linux-systemd.sh --system
 ```
 
-#### 方案二：systemd（Linux）
+By default it uses:
+
+- runtime files: `~/.local/lib/openclaw-lark-multi-agent/`
+- state/config/data: `~/.openclaw/openclaw-lark-multi-agent/`
+- systemd service: `openclaw-lark-multi-agent.service`
+
+Only built runtime files are deployed to the runtime directory (`dist/`, `package.json`, `package-lock.json`, production `node_modules`). Source files are not copied there.
+
+For a user service instead of a system service:
 
 ```bash
-sudo cp openclaw-lark-multi-agent.service /etc/systemd/system/
+./scripts/install-linux-systemd.sh --user
+```
 
-# 根据实际情况修改 User 和 WorkingDirectory
-sudo vim /etc/systemd/system/openclaw-lark-multi-agent.service
+Custom directories:
 
-sudo systemctl daemon-reload
-sudo systemctl enable openclaw-lark-multi-agent
-sudo systemctl start openclaw-lark-multi-agent
+```bash
+./scripts/install-linux-systemd.sh \
+  --deploy-dir ~/.local/lib/openclaw-lark-multi-agent-prod \
+  --state-dir ~/.openclaw/openclaw-lark-multi-agent-prod
+```
 
-# 查看状态和日志
-sudo systemctl status openclaw-lark-multi-agent
+Useful commands:
+
+```bash
+systemctl status openclaw-lark-multi-agent
 journalctl -u openclaw-lark-multi-agent -f
+sudo systemctl restart openclaw-lark-multi-agent
 ```
 
-#### 方案三：launchd（macOS）
+## Lark/Feishu app setup
+
+For each bot:
+
+1. Create a self-built Lark/Feishu app.
+2. Enable bot capability.
+3. Enable event subscription over WebSocket / long connection.
+4. Subscribe to message receive events.
+5. Copy the app ID and app secret into `config.json`.
+6. Add the bot to the target chats.
+
+Each bot app should have its own identity and credentials.
+
+## Commands
+
+Bridge-level commands use a single slash and are handled by this project:
+
+- `/help` — show command help
+- `/status` — show bot model, token usage, and session state
+- `/compact` — compact the OpenClaw session
+- `/reset` — reset the OpenClaw session
+- `/verbose` — toggle tool-call messages for this bot in this chat
+- `/free` — toggle Free Discussion mode in group chats
+
+OpenClaw-level slash commands can be sent by escaping with a double slash:
+
+```text
+//status
+//reset
+//compact
+```
+
+The bridge converts `//status` to `/status` and forwards it to OpenClaw instead of handling it locally.
+
+## Message routing rules
+
+### Private chats
+
+A private chat is owned by the bot connected to that chat. Other bots ignore it.
+
+### Group chats
+
+By default, a bot responds when:
+
+- it is directly mentioned;
+- `@all` / `@_all` appears in the message;
+- Free Discussion is enabled for that group.
+
+Bot messages do not trigger other bots unless they mention them. A bot-streak guard prevents infinite bot-to-bot loops.
+
+## Data model
+
+SQLite state lives in the configured data directory. Important tables:
+
+- `messages` — local conversation log and context
+- `sync_state` — per-bot/per-chat sync cursor
+- `pending_triggers` — messages that should actively trigger a bot run
+- `delivered_replies` — delivered response markers for idempotency
+- `processed_events` — Feishu event de-duplication
+- `bot_chat_settings` — per-bot/per-chat settings such as verbose mode
+
+## Development
 
 ```bash
-# 修改 plist 中的路径（WorkingDirectory 和 node 路径）
-vim openclaw-lark-multi-agent.plist
-
-# 安装并启动
-cp openclaw-lark-multi-agent.plist ~/Library/LaunchAgents/com.hackerphysics.openclaw-lark-multi-agent.plist
-launchctl load ~/Library/LaunchAgents/com.hackerphysics.openclaw-lark-multi-agent.plist
-
-# 查看状态
-launchctl list | grep openclaw-lark-multi-agent
-
-# 停止
-launchctl unload ~/Library/LaunchAgents/com.hackerphysics.openclaw-lark-multi-agent.plist
-
-# 日志
-tail -f /tmp/openclaw-lark-multi-agent.log
-```
-
-特性：`KeepAlive: true` 崩溃自动重启，`RunAtLoad: true` 登录时自动启动。
-
-#### 方案四：Windows 服务（NSSM）
-
-使用 [NSSM](https://nssm.cc/download)（Non-Sucking Service Manager）注册为 Windows 服务：
-
-```powershell
-# 1. 下载 NSSM，解压后将 nssm.exe 放入 PATH
-
-# 2. 修改 install-windows-service.bat 中的路径
-
-# 3. 以管理员身份运行
-install-windows-service.bat
-
-# 常用命令
-nssm status openclaw-lark-multi-agent     # 查看状态
-nssm restart openclaw-lark-multi-agent    # 重启
-nssm stop openclaw-lark-multi-agent       # 停止
-nssm remove openclaw-lark-multi-agent     # 卸载服务
-```
-
-特性：崩溃自动重启、开机自启、日志自动轮转。
-
-#### 方案五：pm2（跨平台通用）
-
-如果不想折腾平台原生方案，pm2 三个系统都能用：
-
-```bash
-npm install -g pm2
+npm ci
 npm run build
-pm2 start dist/index.js --name openclaw-lark-multi-agent -- config.json
-pm2 startup   # 按提示设置开机自启
-pm2 save
+npm run dev -- config.json
 ```
 
-### 用 OpenClaw 配置（推荐）
+TypeScript output goes to `dist/`.
 
-如果你已经有一个 OpenClaw 实例在运行，最简单的方式是直接告诉它：
+## Repository hygiene
 
-> 帮我配置 openclaw-lark-multi-agent。GPT bot 的 App ID 是 cli_xxx，Secret 是 yyy，用 gpt-5.5 模型。
+The repository intentionally excludes:
 
-OpenClaw 会自动克隆仓库、写配置、启动服务。
+- `config.json`
+- `config*.json.bak*`
+- `.env*`
+- `data/`
+- `dist/`
+- `node_modules/`
 
-## 配置参考
+Before publishing or pushing, run:
 
-| 字段 | 说明 |
-|------|------|
-| `openclaw.baseUrl` | OpenClaw Gateway 的 HTTP 地址 |
-| `openclaw.token` | Gateway 认证 Token（`openclaw.json` 里的 `gateway.auth.token`） |
-| `bots[].name` | Bot 名称，必须唯一，用于 Session Key 和日志 |
-| `bots[].appId` | 飞书自建应用的 App ID |
-| `bots[].appSecret` | 飞书自建应用的 App Secret |
-| `bots[].model` | OpenClaw 模型标识（如 `openai/gpt-5.5`） |
-| `adminOpenId` | （可选）管理员的飞书 Open ID，用于接收系统通知 |
-
-## 数据存储
-
-- `data/messages.db` — SQLite，存储消息记录、同步状态、聊天信息
-- OpenClaw 管理各 Session 的对话历史（在 `~/.openclaw/sessions/`）
-
-## 工作原理
-
-### 消息流
-
-```
-用户发消息 → 飞书 SDK (WebSocket) → handleMessage
-  → 存入 SQLite
-  → 加 Reaction 确认收到
-  → 检查 Agent 是否忙碌
-    → 忙碌：消息留在队列，等 Agent 完成后一起发
-    → 空闲：打包所有未同步消息 → OpenClaw chat.send
-      → 收到回复 → 回复飞书 → 替换 Reaction 为 DONE
-      → 检查是否有新的积压消息 → 循环处理
+```bash
+git status --short
+git ls-files | grep -E 'config|secret|\.env' || true
 ```
 
-### 防串台机制
+If a secret is ever committed, remove it from the current tree and rewrite git history before making the repository public. Also rotate the leaked credential.
 
-- 飞书 SDK 层面：每个 Bot 独立的 WSClient，只收自己的事件
-- OpenClaw 层面：Session Key 按 `bot名+chatId` 隔离
-- 回复层面：每个 Bot 用自己的 `lark.Client` 发消息
-- 本地存储：`sync_state` 按 `(bot_name, chat_id)` 独立追踪
+## Security notes
 
-### 容错机制
-
-- **消息去重**：内存 Set + 数据库 UNIQUE 约束双重保护
-- **队列超时**：3 分钟未完成自动解锁，防止永远卡死
-- **启动排水**：重启后自动处理上次未发送的消息
-- **模型守护**：每次对话前检查模型是否正确
+- Treat every Lark app secret and OpenClaw Gateway token as sensitive.
+- Use one bot app per model/identity.
+- Prefer private repositories until credentials have been audited and rotated if needed.
+- Do not expose the OpenClaw Gateway to the public internet without authentication.
 
 ## License
 

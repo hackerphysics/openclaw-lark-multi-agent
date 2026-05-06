@@ -16,7 +16,7 @@ export interface OpenClawConfig {
 export interface AppConfig {
   openclaw: OpenClawConfig;
   bots: BotConfig[];
-  /** Stephen's open_id for model-drift notifications */
+  /** Optional Feishu/Lark open_id for model-drift notifications */
   adminOpenId?: string;
 }
 

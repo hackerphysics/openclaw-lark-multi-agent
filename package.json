@@ -1,7 +1,7 @@
 {
   "name": "openclaw-lark-multi-agent",
   "version": "0.1.0",
-  "description": "Multi Feishu bot proxy to OpenClaw - each bot bound to a specific model",
+  "description": "Multi-bot Lark/Feishu bridge for OpenClaw, with per-bot model routing and isolated sessions",
   "type": "module",
   "scripts": {
     "build": "tsc",
@@ -19,5 +19,23 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
-  }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/hackerphysics/openclaw-lark-multi-agent.git"
+  },
+  "bugs": {
+    "url": "https://github.com/hackerphysics/openclaw-lark-multi-agent/issues"
+  },
+  "homepage": "https://github.com/hackerphysics/openclaw-lark-multi-agent#readme",
+  "keywords": [
+    "openclaw",
+    "lark",
+    "feishu",
+    "multi-agent",
+    "chatbot",
+    "agent",
+    "gateway"
+  ]
 }
