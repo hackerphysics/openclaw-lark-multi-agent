@@ -340,6 +340,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               const finalText = chatFinalText || text;
               const finishFromLifecycle = () => {
                 const latestFinalText = chatFinalText || text;
+                if (!chatFinalText && latestFinalText.trim() === "N") {
+                  // Some providers stream the first character of NO_REPLY ("N") but
+                  // never deliver a final chat message in time. Never surface a lone
+                  // "N" to the user; treat it as a suppressed reply.
+                  finish("NO_REPLY");
+                  return;
+                }
                 if (!latestFinalText && ev.data?.livenessState !== "working") {
                   const state = ev.data?.livenessState || "unknown";
                   const reason = ev.data?.stopReason || "";
@@ -357,9 +364,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               };
 
               // If lifecycle end beats chat final, a short delta like "N" can be a truncated
-              // final reply. Wait briefly for chatFinal before resolving.
+              // final reply. Wait for chatFinal before resolving; otherwise suppress lone "N".
               if (!chatFinalText && text.length <= 1) {
-                lifecycleEndTimer = setTimeout(finishFromLifecycle, 800);
+                lifecycleEndTimer = setTimeout(finishFromLifecycle, 5000);
               } else {
                 finishFromLifecycle();
               }
