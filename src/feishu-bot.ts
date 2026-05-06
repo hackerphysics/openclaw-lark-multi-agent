@@ -365,8 +365,10 @@ export class FeishuBot {
       const isBridgeCommand = !commandText.startsWith("//");
       const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
       if (isCommand) {
-        // In group chats, commands also require mention/shouldRespond
-        if (chatType !== "p2p" && !this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
+        // In group chats, bridge commands must be explicitly routed to this bot
+        // or @all. Do not let Free Discussion make a bot execute commands meant
+        // for another bot.
+        if (chatType !== "p2p" && !this.shouldHandleBridgeCommand(chatType, message, isBot, message.content)) return;
 
         const markCommandSynced = () => {
           if (insertedId > 0) {
@@ -662,6 +664,19 @@ export class FeishuBot {
     }
   }
 
+  private shouldHandleBridgeCommand(
+    chatType: string,
+    message: any,
+    isBot: boolean,
+    rawText?: string
+  ): boolean {
+    if (chatType === "p2p") return !isBot;
+    if (isBot) return false;
+    const mentions: any[] = message.mentions || [];
+    if (this.isAllMention(rawText, mentions)) return true;
+    return this.isMentioned(mentions);
+  }
+
   private shouldRespond(
     chatType: string,
     message: any,
@@ -679,19 +694,13 @@ export class FeishuBot {
     }
 
     // @all in text: all bots respond
-    if (rawText && (rawText.includes("@_all") || rawText.includes("@all"))) return true;
+    if (this.isAllMention(rawText, mentions)) return true;
 
     // Check if this bot is explicitly mentioned
     if (this.isMentioned(mentions)) return true;
 
     // Check if any other bot is mentioned (not us) — don't respond
-    const anyBotMentioned = mentions.some((m: any) => {
-      for (const bot of FeishuBot.allBots.values()) {
-        if (m.id?.app_id === bot.config.appId) return true;
-        if (bot.botOpenId && m.id?.open_id === bot.botOpenId) return true;
-      }
-      return false;
-    });
+    const anyBotMentioned = mentions.some((m: any) => this.mentionedBotName(m) !== null);
     if (anyBotMentioned && !this.isMentioned(mentions)) return false;
 
     // No bot mentioned: check free discussion mode
@@ -704,21 +713,27 @@ export class FeishuBot {
   }
 
   private isMentioned(mentions: any[]): boolean {
-    return mentions.some((m: any) => {
-      // @ this specific bot
-      if (m.id?.app_id === this.config.appId) return true;
-      if (this.botOpenId && m.id?.open_id === this.botOpenId) return true;
-      // Feishu may provide only a display name in some mention payloads.
-      // Use this only as a fallback; open_id/app_id checks above remain primary.
-      if (typeof m.name === "string") {
-        const normalizedName = m.name.toLowerCase();
-        const normalizedConfigName = this.config.name.toLowerCase();
-        if (normalizedName === normalizedConfigName || normalizedName.includes(`（${normalizedConfigName}）`) || normalizedName.includes(`(${normalizedConfigName})`)) return true;
+    return mentions.some((m: any) => this.mentionedBotName(m) === this.config.name);
+  }
+
+  private isAllMention(rawText?: string, mentions: any[] = []): boolean {
+    if (rawText && (rawText.includes("@_all") || rawText.includes("@all") || rawText.includes("@所有人"))) return true;
+    return mentions.some((m: any) => m.key === "all" || m.key === "@_all" || m.id?.user_id === "all" || m.id?.open_id === "all" || m.name === "所有人");
+  }
+
+  private mentionedBotName(mention: any): string | null {
+    if (mention.key === "all" || mention.key === "@_all" || mention.id?.user_id === "all" || mention.id?.open_id === "all" || mention.name === "所有人") return null;
+    const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this)];
+    for (const bot of candidates) {
+      if (mention.id?.app_id === bot.config.appId) return bot.config.name;
+      if (bot.botOpenId && mention.id?.open_id === bot.botOpenId) return bot.config.name;
+      if (typeof mention.name === "string") {
+        const n = mention.name.toLowerCase();
+        const botName = bot.config.name.toLowerCase();
+        if (n === botName || n.includes(`（${botName}）`) || n.includes(`(${botName})`)) return bot.config.name;
       }
-      // @all / @ 所有人 is handled by raw text gating, not by direct-bot mention matching.
-      if (m.key === "all" || m.key === "@_all" || m.id?.user_id === "all" || m.id?.open_id === "all" || m.name === "所有人") return false;
-      return false;
-    });
+    }
+    return null;
   }
 
   private resolveBotName(sender: any): string | null {

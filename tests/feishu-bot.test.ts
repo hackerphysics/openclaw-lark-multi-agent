@@ -129,6 +129,26 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { gpt.cleanup(); gemini.cleanup(); }
   });
 
+  it("does not let free discussion execute commands addressed to another bot", async () => {
+    const claude = makeHarness("Claude");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", { config: { appId: "app-GPT", name: "GPT" }, botOpenId: "gpt-open-id" } as any);
+      claude.store.setBotFreeDiscussion("Claude", "chat1", true);
+      await (claude.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（GPT） /free",
+        messageId: "free-gpt",
+        mentions: [{ name: "万万（GPT）", id: { app_id: "app-GPT", open_id: "gpt-open-id" } }],
+      }));
+      expect(claude.store.getBotFreeDiscussion("Claude", "chat1")).toBe(true);
+      expect((claude.bot as any).replyMessage).not.toHaveBeenCalled();
+      expect(claude.openclaw.chatCalls).toHaveLength(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      claude.cleanup();
+    }
+  });
+
   it("passes double-slash commands through to OpenClaw as single-slash commands", async () => {
     const h = makeHarness();
     try {
