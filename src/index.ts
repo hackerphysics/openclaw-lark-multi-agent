@@ -4,9 +4,9 @@ import { MessageStore } from "./message-store.js";
 import { FeishuBot } from "./feishu-bot.js";
 import { mkdirSync } from "fs";
 import { dirname, resolve } from "path";
+import { fileURLToPath } from "url";
 
-async function main() {
-  const configPath = process.argv[2];
+export async function startApp(configPath?: string) {
   const config = loadConfig(configPath);
 
   console.log("=== OpenClaw Lark Multi-Agent ===");
@@ -54,7 +54,9 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
-  process.exit(1);
-});
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  startApp(process.argv[2]).catch((err) => {
+    console.error("Fatal error:", err);
+    process.exit(1);
+  });
+}

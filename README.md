@@ -51,7 +51,43 @@ The bridge stores every message as local context, but only messages that should 
 - One or more Lark/Feishu self-built apps with WebSocket event subscription enabled
 - Linux systemd for the provided installer, or another process manager such as pm2
 
-## Quick start
+## Quick start with npm
+
+After the package is published to npm:
+
+```bash
+npm install -g openclaw-lark-multi-agent
+openclaw-lark-multi-agent init
+```
+
+This creates:
+
+- config: `~/.openclaw/openclaw-lark-multi-agent/config.json`
+- data dir: `~/.openclaw/openclaw-lark-multi-agent/data/`
+
+Edit the generated config and fill in your OpenClaw Gateway token and Lark app credentials. Then run:
+
+```bash
+openclaw-lark-multi-agent start
+```
+
+Install as a systemd user service:
+
+```bash
+openclaw-lark-multi-agent install-systemd --user
+```
+
+Useful CLI commands:
+
+```bash
+openclaw-lark-multi-agent --help
+openclaw-lark-multi-agent doctor
+openclaw-lark-multi-agent start [config]
+openclaw-lark-multi-agent init [--state-dir DIR] [--force]
+openclaw-lark-multi-agent install-systemd [--user|--system] [--state-dir DIR]
+```
+
+## Quick start from source
 
 ```bash
 git clone https://github.com/hackerphysics/openclaw-lark-multi-agent.git

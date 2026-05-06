@@ -51,7 +51,43 @@ Lark Bot App C ┘                                              └─ SQLite st
 - 一个或多个 Lark/飞书自建应用，并启用 WebSocket 事件订阅
 - 使用内置安装脚本时需要 Linux systemd；也可以用 pm2 等其他进程管理器
 
-## 快速开始
+## 使用 npm 快速开始
+
+发布到 npm 后，可以这样安装：
+
+```bash
+npm install -g openclaw-lark-multi-agent
+openclaw-lark-multi-agent init
+```
+
+这会创建：
+
+- 配置文件：`~/.openclaw/openclaw-lark-multi-agent/config.json`
+- 数据目录：`~/.openclaw/openclaw-lark-multi-agent/data/`
+
+编辑生成的配置文件，填入 OpenClaw Gateway token 和 Lark/飞书应用凭证。然后运行：
+
+```bash
+openclaw-lark-multi-agent start
+```
+
+安装成 systemd user service：
+
+```bash
+openclaw-lark-multi-agent install-systemd --user
+```
+
+常用 CLI 命令：
+
+```bash
+openclaw-lark-multi-agent --help
+openclaw-lark-multi-agent doctor
+openclaw-lark-multi-agent start [config]
+openclaw-lark-multi-agent init [--state-dir DIR] [--force]
+openclaw-lark-multi-agent install-systemd [--user|--system] [--state-dir DIR]
+```
+
+## 从源码快速开始
 
 ```bash
 git clone https://github.com/hackerphysics/openclaw-lark-multi-agent.git
