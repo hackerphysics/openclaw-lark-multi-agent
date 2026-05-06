@@ -4,3 +4,9 @@ config.json
 data/
 *.log
 .DS_Store
+
+# Local secrets/backups
+config*.json.bak*
+*.secret
+.env
+.env.*

@@ -11,7 +11,7 @@ SUDO_CMD="${SUDO_CMD:-sudo}"
 
 usage() {
   cat <<USAGE
-Usage: $0 [--user|--system] [--deploy-dir DIR] [--no-restart]
+Usage: $0 [--user|--system] [--deploy-dir DIR] [--state-dir DIR] [--no-restart]
 
 Build and deploy ${APP_NAME} to a runtime directory, then install a systemd service.
 
@@ -23,7 +23,7 @@ Defaults:
 Examples:
   $0
   $0 --system
-  $0 --deploy-dir ~/.local/lib/${APP_NAME}-prod
+  $0 --deploy-dir ~/.local/lib/${APP_NAME}-prod --state-dir ~/.openclaw/${APP_NAME}-prod
 USAGE
 }
 
@@ -32,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --user) MODE="user"; shift ;;
     --system) MODE="system"; shift ;;
     --deploy-dir) DEPLOY_DIR="$2"; shift 2 ;;
+    --state-dir) STATE_DIR="$2"; shift 2 ;;
     --no-restart) RESTART="0"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 1 ;;
