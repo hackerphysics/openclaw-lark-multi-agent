@@ -817,16 +817,22 @@ export class FeishuBot {
           msg_type: "interactive",
         },
       });
-    } catch {
+    } catch (err) {
+      console.warn(`[${this.config.name}] sendMessage interactive failed:`, JSON.stringify((err as any)?.response?.data || (err as any)?.data || { message: (err as Error).message }));
       // Fallback to plain text
-      await this.client.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: {
-          receive_id: chatId,
-          content: JSON.stringify({ text }),
-          msg_type: "text",
-        },
-      });
+      try {
+        await this.client.im.message.create({
+          params: { receive_id_type: "chat_id" },
+          data: {
+            receive_id: chatId,
+            content: JSON.stringify({ text }),
+            msg_type: "text",
+          },
+        });
+      } catch (fallbackErr) {
+        console.warn(`[${this.config.name}] sendMessage text failed:`, JSON.stringify((fallbackErr as any)?.response?.data || (fallbackErr as any)?.data || { message: (fallbackErr as Error).message }));
+        throw fallbackErr;
+      }
     }
   }
 
