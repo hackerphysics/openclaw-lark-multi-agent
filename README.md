@@ -232,6 +232,29 @@ OpenClaw-level slash commands can be sent by escaping with a double slash:
 
 The bridge converts `//status` to `/status` and forwards it to OpenClaw instead of handling it locally.
 
+How to test the double-slash behavior:
+
+1. In a private chat with one bot, send `//status`.
+   - Expected: the message is forwarded to OpenClaw as `/status`.
+   - It should **not** be handled by the bridge-level `/status` command.
+2. In a group chat, mention a specific bot or use `@all` with a double slash:
+
+```text
+@GPT //status
+@all //reset
+```
+
+Expected: the bridge strips the leading mention for routing, converts `//...` to `/...`, and forwards the command to OpenClaw.
+
+To test bridge-level commands instead, use a single slash:
+
+```text
+/reset
+@all /reset
+```
+
+Expected: the bridge handles the command locally and does not forward it to OpenClaw.
+
 ## Message routing rules
 
 ### Private chats

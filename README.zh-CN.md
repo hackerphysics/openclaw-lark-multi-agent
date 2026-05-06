@@ -232,6 +232,29 @@ openclaw-lark-multi-agent install-windows-service
 
 桥接层会把 `//status` 转成 `/status` 并转发给 OpenClaw，而不是自己处理。
 
+如何测试 double slash 行为：
+
+1. 在某个 bot 私聊里发送 `//status`。
+   - 预期：消息会被转成 `/status` 发给 OpenClaw。
+   - 它**不会**被桥接层当成本地 `/status` 命令处理。
+2. 在群聊里，先 @ 某个 bot，或者 @所有人，再加双斜杠命令：
+
+```text
+@GPT //status
+@所有人 //reset
+```
+
+预期：桥接层只用前面的 @ 来做路由，然后把 `//...` 转成 `/...` 发给 OpenClaw。
+
+如果要测试桥接层自己的命令，用单斜杠：
+
+```text
+/reset
+@所有人 /reset
+```
+
+预期：桥接层本地处理这个命令，不会转发给 OpenClaw。
+
 ## 消息路由规则
 
 ### 私聊
