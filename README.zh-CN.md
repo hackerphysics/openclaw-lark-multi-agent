@@ -269,6 +269,27 @@ npm run dev -- config.json
 
 TypeScript 输出目录是 `dist/`。
 
+
+## npm 自动发布
+
+仓库里已经包含 `.github/workflows/publish.yml`。启用自动发布需要：
+
+1. 在 npm 创建 automation/granular token，并授予 package publish 权限。
+2. 在 GitHub 仓库 Settings → Secrets and variables → Actions 中添加 `NPM_TOKEN`。
+3. 修改 `package.json` version。
+4. 提交并推送。
+5. 创建匹配的 tag，例如：
+
+```bash
+npm version patch --no-git-tag-version
+git add package.json package-lock.json
+git commit -m "chore: release v0.1.1"
+git tag v0.1.1
+git push origin main --tags
+```
+
+发布 workflow 会检查 git tag 是否和 package version 一致，然后再执行 `npm publish`。
+
 ## 仓库卫生
 
 仓库会忽略：

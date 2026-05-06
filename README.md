@@ -269,6 +269,27 @@ npm run dev -- config.json
 
 TypeScript output goes to `dist/`.
 
+
+## npm release automation
+
+This repository includes `.github/workflows/publish.yml`. To enable automated npm publishing:
+
+1. Create an npm automation/granular token with package publish permission.
+2. Add it to GitHub repository secrets as `NPM_TOKEN`.
+3. Bump `package.json` version.
+4. Commit and push.
+5. Create a matching tag, for example:
+
+```bash
+npm version patch --no-git-tag-version
+git add package.json package-lock.json
+git commit -m "chore: release v0.1.1"
+git tag v0.1.1
+git push origin main --tags
+```
+
+The publish workflow checks that the git tag matches the package version before running `npm publish`.
+
 ## Repository hygiene
 
 The repository intentionally excludes:
