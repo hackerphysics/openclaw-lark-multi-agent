@@ -331,23 +331,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               const finalText = chatFinalText || text;
               const finishFromLifecycle = () => {
                 const latestFinalText = chatFinalText || text;
-                const state = ev.data?.livenessState || "unknown";
-                const replayInvalid = !!ev.data?.replayInvalid;
-                if (state !== "working" || replayInvalid) {
-                  // Terminal non-working/replay-invalid runs can still emit delayed
-                  // tool/session events. Abort and clear buffers so those stale events do
-                  // not leak into the next bridge-collected reply.
-                  const abortRunId = evRunId || runId;
-                  this.abortChat(targetSessionKey || sessionKey, abortRunId).catch((err) => {
-                    console.warn(`[OpenClaw] abort after non-working lifecycle failed:`, (err as Error).message);
-                  });
-                  if (sessionKey) this.agentEvents.set(sessionKey, []);
-                  if (targetSessionKey) this.agentEvents.set(targetSessionKey, []);
-                }
-                if (!latestFinalText && state !== "working") {
+                if (!latestFinalText && ev.data?.livenessState !== "working") {
+                  const state = ev.data?.livenessState || "unknown";
                   const reason = ev.data?.stopReason || "";
-                  const replayInvalidText = replayInvalid ? ", replayInvalid" : "";
-                  finish(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalidText}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`);
+                  const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
+                  finish(`⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`);
                 } else {
                   finish(latestFinalText);
                 }
