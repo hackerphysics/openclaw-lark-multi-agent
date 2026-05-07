@@ -31,7 +31,7 @@ describe("OpenClawClient bridge attachment hint", () => {
     });
     expect(chatSend).toHaveBeenCalledOnce();
     expect(result).toContain("Bridge attachment capability hint");
-    expect(result).toContain("/home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/");
+    expect(result).toContain(".openclaw/openclaw-lark-multi-agent/attachments/");
     expect(result).toContain("LMA_BRIDGE_ATTACHMENTS");
     expect(result).toContain("type=document for Markdown documents");
   });
