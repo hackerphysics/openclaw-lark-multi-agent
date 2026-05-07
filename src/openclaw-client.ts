@@ -535,6 +535,17 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     }
   }
 
+  private shouldInjectBridgeAttachmentHint(text: string): boolean {
+    return /发送|发到|发给|传|上传|附件|文件|文档|图片|图像|照片|生成图|做张图|画张图|导出|保存|pdf|docx?|xlsx?|pptx?|markdown|\bmd\b/i.test(text);
+  }
+
+  private bridgeAttachmentHint(text: string): string {
+    if (!this.shouldInjectBridgeAttachmentHint(text)) return "";
+    return `
+
+[Bridge attachment capability hint: This is an OpenClaw Lark Multi-Agent bridge session. If the user asks you to send an image/file/document to Feishu, create the local file under /home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/ and include this exact marker at the very end of your final reply (do not explain or expose the marker as normal text): <LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image|file|document","path":"/absolute/path","caption":"optional"}]}</LMA_BRIDGE_ATTACHMENTS>. Use type=image for images; type=document for markdown/pdf/doc-like documents; type=file for other files.]`;
+  }
+
   /**
    * Build and send a context catch-up message followed by the actual message.
    *
@@ -563,11 +574,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     const mediaInstruction = attachments.length > 0
       ? "\n\n[Media note: Image attachments are included with this message. If your model can inspect images directly, use the attached image input. If it cannot, use the image tool on the provided media/attachment path; do not try unrelated network or model-provider workarounds.]"
       : "";
+    const bridgeAttachmentHint = this.bridgeAttachmentHint(params.currentMessage);
     if (params.unsyncedMessages.length === 0) {
       // No context to catch up, send directly
       return this.chatSend({
         sessionKey: params.sessionKey,
-        message: params.currentMessage + mediaInstruction,
+        message: params.currentMessage + mediaInstruction + bridgeAttachmentHint,
         attachments,
         deliver: params.deliver,
         timeoutMs: params.timeoutMs,
@@ -593,7 +605,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
     return this.chatSend({
       sessionKey: params.sessionKey,
-      message: combined + mediaInstruction,
+      message: combined + mediaInstruction + bridgeAttachmentHint,
       attachments,
       deliver: params.deliver,
       timeoutMs: params.timeoutMs,

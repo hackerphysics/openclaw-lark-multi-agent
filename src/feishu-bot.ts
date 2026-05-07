@@ -2,8 +2,17 @@ import * as lark from "@larksuiteoapi/node-sdk";
 import { BotConfig } from "./config.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
+import { existsSync, readFileSync, statSync } from "fs";
+import { basename, extname, resolve } from "path";
 
 const MAX_BOT_STREAK = 10;
+const BRIDGE_ATTACHMENTS_DIR = "/home/haipw/.openclaw/openclaw-lark-multi-agent/attachments";
+
+type BridgeAttachment = {
+  type?: "image" | "file" | "document";
+  path: string;
+  caption?: string;
+};
 
 /**
  * Manages a single Feishu bot instance.
@@ -127,7 +136,11 @@ export class FeishuBot {
     await this.openclawClient.subscribeSession(sessionKey, async (text) => {
       try {
         console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
-        await this.sendMessage(chatId, text);
+        const parsed = this.extractBridgeAttachments(text);
+        if (parsed.text.trim()) await this.sendMessage(chatId, parsed.text);
+        for (const attachment of parsed.attachments) {
+          await this.sendBridgeAttachment(chatId, attachment);
+        }
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
       }
@@ -599,17 +612,23 @@ export class FeishuBot {
         this.store.markSynced(this.config.name, chatId, maxId);
         this.store.clearPendingTriggers(this.config.name, chatId, maxId);
 
-        const trimmedReply = reply.trim();
+        const parsedReply = this.extractBridgeAttachments(reply);
+        const visibleReply = parsedReply.text;
+        const trimmedReply = visibleReply.trim();
         const shouldReply = trimmedReply.length > 0 && trimmedReply.toUpperCase() !== "NO_REPLY";
+        const hasAttachments = parsedReply.attachments.length > 0;
 
         // Record bot reply only if it is user-visible/context-worthy.
-        if (shouldReply) {
+        if (shouldReply || hasAttachments) {
+          const storedContent = [visibleReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
+            .filter(Boolean)
+            .join("\n");
           const replyId = this.store.insert({
             chatId,
             messageId: `self-${this.config.name}-${Date.now()}`,
             senderType: "bot",
             senderName: this.config.name,
-            content: reply,
+            content: storedContent,
             timestamp: Date.now(),
           });
           if (replyId > 0) this.store.markSynced(this.config.name, chatId, replyId);
@@ -624,25 +643,30 @@ export class FeishuBot {
 
         // Reply to the last human message on Feishu (ordered after tool msgs)
         // Skip empty replies and explicit NO_REPLY responses
-        if (shouldReply && lastHuman.messageId) {
+        if ((shouldReply || hasAttachments) && lastHuman.messageId) {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
           } else {
             await this.sendOrdered(chatId, async () => {
-              try {
-                await this.replyMessage(lastHuman.messageId, reply);
-              } catch (err) {
-                // Reply can fail for historical messages sent before this bot joined the chat
-                // (Feishu 230002: Bot/User can NOT be out of the chat). Fall back to a normal
-                // chat message so queue processing still completes.
-                console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
-                await this.sendMessage(chatId, reply);
+              if (shouldReply) {
+                try {
+                  await this.replyMessage(lastHuman.messageId, visibleReply);
+                } catch (err) {
+                  // Reply can fail for historical messages sent before this bot joined the chat
+                  // (Feishu 230002: Bot/User can NOT be out of the chat). Fall back to a normal
+                  // chat message so queue processing still completes.
+                  console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
+                  await this.sendMessage(chatId, visibleReply);
+                }
+              }
+              for (const attachment of parsedReply.attachments) {
+                await this.sendBridgeAttachment(chatId, attachment);
               }
               if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
             });
           }
         }
-        console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars)`);
+        console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 
         // Replace ack reactions with DONE for all pending messages in this chat
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
@@ -794,6 +818,134 @@ export class FeishuBot {
         },
       });
     }
+  }
+
+  private extractBridgeAttachments(reply: string): { text: string; attachments: BridgeAttachment[] } {
+    const attachments: BridgeAttachment[] = [];
+    const markerPattern = /<LMA_BRIDGE_ATTACHMENTS>([\s\S]*?)<\/LMA_BRIDGE_ATTACHMENTS>/g;
+    let text = reply.replace(markerPattern, (_match, jsonText) => {
+      try {
+        const parsed = JSON.parse(String(jsonText).trim());
+        const rawAttachments = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.attachments) ? parsed.attachments : [parsed];
+        for (const item of rawAttachments) {
+          if (!item || typeof item.path !== "string") continue;
+          attachments.push({
+            type: item.type === "image" || item.type === "document" || item.type === "file" ? item.type : undefined,
+            path: item.path,
+            caption: typeof item.caption === "string" ? item.caption : undefined,
+          });
+        }
+      } catch (err) {
+        console.warn(`[${this.config.name}] Failed to parse bridge attachment marker:`, (err as Error).message);
+      }
+      return "";
+    }).trim();
+    return { text, attachments };
+  }
+
+  private validateBridgeAttachmentPath(filePath: string): string {
+    const resolvedPath = resolve(filePath);
+    const allowedRoot = resolve(BRIDGE_ATTACHMENTS_DIR);
+    if (!(resolvedPath === allowedRoot || resolvedPath.startsWith(allowedRoot + "/"))) {
+      throw new Error(`Attachment path outside allowed directory: ${resolvedPath}`);
+    }
+    if (!existsSync(resolvedPath)) throw new Error(`Attachment file not found: ${resolvedPath}`);
+    const stats = statSync(resolvedPath);
+    if (!stats.isFile()) throw new Error(`Attachment path is not a file: ${resolvedPath}`);
+    if (stats.size <= 0) throw new Error(`Attachment file is empty: ${resolvedPath}`);
+    if (stats.size > 30 * 1024 * 1024) throw new Error(`Attachment file too large (>30MB): ${resolvedPath}`);
+    return resolvedPath;
+  }
+
+  private inferFeishuFileType(filePath: string): "pdf" | "doc" | "xls" | "ppt" | "stream" {
+    const ext = extname(filePath).toLowerCase();
+    if (ext === ".pdf") return "pdf";
+    if ([".doc", ".docx"].includes(ext)) return "doc";
+    if ([".xls", ".xlsx", ".csv"].includes(ext)) return "xls";
+    if ([".ppt", ".pptx"].includes(ext)) return "ppt";
+    return "stream";
+  }
+
+  private isImagePath(filePath: string): boolean {
+    return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".tiff", ".bmp", ".ico"].includes(extname(filePath).toLowerCase());
+  }
+
+  private async createFeishuDocFromMarkdown(filePath: string): Promise<{ title: string; url: string }> {
+    const rawTitle = basename(filePath).replace(/\.[^.]+$/, "").trim() || "Markdown Document";
+    const markdown = readFileSync(filePath, "utf8");
+    const docx = (this.client as any).docx;
+    const created = await docx.document.create({ data: { title: rawTitle } });
+    const documentId = created?.data?.document?.document_id || created?.document?.document_id;
+    const revisionId = created?.data?.document?.revision_id || created?.document?.revision_id;
+    if (!documentId) throw new Error(`Feishu doc create returned no document_id for ${filePath}`);
+
+    const converted = await docx.document.convert({ data: { content_type: "markdown", content: markdown } });
+    const convertedData = converted?.data || converted;
+    const blocks = convertedData?.blocks || [];
+    const firstLevelBlockIds = convertedData?.first_level_block_ids || [];
+    if (Array.isArray(blocks) && blocks.length > 0) {
+      await docx.documentBlockDescendant.create({
+        path: { document_id: documentId, block_id: documentId },
+        data: {
+          children_id: firstLevelBlockIds,
+          descendants: blocks,
+          document_revision_id: revisionId,
+        },
+      });
+    }
+
+    return { title: rawTitle, url: `https://www.feishu.cn/docx/${documentId}` };
+  }
+
+  private async sendBridgeAttachment(chatId: string, attachment: BridgeAttachment): Promise<void> {
+    const filePath = this.validateBridgeAttachmentPath(attachment.path);
+    const type = attachment.type || (this.isImagePath(filePath) ? "image" : "file");
+
+    if (type === "document" && extname(filePath).toLowerCase() === ".md") {
+      const doc = await this.createFeishuDocFromMarkdown(filePath);
+      const caption = attachment.caption?.trim() || `飞书文档：${doc.title}`;
+      await this.sendMessage(chatId, `${caption}
+${doc.url}`);
+      return;
+    }
+
+    if (attachment.caption?.trim()) await this.sendMessage(chatId, attachment.caption.trim());
+
+    if (type === "image") {
+      if (statSync(filePath).size > 10 * 1024 * 1024) throw new Error(`Image too large (>10MB): ${filePath}`);
+      const uploaded = await this.client.im.image.create({
+        data: { image_type: "message", image: readFileSync(filePath) },
+      });
+      const imageKey = (uploaded as any)?.image_key || (uploaded as any)?.data?.image_key;
+      if (!imageKey) throw new Error(`Feishu image upload returned no image_key for ${filePath}`);
+      await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ image_key: imageKey }),
+          msg_type: "image",
+        },
+      });
+      return;
+    }
+
+    const uploaded = await this.client.im.file.create({
+      data: {
+        file_type: this.inferFeishuFileType(filePath),
+        file_name: basename(filePath),
+        file: readFileSync(filePath),
+      },
+    });
+    const fileKey = (uploaded as any)?.file_key || (uploaded as any)?.data?.file_key;
+    if (!fileKey) throw new Error(`Feishu file upload returned no file_key for ${filePath}`);
+    await this.client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: chatId,
+        content: JSON.stringify({ file_key: fileKey }),
+        msg_type: "file",
+      },
+    });
   }
 
   /**
