@@ -188,4 +188,23 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
     } finally { h.cleanup(); }
   });
+
+  it("strips bridge attachment markers and sends parsed attachments", async () => {
+    const h = makeHarness();
+    try {
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        return '正文说明\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"document","path":"/home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/test.md","caption":"文档"}]}</LMA_BRIDGE_ATTACHMENTS>';
+      });
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "写 md 文档并发给我", messageId: "m1" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "正文说明");
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", {
+        type: "document",
+        path: "/home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/test.md",
+        caption: "文档",
+      });
+      expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("[Attachment: document"))).toBe(true);
+    } finally { h.cleanup(); }
+  });
 });

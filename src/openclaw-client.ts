@@ -1,7 +1,8 @@
 import WebSocket from "ws";
 import { randomUUID } from "crypto";
 import { readFileSync } from "fs";
-import { basename, extname } from "path";
+import { homedir } from "os";
+import { basename, extname, resolve } from "path";
 import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
 
@@ -11,6 +12,8 @@ export type ChatAttachment = {
   fileName?: string;
   content: string;
 };
+
+const BRIDGE_ATTACHMENTS_DIR = resolve(homedir(), ".openclaw/openclaw-lark-multi-agent/attachments");
 
 type PendingReq = {
   resolve: (data: any) => void;
@@ -543,7 +546,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     if (!this.shouldInjectBridgeAttachmentHint(text)) return "";
     return `
 
-[Bridge attachment capability hint: This is an OpenClaw Lark Multi-Agent bridge session. If the user asks you to send an image/file/document to Feishu, create the local file under /home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/ and include this exact marker at the very end of your final reply (do not explain or expose the marker as normal text): <LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image|file|document","path":"/absolute/path","caption":"optional"}]}</LMA_BRIDGE_ATTACHMENTS>. Use type=image for images; type=document for markdown/pdf/doc-like documents; type=file for other files.]`;
+[Bridge attachment capability hint: This is an OpenClaw Lark Multi-Agent bridge session. If the user asks you to send an image/file/document to Feishu, create the local file under ${BRIDGE_ATTACHMENTS_DIR}/ and include this exact marker at the very end of your final reply (do not explain or expose the marker as normal text): <LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image|file|document","path":"/absolute/path","caption":"optional"}]}</LMA_BRIDGE_ATTACHMENTS>. Use type=image for images; use type=document for Markdown documents (.md) so the bridge creates a Feishu cloud document and sends its link; use type=file for other ordinary files.]`;
   }
 
   /**
