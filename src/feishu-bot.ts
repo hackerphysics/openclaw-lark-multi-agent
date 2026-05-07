@@ -4,10 +4,10 @@ import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, readFileSync, statSync } from "fs";
 import { basename, extname, resolve } from "path";
-import { homedir } from "os";
+import { getBridgeAttachmentsDir } from "./paths.js";
 
 const MAX_BOT_STREAK = 10;
-const BRIDGE_ATTACHMENTS_DIR = resolve(homedir(), ".openclaw/openclaw-lark-multi-agent/attachments");
+const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 
 type BridgeAttachment = {
   type?: "image" | "file" | "document";

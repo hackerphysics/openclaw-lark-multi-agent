@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { OpenClawClient } from "../src/openclaw-client.js";
+import { getBridgeAttachmentsDir } from "../src/paths.js";
 
 describe("OpenClawClient bridge attachment hint", () => {
   function clientWithCapturedChatSend() {
@@ -31,7 +32,7 @@ describe("OpenClawClient bridge attachment hint", () => {
     });
     expect(chatSend).toHaveBeenCalledOnce();
     expect(result).toContain("Bridge attachment capability hint");
-    expect(result).toContain(".openclaw/openclaw-lark-multi-agent/attachments/");
+    expect(result).toContain(`${getBridgeAttachmentsDir()}/`);
     expect(result).toContain("LMA_BRIDGE_ATTACHMENTS");
     expect(result).toContain("type=document for Markdown documents");
   });

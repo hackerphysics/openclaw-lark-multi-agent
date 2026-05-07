@@ -1,10 +1,10 @@
 import WebSocket from "ws";
 import { randomUUID } from "crypto";
 import { readFileSync } from "fs";
-import { homedir } from "os";
-import { basename, extname, resolve } from "path";
+import { basename, extname } from "path";
 import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
+import { getBridgeAttachmentsDir } from "./paths.js";
 
 export type ChatAttachment = {
   type?: string;
@@ -13,7 +13,7 @@ export type ChatAttachment = {
   content: string;
 };
 
-const BRIDGE_ATTACHMENTS_DIR = resolve(homedir(), ".openclaw/openclaw-lark-multi-agent/attachments");
+const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 
 type PendingReq = {
   resolve: (data: any) => void;

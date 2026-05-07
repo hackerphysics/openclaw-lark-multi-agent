@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
 import { MessageStore } from "../src/message-store.js";
 import type { BotConfig } from "../src/config.js";
@@ -192,16 +192,17 @@ describe("FeishuBot routing and queue behavior", () => {
   it("strips bridge attachment markers and sends parsed attachments", async () => {
     const h = makeHarness();
     try {
+      const attachmentPath = resolve(tmpdir(), "olma-test-attachments", "test.md");
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
-        return '正文说明\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"document","path":"/home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/test.md","caption":"文档"}]}</LMA_BRIDGE_ATTACHMENTS>';
+        return `正文说明\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"document","path":"${attachmentPath}","caption":"文档"}]}</LMA_BRIDGE_ATTACHMENTS>`;
       });
       (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "写 md 文档并发给我", messageId: "m1" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "正文说明");
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", {
         type: "document",
-        path: "/home/haipw/.openclaw/openclaw-lark-multi-agent/attachments/test.md",
+        path: attachmentPath,
         caption: "文档",
       });
       expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("[Attachment: document"))).toBe(true);
