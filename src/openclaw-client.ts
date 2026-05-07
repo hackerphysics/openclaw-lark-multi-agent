@@ -37,8 +37,9 @@ export class OpenClawClient {
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
   /** Session keys that should be re-subscribed on reconnect */
   private subscribedKeys: Set<string> = new Set();
-  /** Session keys with active chatSend — suppress proactive message delivery */
+  /** Session keys with active/recent chatSend — suppress proactive message delivery */
   private suppressedSessions: Set<string> = new Set();
+  private suppressedSessionTimers: Map<string, NodeJS.Timeout> = new Map();
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -167,11 +168,20 @@ export class OpenClawClient {
             if (typeof content === "string") {
               proactiveText = content;
             } else if (Array.isArray(content)) {
-              proactiveText = content
-                .filter((part: any) => part?.type === "text" && typeof part.text === "string")
-                .map((part: any) => part.text)
-                .join("\n")
-                .trim();
+              const hasToolBlock = content.some((part: any) => {
+                const type = String(part?.type || "").toLowerCase();
+                return type === "toolcall" || type === "tool_call" || type === "tooluse" || type === "tool_use" || type === "toolresult" || type === "tool_result";
+              });
+              // Do not deliver mixed text+toolCall assistant messages; those are
+              // usually intermediate reasoning/status during a tool loop. Cron
+              // final messages arrive as text-only (optionally with thinking).
+              if (!hasToolBlock) {
+                proactiveText = content
+                  .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+                  .map((part: any) => part.text)
+                  .join("\n")
+                  .trim();
+              }
             }
           }
           if (proactiveText) {
@@ -465,6 +475,27 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     return this.rpc("chat.abort", { sessionKey: key, runId }, 5000).catch(() => {});
   }
 
+  private suppressSessionKeys(keys: string[]): void {
+    for (const key of keys) {
+      const timer = this.suppressedSessionTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.suppressedSessionTimers.delete(key);
+      this.suppressedSessions.add(key);
+    }
+  }
+
+  private releaseSuppressedSessionKeysAfter(keys: string[], delayMs: number): void {
+    for (const key of keys) {
+      const oldTimer = this.suppressedSessionTimers.get(key);
+      if (oldTimer) clearTimeout(oldTimer);
+      const timer = setTimeout(() => {
+        this.suppressedSessions.delete(key);
+        this.suppressedSessionTimers.delete(key);
+      }, delayMs);
+      this.suppressedSessionTimers.set(key, timer);
+    }
+  }
+
   async chatSend(params: {
     sessionKey: string;
     message: string;
@@ -474,8 +505,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   }): Promise<string> {
     const sk = params.sessionKey;
     const fullSessionKey = `agent:main:${sk}`;
-    this.suppressedSessions.add(sk);
-    this.suppressedSessions.add(fullSessionKey);
+    const suppressedKeys = [sk, fullSessionKey];
+    this.suppressSessionKeys(suppressedKeys);
     try {
       // Drop stale buffered events for this session before starting a new run.
       // This prevents an old final text (e.g. previous "ok") from being consumed by
@@ -493,8 +524,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk);
     } finally {
-      this.suppressedSessions.delete(sk);
-      this.suppressedSessions.delete(fullSessionKey);
+      // OpenClaw can emit the final assistant session.message a moment after
+      // collectReply returns. Keep a short grace window so normal chat replies
+      // are not delivered twice via the proactive-message path. Cron/LMA runs
+      // are unaffected because they do not go through chatSend.
+      this.releaseSuppressedSessionKeysAfter(suppressedKeys, 30000);
     }
   }
 
@@ -591,6 +625,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
   async disconnect() {
     this.shouldReconnect = false;
+    for (const timer of this.suppressedSessionTimers.values()) clearTimeout(timer);
+    this.suppressedSessionTimers.clear();
+    this.suppressedSessions.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
