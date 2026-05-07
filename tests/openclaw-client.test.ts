@@ -34,6 +34,7 @@ describe("OpenClawClient bridge attachment hint", () => {
     expect(result).toContain("Bridge attachment capability hint");
     expect(result).toContain(`${getBridgeAttachmentsDir()}/`);
     expect(result).toContain("LMA_BRIDGE_ATTACHMENTS");
+    expect(result).toContain("Do NOT call message, sessions_send");
     expect(result).toContain("type=document for Markdown documents");
   });
 });
