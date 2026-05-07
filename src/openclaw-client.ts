@@ -172,9 +172,12 @@ export class OpenClawClient {
                 const type = String(part?.type || "").toLowerCase();
                 return type === "toolcall" || type === "tool_call" || type === "tooluse" || type === "tool_use" || type === "toolresult" || type === "tool_result";
               });
-              // Do not deliver mixed text+toolCall assistant messages; those are
-              // usually intermediate reasoning/status during a tool loop. Cron
-              // final messages arrive as text-only (optionally with thinking).
+              // Do not deliver mixed text+toolCall assistant messages through
+              // the proactive final-text path; those are usually intermediate
+              // reasoning/status during a tool loop. Tool calls are still
+              // delivered via the verbose channel from agent item events when
+              // /verbose is enabled. Cron final messages arrive as text-only
+              // (optionally with thinking).
               if (!hasToolBlock) {
                 proactiveText = content
                   .filter((part: any) => part?.type === "text" && typeof part.text === "string")
