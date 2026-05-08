@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import { resolve } from "path";
 import { mkdirSync } from "fs";
 
+export type BotChatMode = "normal" | "free" | "mute";
+
 export interface ChatInfo {
   chatId: string;
   chatType: "p2p" | "group";
@@ -12,7 +14,7 @@ export interface ChatInfo {
   memberNames: string;
   /** Which bot owns this chat (for p2p isolation) */
   ownerBot: string;
-  /** Free discussion mode (group chat: all bots respond without @) */
+  /** Legacy chat-level free discussion flag; per-bot mode is authoritative. */
   freeDiscussion: boolean;
   verbose: boolean;
   updatedAt: number;
@@ -106,6 +108,7 @@ export class MessageStore {
         chat_id TEXT NOT NULL,
         verbose INTEGER NOT NULL DEFAULT 0,
         free_discussion INTEGER NOT NULL DEFAULT 0,
+        mode TEXT NOT NULL DEFAULT 'normal',
         updated_at INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (bot_name, chat_id)
       );
@@ -138,6 +141,18 @@ export class MessageStore {
     } catch {
       // Column already exists
     }
+
+    // Migration: replace independent free/mute booleans with one mutually exclusive mode.
+    try {
+      this.db.exec(`ALTER TABLE bot_chat_settings ADD COLUMN mode TEXT NOT NULL DEFAULT 'normal'`);
+    } catch {
+      // Column already exists
+    }
+    this.db.exec(`
+      UPDATE bot_chat_settings
+      SET mode = 'free'
+      WHERE free_discussion = 1 AND (mode IS NULL OR mode = '' OR mode = 'normal')
+    `);
   }
 
   /**
@@ -331,22 +346,33 @@ export class MessageStore {
     return !!row?.verbose;
   }
 
-  setBotFreeDiscussion(botName: string, chatId: string, on: boolean): void {
+  setBotMode(botName: string, chatId: string, mode: BotChatMode): void {
+    const freeDiscussion = mode === "free" ? 1 : 0;
     this.db.prepare(`
-      INSERT INTO bot_chat_settings (bot_name, chat_id, free_discussion, updated_at)
-      VALUES (?, ?, ?, ?)
+      INSERT INTO bot_chat_settings (bot_name, chat_id, mode, free_discussion, updated_at)
+      VALUES (?, ?, ?, ?, ?)
       ON CONFLICT (bot_name, chat_id) DO UPDATE SET
+        mode = excluded.mode,
         free_discussion = excluded.free_discussion,
         updated_at = excluded.updated_at
-    `).run(botName, chatId, on ? 1 : 0, Date.now());
+    `).run(botName, chatId, mode, freeDiscussion, Date.now());
+  }
+
+  getBotMode(botName: string, chatId: string): BotChatMode {
+    const row = this.db.prepare(`
+      SELECT mode, free_discussion FROM bot_chat_settings
+      WHERE bot_name = ? AND chat_id = ?
+    `).get(botName, chatId) as any;
+    if (row?.mode === "free" || row?.mode === "mute" || row?.mode === "normal") return row.mode;
+    return row?.free_discussion ? "free" : "normal";
+  }
+
+  setBotFreeDiscussion(botName: string, chatId: string, on: boolean): void {
+    this.setBotMode(botName, chatId, on ? "free" : "normal");
   }
 
   getBotFreeDiscussion(botName: string, chatId: string): boolean {
-    const row = this.db.prepare(`
-      SELECT free_discussion FROM bot_chat_settings
-      WHERE bot_name = ? AND chat_id = ?
-    `).get(botName, chatId) as any;
-    return !!row?.free_discussion;
+    return this.getBotMode(botName, chatId) === "free";
   }
 
   getChatInfo(chatId: string): ChatInfo | null {

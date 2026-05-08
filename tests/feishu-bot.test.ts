@@ -117,15 +117,17 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("toggles free discussion per bot per chat", async () => {
+  it("toggles free mode per bot per chat", async () => {
     const gpt = makeHarness("GPT");
     const gemini = makeHarness("Gemini");
     try {
-      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free on", messageId: "free-on" }));
-      expect(gpt.store.getBotFreeDiscussion("GPT", "chat1")).toBe(true);
-      expect(gpt.store.getBotFreeDiscussion("Gemini", "chat1")).toBe(false);
-      expect(gemini.store.getBotFreeDiscussion("Gemini", "chat1")).toBe(false);
-      expect((gpt.bot as any).replyMessage).toHaveBeenCalledWith("free-on", expect.stringContaining("GPT Free Discussion 已开启"));
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free", messageId: "free-on" }));
+      expect(gpt.store.getBotMode("GPT", "chat1")).toBe("free");
+      expect(gpt.store.getBotMode("Gemini", "chat1")).toBe("normal");
+      expect(gemini.store.getBotMode("Gemini", "chat1")).toBe("normal");
+      expect((gpt.bot as any).replyMessage).toHaveBeenCalledWith("free-on", expect.stringContaining("GPT 已切换到 free 模式"));
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free", messageId: "free-off" }));
+      expect(gpt.store.getBotMode("GPT", "chat1")).toBe("normal");
     } finally { gpt.cleanup(); gemini.cleanup(); }
   });
 
@@ -133,20 +135,51 @@ describe("FeishuBot routing and queue behavior", () => {
     const claude = makeHarness("Claude");
     try {
       FeishuBot.getAllBots().set("app-GPT", { config: { appId: "app-GPT", name: "GPT" }, botOpenId: "gpt-open-id" } as any);
-      claude.store.setBotFreeDiscussion("Claude", "chat1", true);
+      claude.store.setBotMode("Claude", "chat1", "free");
       await (claude.bot as any).handleMessage(event({
         chatType: "group",
         text: "@万万（GPT） /free",
         messageId: "free-gpt",
         mentions: [{ name: "万万（GPT）", id: { app_id: "app-GPT", open_id: "gpt-open-id" } }],
       }));
-      expect(claude.store.getBotFreeDiscussion("Claude", "chat1")).toBe(true);
+      expect(claude.store.getBotMode("Claude", "chat1")).toBe("free");
       expect((claude.bot as any).replyMessage).not.toHaveBeenCalled();
       expect(claude.openclaw.chatCalls).toHaveLength(0);
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
       claude.cleanup();
     }
+  });
+
+  it("mutes bot without forwarding direct mentions to OpenClaw", async () => {
+    const h = makeHarness("Gemini");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /mute", messageId: "mute-on" }));
+      expect(h.store.getBotMode("Gemini", "chat1")).toBe("mute");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("mute-on", expect.stringContaining("Gemini 已切换到 mute 模式"));
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all hello", messageId: "all-muted" }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（Gemini） hello",
+        messageId: "direct-muted",
+        mentions: [{ name: "万万（Gemini）", id: { app_id: "app-Gemini" } }],
+      }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("direct-muted", expect.stringContaining("Gemini 当前处于 mute 模式"));
+    } finally { h.cleanup(); }
+  });
+
+  it("reports mode locally", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.setBotMode("GPT", "chat1", "mute");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /mode", messageId: "mode" }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("mode", expect.stringContaining("当前模式：mute"));
+    } finally { h.cleanup(); }
   });
 
   it("passes double-slash commands through to OpenClaw as single-slash commands", async () => {

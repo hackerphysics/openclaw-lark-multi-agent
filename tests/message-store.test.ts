@@ -50,12 +50,17 @@ describe("MessageStore", () => {
     expect(store.getBotVerbose("GPT", "group")).toBe(false);
   }));
 
-  it("stores free discussion per bot per chat", () => withStore((store) => {
-    store.setBotFreeDiscussion("GPT", "group", true);
+  it("stores mutually exclusive modes per bot per chat", () => withStore((store) => {
+    expect(store.getBotMode("GPT", "group")).toBe("normal");
+    store.setBotMode("GPT", "group", "free");
+    expect(store.getBotMode("GPT", "group")).toBe("free");
     expect(store.getBotFreeDiscussion("GPT", "group")).toBe(true);
-    expect(store.getBotFreeDiscussion("Gemini", "group")).toBe(false);
-    store.setBotFreeDiscussion("GPT", "group", false);
+    expect(store.getBotMode("Gemini", "group")).toBe("normal");
+    store.setBotMode("GPT", "group", "mute");
+    expect(store.getBotMode("GPT", "group")).toBe("mute");
     expect(store.getBotFreeDiscussion("GPT", "group")).toBe(false);
+    store.setBotFreeDiscussion("GPT", "group", false);
+    expect(store.getBotMode("GPT", "group")).toBe("normal");
   }));
 
   it("preserves p2p owner when upserting chat info without owner", () => withStore((store) => {

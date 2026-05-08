@@ -377,7 +377,7 @@ export class FeishuBot {
       // Single slash commands are handled by the bridge. Double slash commands were
       // already unescaped above and should pass through to OpenClaw instead.
       const isBridgeCommand = !commandText.startsWith("//");
-      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free)/.test(cleanText.trim());
+      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free|mute|mode)/.test(cleanText.trim());
       if (isCommand) {
         // In group chats, bridge commands must be explicitly routed to this bot
         // or @all. Do not let Free Discussion make a bot execute commands meant
@@ -400,7 +400,9 @@ export class FeishuBot {
             `🧹 /compact — 压缩当前 bot 的 OpenClaw session`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
-            `🔓 /free [on|off|status] — 开关当前 bot 在当前群聊的 Free Discussion`,
+            `🔓 /free   — 切换当前 bot 的 free 模式（不 @ 也可回复）`,
+            `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
+            `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
             `❓ /help    — 显示此帮助信息`,
             ``,
             `OpenClaw 原生命令（双斜杠，会转成单斜杠发给 OpenClaw）`,
@@ -458,29 +460,61 @@ export class FeishuBot {
         }
         if (cleanText.trim().startsWith("/free")) {
           if (chatType === "p2p") {
-            await this.replyMessage(messageId, "❌ Free Discussion 只在群聊中可用");
+            await this.replyMessage(messageId, "❌ Free 模式只在群聊中可用");
             markCommandSynced();
             return;
           }
-          const parts = cleanText.trim().split(/\s+/);
-          const arg = (parts[1] || "").toLowerCase();
-          const isOn = this.store.getBotFreeDiscussion(this.config.name, chatId);
-          const next = arg === "on" || arg === "true" || arg === "1"
-            ? true
-            : arg === "off" || arg === "false" || arg === "0"
-              ? false
-              : arg === "status"
-                ? isOn
-                : !isOn;
-          if (arg !== "status") this.store.setBotFreeDiscussion(this.config.name, chatId, next);
-          if (next) {
-            await this.replyMessage(messageId, `🔓 ${this.config.name} Free Discussion 已开启\n只影响当前 Bot 在当前群聊的自由发言（连续 Bot 回复超过 ${MAX_BOT_STREAK} 轮将暂停，等待人类发言）`);
+          const current = this.store.getBotMode(this.config.name, chatId);
+          const next = current === "free" ? "normal" : "free";
+          this.store.setBotMode(this.config.name, chatId, next);
+          if (next === "free") {
+            await this.replyMessage(messageId, `🔓 ${this.config.name} 已切换到 free 模式\n不需要 @ 也可以参与回复（连续 Bot 回复超过 ${MAX_BOT_STREAK} 轮将暂停，等待人类发言）`);
           } else {
-            await this.replyMessage(messageId, `🔒 ${this.config.name} Free Discussion 已关闭\n只影响当前 Bot；群聊中需要 @ 指定 Bot 才会回复`);
+            await this.replyMessage(messageId, `🔒 ${this.config.name} 已切换到 normal 模式\n只有明确 @ 我才会回复`);
           }
           markCommandSynced();
           return;
         }
+        if (cleanText.trim().startsWith("/mute")) {
+          if (chatType === "p2p") {
+            await this.replyMessage(messageId, "❌ Mute 模式只在群聊中可用");
+            markCommandSynced();
+            return;
+          }
+          const current = this.store.getBotMode(this.config.name, chatId);
+          const next = current === "mute" ? "normal" : "mute";
+          this.store.setBotMode(this.config.name, chatId, next);
+          if (next === "mute") {
+            await this.replyMessage(messageId, `🤐 ${this.config.name} 已切换到 mute 模式\n普通消息、@所有人 都不会回复；明确 @ 我时只提示禁言中`);
+          } else {
+            await this.replyMessage(messageId, `🔒 ${this.config.name} 已解除 mute，回到 normal 模式\n只有明确 @ 我才会回复`);
+          }
+          markCommandSynced();
+          return;
+        }
+        if (cleanText.trim().startsWith("/mode")) {
+          if (chatType === "p2p") {
+            await this.replyMessage(messageId, `🎛️ ${this.config.name} 当前模式：normal（私聊总是响应）`);
+          } else {
+            const mode = this.store.getBotMode(this.config.name, chatId);
+            const desc = mode === "free" ? "不需要 @ 也可以参与回复" : mode === "mute" ? "禁言中；明确 @ 我时只提示禁言中" : "只有明确 @ 我才会回复";
+            await this.replyMessage(messageId, `🎛️ ${this.config.name} 当前模式：${mode}\n${desc}`);
+          }
+          markCommandSynced();
+          return;
+        }
+      }
+
+      // --- Mute mode: do not forward anything to OpenClaw. Only direct mentions get a local notice. ---
+      if (chatType !== "p2p" && !isBot && this.store.getBotMode(this.config.name, chatId) === "mute") {
+        if (this.isMentioned(message.mentions || [])) {
+          await this.replyMessage(messageId, `🤐 ${this.config.name} 当前处于 mute 模式，发送 /mute 可解除`);
+          if (insertedId > 0) {
+            this.store.markSynced(this.config.name, chatId, insertedId);
+            this.store.clearPendingTriggers(this.config.name, chatId, insertedId);
+          }
+        }
+        return;
       }
 
       // --- Should this bot respond? ---
@@ -728,9 +762,9 @@ export class FeishuBot {
     const anyBotMentioned = mentions.some((m: any) => this.mentionedBotName(m) !== null);
     if (anyBotMentioned && !this.isMentioned(mentions)) return false;
 
-    // No bot mentioned: check free discussion mode
+    // No bot mentioned: check current per-bot mode
     if (chatId) {
-      if (this.store.getBotFreeDiscussion(this.config.name, chatId)) return true;
+      if (this.store.getBotMode(this.config.name, chatId) === "free") return true;
     }
 
     // Default: don't respond without @
@@ -1069,7 +1103,7 @@ ${doc.url}`);
     const status = session?.status || "unknown";
 
     const verboseStatus = this.store.getBotVerbose(this.config.name, chatId) ? "🔊 开启" : "🔇 关闭";
-    const freeStatus = this.store.getBotFreeDiscussion(this.config.name, chatId) ? "🔓 开启" : "🔒 关闭";
+    const mode = chatType === "p2p" ? "normal" : this.store.getBotMode(this.config.name, chatId);
 
     const statusText = [
       `📊 ${this.config.name} Bot Status`,
@@ -1083,7 +1117,7 @@ ${doc.url}`);
       `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)${tokenNote}`,
       `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
       `🔧 Verbose: ${verboseStatus}`,
-      `💬 Free Discussion: ${freeStatus}`,
+      `🎛️ Mode: ${mode}`,
     ].join("\n");
 
     await this.replyMessage(messageId, statusText);
