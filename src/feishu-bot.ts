@@ -825,16 +825,24 @@ export class FeishuBot {
     return s;
   }
 
-  private async replyMessage(messageId: string, text: string) {
-    // Use interactive card for markdown rendering
-    const card = {
-      elements: [
-        {
-          tag: "markdown",
-          content: text,
-        },
-      ],
+  private buildMarkdownCard(text: string) {
+    return {
+      schema: "2.0",
+      config: { wide_screen_mode: true },
+      body: {
+        elements: [
+          {
+            tag: "markdown",
+            content: text,
+          },
+        ],
+      },
     };
+  }
+
+  private async replyMessage(messageId: string, text: string) {
+    // Use Feishu CardKit v2 markdown component for full Markdown rendering.
+    const card = this.buildMarkdownCard(text);
     try {
       await this.client.im.message.reply({
         path: { message_id: messageId },
@@ -987,14 +995,7 @@ ${doc.url}`);
    * Send a proactive message to a chat (not a reply).
    */
   private async sendMessage(chatId: string, text: string) {
-    const card = {
-      elements: [
-        {
-          tag: "markdown",
-          content: text,
-        },
-      ],
-    };
+    const card = this.buildMarkdownCard(text);
     try {
       await this.client.im.message.create({
         params: { receive_id_type: "chat_id" },
