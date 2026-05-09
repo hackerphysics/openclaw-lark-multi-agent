@@ -5,6 +5,7 @@ import { MessageStore } from "./message-store.js";
 import { existsSync, readFileSync, statSync } from "fs";
 import { basename, extname, resolve } from "path";
 import { getBridgeAttachmentsDir } from "./paths.js";
+import { buildFeishuCardElements } from "./markdown.js";
 
 const MAX_BOT_STREAK = 10;
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
@@ -830,12 +831,7 @@ export class FeishuBot {
       schema: "2.0",
       config: { wide_screen_mode: true },
       body: {
-        elements: [
-          {
-            tag: "markdown",
-            content: text,
-          },
-        ],
+        elements: buildFeishuCardElements(text),
       },
     };
   }
