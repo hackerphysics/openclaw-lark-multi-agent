@@ -282,20 +282,24 @@ export class MessageStore {
   }
 
   /**
-   * Count consecutive bot messages at the tail of a chat.
+   * Count consecutive messages from one bot at the tail of a chat.
+   *
+   * Other bots do not consume this bot's anti-loop budget. Human messages reset
+   * the streak. This lets multiple bots free-discuss without a global bot-streak
+   * guard shutting everyone down after N total bot messages.
    */
-  getBotStreak(chatId: string): number {
+  getBotStreak(chatId: string, botName: string): number {
     const rows = this.db.prepare(`
-      SELECT sender_type FROM messages
+      SELECT sender_type, sender_name FROM messages
       WHERE chat_id = ?
       ORDER BY timestamp DESC
-      LIMIT 20
+      LIMIT 50
     `).all(chatId) as any[];
 
     let count = 0;
     for (const r of rows) {
-      if ((r as any).sender_type === "bot") count++;
-      else break;
+      if ((r as any).sender_type === "human") break;
+      if ((r as any).sender_type === "bot" && (r as any).sender_name === botName) count++;
     }
     return count;
   }

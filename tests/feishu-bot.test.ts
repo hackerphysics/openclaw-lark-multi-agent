@@ -77,6 +77,23 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("routes mention-only messages as triggers with previous context", async () => {
+    const h = makeHarness("Claude");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "请分析上一条", messageId: "prev" }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（Claude）",
+        messageId: "mention-only",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude" } }],
+      }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("请回复上面最近一条用户消息。");
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.content)).toContain("请分析上一条");
+    } finally { h.cleanup(); }
+  });
+
   it("routes direct bot mentions only to the mentioned bot", async () => {
     const h = makeHarness("GPT");
     try {
@@ -129,6 +146,49 @@ describe("FeishuBot routing and queue behavior", () => {
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free", messageId: "free-off" }));
       expect(gpt.store.getBotMode("GPT", "chat1")).toBe("normal");
     } finally { gpt.cleanup(); gemini.cleanup(); }
+  });
+
+  it("does not let free mode respond to messages mentioning another bot", async () => {
+    const claude = makeHarness("Claude");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", { config: { appId: "app-GPT", name: "GPT" }, botOpenId: "gpt-open-id" } as any);
+      claude.store.setBotMode("Claude", "chat1", "free");
+      await (claude.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（GPT） hello",
+        messageId: "mention-gpt",
+        mentions: [{ name: "万万（GPT）", id: { app_id: "app-GPT", open_id: "gpt-open-id" } }],
+      }));
+      expect(claude.openclaw.chatCalls).toHaveLength(0);
+      expect(claude.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      claude.cleanup();
+    }
+  });
+
+  it("does not let free mode respond to messages mentioning a human", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.store.setBotMode("Claude", "chat1", "free");
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@张三 hello",
+        messageId: "mention-human",
+        mentions: [{ name: "张三", id: { open_id: "ou_human" } }],
+      }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("lets free mode respond to plain human messages", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.store.setBotMode("Claude", "chat1", "free");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "plain question", messageId: "plain" }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { h.cleanup(); }
   });
 
   it("does not let free discussion execute commands addressed to another bot", async () => {

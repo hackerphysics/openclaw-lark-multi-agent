@@ -63,6 +63,19 @@ describe("MessageStore", () => {
     expect(store.getBotMode("GPT", "group")).toBe("normal");
   }));
 
+  it("counts bot streak per bot and resets on human messages", () => withStore((store) => {
+    store.insert({ chatId: "c1", messageId: "h1", senderType: "human", senderName: "u", content: "start", timestamp: 1 });
+    store.insert({ chatId: "c1", messageId: "g1", senderType: "bot", senderName: "GPT", content: "g1", timestamp: 2 });
+    store.insert({ chatId: "c1", messageId: "c1", senderType: "bot", senderName: "Claude", content: "c1", timestamp: 3 });
+    store.insert({ chatId: "c1", messageId: "g2", senderType: "bot", senderName: "GPT", content: "g2", timestamp: 4 });
+    store.insert({ chatId: "c1", messageId: "d1", senderType: "bot", senderName: "DeepSeek", content: "d1", timestamp: 5 });
+    expect(store.getBotStreak("c1", "GPT")).toBe(2);
+    expect(store.getBotStreak("c1", "Claude")).toBe(1);
+    expect(store.getBotStreak("c1", "DeepSeek")).toBe(1);
+    store.insert({ chatId: "c1", messageId: "h2", senderType: "human", senderName: "u", content: "reset", timestamp: 6 });
+    expect(store.getBotStreak("c1", "GPT")).toBe(0);
+  }));
+
   it("preserves p2p owner when upserting chat info without owner", () => withStore((store) => {
     store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm", members: "", memberNames: "", ownerBot: "GPT", freeDiscussion: false, verbose: false, updatedAt: 1 });
     store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm2", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, updatedAt: 2 });

@@ -302,6 +302,12 @@ export class FeishuBot {
       if (messageType === "text") {
         const rawText: string = content.text || "";
         cleanText = this.cleanMentions(rawText);
+        // A mention-only text message is still a valid routing trigger. Feishu may
+        // expose mentions as display text like "@万万（Claude）" rather than @_user_xxx,
+        // so decide emptiness after stripping leading routing mentions.
+        if ((this.isMentioned(message.mentions || []) || this.isAllMention(rawText, message.mentions || [])) && !this.stripLeadingCommandMentions(cleanText).trim()) {
+          cleanText = "请回复上面最近一条用户消息。";
+        }
       } else if (messageType === "image") {
         // Download image and pass local path
         const imageKey = content.image_key;
@@ -528,7 +534,7 @@ export class FeishuBot {
       const pending = this.pendingAckMessages.get(chatId) || [];
 
       // Anti-loop
-      const streak = this.store.getBotStreak(chatId);
+      const streak = this.store.getBotStreak(chatId, this.config.name);
       if (streak >= MAX_BOT_STREAK) {
         console.log(
           `[${this.config.name}] Anti-loop: ${streak} consecutive bot msgs`
@@ -759,9 +765,11 @@ export class FeishuBot {
     // Check if this bot is explicitly mentioned
     if (this.isMentioned(mentions)) return true;
 
-    // Check if any other bot is mentioned (not us) — don't respond
-    const anyBotMentioned = mentions.some((m: any) => this.mentionedBotName(m) !== null);
-    if (anyBotMentioned && !this.isMentioned(mentions)) return false;
+    // Targeted mentions are exclusive. If a human mentions another person or
+    // another bot, free-mode bots must not steal that message. Free mode only
+    // applies to plain human messages with no targeted mentions.
+    const hasTargetedMention = mentions.some((m: any) => !this.isAllMentionItem(m));
+    if (hasTargetedMention) return false;
 
     // No bot mentioned: check current per-bot mode
     if (chatId) {
@@ -778,11 +786,15 @@ export class FeishuBot {
 
   private isAllMention(rawText?: string, mentions: any[] = []): boolean {
     if (rawText && (rawText.includes("@_all") || rawText.includes("@all") || rawText.includes("@所有人"))) return true;
-    return mentions.some((m: any) => m.key === "all" || m.key === "@_all" || m.id?.user_id === "all" || m.id?.open_id === "all" || m.name === "所有人");
+    return mentions.some((m: any) => this.isAllMentionItem(m));
+  }
+
+  private isAllMentionItem(mention: any): boolean {
+    return mention.key === "all" || mention.key === "@_all" || mention.id?.user_id === "all" || mention.id?.open_id === "all" || mention.name === "所有人";
   }
 
   private mentionedBotName(mention: any): string | null {
-    if (mention.key === "all" || mention.key === "@_all" || mention.id?.user_id === "all" || mention.id?.open_id === "all" || mention.name === "所有人") return null;
+    if (this.isAllMentionItem(mention)) return null;
     const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this)];
     for (const bot of candidates) {
       if (mention.id?.app_id === bot.config.appId) return bot.config.name;
