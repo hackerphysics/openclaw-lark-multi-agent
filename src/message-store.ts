@@ -17,6 +17,8 @@ export interface ChatInfo {
   /** Legacy chat-level free discussion flag; per-bot mode is authoritative. */
   freeDiscussion: boolean;
   verbose: boolean;
+  discuss: boolean;
+  discussMaxRounds: number;
   updatedAt: number;
 }
 
@@ -63,6 +65,8 @@ export class MessageStore {
         members TEXT NOT NULL DEFAULT '',
         member_names TEXT NOT NULL DEFAULT '',
         verbose INTEGER NOT NULL DEFAULT 0,
+        discuss INTEGER NOT NULL DEFAULT 0,
+        discuss_max_rounds INTEGER NOT NULL DEFAULT 3,
         updated_at INTEGER NOT NULL DEFAULT 0
       );
 
@@ -117,6 +121,18 @@ export class MessageStore {
     // Migration: add verbose column if missing
     try {
       this.db.exec(`ALTER TABLE chat_info ADD COLUMN verbose INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+
+    // Migration: add discuss columns if missing
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN discuss INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN discuss_max_rounds INTEGER NOT NULL DEFAULT 3`);
     } catch {
       // Column already exists
     }
@@ -197,6 +213,13 @@ export class MessageStore {
       DELETE FROM pending_triggers
       WHERE bot_name = ? AND chat_id = ? AND message_row_id <= ?
     `).run(botName, chatId, upToId);
+  }
+
+  clearPendingTrigger(botName: string, chatId: string, messageRowId: number): void {
+    this.db.prepare(`
+      DELETE FROM pending_triggers
+      WHERE bot_name = ? AND chat_id = ? AND message_row_id = ?
+    `).run(botName, chatId, messageRowId);
   }
 
   hasDeliveredReply(botName: string, chatId: string, triggerMessageRowId: number): boolean {
@@ -308,8 +331,8 @@ export class MessageStore {
 
   upsertChatInfo(info: ChatInfo): void {
     this.db.prepare(`
-      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, discuss, discuss_max_rounds, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = excluded.chat_type,
         chat_name = excluded.chat_name,
@@ -318,8 +341,10 @@ export class MessageStore {
         verbose = excluded.verbose,
         free_discussion = excluded.free_discussion,
         owner_bot = CASE WHEN excluded.owner_bot != '' THEN excluded.owner_bot ELSE chat_info.owner_bot END,
+        discuss = CASE WHEN excluded.discuss != 0 THEN excluded.discuss ELSE chat_info.discuss END,
+        discuss_max_rounds = CASE WHEN excluded.discuss_max_rounds != 3 THEN excluded.discuss_max_rounds ELSE chat_info.discuss_max_rounds END,
         updated_at = excluded.updated_at
-    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.updatedAt);
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.discuss ? 1 : 0, info.discussMaxRounds || 3, info.updatedAt);
   }
 
   setFreeDiscussion(chatId: string, on: boolean): void {
@@ -330,6 +355,23 @@ export class MessageStore {
     this.db.prepare(`
       UPDATE chat_info SET verbose = ? WHERE chat_id = ?
     `).run(verbose ? 1 : 0, chatId);
+  }
+
+  setDiscussMode(chatId: string, on: boolean): void {
+    this.db.prepare(`
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, discuss, discuss_max_rounds, updated_at)
+      VALUES (?, 'group', '', ?, 3, ?)
+      ON CONFLICT (chat_id) DO UPDATE SET discuss = excluded.discuss, updated_at = excluded.updated_at
+    `).run(chatId, on ? 1 : 0, Date.now());
+  }
+
+  setDiscussMaxRounds(chatId: string, rounds: number): void {
+    const normalized = Math.max(1, Math.min(10, Math.round(rounds)));
+    this.db.prepare(`
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, discuss, discuss_max_rounds, updated_at)
+      VALUES (?, 'group', '', 0, ?, ?)
+      ON CONFLICT (chat_id) DO UPDATE SET discuss_max_rounds = excluded.discuss_max_rounds, updated_at = excluded.updated_at
+    `).run(chatId, normalized, Date.now());
   }
 
   setBotVerbose(botName: string, chatId: string, verbose: boolean): void {
@@ -391,6 +433,8 @@ export class MessageStore {
       ownerBot: row.owner_bot || '',
       freeDiscussion: !!row.free_discussion,
       verbose: !!row.verbose,
+      discuss: !!row.discuss,
+      discussMaxRounds: row.discuss_max_rounds || 3,
       updatedAt: row.updated_at,
     };
   }
@@ -406,6 +450,8 @@ export class MessageStore {
       ownerBot: r.owner_bot || '',
       freeDiscussion: !!r.free_discussion,
       verbose: !!r.verbose,
+      discuss: !!r.discuss,
+      discussMaxRounds: r.discuss_max_rounds || 3,
       updatedAt: r.updated_at,
     }));
   }

@@ -24,16 +24,20 @@ This is intentional enough for simple participation, but it does not match the d
 
 Introduce a separate discussion mode, independent from `free` mode.
 
-A human message starts a discussion session. The bridge then orchestrates participants in rounds:
+A human message starts a discussion session. The bridge then orchestrates participants in barrier-style rounds:
 
 ```text
 Human topic
-  → Round 1: GPT → Claude → DeepSeek → GLM → ...
-  → Round 2: GPT → Claude → DeepSeek → GLM → ...
+  → Round 1: GPT, Claude, DeepSeek, GLM each answer the same topic independently
+  → Wait until Round 1 finishes
+  → Round 2: GPT, Claude, DeepSeek, GLM each respond again, now with Round 1 as shared context
+  → Wait until Round 2 finishes
   → ... until stop condition
 ```
 
-A “round” means every participant gets at most one turn. A 10-round limit means each bot can speak up to 10 times, not that the whole group has only 10 total bot messages.
+A “round” means every participant gets at most one turn against the same discussion state. A 10-round limit means each bot can speak up to 10 times, not that the whole group has only 10 total bot messages.
+
+Within one round, bots should **not** be chained as “GPT speaks, then Claude sees GPT, then DeepSeek sees GPT+Claude”. Instead, all participants in the same round should receive the same base context and produce independent views. After the round completes, the next round may include all previous-round replies as shared context.
 
 ## Why Not Trigger on Bot Messages
 
@@ -45,7 +49,7 @@ A naive implementation would let bot messages trigger other bots in `free` mode.
 4. reaction / pending / done state becomes ambiguous;
 5. one bot may miss another bot’s reply depending on Feishu event timing.
 
-Discussion should therefore be an explicit scheduler/orchestrator, not normal message-trigger chaining.
+Discussion should therefore be an explicit scheduler/orchestrator, not normal message-trigger chaining. The scheduler should use a barrier between rounds: start a round, collect all participant replies, then start the next round.
 
 ## Proposed MVP
 
@@ -69,7 +73,7 @@ MVP participant selection can be one of:
 2. all bots explicitly mentioned by the human;
 3. all bots when the trigger is `@all`.
 
-Recommended first version: use bots with `mode = free`, ordered by config order.
+Recommended first version: use bots with `mode = free`. Ordering still matters for Feishu delivery and deterministic logs, but the logical model should be barrier-style: all participants in one round answer the same topic/context rather than seeing earlier replies from the same round.
 
 ### Discussion Session State
 
@@ -113,6 +117,15 @@ CREATE TABLE discussion_turns (
 
 Each participant should receive a discussion prompt, not just the raw human message.
 
+Within a round, every participant receives the same shared context:
+
+- original human topic;
+- all completed previous rounds;
+- current round number;
+- the current bot name.
+
+They should **not** receive partial replies from other bots in the current round.
+
 Example:
 
 ```text
@@ -124,12 +137,16 @@ Topic:
 Current round: 2
 You are: Claude
 
-Previous turns:
+Completed previous rounds:
+Round 1:
 - GPT: ...
+- Claude: ...
 - DeepSeek: ...
 
+Current-round replies are hidden from you so that each bot gives an independent view.
+
 Instructions:
-1. Do not repeat points already made.
+1. Do not repeat points already made in previous rounds.
 2. Add only new, useful information.
 3. If you have nothing useful to add, reply exactly NO_REPLY.
 4. Keep the answer concise unless asked otherwise.
@@ -144,11 +161,14 @@ Discussion should stop when any of these happens:
 - user sends `/discuss stop`;
 - a new human message arrives and policy says “interrupt current discussion”; 
 - too many consecutive errors occur;
-- no participant remains eligible.
+- no participant remains eligible;
+- a round-level timeout is hit while waiting for straggler bots.
 
 ## Interaction With Current Queue Logic
 
 Discussion turns should not rely on ordinary Feishu bot-message events. The scheduler should invoke bot OpenClaw sessions directly through the same `chatSendWithContext` path, then send replies to Feishu and insert them into `messages`.
+
+For the first MVP, use sequential execution for operational simplicity but preserve barrier semantics: build each bot's prompt from the same round context, not from replies already produced earlier in the current round. Later, this can be optimized to true parallel execution per round.
 
 Need to be careful with:
 
@@ -162,9 +182,10 @@ Need to be careful with:
 
 1. Should a new human message interrupt the active discussion or become the next topic?
 2. Should participants be manually selected or derived from `/free` mode?
-3. Should bot replies be visible immediately or buffered until a round is complete?
-4. Should the scheduler support parallel mode later, or always sequential for determinism?
+3. Should bot replies be visible immediately as they finish, or buffered and sent after the whole round completes?
+4. Should the MVP execute round participants sequentially with barrier semantics, or true parallel from day one?
 5. What is the default max round count: 3 for safety, or 10 for full discussion?
+6. Should later rounds include all previous rounds verbatim, or a compact rolling summary to control context size?
 
 ## Recommended Direction
 
@@ -172,7 +193,8 @@ Start with a conservative MVP:
 
 - explicit `/discuss on` separate from `/free`;
 - participants = bots with `mode = free`;
-- sequential turns in config order;
+- barrier-style rounds over free-mode participants;
+- implement sequential execution first, but build each prompt from the same per-round context;
 - default `max_rounds = 3`;
 - stop if all bots return `NO_REPLY` in one round;
 - persist session and turns in SQLite.

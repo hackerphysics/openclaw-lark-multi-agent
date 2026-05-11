@@ -25,11 +25,16 @@ All of them connect to the same OpenClaw Gateway while keeping sessions, queues,
 - Group chat routing:
   - reply when directly mentioned
   - reply to `@all` / `@_all`
-  - optional Free Discussion mode
+  - optional per-bot Free mode for plain human messages
+  - targeted mentions are exclusive, so Free-mode bots do not steal messages addressed to another person or bot
+  - mention-only messages can trigger a bot with the previous unsynced context
+- Per-bot anti-loop guard, so one bot's free-discussion budget is not consumed by other bots
 - Local SQLite message store for context, trigger tracking, and duplicate prevention
 - `pending_triggers` queue so restart recovery does not replay every context message
 - `delivered_replies` table so one trigger message gets at most one delivered reply per bot
 - Feishu image download and OpenClaw multimodal attachment forwarding
+- Bridge attachment marker protocol for generated files/images/documents
+- Feishu CardKit v2 Markdown rendering, including native table elements for pipe tables
 - Bridge-level slash commands and escaped OpenClaw slash commands
 - Linux systemd installer with separate runtime and state directories
 
@@ -220,7 +225,9 @@ Bridge-level commands use a single slash and are handled by this project:
 - `/compact` — compact the OpenClaw session
 - `/reset` — reset the OpenClaw session
 - `/verbose` — toggle tool-call messages for this bot in this chat
-- `/free` — toggle Free Discussion mode in group chats
+- `/free` — toggle this bot's Free mode in the current group chat
+- `/mute` — toggle this bot's mute mode in the current group chat
+- `/mode` — show this bot's current mode in the current chat
 
 OpenClaw-level slash commands can be sent by escaping with a double slash:
 
@@ -267,9 +274,39 @@ By default, a bot responds when:
 
 - it is directly mentioned;
 - `@all` / `@_all` appears in the message;
-- Free Discussion is enabled for that group.
+- this bot's Free mode is enabled and the message is a plain human message with no targeted mentions.
 
-Bot messages do not trigger other bots unless they mention them. A bot-streak guard prevents infinite bot-to-bot loops.
+Free mode is intentionally per-bot and conservative:
+
+- Free mode lets a bot reply to ordinary human messages without being mentioned.
+- If a human message mentions another bot, only that bot may respond. Other Free-mode bots stay silent.
+- If a human message mentions a regular person, Free-mode bots stay silent.
+- `@all` remains a broadcast trigger and may activate every eligible bot.
+
+Mention-only routing is supported. If a user first sends content and then sends only a bot mention, for example:
+
+```text
+Please analyze the contract risk.
+@Claude
+```
+
+the mention-only message is treated as a trigger and is combined with the previous unsynced context before being sent to the mentioned bot.
+
+Bot messages do not trigger other bots unless they mention them. The anti-loop guard is counted per bot per chat: other bots' replies do not consume the current bot's streak budget, and a human message resets the streak.
+
+`/free` is not a full multi-agent discussion scheduler. Notes for a future explicit `/discuss` mode live in [`docs/ideas/discussion-mode.md`](docs/ideas/discussion-mode.md).
+
+
+## Markdown, tables, and attachments
+
+Assistant replies are sent as Feishu CardKit v2 cards. Markdown is preprocessed for Feishu rendering:
+
+- headings are downgraded to Feishu-friendly heading levels;
+- fenced code blocks are preserved;
+- unsupported external Markdown image URLs are stripped unless already resolved to Feishu `img_` keys;
+- GitHub-style pipe tables are converted into native CardKit `table` elements.
+
+For generated files/images/documents, agents should use the bridge attachment marker protocol instead of calling Feishu messaging tools directly. The bridge strips the marker from the visible reply, validates the file path under the configured attachment directory, uploads/sends the attachment, and records it in local context. Markdown documents can be converted into Feishu cloud documents through this path.
 
 ## Data model
 

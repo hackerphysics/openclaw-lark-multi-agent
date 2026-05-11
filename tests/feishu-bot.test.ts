@@ -8,6 +8,8 @@ import type { BotConfig } from "../src/config.js";
 
 class MockOpenClaw {
   chatCalls: any[] = [];
+  replies: string[] = [];
+  resolvers: Array<(value: string) => void> = [];
   async getSessionInfo() { return { session: { totalTokens: 0 } }; }
   async ensureModel() { return false; }
   async createSession() {}
@@ -16,6 +18,7 @@ class MockOpenClaw {
   onToolEvent() {}
   async chatSendWithContext(params: any) {
     this.chatCalls.push(params);
+    if (this.replies.length > 0) return this.replies.shift()!;
     return "mock reply";
   }
   async compactSession() { return "ok"; }
@@ -46,7 +49,7 @@ function makeHarness(name = "GPT") {
   const config: BotConfig = { name, appId: `app-${name}`, appSecret: "secret", model: `model-${name}` };
   const bot = new FeishuBot(config, openclaw as any, store);
   (bot as any).fetchAndCacheChatInfo = async (chatId: string, chatType: string) => {
-    store.upsertChatInfo({ chatId, chatType, chatName: chatType, members: "", memberNames: "", ownerBot: chatType === "p2p" ? name : "", freeDiscussion: false, verbose: false, updatedAt: Date.now() });
+    store.upsertChatInfo({ chatId, chatType, chatName: chatType, members: "", memberNames: "", ownerBot: chatType === "p2p" ? name : "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: Date.now() });
   };
   (bot as any).ensureSession = async (chatId: string) => bot.getSessionKey(chatId);
   (bot as any).addReaction = vi.fn(async () => {});
@@ -111,6 +114,49 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally {
       FeishuBot.getAllBots().delete("app-Gemini");
       h.cleanup();
+    }
+  });
+
+  it("handles /discuss commands locally", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss on", messageId: "discuss-on" }));
+      expect(h.store.getChatInfo("chat1")?.discuss).toBe(true);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-on", expect.stringContaining("Discuss 已开启"));
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss rounds 2", messageId: "discuss-rounds" }));
+      expect(h.store.getChatInfo("chat1")?.discussMaxRounds).toBe(2);
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss off", messageId: "discuss-off" }));
+      expect(h.store.getChatInfo("chat1")?.discuss).toBe(false);
+    } finally { h.cleanup(); }
+  });
+
+  it("discuss mode takes over plain human messages and runs free participants", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      // The production app shares one MessageStore instance across bots.
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      gpt.store.setBotMode("GPT", "chat1", "free");
+      gpt.store.setBotMode("Claude", "chat1", "free");
+      gpt.store.setDiscussMode("chat1", true);
+      gpt.store.setDiscussMaxRounds("chat1", 1);
+
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic" }));
+      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1 && claude.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect(gpt.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
+      expect(claude.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
+      expect(gpt.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+      expect(gpt.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
     }
   });
 
@@ -242,6 +288,16 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("does not let bridge /status clear older pending triggers", async () => {
+    const h = makeHarness("GLM");
+    try {
+      const pendingRow = h.store.insert({ chatId: "chat1", messageId: "old-pending", senderType: "human", senderName: "u", content: "还没处理的问题", timestamp: Date.now() });
+      h.store.markPendingTrigger("GLM", "chat1", pendingRow);
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/status", messageId: "status-after-fail" }));
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(pendingRow)).toBe(true);
+    } finally { h.cleanup(); }
+  });
+
   it("passes double-slash commands through to OpenClaw as single-slash commands", async () => {
     const h = makeHarness();
     try {
@@ -267,6 +323,63 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "quiet", messageId: "m1" }));
       expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
       expect(h.store.getRecent("chat1").filter((m) => m.senderType === "bot")).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("notifies the group when provider errors happen", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setBotMode("GLM", "chat1", "free");
+      (h.openclaw as any).chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        throw new Error("You have exceeded the 5-hour usage quota. It will reset at 2026-05-11 21:57:42 +0800 CST.");
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "需要回答", messageId: "quota-error" }));
+      const rowId = h.store.getMessageId("quota-error")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(false);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("quota-error", expect.stringContaining("额度已用尽"));
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("quota-error", "FAIL");
+    } finally { h.cleanup(); }
+  });
+
+  it("keeps truly empty replies pending instead of marking DONE", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setBotMode("GLM", "chat1", "free");
+      h.openclaw.replies.push("");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "需要回答的问题", messageId: "empty-reply" }));
+      const rowId = h.store.getMessageId("empty-reply")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(true);
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("empty-reply", "DONE");
+      expect(h.store.getChatInfo("chat1")).toBeTruthy();
+    } finally { h.cleanup(); }
+  });
+
+  it("does not mark queued mid-run messages DONE or synced before processing", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setBotMode("GLM", "chat1", "free");
+      let releaseFirst!: (value: string) => void;
+      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
+        h.openclaw.chatCalls.push(params);
+        if (h.openclaw.chatCalls.length === 1) {
+          return new Promise<string>((resolve) => { releaseFirst = resolve; });
+        }
+        return Promise.resolve("second reply");
+      });
+
+      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "第一条", messageId: "busy-1" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "第二条", messageId: "busy-2" }));
+
+      const secondRow = h.store.getMessageId("busy-2")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(true);
+      releaseFirst("first reply");
+      await first;
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
+      expect(h.openclaw.chatCalls[1].currentMessage).toBe("第二条");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "DONE");
     } finally { h.cleanup(); }
   });
 

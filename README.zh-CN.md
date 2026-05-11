@@ -25,11 +25,16 @@ Lark/飞书里每个机器人都有自己的 App 身份，但 OpenClaw 通常在
 - 群聊路由：
   - 直接 @ 某个 bot 时回复
   - `@all` / `@_all` 时回复
-  - 可选 Free Discussion 模式
+  - 可选的 per-bot Free 模式，用于普通人类消息
+  - 定向 @ 具有排他性，Free 模式 bot 不会抢答发给其他人或其他 bot 的消息
+  - 纯 @ 某个 bot 的消息可以结合前文未同步上下文触发回复
+- per-bot anti-loop 防护，其他 bot 的发言不会消耗当前 bot 的发言额度
 - 本地 SQLite 消息存储，用于上下文、触发队列和重复投递防护
 - `pending_triggers` 队列，避免重启后把所有历史上下文都重新发给 OpenClaw
 - `delivered_replies` 表，保证同一个触发消息每个 bot 最多投递一次回复
 - 支持飞书图片下载，并以 OpenClaw multimodal attachment 形式转发
+- Bridge attachment marker 协议，用于发送生成的文件、图片和文档
+- Feishu CardKit v2 Markdown 渲染，并把 pipe table 转成原生 table 组件
 - 桥接层 slash command + 转义后的 OpenClaw slash command
 - Linux systemd 安装脚本，运行产物和状态目录分离
 
@@ -220,7 +225,9 @@ openclaw-lark-multi-agent install-windows-service
 - `/compact` — 压缩 OpenClaw session
 - `/reset` — 重置 OpenClaw session
 - `/verbose` — 开关当前 bot 在当前聊天里的 tool-call 展示
-- `/free` — 开关群聊 Free Discussion 模式
+- `/free` — 开关当前 bot 在当前群聊里的 Free 模式
+- `/mute` — 开关当前 bot 在当前群聊里的 mute 模式
+- `/mode` — 查看当前 bot 在当前聊天里的模式
 
 如果你想把 slash command 直接发给 OpenClaw，可以用双斜杠转义：
 
@@ -267,9 +274,39 @@ openclaw-lark-multi-agent install-windows-service
 
 - 被直接 @；
 - 消息里出现 `@all` / `@_all`；
-- 当前群开启了 Free Discussion 模式。
+- 当前 bot 开启了 Free 模式，并且这是一条没有定向 @ 的普通人类消息。
 
-bot 发出的消息默认不会触发其他 bot，除非明确 @。同时有 bot-streak 防护，避免 bot 之间无限互相回复。
+Free 模式是 per-bot 且保守的：
+
+- Free 模式允许 bot 在没有被 @ 时回复普通人类消息。
+- 如果人类消息 @ 了另一个 bot，只有被 @ 的 bot 可以回复，其他 Free 模式 bot 保持静默。
+- 如果人类消息 @ 了普通人，Free 模式 bot 保持静默。
+- `@all` 仍然是广播触发，可激活所有符合条件的 bot。
+
+支持“纯 @ 触发”。例如用户先发：
+
+```text
+帮我分析一下这个合同风险。
+@Claude
+```
+
+第二条纯 @ 消息会被当作触发器，并和前面未同步的上下文一起发给被 @ 的 bot。
+
+bot 发出的消息默认不会触发其他 bot，除非明确 @。anti-loop 防护按 bot + chat 单独计算：其他 bot 的发言不会消耗当前 bot 的额度，人类发言会重置计数。
+
+`/free` 不是完整的多 Agent 讨论调度器。未来独立 `/discuss` 模式的设计草案在 [`docs/ideas/discussion-mode.md`](docs/ideas/discussion-mode.md)。
+
+
+## Markdown、表格和附件
+
+助手回复会以 Feishu CardKit v2 卡片发送。Markdown 会先做飞书兼容预处理：
+
+- 标题会降级到飞书更稳定的标题层级；
+- fenced code block 会被保护；
+- 未解析成飞书 `img_` key 的外部 Markdown 图片会被剥离，避免卡片发送失败；
+- GitHub 风格 pipe table 会转换成 CardKit 原生 `table` 组件。
+
+如果 Agent 需要发送生成的文件、图片或文档，应使用 bridge attachment marker 协议，而不是直接调用飞书消息工具。桥接层会从可见回复中剥离 marker，校验文件路径位于配置的附件目录下，然后上传/发送附件，并写入本地上下文。Markdown 文档也可以通过这个路径转换成飞书云文档。
 
 ## 数据模型
 

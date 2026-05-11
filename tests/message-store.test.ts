@@ -31,8 +31,13 @@ describe("MessageStore", () => {
     expect(store.getUnsyncedMessages("GPT", "c1").map((m) => m.id)).toEqual([contextId, triggerId]);
     expect([...store.getPendingTriggerIds("GPT", "c1")]).toEqual([triggerId]);
 
-    store.clearPendingTriggers("GPT", "c1", triggerId);
+    store.clearPendingTrigger("GPT", "c1", triggerId);
     expect([...store.getPendingTriggerIds("GPT", "c1")]).toEqual([]);
+
+    store.markPendingTrigger("GPT", "c1", contextId);
+    store.markPendingTrigger("GPT", "c1", triggerId);
+    store.clearPendingTriggers("GPT", "c1", contextId);
+    expect([...store.getPendingTriggerIds("GPT", "c1")]).toEqual([triggerId]);
   }));
 
   it("tracks delivered replies idempotently", () => withStore((store) => {
@@ -77,8 +82,8 @@ describe("MessageStore", () => {
   }));
 
   it("preserves p2p owner when upserting chat info without owner", () => withStore((store) => {
-    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm", members: "", memberNames: "", ownerBot: "GPT", freeDiscussion: false, verbose: false, updatedAt: 1 });
-    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm2", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, updatedAt: 2 });
+    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm", members: "", memberNames: "", ownerBot: "GPT", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 1 });
+    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm2", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 2 });
     expect(store.getChatInfo("p2p")?.ownerBot).toBe("GPT");
   }));
 });

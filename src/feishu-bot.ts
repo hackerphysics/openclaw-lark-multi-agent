@@ -6,6 +6,7 @@ import { existsSync, readFileSync, statSync } from "fs";
 import { basename, extname, resolve } from "path";
 import { getBridgeAttachmentsDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
+import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
 const MAX_BOT_STREAK = 10;
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
@@ -36,8 +37,8 @@ export class FeishuBot {
   private initializedSessions: Set<string> = new Set();
   /** Per-chat busy lock: timestamp when became busy (0 = not busy) */
   private busyChats: Map<string, number> = new Map();
-  /** Per-chat pending reply message IDs (to ack with DONE when reply arrives) */
-  private pendingAckMessages: Map<string, { messageId: string; emoji: string }[]> = new Map();
+  /** Per-chat pending reply message IDs (to ack with DONE when their trigger is processed) */
+  private pendingAckMessages: Map<string, { messageId: string; emoji: string; rowId: number }[]> = new Map();
   /** Per-chat pending tool message sends (to await before final reply) */
   private pendingToolSends: Map<string, Promise<void>[]> = new Map();
   /** Per-chat processQueue lock to avoid duplicate concurrent chat.send runs */
@@ -244,6 +245,13 @@ export class FeishuBot {
     return FeishuBot.allBots;
   }
 
+  static getByName(name: string): FeishuBot | undefined {
+    for (const bot of FeishuBot.allBots.values()) {
+      if (bot.config.name === name) return bot;
+    }
+    return undefined;
+  }
+
   static findByOpenId(openId: string): FeishuBot | undefined {
     for (const bot of FeishuBot.allBots.values()) {
       if (bot.botOpenId === openId) return bot;
@@ -384,17 +392,23 @@ export class FeishuBot {
       // Single slash commands are handled by the bridge. Double slash commands were
       // already unescaped above and should pass through to OpenClaw instead.
       const isBridgeCommand = !commandText.startsWith("//");
-      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free|mute|mode)/.test(cleanText.trim());
+      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free|mute|mode|discuss)/.test(cleanText.trim());
       if (isCommand) {
-        // In group chats, bridge commands must be explicitly routed to this bot
-        // or @all. Do not let Free Discussion make a bot execute commands meant
-        // for another bot.
-        if (chatType !== "p2p" && !this.shouldHandleBridgeCommand(chatType, message, isBot, message.content)) return;
+        // In group chats, most bridge commands must be explicitly routed to this
+        // bot or @all. /discuss is a group-level command, so an unmentioned
+        // /discuss command is handled by one coordinator bot to avoid N replies.
+        const isDiscussCommand = cleanText.trim().startsWith("/discuss");
+        if (chatType !== "p2p" && !this.shouldHandleBridgeCommand(chatType, message, isBot, message.content)) {
+          if (!(isDiscussCommand && this.isDiscussionCoordinator())) return;
+        }
 
         const markCommandSynced = () => {
           if (insertedId > 0) {
             this.store.markSynced(this.config.name, chatId, insertedId);
-            this.store.clearPendingTriggers(this.config.name, chatId, insertedId);
+            // Bridge commands should only clear their own pending row. They
+            // must not clear earlier human triggers that are waiting after a
+            // failed/empty run; /status must be safe to use for debugging.
+            this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
           }
         };
 
@@ -410,6 +424,7 @@ export class FeishuBot {
             `🔓 /free   — 切换当前 bot 的 free 模式（不 @ 也可回复）`,
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
+            `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论`,
             `❓ /help    — 显示此帮助信息`,
             ``,
             `OpenClaw 原生命令（双斜杠，会转成单斜杠发给 OpenClaw）`,
@@ -510,6 +525,33 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
+        if (cleanText.trim().startsWith("/discuss")) {
+          await this.handleDiscussCommand(chatId, chatType, messageId, cleanText.trim());
+          markCommandSynced();
+          return;
+        }
+      }
+
+      // --- Discuss mode: group-level multi-bot round scheduler. It takes over
+      // plain human messages so normal Free mode does not duplicate Round 1.
+      if (chatType !== "p2p" && !isBot && this.store.getChatInfo(chatId)?.discuss) {
+        const mentions: any[] = message.mentions || [];
+        const hasTargetedMention = mentions.some((m: any) => !this.isAllMentionItem(m));
+        if (!hasTargetedMention) {
+          const participants = this.getDiscussionParticipants(chatId);
+          if (participants.length > 0) {
+            discussionManager.startIfAbsent({
+              chatId,
+              rootMessageId: messageId,
+              topic: cleanText,
+              maxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 3,
+              participants,
+              sendSystemMessage: async (text) => { await this.sendMessage(chatId, text); },
+            });
+          }
+          if (insertedId > 0) this.store.markSynced(this.config.name, chatId, insertedId);
+          return;
+        }
       }
 
       // --- Mute mode: do not forward anything to OpenClaw. Only direct mentions get a local notice. ---
@@ -518,7 +560,7 @@ export class FeishuBot {
           await this.replyMessage(messageId, `🤐 ${this.config.name} 当前处于 mute 模式，发送 /mute 可解除`);
           if (insertedId > 0) {
             this.store.markSynced(this.config.name, chatId, insertedId);
-            this.store.clearPendingTriggers(this.config.name, chatId, insertedId);
+            this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
           }
         }
         return;
@@ -550,7 +592,7 @@ export class FeishuBot {
       if (isBusy) {
         // Queued: show waiting reaction
         await this.addReaction(messageId, "Typing").catch(() => {});
-        pending.push({ messageId, emoji: "Typing" });
+        pending.push({ messageId, emoji: "Typing", rowId: insertedId });
         this.pendingAckMessages.set(chatId, pending);
         console.log(
           `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, queuing: "${cleanText.substring(0, 50)}..."`
@@ -571,7 +613,7 @@ export class FeishuBot {
       // --- Not busy, send now (with any accumulated messages) ---
       // Acknowledge receipt: sent to OpenClaw (GET/了解)
       await this.addReaction(messageId, "Get").catch(() => {});
-      pending.push({ messageId, emoji: "Get" });
+      pending.push({ messageId, emoji: "Get", rowId: insertedId });
       this.pendingAckMessages.set(chatId, pending);
       await this.processQueue(chatId);
     } catch (err) {
@@ -649,16 +691,30 @@ export class FeishuBot {
         });
         console.log(`[${this.config.name}] OpenClaw reply collected for ${chatId.slice(-8)} in ${Date.now() - queueStartedAt}ms`);
 
-        // Mark everything up to now as synced
-        const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
-        this.store.markSynced(this.config.name, chatId, maxId);
-        this.store.clearPendingTriggers(this.config.name, chatId, maxId);
-
         const parsedReply = this.extractBridgeAttachments(reply);
         const visibleReply = parsedReply.text;
         const trimmedReply = visibleReply.trim();
-        const shouldReply = trimmedReply.length > 0 && trimmedReply.toUpperCase() !== "NO_REPLY";
         const hasAttachments = parsedReply.attachments.length > 0;
+        const explicitNoReply = trimmedReply.toUpperCase() === "NO_REPLY";
+        const trulyEmptyReply = trimmedReply.length === 0 && !hasAttachments;
+        if (trulyEmptyReply) {
+          // Empty final text is not the same as an explicit NO_REPLY. It often
+          // means the upstream session/run was interrupted, raced, or collected
+          // incorrectly. Do not mark sync, clear pending triggers, or mark DONE.
+          // Leave the trigger pending for a later retry/new message.
+          console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; keeping pending for retry`);
+          break;
+        }
+
+        // Mark only the snapshot processed in this run as synced. Messages that
+        // arrive while the agent is busy may already be in pendingAckMessages,
+        // but they are not part of allUnsynced/humanUnsynced for this run and
+        // must remain pending for the next loop.
+        const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
+        const processedTriggerIds = new Set(humanUnsynced.map((m) => m.id || 0).filter(Boolean));
+        this.store.markSynced(this.config.name, chatId, maxId);
+        this.store.clearPendingTriggers(this.config.name, chatId, maxId);
+        const shouldReply = trimmedReply.length > 0 && !explicitNoReply;
 
         // Record bot reply only if it is user-visible/context-worthy.
         if (shouldReply || hasAttachments) {
@@ -673,7 +729,14 @@ export class FeishuBot {
             content: storedContent,
             timestamp: Date.now(),
           });
-          if (replyId > 0) this.store.markSynced(this.config.name, chatId, replyId);
+          if (replyId > 0) {
+            const remainingPending = this.store.getPendingTriggerIds(this.config.name, chatId);
+            const hasEarlierPending = Array.from(remainingPending).some((id) => id <= replyId);
+            // Do not advance sync past a human message that arrived while this
+            // run was busy. Otherwise the pending trigger remains in the table
+            // but getUnsyncedMessages() can no longer see it.
+            if (!hasEarlierPending) this.store.markSynced(this.config.name, chatId, replyId);
+          }
         }
 
         // Wait for all pending tool event messages to be delivered first
@@ -710,15 +773,50 @@ export class FeishuBot {
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 
-        // Replace ack reactions with DONE for all pending messages in this chat
+        // Replace ack reactions with DONE only for trigger messages actually
+        // processed in this run. Queued messages that arrived mid-run keep their
+        // Typing/Get reaction and will be acknowledged by the next loop.
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+        const remainingAcks: typeof pendingAcks = [];
         for (const ack of pendingAcks) {
-          await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
-          await this.addReaction(ack.messageId, "DONE").catch(() => {});
+          if (processedTriggerIds.has(ack.rowId)) {
+            await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+            await this.addReaction(ack.messageId, "DONE").catch(() => {});
+          } else {
+            remainingAcks.push(ack);
+          }
         }
-        this.pendingAckMessages.set(chatId, []);
+        this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
         console.error(`[${this.config.name}] processQueue error:`, err);
+        const errorText = this.formatUserVisibleError(err);
+        if (lastHuman.messageId) {
+          await this.sendOrdered(chatId, async () => {
+            try {
+              await this.replyMessage(lastHuman.messageId, errorText);
+            } catch {
+              await this.sendMessage(chatId, errorText);
+            }
+            if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+          }).catch(() => {});
+        }
+        if (triggerId) {
+          // The run failed after OpenClaw/provider rejected it. Notify the user
+          // and clear only this failed trigger so later messages can continue.
+          this.store.clearPendingTrigger(this.config.name, chatId, triggerId);
+          this.store.markSynced(this.config.name, chatId, triggerId);
+        }
+        const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+        const remainingAcks: typeof pendingAcks = [];
+        for (const ack of pendingAcks) {
+          if (ack.rowId === triggerId) {
+            await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+            await this.addReaction(ack.messageId, "FAIL").catch(() => {});
+          } else {
+            remainingAcks.push(ack);
+          }
+        }
+        this.pendingAckMessages.set(chatId, remainingAcks);
         break;
       } finally {
         this.busyChats.set(chatId, 0);
@@ -846,6 +944,70 @@ export class FeishuBot {
         elements: buildFeishuCardElements(text),
       },
     };
+  }
+
+  private formatUserVisibleError(err: unknown): string {
+    const raw = err instanceof Error ? err.message : String(err);
+    let reason = raw.replace(/\s+/g, " ").trim();
+    if (/quota/i.test(reason) || /exceeded/i.test(reason)) {
+      const reset = reason.match(/reset at ([^.;]+)/i)?.[1];
+      reason = reset ? `模型/供应商额度已用尽，重置时间：${reset}` : "模型/供应商额度已用尽，请稍后重试或切换模型";
+    } else if (/timeout/i.test(reason)) {
+      reason = "模型响应超时，请稍后重试";
+    } else if (/schema|tool payload|rejected/i.test(reason)) {
+      reason = "模型供应商拒绝了请求格式或工具参数，需要调整模型/工具调用";
+    } else if (reason.length > 220) {
+      reason = reason.slice(0, 220) + "...";
+    }
+    return `⚠️ ${this.config.name} 这次没有完成回复。\n原因：${reason}`;
+  }
+
+  private isDiscussionCoordinator(): boolean {
+    const bots = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store);
+    if (bots.length === 0) return true;
+    return bots[0] === this;
+  }
+
+  private getDiscussionParticipants(chatId: string): DiscussionParticipant[] {
+    return Array.from(FeishuBot.allBots.values())
+      .filter((bot) => bot.store === this.store && bot.store.getBotMode(bot.config.name, chatId) === "free")
+      .map((bot) => ({
+        name: bot.config.name,
+        runDiscussionTurn: async (_chatId: string, prompt: string) => bot.runDiscussionTurn(chatId, prompt),
+      }));
+  }
+
+  private async runDiscussionTurn(chatId: string, prompt: string): Promise<ReplyResult> {
+    const sessionKey = await this.ensureSession(chatId);
+    const reply = await this.openclawClient.chatSendWithContext({
+      sessionKey,
+      unsyncedMessages: [],
+      currentMessage: prompt,
+      currentSenderName: "Discussion Scheduler",
+      deliver: false,
+      timeoutMs: 600000,
+    });
+    const parsedReply = this.extractBridgeAttachments(reply);
+    const visibleReply = parsedReply.text.trim();
+    const isVisible = visibleReply.length > 0 && visibleReply.toUpperCase() !== "NO_REPLY";
+    if (isVisible || parsedReply.attachments.length > 0) {
+      const storedContent = [visibleReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
+        .filter(Boolean)
+        .join("\n");
+      this.store.insert({
+        chatId,
+        messageId: `self-${this.config.name}-discuss-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        senderType: "bot",
+        senderName: this.config.name,
+        content: storedContent,
+        timestamp: Date.now(),
+      });
+      await this.sendOrdered(chatId, async () => {
+        if (isVisible) await this.sendMessage(chatId, visibleReply);
+        for (const attachment of parsedReply.attachments) await this.sendBridgeAttachment(chatId, attachment);
+      });
+    }
+    return { botName: this.config.name, text: visibleReply, visible: isVisible };
   }
 
   private async replyMessage(messageId: string, text: string) {
@@ -1080,6 +1242,50 @@ ${doc.url}`);
     }
   }
 
+  private async handleDiscussCommand(chatId: string, chatType: string, messageId: string, text: string): Promise<void> {
+    if (chatType === "p2p") {
+      await this.replyMessage(messageId, "❌ Discuss 模式只在群聊中可用");
+      return;
+    }
+    const parts = text.split(/\s+/).filter(Boolean);
+    const action = parts[1] || "status";
+    if (action === "on") {
+      this.store.setDiscussMode(chatId, true);
+      await this.replyMessage(messageId, `💬 Discuss 已开启\n参与者：当前群所有 free 模式 bot\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 3}`);
+      return;
+    }
+    if (action === "off") {
+      this.store.setDiscussMode(chatId, false);
+      discussionManager.stop(chatId);
+      await this.replyMessage(messageId, "💬 Discuss 已关闭");
+      return;
+    }
+    if (action === "stop") {
+      const stopped = discussionManager.stop(chatId);
+      await this.replyMessage(messageId, stopped ? "💬 当前 discuss 已停止" : "💬 当前没有运行中的 discuss");
+      return;
+    }
+    if (action === "rounds") {
+      const n = Number.parseInt(parts[2] || "", 10);
+      if (!Number.isFinite(n)) {
+        await this.replyMessage(messageId, "❌ 用法：/discuss rounds <1-10>");
+        return;
+      }
+      this.store.setDiscussMaxRounds(chatId, n);
+      await this.replyMessage(messageId, `💬 Discuss 轮数已设置为 ${this.store.getChatInfo(chatId)?.discussMaxRounds || n}`);
+      return;
+    }
+    const info = this.store.getChatInfo(chatId);
+    const active = discussionManager.status(chatId);
+    const participants = this.getDiscussionParticipants(chatId).map((p) => p.name);
+    await this.replyMessage(messageId, [
+      `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
+      `轮数：${info?.discussMaxRounds || 3}`,
+      `参与者：${participants.length ? participants.join(", ") : "（无 free bot）"}`,
+      active ? `运行中：第 ${active.currentRound}/${active.maxRounds} 轮，topic=${active.topic.slice(0, 80)}` : "运行中：无",
+    ].join("\n"));
+  }
+
   /**
    * Handle /status command: show current session info.
    */
@@ -1187,6 +1393,8 @@ ${doc.url}`);
           ownerBot: this.config.name,
           freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
           verbose: this.store.getChatInfo(chatId)?.verbose || false,
+          discuss: this.store.getChatInfo(chatId)?.discuss || false,
+          discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 3,
           updatedAt: Date.now(),
         });
         return;
@@ -1224,6 +1432,8 @@ ${doc.url}`);
         ownerBot: "",  // group chats are shared, no owner
         freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
         verbose: this.store.getChatInfo(chatId)?.verbose || false,
+        discuss: this.store.getChatInfo(chatId)?.discuss || false,
+        discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 3,
         updatedAt: Date.now(),
       });
       console.log(`[${this.config.name}] Cached chat info: ${chatName} (${chatId.slice(-8)})`);
