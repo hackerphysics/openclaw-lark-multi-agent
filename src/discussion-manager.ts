@@ -29,7 +29,8 @@ export type DiscussionParticipant = {
 
 export class DiscussionManager {
   private sessions = new Map<string, DiscussionSession>();
-  private seenRoots = new Set<string>();
+  private seenRoots = new Map<string, number>();
+  private readonly seenRootTtlMs = 6 * 60 * 60 * 1000;
 
   isActive(chatId: string): boolean {
     return this.sessions.get(chatId)?.status === "running";
@@ -56,14 +57,18 @@ export class DiscussionManager {
     participants: DiscussionParticipant[];
     sendSystemMessage?: (text: string) => Promise<void>;
   }): boolean {
+    this.pruneSeenRoots();
     const key = `${params.chatId}:${params.rootMessageId}`;
     if (this.seenRoots.has(key)) return false;
-    this.seenRoots.add(key);
+    this.seenRoots.set(key, Date.now());
 
     if (this.isActive(params.chatId)) this.stop(params.chatId);
 
     const participants = params.participants.filter((p, index, arr) => arr.findIndex((x) => x.name === p.name) === index);
-    if (participants.length === 0) return false;
+    if (participants.length === 0) {
+      this.seenRoots.delete(key);
+      return false;
+    }
 
     const session: DiscussionSession = {
       id: randomUUID(),
@@ -84,6 +89,12 @@ export class DiscussionManager {
       if (current?.id === session.id) this.sessions.delete(params.chatId);
     });
     return true;
+  }
+
+  private pruneSeenRoots(now = Date.now()): void {
+    for (const [key, ts] of this.seenRoots) {
+      if (now - ts > this.seenRootTtlMs) this.seenRoots.delete(key);
+    }
   }
 
   private async runLoop(sessionId: string, participants: DiscussionParticipant[], sendSystemMessage?: (text: string) => Promise<void>): Promise<void> {

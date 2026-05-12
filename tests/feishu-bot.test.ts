@@ -189,6 +189,8 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(gpt.store.getBotMode("Gemini", "chat1")).toBe("normal");
       expect(gemini.store.getBotMode("Gemini", "chat1")).toBe("normal");
       expect((gpt.bot as any).replyMessage).toHaveBeenCalledWith("free-on", expect.stringContaining("GPT 已切换到 free 模式"));
+      expect((gpt.bot as any).replyMessage).toHaveBeenCalledWith("free-on", expect.not.stringContaining("连续 Bot 回复超过"));
+      expect((gpt.bot as any).replyMessage).toHaveBeenCalledWith("free-on", expect.stringContaining("/discuss on"));
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free", messageId: "free-off" }));
       expect(gpt.store.getBotMode("GPT", "chat1")).toBe("normal");
     } finally { gpt.cleanup(); gemini.cleanup(); }

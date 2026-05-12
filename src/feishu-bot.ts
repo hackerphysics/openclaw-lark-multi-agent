@@ -490,7 +490,7 @@ export class FeishuBot {
           const next = current === "free" ? "normal" : "free";
           this.store.setBotMode(this.config.name, chatId, next);
           if (next === "free") {
-            await this.replyMessage(messageId, `🔓 ${this.config.name} 已切换到 free 模式\n不需要 @ 也可以参与回复（连续 Bot 回复超过 ${MAX_BOT_STREAK} 轮将暂停，等待人类发言）`);
+            await this.replyMessage(messageId, `🔓 ${this.config.name} 已切换到 free 模式\n不需要 @ 也可以回复普通人类消息；如果消息明确 @ 了其他 bot 或普通人，我不会抢答。\n如需多轮自动讨论，请使用群级命令 /discuss on。`);
           } else {
             await this.replyMessage(messageId, `🔒 ${this.config.name} 已切换到 normal 模式\n只有明确 @ 我才会回复`);
           }
@@ -687,7 +687,7 @@ export class FeishuBot {
           deliver: false,
           // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
           // instead of leaving reactions stuck forever.
-          timeoutMs: 600000,
+          timeoutMs: 1_800_000,
         });
         console.log(`[${this.config.name}] OpenClaw reply collected for ${chatId.slice(-8)} in ${Date.now() - queueStartedAt}ms`);
 
@@ -985,7 +985,7 @@ export class FeishuBot {
       currentMessage: prompt,
       currentSenderName: "Discussion Scheduler",
       deliver: false,
-      timeoutMs: 600000,
+      timeoutMs: 1_800_000,
     });
     const parsedReply = this.extractBridgeAttachments(reply);
     const visibleReply = parsedReply.text.trim();

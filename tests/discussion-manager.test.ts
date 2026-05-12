@@ -49,4 +49,15 @@ describe("DiscussionManager", () => {
     expect(manager.startIfAbsent({ chatId: "chat1", rootMessageId: "m1", topic: "t", maxRounds: 3, participants: [p] })).toBe(false);
     await vi.waitUntil(() => !manager.isActive("chat1"), { timeout: 1000 });
   });
+
+  it("does not retain seen roots forever", async () => {
+    const manager = new DiscussionManager();
+    const calls: Array<{ name: string; prompt: string }> = [];
+    const p = participant("GPT", ["NO_REPLY"], calls);
+    expect(manager.startIfAbsent({ chatId: "chat1", rootMessageId: "m1", topic: "t", maxRounds: 3, participants: [p] })).toBe(true);
+    expect((manager as any).seenRoots.size).toBe(1);
+    (manager as any).pruneSeenRoots(Date.now() + 7 * 60 * 60 * 1000);
+    expect((manager as any).seenRoots.size).toBe(0);
+    await vi.waitUntil(() => !manager.isActive("chat1"), { timeout: 1000 });
+  });
 });
