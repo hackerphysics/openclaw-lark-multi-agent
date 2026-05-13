@@ -2,6 +2,72 @@ import { describe, expect, it, vi } from "vitest";
 import { OpenClawClient } from "../src/openclaw-client.js";
 import { getBridgeAttachmentsDir } from "../src/paths.js";
 
+describe("OpenClawClient collectReply", () => {
+  it("ignores empty lifecycle end and waits for later real text", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(key)!.push({
+      runId: "other-runtime-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "working" },
+    });
+    setTimeout(() => {
+      events.get(key)!.push({
+        runId: "real-agent-run",
+        sessionKey: key,
+        stream: "assistant",
+        data: { delta: "real reply" },
+      });
+      events.get(key)!.push({
+        runId: "real-agent-run",
+        sessionKey: key,
+        stream: "lifecycle",
+        data: { phase: "end", livenessState: "working" },
+      });
+    }, 50);
+
+    await expect(replyPromise).resolves.toBe("real reply");
+  });
+
+  it("ignores empty chatFinal fallback and waits for later real text", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(key)!.push({
+      runId: "other-runtime-run",
+      sessionKey: key,
+      stream: "chatFinal",
+      data: { text: "" },
+    });
+    setTimeout(() => {
+      events.get(key)!.push({
+        runId: "real-agent-run",
+        sessionKey: key,
+        stream: "assistant",
+        data: { delta: "later text" },
+      });
+      events.get(key)!.push({
+        runId: "real-agent-run",
+        sessionKey: key,
+        stream: "lifecycle",
+        data: { phase: "end", livenessState: "working" },
+      });
+    }, 50);
+
+    await expect(replyPromise).resolves.toBe("later text");
+  });
+});
+
 describe("OpenClawClient bridge attachment hint", () => {
   function clientWithCapturedChatSend() {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);

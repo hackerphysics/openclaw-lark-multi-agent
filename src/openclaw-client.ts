@@ -370,7 +370,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                   });
                   // Prefer final chat message over accumulated deltas: some providers may
                   // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-                  finish(chatFinalText || text);
+                  const latestFinalText = chatFinalText || text;
+                  if (latestFinalText) {
+                    finish(latestFinalText);
+                  } else {
+                    console.warn(`[OpenClaw] collectReply: empty chatFinal fallback ignored; waiting for real text or idle timeout`);
+                    chatFinalTimer = null;
+                  }
                 }, 5000);
               }
             }
@@ -387,7 +393,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                   finish("NO_REPLY");
                   return;
                 }
-                if (!latestFinalText && ev.data?.livenessState !== "working") {
+                if (!latestFinalText) {
                   const state = ev.data?.livenessState || "unknown";
                   const reason = ev.data?.stopReason || "";
                   const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
@@ -397,10 +403,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                     replayInvalidTimer = setTimeout(() => finish(failureText), 120000);
                     return;
                   }
-                  finish(failureText);
-                } else {
-                  finish(latestFinalText);
+                  if (ev.data?.livenessState !== "working") {
+                    finish(failureText);
+                    return;
+                  }
+                  console.warn(`[OpenClaw] empty lifecycle end ignored for runId=${evRunId || runId}; waiting for real text or idle timeout`);
+                  return;
                 }
+                finish(latestFinalText);
               };
 
               // If lifecycle end beats chat final, a short delta like "N" can be a truncated
