@@ -1,6 +1,6 @@
 {
   "name": "openclaw-lark-multi-agent",
-  "version": "0.1.15",
+  "version": "1.0.0",
   "description": "Multi-bot Lark/Feishu bridge for OpenClaw, with per-bot model routing and isolated sessions",
   "type": "module",
   "scripts": {
