@@ -45,6 +45,8 @@ export class FeishuBot {
   private queueRuns: Map<string, Promise<void>> = new Map();
   /** Per-chat serial send queue to guarantee message order */
   private sendQueue: Map<string, Promise<void>> = new Map();
+  /** Per-chat delayed runtime failure notifications, canceled if a real reply arrives. */
+  private delayedFailureTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -140,6 +142,7 @@ export class FeishuBot {
       try {
         console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
         const parsed = this.extractBridgeAttachments(text);
+        if (parsed.text.trim()) this.cancelDelayedFailure(chatId);
         if (parsed.text.trim()) await this.sendMessage(chatId, parsed.text);
         for (const attachment of parsed.attachments) {
           await this.sendBridgeAttachment(chatId, attachment);
@@ -715,6 +718,7 @@ export class FeishuBot {
         this.store.markSynced(this.config.name, chatId, maxId);
         this.store.clearPendingTriggers(this.config.name, chatId, maxId);
         const shouldReply = trimmedReply.length > 0 && !explicitNoReply;
+        const isRuntimeFailure = shouldReply && this.isRuntimeFailureText(trimmedReply);
 
         // Record bot reply only if it is user-visible/context-worthy.
         if (shouldReply || hasAttachments) {
@@ -748,7 +752,7 @@ export class FeishuBot {
 
         // Reply to the last human message on Feishu (ordered after tool msgs)
         // Skip empty replies and explicit NO_REPLY responses
-        if ((shouldReply || hasAttachments) && lastHuman.messageId) {
+        if ((shouldReply || hasAttachments) && lastHuman.messageId && !isRuntimeFailure) {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
           } else {
@@ -770,6 +774,9 @@ export class FeishuBot {
               if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
             });
           }
+        }
+        if (isRuntimeFailure && lastHuman.messageId) {
+          this.scheduleDelayedFailure(chatId, lastHuman.messageId, visibleReply, triggerId);
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 
@@ -960,6 +967,34 @@ export class FeishuBot {
       reason = reason.slice(0, 220) + "...";
     }
     return `⚠️ ${this.config.name} 这次没有完成回复。\n原因：${reason}`;
+  }
+
+  private isRuntimeFailureText(text: string): boolean {
+    return text.startsWith("⚠️ Agent 未正常完成") || /\n原因:\s*rpc\b/.test(text);
+  }
+
+  private cancelDelayedFailure(chatId: string): void {
+    const timer = this.delayedFailureTimers.get(chatId);
+    if (timer) clearTimeout(timer);
+    this.delayedFailureTimers.delete(chatId);
+  }
+
+  private scheduleDelayedFailure(chatId: string, replyToMessageId: string, text: string, triggerId: number): void {
+    this.cancelDelayedFailure(chatId);
+    const timer = setTimeout(() => {
+      this.delayedFailureTimers.delete(chatId);
+      void this.sendOrdered(chatId, async () => {
+        try {
+          await this.replyMessage(replyToMessageId, text);
+        } catch {
+          await this.sendMessage(chatId, text);
+        }
+        if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
+      }).catch((err) => {
+        console.warn(`[${this.config.name}] delayed failure delivery failed:`, (err as Error).message);
+      });
+    }, 60_000);
+    this.delayedFailureTimers.set(chatId, timer);
   }
 
   private isDiscussionCoordinator(): boolean {

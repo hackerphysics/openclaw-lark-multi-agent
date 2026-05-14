@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -58,6 +58,10 @@ function makeHarness(name = "GPT") {
   (bot as any).sendMessage = vi.fn(async () => {});
   return { bot, store, openclaw, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("FeishuBot routing and queue behavior", () => {
   it("does not respond to unmentioned group messages by default", async () => {
@@ -325,6 +329,30 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "quiet", messageId: "m1" }));
       expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
       expect(h.store.getRecent("chat1").filter((m) => m.senderType === "bot")).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("delays runtime failure notices and cancels them when a real proactive reply arrives", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).scheduleDelayedFailure("chat1", "runtime-fail", "⚠️ Agent 未正常完成\n状态: unknown\n原因: rpc\n请重试，或用 /reset 重置会话", 123);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runtime-fail", expect.any(String));
+      (h.bot as any).cancelDelayedFailure("chat1");
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runtime-fail", expect.any(String));
+    } finally { h.cleanup(); }
+  });
+
+  it("delivers delayed runtime failure notices if no real reply arrives", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).scheduleDelayedFailure("chat1", "runtime-fail", "⚠️ Agent 未正常完成\n状态: unknown\n原因: rpc\n请重试，或用 /reset 重置会话", 123);
+      await vi.advanceTimersByTimeAsync(60_000);
+      await Promise.resolve();
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("runtime-fail", expect.stringContaining("原因: rpc"));
     } finally { h.cleanup(); }
   });
 
