@@ -103,6 +103,16 @@ export class MessageStore {
         PRIMARY KEY (bot_name, message_id)
       );
 
+      -- Tracks recalled human messages. Recalled messages are kept in the raw
+      -- message ledger for audit, but excluded from future OpenClaw context and
+      -- pending trigger processing.
+      CREATE TABLE IF NOT EXISTS recalled_messages (
+        message_id TEXT PRIMARY KEY,
+        chat_id TEXT NOT NULL,
+        recalled_at INTEGER NOT NULL,
+        recall_type TEXT NOT NULL DEFAULT ''
+      );
+
       -- Tracks messages that should actively trigger a bot reply.
       -- Other unsynced messages remain local context and are sent only when a trigger arrives.
       CREATE TABLE IF NOT EXISTS pending_triggers (
@@ -274,6 +284,19 @@ export class MessageStore {
     return row?.id || null;
   }
 
+  markMessageRecalled(messageId: string, chatId: string, recalledAt: number = Date.now(), recallType: string = ''): void {
+    this.db.prepare(`
+      INSERT INTO recalled_messages (message_id, chat_id, recalled_at, recall_type)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(message_id) DO UPDATE SET chat_id = excluded.chat_id, recalled_at = excluded.recalled_at, recall_type = excluded.recall_type
+    `).run(messageId, chatId, recalledAt, recallType || '');
+  }
+
+  isMessageRecalled(messageId: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM recalled_messages WHERE message_id = ?`).get(messageId);
+    return !!row;
+  }
+
   markPendingTrigger(botName: string, chatId: string, messageRowId: number): void {
     this.db.prepare(`
       INSERT OR IGNORE INTO pending_triggers (bot_name, chat_id, message_row_id)
@@ -438,9 +461,10 @@ export class MessageStore {
     const lastId = row?.last_synced_msg_id || 0;
 
     const rows = this.db.prepare(`
-      SELECT * FROM messages
-      WHERE chat_id = ? AND id > ?
-      ORDER BY timestamp ASC
+      SELECT messages.* FROM messages
+      LEFT JOIN recalled_messages ON recalled_messages.message_id = messages.message_id
+      WHERE messages.chat_id = ? AND messages.id > ? AND recalled_messages.message_id IS NULL
+      ORDER BY messages.timestamp ASC
       LIMIT ?
     `).all(chatId, lastId, maxCount) as any[];
 

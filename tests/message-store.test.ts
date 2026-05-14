@@ -23,6 +23,15 @@ describe("MessageStore", () => {
     expect(store.getMessageId("m1")).toBe(id);
   }));
 
+  it("excludes recalled messages from future unsynced context", () => withStore((store) => {
+    const keepId = store.insert({ chatId: "c1", messageId: "keep", senderType: "human", senderName: "u", content: "keep", timestamp: 1 });
+    const recalledId = store.insert({ chatId: "c1", messageId: "recall", senderType: "human", senderName: "u", content: "recall", timestamp: 2 });
+    store.markMessageRecalled("recall", "c1", 123, "message_owner");
+    expect(store.isMessageRecalled("recall")).toBe(true);
+    expect(store.getUnsyncedMessages("GPT", "c1").map((m) => m.id)).toEqual([keepId]);
+    expect(recalledId).toBeGreaterThan(0);
+  }));
+
   it("keeps pending triggers separate from context messages", () => withStore((store) => {
     const contextId = store.insert({ chatId: "c1", messageId: "ctx", senderType: "human", senderName: "u", content: "context", timestamp: 1 });
     const triggerId = store.insert({ chatId: "c1", messageId: "trg", senderType: "human", senderName: "u", content: "trigger", timestamp: 2 });

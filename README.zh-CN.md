@@ -32,10 +32,13 @@ Lark/飞书里每个机器人都有自己的 App 身份，但 OpenClaw 通常在
 - 本地 SQLite 消息存储，用于上下文、触发队列和重复投递防护
 - `pending_triggers` 队列，避免重启后把所有历史上下文都重新发给 OpenClaw
 - `delivered_replies` 表，保证同一个触发消息每个 bot 最多投递一次回复
+- 持久化 delivery outbox：所有用户可见输出先入库，再通过稳定 key、原子 claim 和短窗口去重后投递
+- 消息撤回处理：已撤回且仍在排队/待处理的用户消息会从 pending 队列移除，并从后续上下文中排除
 - 支持飞书图片下载，并以 OpenClaw multimodal attachment 形式转发
 - Bridge attachment marker 协议，用于发送生成的文件、图片和文档
 - Feishu CardKit v2 Markdown 渲染，并把 pipe table 转成原生 table 组件
 - 桥接层 slash command + 转义后的 OpenClaw slash command
+- `/discuss` 多 bot 结构化讨论模式，支持轮次标注和无新增回复提示
 - Linux systemd 安装脚本，运行产物和状态目录分离
 
 ## 架构
@@ -228,6 +231,7 @@ openclaw-lark-multi-agent install-windows-service
 - `/free` — 开关当前 bot 在当前群聊里的 Free 模式
 - `/mute` — 开关当前 bot 在当前群聊里的 mute 模式
 - `/mode` — 查看当前 bot 在当前聊天里的模式
+- `/discuss on|off|status|stop|rounds N` — 控制群级多 bot 讨论模式
 
 如果你想把 slash command 直接发给 OpenClaw，可以用双斜杠转义：
 
@@ -294,8 +298,55 @@ Free 模式是 per-bot 且保守的：
 
 bot 发出的消息默认不会触发其他 bot，除非明确 @。anti-loop 防护按 bot + chat 单独计算：其他 bot 的发言不会消耗当前 bot 的额度，人类发言会重置计数。
 
-`/free` 不是完整的多 Agent 讨论调度器。未来独立 `/discuss` 模式的设计草案在 [`docs/ideas/discussion-mode.md`](docs/ideas/discussion-mode.md)。
 
+## `/discuss` 讨论模式
+
+`/discuss` 是显式的群级多智能体讨论调度器，和 Free 模式分工不同：
+
+- `/free` 控制单个 bot 是否可以响应普通人类消息。
+- `/discuss on` 让一个 coordinator 接管普通人类消息，并按 barrier-style round 调度所有 Free 模式 bot。
+- 定向 @ 仍然走普通路由，所以 discuss 开启时 `@GPT hello` 仍会只触发 GPT。
+- 每个参与 bot 在同一轮拿到相同 prompt，本轮内看不到其他 bot 的回复，下一轮才会看到上一轮结果。
+- 每条可见讨论回复会自动追加轮次标注，例如 `—— 第 2/3 轮 · Claude`。
+- 如果某些 bot 返回 `NO_REPLY` 或空回复，coordinator 会发送轻量提示，例如 `💬 第 3/3 轮：Qwen、Gemini 无新增回复`。
+- 达到配置轮数后，coordinator 会发送讨论完成提示。
+
+命令：
+
+```text
+/discuss on
+/discuss off
+/discuss status
+/discuss stop
+/discuss rounds 3
+```
+
+## Delivery outbox 与重复投递防护
+
+所有用户可见 assistant 输出都会先进入本地 `delivery_outbox`，再统一投递到飞书。覆盖普通 chat final、proactive `session.message`、延迟 runtime error、provider error、discussion 回复和附件 marker。
+
+outbox 提供：
+
+- 稳定 trigger key，例如 `trigger:<message_row_id>`；
+- `UNIQUE(bot_name, chat_id, delivery_key)` 防止同一逻辑输出重复投递；
+- `pending -> delivering -> delivered/failed` 原子 claim，避免并发重复发送；
+- proactive-only 输出的短窗口 content hash 去重；
+- chat final 包含“中间说明 + 最终答案”、proactive 只包含“最终答案”时的短窗口包含关系去重；
+- 附件感知去重，避免把带文件/图片/文档的输出和纯文本误合并。
+
+这样普通回复、subagent/proactive 回传、讨论消息、延迟错误、provider 错误和生成附件都走同一条可靠投递链路。
+
+## 消息撤回
+
+桥接层订阅飞书 `im.message.recalled_v1` 事件。用户撤回一条仍在 pending/排队中的消息时：
+
+1. 原始消息仍保留在 `messages` 表，便于审计；
+2. 撤回记录写入 `recalled_messages`；
+3. 删除各 bot 对应的 `pending_triggers`；
+4. 移除本地 pending reaction ack；
+5. 后续同步上下文时排除这条撤回消息。
+
+v1 行为边界：如果消息已经进入 OpenClaw 正在处理，暂不 abort；如果 bot 回复已经发出，也不自动撤回 bot 回复。第一版目标是可靠取消“尚未处理/排队中”的撤回消息。
 
 ## Markdown、表格和附件
 

@@ -194,6 +194,20 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("cancels pending queued messages when they are recalled", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const rowId = h.store.insert({ chatId: "chat1", messageId: "recall-me", senderType: "human", senderName: "u", content: "queued", timestamp: 1 });
+      h.store.markPendingTrigger("GPT", "chat1", rowId);
+      (h.bot as any).pendingAckMessages.set("chat1", [{ messageId: "recall-me", emoji: "Typing", rowId }]);
+      await (h.bot as any).handleMessageRecalled({ chat_id: "chat1", message_id: "recall-me", recall_time: "123", recall_type: "message_owner" });
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(rowId)).toBe(false);
+      expect(h.store.isMessageRecalled("recall-me")).toBe(true);
+      expect((h.bot as any).pendingAckMessages.get("chat1")).toEqual([]);
+      expect((h.bot as any).removeReaction).toHaveBeenCalledWith("recall-me", "Typing");
+    } finally { h.cleanup(); }
+  });
+
   it("handles bridge /verbose locally and does not forward it", async () => {
     const h = makeHarness();
     try {

@@ -77,7 +77,31 @@ export class FeishuBot {
 
     this.eventDispatcher = new lark.EventDispatcher({}).register({
       "im.message.receive_v1": this.handleMessage.bind(this),
+      "im.message.recalled_v1": this.handleMessageRecalled.bind(this),
     });
+  }
+
+  private async handleMessageRecalled(data: any) {
+    console.log(`[${this.config.name}] Message recalled event:`, JSON.stringify(data));
+    const messageId = data?.message_id;
+    const chatId = data?.chat_id;
+    if (!messageId || !chatId) return;
+    const rowId = this.store.getMessageId(messageId);
+    this.store.markMessageRecalled(messageId, chatId, Number(data?.recall_time) || Date.now(), data?.recall_type || '');
+    if (!rowId) return;
+
+    this.store.clearPendingTrigger(this.config.name, chatId, rowId);
+    const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+    const remainingAcks: typeof pendingAcks = [];
+    for (const ack of pendingAcks) {
+      if (ack.rowId === rowId) {
+        await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+      } else {
+        remainingAcks.push(ack);
+      }
+    }
+    this.pendingAckMessages.set(chatId, remainingAcks);
+    console.log(`[${this.config.name}] Recalled message ${messageId} row=${rowId}; pending trigger canceled if present`);
   }
 
   register() {

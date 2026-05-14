@@ -32,10 +32,13 @@ All of them connect to the same OpenClaw Gateway while keeping sessions, queues,
 - Local SQLite message store for context, trigger tracking, and duplicate prevention
 - `pending_triggers` queue so restart recovery does not replay every context message
 - `delivered_replies` table so one trigger message gets at most one delivered reply per bot
+- Durable delivery outbox for assistant-visible output, with stable delivery keys, atomic claim-before-send dispatch, and short-window duplicate suppression
+- Message recall handling: recalled queued/pending user messages are removed before they reach OpenClaw and excluded from future context
 - Feishu image download and OpenClaw multimodal attachment forwarding
 - Bridge attachment marker protocol for generated files/images/documents
 - Feishu CardKit v2 Markdown rendering, including native table elements for pipe tables
 - Bridge-level slash commands and escaped OpenClaw slash commands
+- `/discuss` mode for barrier-style multi-bot group discussion, including per-round markers and no-reply status notices
 - Linux systemd installer with separate runtime and state directories
 
 ## Architecture
@@ -228,6 +231,7 @@ Bridge-level commands use a single slash and are handled by this project:
 - `/free` — toggle this bot's Free mode in the current group chat
 - `/mute` — toggle this bot's mute mode in the current group chat
 - `/mode` — show this bot's current mode in the current chat
+- `/discuss on|off|status|stop|rounds N` — control group-level multi-bot discussion mode
 
 OpenClaw-level slash commands can be sent by escaping with a double slash:
 
@@ -294,7 +298,54 @@ the mention-only message is treated as a trigger and is combined with the previo
 
 Bot messages do not trigger other bots unless they mention them. The anti-loop guard is counted per bot per chat: other bots' replies do not consume the current bot's streak budget, and a human message resets the streak.
 
-`/free` is not a full multi-agent discussion scheduler. Notes for a future explicit `/discuss` mode live in [`docs/ideas/discussion-mode.md`](docs/ideas/discussion-mode.md).
+### `/discuss` mode
+
+`/discuss` is an explicit group-level multi-agent discussion scheduler. It is separate from Free mode:
+
+- `/free` controls whether a single bot may answer plain human messages.
+- `/discuss on` lets one coordinator take over plain human messages and run all Free-mode bots in barrier-style rounds.
+- Targeted mentions still fall through to normal routing, so `@GPT hello` works even while discuss mode is enabled.
+- Each participant receives the same round prompt and does not see other participants' replies from the current round until the next round.
+- Each visible discussion reply is annotated with a round marker such as `—— 第 2/3 轮 · Claude`.
+- If some participants return `NO_REPLY` or an empty reply, the coordinator sends a lightweight status notice such as `💬 第 3/3 轮：Qwen、Gemini 无新增回复`.
+- When the configured maximum round count is reached, the coordinator sends a completion notice.
+
+Commands:
+
+```text
+/discuss on
+/discuss off
+/discuss status
+/discuss stop
+/discuss rounds 3
+```
+
+## Delivery outbox and duplicate prevention
+
+All user-visible assistant outputs go through the local `delivery_outbox` before being sent to Feishu. This includes normal chat final replies, proactive `session.message` replies, delayed runtime-error notices, provider-error notices, discussion replies, and attachment marker deliveries.
+
+The outbox provides several protections:
+
+- stable trigger-based delivery keys such as `trigger:<message_row_id>`;
+- `UNIQUE(bot_name, chat_id, delivery_key)` to prevent duplicate deliveries for the same logical output;
+- `pending -> delivering -> delivered/failed` claim-before-send dispatch to avoid concurrent resend races;
+- short-window content-hash dedupe for proactive-only outputs;
+- short-window containment dedupe for cases where `chat final` contains an intermediate note plus final answer while proactive contains only the final answer;
+- attachment-aware dedupe so file/image/document deliveries are not accidentally collapsed with text-only replies.
+
+This keeps normal replies, subagent/proactive completions, discussion messages, delayed runtime failures, provider errors, and generated attachments on one consistent delivery path.
+
+## Message recall
+
+The bridge subscribes to Feishu `im.message.recalled_v1` events. When a user recalls a message that is still pending or queued:
+
+1. the original message remains in the local `messages` ledger for audit;
+2. the message is recorded in `recalled_messages`;
+3. matching `pending_triggers` for each bot are removed;
+4. pending local reaction acknowledgements are removed;
+5. future context sync excludes the recalled message.
+
+Version 1 behavior intentionally does **not** abort an OpenClaw run that has already started processing the recalled message, and it does not recall bot replies that were already sent. The first goal is to make recall reliable for queued/not-yet-processed messages.
 
 
 ## Markdown, tables, and attachments
@@ -316,6 +367,8 @@ SQLite state lives in the configured data directory. Important tables:
 - `sync_state` — per-bot/per-chat sync cursor
 - `pending_triggers` — messages that should actively trigger a bot run
 - `delivered_replies` — delivered response markers for idempotency
+- `delivery_outbox` — durable user-visible delivery ledger with claim/dedupe state
+- `recalled_messages` — recalled user messages excluded from pending work and future context
 - `processed_events` — Feishu event de-duplication
 - `bot_chat_settings` — per-bot/per-chat settings such as verbose mode
 
