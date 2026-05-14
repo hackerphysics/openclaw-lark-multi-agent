@@ -313,6 +313,25 @@ export class MessageStore {
     return new Set(rows.map((r) => Number(r.message_row_id)));
   }
 
+  getPendingTriggerMessages(botName: string, chatId: string): ChatMessage[] {
+    const rows = this.db.prepare(`
+      SELECT messages.* FROM pending_triggers
+      JOIN messages ON messages.id = pending_triggers.message_row_id
+      LEFT JOIN recalled_messages ON recalled_messages.message_id = messages.message_id
+      WHERE pending_triggers.bot_name = ? AND pending_triggers.chat_id = ? AND recalled_messages.message_id IS NULL
+      ORDER BY messages.timestamp ASC
+    `).all(botName, chatId) as any[];
+    return rows.map((r: any) => ({
+      id: r.id,
+      chatId: r.chat_id,
+      messageId: r.message_id,
+      senderType: r.sender_type,
+      senderName: r.sender_name,
+      content: r.content,
+      timestamp: r.timestamp,
+    }));
+  }
+
   clearPendingTriggers(botName: string, chatId: string, upToId: number): void {
     this.db.prepare(`
       DELETE FROM pending_triggers

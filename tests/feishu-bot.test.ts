@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
@@ -348,6 +348,44 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("startup drain starts all pending chats without waiting for the first one to finish", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.upsertChatInfo({ chatId: "chat-a", chatType: "group", chatName: "A", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 1 });
+      h.store.upsertChatInfo({ chatId: "chat-b", chatType: "group", chatName: "B", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 2 });
+      const rowA = h.store.insert({ chatId: "chat-a", messageId: "a", senderType: "human", senderName: "u", content: "a", timestamp: 1 });
+      const rowB = h.store.insert({ chatId: "chat-b", messageId: "b", senderType: "human", senderName: "u", content: "b", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat-a", rowA);
+      h.store.markPendingTrigger("GPT", "chat-b", rowB);
+      let releaseA!: () => void;
+      const calls: string[] = [];
+      (h.bot as any).processQueue = vi.fn((chatId: string) => {
+        calls.push(chatId);
+        if (chatId === "chat-a") return new Promise<void>((resolve) => { releaseA = resolve; });
+        return Promise.resolve();
+      });
+      const drain = (h.bot as any).drainOnStartup();
+      await vi.waitUntil(() => calls.includes("chat-b"), { timeout: 1000 });
+      releaseA();
+      await drain;
+      expect(calls).toEqual(expect.arrayContaining(["chat-a", "chat-b"]));
+    } finally { h.cleanup(); }
+  });
+
+  it("processes pending triggers even if sync cursor moved past them", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const pendingRow = h.store.insert({ chatId: "chat1", messageId: "old-pending", senderType: "human", senderName: "u", content: "old pending", timestamp: 1 });
+      h.store.markPendingTrigger("GPT", "chat1", pendingRow);
+      const laterRow = h.store.insert({ chatId: "chat1", messageId: "later-status", senderType: "human", senderName: "u", content: "/status", timestamp: 2 });
+      h.store.markSynced("GPT", "chat1", laterRow);
+      await (h.bot as any).processQueue("chat1");
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("old pending");
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(pendingRow)).toBe(false);
+    } finally { h.cleanup(); }
+  });
+
   it("passes double-slash commands through to OpenClaw as single-slash commands", async () => {
     const h = makeHarness();
     try {
@@ -385,6 +423,18 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runtime-fail", expect.any(String));
       (h.bot as any).cancelDelayedFailure("chat1");
       await vi.advanceTimersByTimeAsync(31_000);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runtime-fail", expect.any(String));
+    } finally { h.cleanup(); }
+  });
+
+  it("suppresses delayed runtime failure if a real reply was just delivered", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-05-14T00:00:00Z"));
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).lastRealDeliveryAt.set("chat1", Date.now());
+      (h.bot as any).scheduleDelayedFailure("chat1", "runtime-fail", "⚠️ Agent 未正常完成\n状态: unknown\n原因: rpc\n请重试，或用 /reset 重置会话", 123);
+      await vi.advanceTimersByTimeAsync(60_000);
       expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runtime-fail", expect.any(String));
     } finally { h.cleanup(); }
   });
@@ -494,6 +544,37 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).processQueue("chat1");
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("falls back to sending markdown as a file when Feishu doc creation is unavailable", async () => {
+    const h = makeHarness("Claude");
+    const dir = mkdtempSync(join(tmpdir(), "olma-md-fallback-"));
+    try {
+      const filePath = join(dir, "doc.md");
+      writeFileSync(filePath, "# hello\n");
+      (h.bot as any).validateBridgeAttachmentPath = () => filePath;
+      (h.bot as any).sendMessage = vi.fn(async () => {});
+      (h.bot as any).client = {
+        docx: { document: { create: vi.fn(async () => { throw Object.assign(new Error("Request failed with status code 400"), { response: { data: { code: 99991672, msg: "Access denied" } } }); }) } },
+        im: {
+          file: { create: vi.fn(async () => ({ data: { file_key: "file-key" } })) },
+          message: { create: vi.fn(async () => ({})) },
+        },
+      };
+      await (h.bot as any).sendBridgeAttachment("chat1", { type: "document", path: filePath, caption: "文档" });
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("飞书文档创建失败"));
+      expect((h.bot as any).client.im.file.create).toHaveBeenCalled();
+      expect((h.bot as any).client.im.message.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ msg_type: "file" }) }));
+    } finally { h.cleanup(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it("surfaces attachment delivery failures to the triggering message", async () => {
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => { throw new Error("upload exploded"); });
+      await expect((h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-attachment", "", [{ type: "file", path: "/tmp/missing" }], "reply-to", "trigger:attachment")).rejects.toThrow("upload exploded");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-to", expect.stringContaining("附件发送失败"));
     } finally { h.cleanup(); }
   });
 

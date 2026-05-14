@@ -32,6 +32,15 @@ describe("MessageStore", () => {
     expect(recalledId).toBeGreaterThan(0);
   }));
 
+  it("returns pending trigger messages even when sync cursor moved past them", () => withStore((store) => {
+    const oldId = store.insert({ chatId: "c1", messageId: "old", senderType: "human", senderName: "u", content: "old", timestamp: 1 });
+    const laterId = store.insert({ chatId: "c1", messageId: "later", senderType: "human", senderName: "u", content: "later", timestamp: 2 });
+    store.markPendingTrigger("GPT", "c1", oldId);
+    store.markSynced("GPT", "c1", laterId);
+    expect(store.getUnsyncedMessages("GPT", "c1")).toEqual([]);
+    expect(store.getPendingTriggerMessages("GPT", "c1").map((m) => m.id)).toEqual([oldId]);
+  }));
+
   it("keeps pending triggers separate from context messages", () => withStore((store) => {
     const contextId = store.insert({ chatId: "c1", messageId: "ctx", senderType: "human", senderName: "u", content: "context", timestamp: 1 });
     const triggerId = store.insert({ chatId: "c1", messageId: "trg", senderType: "human", senderName: "u", content: "trigger", timestamp: 2 });

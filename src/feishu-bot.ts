@@ -4,12 +4,13 @@ import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, readFileSync, statSync } from "fs";
 import { basename, extname, resolve } from "path";
-import { getBridgeAttachmentsDir } from "./paths.js";
+import { getBridgeAttachmentAllowedRoots, getBridgeAttachmentsDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
 const MAX_BOT_STREAK = 10;
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
+const BRIDGE_ATTACHMENT_ALLOWED_ROOTS = getBridgeAttachmentAllowedRoots();
 
 type BridgeAttachment = {
   type?: "image" | "file" | "document";
@@ -47,6 +48,8 @@ export class FeishuBot {
   private sendQueue: Map<string, Promise<void>> = new Map();
   /** Per-chat delayed runtime failure notifications, canceled if a real reply arrives. */
   private delayedFailureTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
+  private lastRealDeliveryAt: Map<string, number> = new Map();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -240,6 +243,7 @@ export class FeishuBot {
   private async drainOnStartup(): Promise<void> {
     try {
       const chats = this.store.getAllChatInfo();
+      const drainTasks: Promise<void>[] = [];
       for (const chat of chats) {
         // Skip p2p chats that belong to other bots
         if (chat.chatType === "p2p" && chat.ownerBot && chat.ownerBot !== this.config.name) {
@@ -247,7 +251,6 @@ export class FeishuBot {
         }
 
         // Re-subscribe to existing sessions
-        const sessionKey = this.getSessionKey(chat.chatId);
         await this.ensureSession(chat.chatId);
 
         // Drain only messages that were explicitly marked as reply triggers.
@@ -257,9 +260,13 @@ export class FeishuBot {
           console.log(
             `[${this.config.name}] Startup drain: ${pendingTriggerIds.size} pending trigger(s) in ${chat.chatName || chat.chatId.slice(-8)}`
           );
-          await this.processQueue(chat.chatId);
+          // Do not let one slow/stuck chat block startup drain for all other chats.
+          drainTasks.push(this.processQueue(chat.chatId).catch((err) => {
+            console.warn(`[${this.config.name}] Startup drain failed for ${chat.chatId.slice(-8)}:`, (err as Error).message);
+          }));
         }
       }
+      await Promise.allSettled(drainTasks);
     } catch (err) {
       console.warn(`[${this.config.name}] Startup drain failed:`, (err as Error).message);
     }
@@ -666,10 +673,16 @@ export class FeishuBot {
 
   private async processQueueInner(chatId: string): Promise<void> {
     while (true) {
-      const allUnsynced = this.store.getUnsyncedMessages(this.config.name, chatId);
+      const unsyncedMessages = this.store.getUnsyncedMessages(this.config.name, chatId);
+      const pendingMessages = this.store.getPendingTriggerMessages(this.config.name, chatId);
+      const messageById = new Map<number, typeof unsyncedMessages[number]>();
+      for (const msg of [...unsyncedMessages, ...pendingMessages]) {
+        if (msg.id) messageById.set(msg.id, msg);
+      }
+      const allUnsynced = Array.from(messageById.values()).sort((a, b) => a.timestamp - b.timestamp);
       const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chatId);
-      // Only proceed if there are unsynced human messages that should actively trigger this bot.
-      // Other unsynced messages remain as context for the next trigger.
+      // Only proceed if there are pending human messages that should actively trigger this bot.
+      // Pending triggers are included even if a later bridge command has advanced sync_state.
       const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id));
       if (humanUnsynced.length === 0) {
         break;
@@ -985,6 +998,11 @@ export class FeishuBot {
   }
 
   private scheduleDelayedFailure(chatId: string, replyToMessageId: string, text: string, triggerId: number): void {
+    const lastRealDelivery = this.lastRealDeliveryAt.get(chatId) || 0;
+    if (Date.now() - lastRealDelivery < 90_000) {
+      console.log(`[${this.config.name}] Suppressed delayed runtime failure for ${chatId.slice(-8)} because a real reply was delivered recently`);
+      return;
+    }
     this.cancelDelayedFailure(chatId);
     const timer = setTimeout(() => {
       this.delayedFailureTimers.delete(chatId);
@@ -1040,6 +1058,9 @@ export class FeishuBot {
     });
     if (deliveryId === null) return;
     await this.dispatchPendingDeliveries(chatId, replyToMessageId);
+    if (sourceType === "assistant_visible" && (text.trim() || attachments.length > 0) && text.trim().toUpperCase() !== "NO_REPLY" && !this.isRuntimeFailureText(text.trim())) {
+      this.lastRealDeliveryAt.set(chatId, Date.now());
+    }
   }
 
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
@@ -1067,6 +1088,14 @@ export class FeishuBot {
           if (item.id) this.store.markDeliveryDelivered(item.id);
         } catch (err) {
           if (item.id) this.store.markDeliveryFailed(item.id);
+          const errorText = `⚠️ 附件发送失败：${this.errorSummary(err)}`;
+          const replyTarget = item.replyToMessageId || replyToMessageId;
+          try {
+            if (replyTarget) await this.replyMessage(replyTarget, errorText);
+            else await this.sendMessage(chatId, errorText);
+          } catch (notifyErr) {
+            console.warn(`[${this.config.name}] Failed to notify attachment delivery error:`, this.errorSummary(notifyErr));
+          }
           throw err;
         }
       });
@@ -1182,9 +1211,9 @@ export class FeishuBot {
 
   private validateBridgeAttachmentPath(filePath: string): string {
     const resolvedPath = resolve(filePath);
-    const allowedRoot = resolve(BRIDGE_ATTACHMENTS_DIR);
-    if (!(resolvedPath === allowedRoot || resolvedPath.startsWith(allowedRoot + "/"))) {
-      throw new Error(`Attachment path outside allowed directory: ${resolvedPath}`);
+    const isAllowed = BRIDGE_ATTACHMENT_ALLOWED_ROOTS.some((root) => resolvedPath === root || resolvedPath.startsWith(root + "/"));
+    if (!isAllowed) {
+      throw new Error(`Attachment path outside allowed directories (${BRIDGE_ATTACHMENT_ALLOWED_ROOTS.join(", ")}): ${resolvedPath}`);
     }
     if (!existsSync(resolvedPath)) throw new Error(`Attachment file not found: ${resolvedPath}`);
     const stats = statSync(resolvedPath);
@@ -1205,6 +1234,13 @@ export class FeishuBot {
 
   private isImagePath(filePath: string): boolean {
     return [".jpg", ".jpeg", ".png", ".webp", ".gif", ".tiff", ".bmp", ".ico"].includes(extname(filePath).toLowerCase());
+  }
+
+  private errorSummary(err: any): string {
+    const data = err?.response?.data || err?.data;
+    const code = data?.code ? `code=${data.code} ` : "";
+    const msg = data?.msg || data?.message || err?.message || String(err);
+    return `${code}${msg}`.slice(0, 800);
   }
 
   private async createFeishuDocFromMarkdown(filePath: string): Promise<{ title: string; url: string }> {
@@ -1239,11 +1275,18 @@ export class FeishuBot {
     const type = attachment.type || (this.isImagePath(filePath) ? "image" : "file");
 
     if (type === "document" && extname(filePath).toLowerCase() === ".md") {
-      const doc = await this.createFeishuDocFromMarkdown(filePath);
-      const caption = attachment.caption?.trim() || `飞书文档：${doc.title}`;
-      await this.sendMessage(chatId, `${caption}
-${doc.url}`);
-      return;
+      try {
+        const doc = await this.createFeishuDocFromMarkdown(filePath);
+        const caption = attachment.caption?.trim() || `飞书文档：${doc.title}`;
+        await this.sendMessage(chatId, `${caption}\n${doc.url}`);
+        return;
+      } catch (err) {
+        console.warn(`[${this.config.name}] Feishu doc conversion failed, falling back to file attachment:`, this.errorSummary(err));
+        const caption = attachment.caption?.trim();
+        await this.sendMessage(chatId, `${caption ? `${caption}\n` : ""}飞书文档创建失败，已改为 Markdown 文件附件发送。`);
+        await this.sendBridgeFileAttachment(chatId, filePath);
+        return;
+      }
     }
 
     if (attachment.caption?.trim()) await this.sendMessage(chatId, attachment.caption.trim());
@@ -1266,6 +1309,10 @@ ${doc.url}`);
       return;
     }
 
+    await this.sendBridgeFileAttachment(chatId, filePath);
+  }
+
+  private async sendBridgeFileAttachment(chatId: string, filePath: string): Promise<void> {
     const uploaded = await this.client.im.file.create({
       data: {
         file_type: this.inferFeishuFileType(filePath),
