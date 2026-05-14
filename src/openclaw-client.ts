@@ -192,11 +192,10 @@ export class OpenClawClient {
           }
           if (proactiveText) {
             if (this.suppressedSessions.has(rawKey) || this.suppressedSessions.has(shortKey)) {
-              console.log(`[OpenClaw] Suppressing proactive msg for ${shortKey} (active chatSend)`);
-            } else {
-              const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-              if (cb) cb(proactiveText);
+              console.log(`[OpenClaw] Forwarding proactive msg for ${shortKey} during active chatSend; delivery outbox will dedupe`);
             }
+            const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
+            if (cb) cb(proactiveText);
           }
 
           // Tool calls in assistant messages — skip, using agent item events instead

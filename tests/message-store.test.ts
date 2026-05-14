@@ -40,6 +40,31 @@ describe("MessageStore", () => {
     expect([...store.getPendingTriggerIds("GPT", "c1")]).toEqual([triggerId]);
   }));
 
+  it("deduplicates and claims delivery outbox items", () => withStore((store) => {
+    const base = {
+      sessionKey: "lma-gpt-chat1",
+      chatId: "chat1",
+      botName: "GPT",
+      sourceType: "assistant_visible",
+      sourceId: "s1",
+      deliveryKey: "trigger:1",
+      contentHash: "hash1",
+      content: "hello",
+      attachmentsJson: "[]",
+      replyToMessageId: "m1",
+    };
+    const id1 = store.enqueueDelivery(base)!;
+    const id2 = store.enqueueDelivery({ ...base, sourceId: "s2" });
+    expect(id1).toBeGreaterThan(0);
+    expect(id2).toBeNull();
+    expect(store.getPendingDeliveries("chat1", "GPT")).toHaveLength(1);
+    expect(store.claimDelivery(id1)).toBe(true);
+    expect(store.claimDelivery(id1)).toBe(false);
+    store.markDeliveryDelivered(id1);
+    expect(store.getPendingDeliveries("chat1", "GPT")).toHaveLength(0);
+    expect(store.hasRecentSimilarDelivery("GPT", "chat1", "hash1", 60_000)).toBe(true);
+  }));
+
   it("tracks delivered replies idempotently", () => withStore((store) => {
     expect(store.hasDeliveredReply("GPT", "c1", 42)).toBe(false);
     store.markDeliveredReply("GPT", "c1", 42, "reply-1");

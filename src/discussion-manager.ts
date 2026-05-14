@@ -24,7 +24,7 @@ type DiscussionSession = {
 
 export type DiscussionParticipant = {
   name: string;
-  runDiscussionTurn(chatId: string, prompt: string): Promise<ReplyResult>;
+  runDiscussionTurn(chatId: string, prompt: string, meta?: { round: number; maxRounds: number }): Promise<ReplyResult>;
 };
 
 export class DiscussionManager {
@@ -111,7 +111,7 @@ export class DiscussionManager {
       const results = await Promise.allSettled(
         participants.map(async (participant) => {
           try {
-            return await participant.runDiscussionTurn(session.chatId, prompt);
+            return await participant.runDiscussionTurn(session.chatId, prompt, { round: session.currentRound, maxRounds: session.maxRounds });
           } catch (err) {
             return {
               botName: participant.name,

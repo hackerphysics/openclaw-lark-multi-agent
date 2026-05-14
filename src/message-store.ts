@@ -32,6 +32,24 @@ export interface ChatMessage {
   timestamp: number; // unix ms
 }
 
+export interface DeliveryOutboxItem {
+  id?: number;
+  sessionKey: string;
+  chatId: string;
+  botName: string;
+  sourceType: string;
+  sourceId: string;
+  deliveryKey: string;
+  contentHash: string;
+  content: string;
+  attachmentsJson: string;
+  replyToMessageId: string;
+  status: "pending" | "delivering" | "delivered" | "failed";
+  attempts: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
 export class MessageStore {
   private db: Database.Database;
 
@@ -116,7 +134,71 @@ export class MessageStore {
         updated_at INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (bot_name, chat_id)
       );
+
+      -- Durable delivery ledger for user-visible assistant outputs. All final
+      -- text/attachment outputs should be inserted here first and dispatched
+      -- once, regardless of whether they came from chat final, proactive
+      -- session.message, subagent announce, or delayed error handling.
+      CREATE TABLE IF NOT EXISTS delivery_outbox (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        bot_name TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_id TEXT NOT NULL,
+        delivery_key TEXT NOT NULL DEFAULT '',
+        content_hash TEXT NOT NULL DEFAULT '',
+        content TEXT NOT NULL DEFAULT '',
+        attachments_json TEXT NOT NULL DEFAULT '[]',
+        reply_to_message_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL DEFAULT 'pending',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE(bot_name, chat_id, delivery_key),
+        UNIQUE(session_key, source_type, source_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_delivery_outbox_pending ON delivery_outbox(status, created_at);
     `);
+
+    // Migration: add delivery_outbox delivery key columns if missing
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN delivery_key TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN reply_to_message_id TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+    // Backfill stable keys for rows created by earlier outbox experiments before
+    // creating indexes that reference the new columns.
+    this.db.exec(`
+      UPDATE delivery_outbox
+      SET delivery_key = source_id
+      WHERE delivery_key IS NULL OR delivery_key = '';
+    `);
+    try {
+      this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_key ON delivery_outbox(bot_name, chat_id, delivery_key)`);
+    } catch {
+      // Existing duplicate experimental rows can prevent index creation in dev DB.
+      // Fresh DBs still get the table-level UNIQUE constraint; dirty DBs still use
+      // source unique + short-window content hash until cleaned.
+    }
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_delivery_outbox_content ON delivery_outbox(bot_name, chat_id, content_hash, created_at)`);
+
+    // Migration: add delivery_outbox reply target if missing
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN reply_to_message_id TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
 
     // Migration: add verbose column if missing
     try {
@@ -235,6 +317,88 @@ export class MessageStore {
       INSERT OR IGNORE INTO delivered_replies (bot_name, chat_id, trigger_message_row_id, delivered_at, reply_message_id)
       VALUES (?, ?, ?, ?, ?)
     `).run(botName, chatId, triggerMessageRowId, Date.now(), replyMessageId);
+  }
+
+  enqueueDelivery(item: Omit<DeliveryOutboxItem, "id" | "status" | "attempts" | "createdAt" | "updatedAt">): number | null {
+    const now = Date.now();
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO delivery_outbox
+        (session_key, chat_id, bot_name, source_type, source_id, delivery_key, content_hash, content, attachments_json, reply_to_message_id, status, attempts, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+    `).run(item.sessionKey, item.chatId, item.botName, item.sourceType, item.sourceId, item.deliveryKey, item.contentHash, item.content, item.attachmentsJson, item.replyToMessageId || '', now, now);
+    return result.changes ? Number(result.lastInsertRowid) : null;
+  }
+
+  getDeliveryBySource(sessionKey: string, sourceType: string, sourceId: string): DeliveryOutboxItem | null {
+    const row = this.db.prepare(`
+      SELECT * FROM delivery_outbox
+      WHERE session_key = ? AND source_type = ? AND source_id = ?
+    `).get(sessionKey, sourceType, sourceId) as any;
+    return row ? this.mapDelivery(row) : null;
+  }
+
+  getPendingDeliveries(chatId?: string, botName?: string, maxCount: number = 20): DeliveryOutboxItem[] {
+    if (chatId && botName) {
+      const rows = this.db.prepare(`
+        SELECT * FROM delivery_outbox
+        WHERE status = 'pending' AND chat_id = ? AND bot_name = ?
+        ORDER BY created_at ASC LIMIT ?
+      `).all(chatId, botName, maxCount) as any[];
+      return rows.map((r) => this.mapDelivery(r));
+    }
+    const rows = this.db.prepare(`
+      SELECT * FROM delivery_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?
+    `).all(maxCount) as any[];
+    return rows.map((r) => this.mapDelivery(r));
+  }
+
+  hasRecentSimilarDelivery(botName: string, chatId: string, contentHash: string, windowMs: number): boolean {
+    if (!contentHash) return false;
+    const row = this.db.prepare(`
+      SELECT 1 FROM delivery_outbox
+      WHERE bot_name = ? AND chat_id = ? AND content_hash = ? AND created_at >= ? AND status IN ('pending', 'delivering', 'delivered')
+      LIMIT 1
+    `).get(botName, chatId, contentHash, Date.now() - windowMs);
+    return !!row;
+  }
+
+  claimDelivery(id: number): boolean {
+    const result = this.db.prepare(`
+      UPDATE delivery_outbox SET status = 'delivering', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'
+    `).run(Date.now(), id);
+    return result.changes === 1;
+  }
+
+  markDeliveryDelivered(id: number): void {
+    this.db.prepare(`
+      UPDATE delivery_outbox SET status = 'delivered', updated_at = ? WHERE id = ?
+    `).run(Date.now(), id);
+  }
+
+  markDeliveryFailed(id: number): void {
+    this.db.prepare(`
+      UPDATE delivery_outbox SET status = 'failed', updated_at = ? WHERE id = ?
+    `).run(Date.now(), id);
+  }
+
+  private mapDelivery(row: any): DeliveryOutboxItem {
+    return {
+      id: row.id,
+      sessionKey: row.session_key,
+      chatId: row.chat_id,
+      botName: row.bot_name,
+      sourceType: row.source_type,
+      sourceId: row.source_id,
+      deliveryKey: row.delivery_key || row.source_id,
+      contentHash: row.content_hash || '',
+      content: row.content || '',
+      attachmentsJson: row.attachments_json || '[]',
+      replyToMessageId: row.reply_to_message_id || '',
+      status: row.status,
+      attempts: row.attempts || 0,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
   }
 
   /**

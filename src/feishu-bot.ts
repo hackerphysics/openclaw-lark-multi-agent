@@ -142,11 +142,8 @@ export class FeishuBot {
       try {
         console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
         const parsed = this.extractBridgeAttachments(text);
-        if (parsed.text.trim()) this.cancelDelayedFailure(chatId);
-        if (parsed.text.trim()) await this.sendMessage(chatId, parsed.text);
-        for (const attachment of parsed.attachments) {
-          await this.sendBridgeAttachment(chatId, attachment);
-        }
+        if (parsed.text.trim() || parsed.attachments.length > 0) this.cancelDelayedFailure(chatId);
+        await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`), parsed.text.trim(), parsed.attachments);
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
       }
@@ -756,23 +753,8 @@ export class FeishuBot {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
           } else {
-            await this.sendOrdered(chatId, async () => {
-              if (shouldReply) {
-                try {
-                  await this.replyMessage(lastHuman.messageId, visibleReply);
-                } catch (err) {
-                  // Reply can fail for historical messages sent before this bot joined the chat
-                  // (Feishu 230002: Bot/User can NOT be out of the chat). Fall back to a normal
-                  // chat message so queue processing still completes.
-                  console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
-                  await this.sendMessage(chatId, visibleReply);
-                }
-              }
-              for (const attachment of parsedReply.attachments) {
-                await this.sendBridgeAttachment(chatId, attachment);
-              }
-              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
-            });
+            await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`), shouldReply ? visibleReply : "", parsedReply.attachments, lastHuman.messageId, `trigger:${triggerId}`);
+            if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
           }
         }
         if (isRuntimeFailure && lastHuman.messageId) {
@@ -798,14 +780,11 @@ export class FeishuBot {
         console.error(`[${this.config.name}] processQueue error:`, err);
         const errorText = this.formatUserVisibleError(err);
         if (lastHuman.messageId) {
-          await this.sendOrdered(chatId, async () => {
-            try {
-              await this.replyMessage(lastHuman.messageId, errorText);
-            } catch {
-              await this.sendMessage(chatId, errorText);
-            }
-            if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
-          }).catch(() => {});
+          await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
+            .then(() => {
+              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+            })
+            .catch(() => {});
         }
         if (triggerId) {
           // The run failed after OpenClaw/provider rejected it. Notify the user
@@ -983,18 +962,85 @@ export class FeishuBot {
     this.cancelDelayedFailure(chatId);
     const timer = setTimeout(() => {
       this.delayedFailureTimers.delete(chatId);
-      void this.sendOrdered(chatId, async () => {
-        try {
-          await this.replyMessage(replyToMessageId, text);
-        } catch {
-          await this.sendMessage(chatId, text);
-        }
-        if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
-      }).catch((err) => {
-        console.warn(`[${this.config.name}] delayed failure delivery failed:`, (err as Error).message);
-      });
+      void this.enqueueAndDispatchDelivery(chatId, "delayed_error", `trigger:${triggerId}:delayed-error`, text, [], replyToMessageId, `trigger:${triggerId}:delayed-error`)
+        .then(() => {
+          if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
+        })
+        .catch((err) => {
+          console.warn(`[${this.config.name}] delayed failure delivery failed:`, (err as Error).message);
+        });
     }, 60_000);
     this.delayedFailureTimers.set(chatId, timer);
+  }
+
+  private deliverySessionKey(chatId: string): string {
+    return this.getSessionKey(chatId);
+  }
+
+  private stableHash(text: string): string {
+    let hash = 2166136261;
+    for (let i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  private deliverySourceId(kind: string, text: string): string {
+    return `${kind}:${this.stableHash(text)}`;
+  }
+
+  private async enqueueAndDispatchDelivery(chatId: string, sourceType: string, sourceId: string, text: string, attachments: BridgeAttachment[] = [], replyToMessageId?: string, deliveryKey?: string): Promise<void> {
+    if (!text.trim() && attachments.length === 0) return;
+    const normalizedPayload = `${text.trim()}|${JSON.stringify(attachments)}`;
+    const contentHash = this.stableHash(normalizedPayload);
+    const finalDeliveryKey = deliveryKey || sourceId;
+    if (!deliveryKey && this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000)) return;
+    const deliveryId = this.store.enqueueDelivery({
+      sessionKey: this.deliverySessionKey(chatId),
+      chatId,
+      botName: this.config.name,
+      sourceType,
+      sourceId,
+      deliveryKey: finalDeliveryKey,
+      contentHash,
+      content: text,
+      attachmentsJson: JSON.stringify(attachments),
+      replyToMessageId: replyToMessageId || "",
+    });
+    if (deliveryId === null) return;
+    await this.dispatchPendingDeliveries(chatId, replyToMessageId);
+  }
+
+  private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
+    const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
+    for (const item of pending) {
+      await this.sendOrdered(chatId, async () => {
+        try {
+          if (!item.id || !this.store.claimDelivery(item.id)) return;
+          const attachments = JSON.parse(item.attachmentsJson || "[]") as BridgeAttachment[];
+          if (item.content.trim()) {
+            const replyTarget = item.replyToMessageId || replyToMessageId;
+            const shouldReplyToSource = replyTarget && (item.sourceType === "assistant_visible" || item.sourceType === "provider_error" || item.sourceType === "delayed_error");
+            if (shouldReplyToSource) {
+              try {
+                await this.replyMessage(replyTarget, item.content);
+              } catch (err) {
+                console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
+                await this.sendMessage(chatId, item.content);
+              }
+            } else {
+              await this.sendMessage(chatId, item.content);
+            }
+          }
+          for (const attachment of attachments) await this.sendBridgeAttachment(chatId, attachment);
+          if (item.id) this.store.markDeliveryDelivered(item.id);
+        } catch (err) {
+          if (item.id) this.store.markDeliveryFailed(item.id);
+          throw err;
+        }
+      });
+    }
   }
 
   private isDiscussionCoordinator(): boolean {
@@ -1008,11 +1054,11 @@ export class FeishuBot {
       .filter((bot) => bot.store === this.store && bot.store.getBotMode(bot.config.name, chatId) === "free")
       .map((bot) => ({
         name: bot.config.name,
-        runDiscussionTurn: async (_chatId: string, prompt: string) => bot.runDiscussionTurn(chatId, prompt),
+        runDiscussionTurn: async (_chatId: string, prompt: string, meta?: { round: number; maxRounds: number }) => bot.runDiscussionTurn(chatId, prompt, meta),
       }));
   }
 
-  private async runDiscussionTurn(chatId: string, prompt: string): Promise<ReplyResult> {
+  private async runDiscussionTurn(chatId: string, prompt: string, meta?: { round: number; maxRounds: number }): Promise<ReplyResult> {
     const sessionKey = await this.ensureSession(chatId);
     const reply = await this.openclawClient.chatSendWithContext({
       sessionKey,
@@ -1023,8 +1069,11 @@ export class FeishuBot {
       timeoutMs: 1_800_000,
     });
     const parsedReply = this.extractBridgeAttachments(reply);
-    const visibleReply = parsedReply.text.trim();
+    let visibleReply = parsedReply.text.trim();
     const isVisible = visibleReply.length > 0 && visibleReply.toUpperCase() !== "NO_REPLY";
+    if (isVisible && meta) {
+      visibleReply = `${visibleReply}\n\n—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
+    }
     if (isVisible || parsedReply.attachments.length > 0) {
       const storedContent = [visibleReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
         .filter(Boolean)
@@ -1037,10 +1086,7 @@ export class FeishuBot {
         content: storedContent,
         timestamp: Date.now(),
       });
-      await this.sendOrdered(chatId, async () => {
-        if (isVisible) await this.sendMessage(chatId, visibleReply);
-        for (const attachment of parsedReply.attachments) await this.sendBridgeAttachment(chatId, attachment);
-      });
+      await this.enqueueAndDispatchDelivery(chatId, "discussion", `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`, isVisible ? visibleReply : "", parsedReply.attachments);
     }
     return { botName: this.config.name, text: visibleReply, visible: isVisible };
   }

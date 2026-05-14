@@ -356,6 +356,25 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("deduplicates assistant delivery across repeated enqueue attempts", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "same text", [], "reply-1", "trigger:1");
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "same text", [], "reply-1", "trigger:1");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(1);
+      expect(h.store.getPendingDeliveries("chat1", "GPT")).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("uses short-window content dedupe for source-only proactive duplicates", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "same proactive text", []);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "same proactive text", []);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+    } finally { h.cleanup(); }
+  });
+
   it("notifies the group when provider errors happen", async () => {
     const h = makeHarness("GLM");
     try {
