@@ -40,9 +40,12 @@ export class OpenClawClient {
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
   /** Session keys that should be re-subscribed on reconnect */
   private subscribedKeys: Set<string> = new Set();
-  /** Session keys with active/recent chatSend — suppress proactive message delivery */
+  /** Session keys with active/recent chatSend — proactive is forwarded and deduped by outbox. */
   private suppressedSessions: Set<string> = new Set();
   private suppressedSessionTimers: Map<string, NodeJS.Timeout> = new Map();
+  /** Session keys whose proactive messages must be dropped by the bridge (e.g. discussion scheduler owns delivery). */
+  private mutedProactiveSessions: Set<string> = new Set();
+  private mutedProactiveSessionCounts: Map<string, number> = new Map();
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -159,44 +162,7 @@ export class OpenClawClient {
           // Try both raw key and without agent:main: prefix
           const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
           const msg = frame.payload.message || frame.payload;
-          const role = msg.role;
-          const content = msg.content;
-
-          // Proactive assistant text messages (suppress during active chatSend).
-          // Cron/session-targeted runs often emit structured content arrays rather
-          // than a plain string. Extract only visible text parts and ignore thinking
-          // / tool blocks so the bridge can deliver final cron results via the bot.
-          let proactiveText = "";
-          if (role === "assistant") {
-            if (typeof content === "string") {
-              proactiveText = content;
-            } else if (Array.isArray(content)) {
-              const hasToolBlock = content.some((part: any) => {
-                const type = String(part?.type || "").toLowerCase();
-                return type === "toolcall" || type === "tool_call" || type === "tooluse" || type === "tool_use" || type === "toolresult" || type === "tool_result";
-              });
-              // Do not deliver mixed text+toolCall assistant messages through
-              // the proactive final-text path; those are usually intermediate
-              // reasoning/status during a tool loop. Tool calls are still
-              // delivered via the verbose channel from agent item events when
-              // /verbose is enabled. Cron final messages arrive as text-only
-              // (optionally with thinking).
-              if (!hasToolBlock) {
-                proactiveText = content
-                  .filter((part: any) => part?.type === "text" && typeof part.text === "string")
-                  .map((part: any) => part.text)
-                  .join("\n")
-                  .trim();
-              }
-            }
-          }
-          if (proactiveText) {
-            if (this.suppressedSessions.has(rawKey) || this.suppressedSessions.has(shortKey)) {
-              console.log(`[OpenClaw] Forwarding proactive msg for ${shortKey} during active chatSend; delivery outbox will dedupe`);
-            }
-            const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-            if (cb) cb(proactiveText);
-          }
+          this.handleProactiveSessionMessage(rawKey, msg);
 
           // Tool calls in assistant messages — skip, using agent item events instead
           // (session.message toolCall events are batched, not real-time)
@@ -230,6 +196,52 @@ export class OpenClawClient {
         }
       });
     });
+  }
+
+  private handleProactiveSessionMessage(rawKey: string, msg: any): boolean {
+    const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+    const role = msg.role;
+    const content = msg.content;
+
+    // Proactive assistant text messages. Cron/session-targeted runs often emit
+    // structured content arrays rather than a plain string. Extract only visible
+    // text parts and ignore thinking/tool blocks so the bridge can deliver final
+    // cron results via the bot.
+    let proactiveText = "";
+    if (role === "assistant") {
+      if (typeof content === "string") {
+        proactiveText = content;
+      } else if (Array.isArray(content)) {
+        const hasToolBlock = content.some((part: any) => {
+          const type = String(part?.type || "").toLowerCase();
+          return type === "toolcall" || type === "tool_call" || type === "tooluse" || type === "tool_use" || type === "toolresult" || type === "tool_result";
+        });
+        // Do not deliver mixed text+toolCall assistant messages through
+        // the proactive final-text path; those are usually intermediate
+        // reasoning/status during a tool loop. Tool calls are still
+        // delivered via the verbose channel from agent item events when
+        // /verbose is enabled. Cron final messages arrive as text-only
+        // (optionally with thinking).
+        if (!hasToolBlock) {
+          proactiveText = content
+            .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+            .map((part: any) => part.text)
+            .join("\n")
+            .trim();
+        }
+      }
+    }
+    if (!proactiveText) return false;
+    if (this.mutedProactiveSessions.has(rawKey) || this.mutedProactiveSessions.has(shortKey)) {
+      console.log(`[OpenClaw] Dropping proactive msg for ${shortKey}; delivery is owned by the caller`);
+      return false;
+    }
+    if (this.suppressedSessions.has(rawKey) || this.suppressedSessions.has(shortKey)) {
+      console.log(`[OpenClaw] Forwarding proactive msg for ${shortKey} during active chatSend; delivery outbox will dedupe`);
+    }
+    const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
+    if (cb) cb(proactiveText);
+    return Boolean(cb);
   }
 
   private scheduleReconnect(): void {
@@ -520,6 +532,39 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     }
   }
 
+  private addMutedProactiveKey(key: string): void {
+    const count = this.mutedProactiveSessionCounts.get(key) || 0;
+    this.mutedProactiveSessionCounts.set(key, count + 1);
+    this.mutedProactiveSessions.add(key);
+  }
+
+  private releaseMutedProactiveKey(key: string): void {
+    const count = this.mutedProactiveSessionCounts.get(key) || 0;
+    if (count <= 1) {
+      this.mutedProactiveSessionCounts.delete(key);
+      this.mutedProactiveSessions.delete(key);
+    } else {
+      this.mutedProactiveSessionCounts.set(key, count - 1);
+    }
+  }
+
+  muteProactiveDelivery(sessionKey: string): (delayMs?: number) => void {
+    const shortKey = sessionKey.startsWith("agent:main:") ? sessionKey.slice("agent:main:".length) : sessionKey;
+    const fullKey = `agent:main:${shortKey}`;
+    const keys = [shortKey, fullKey];
+    for (const key of keys) this.addMutedProactiveKey(key);
+    let released = false;
+    return (delayMs = 0) => {
+      if (released) return;
+      released = true;
+      const release = () => {
+        for (const key of keys) this.releaseMutedProactiveKey(key);
+      };
+      if (delayMs > 0) setTimeout(release, delayMs);
+      else release();
+    };
+  }
+
   async chatSend(params: {
     sessionKey: string;
     message: string;
@@ -664,6 +709,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     for (const timer of this.suppressedSessionTimers.values()) clearTimeout(timer);
     this.suppressedSessionTimers.clear();
     this.suppressedSessions.clear();
+    this.mutedProactiveSessions.clear();
+    this.mutedProactiveSessionCounts.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;

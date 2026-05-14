@@ -65,6 +65,25 @@ describe("MessageStore", () => {
     expect(store.hasRecentSimilarDelivery("GPT", "chat1", "hash1", 60_000)).toBe(true);
   }));
 
+  it("detects recent overlapping deliveries with matching attachments", () => withStore((store) => {
+    const base = {
+      sessionKey: "lma-gpt-chat1",
+      chatId: "chat1",
+      botName: "GPT",
+      sourceType: "assistant_visible",
+      sourceId: "s1",
+      deliveryKey: "trigger:1",
+      contentHash: "hash1",
+      content: "我先说明一下。最终结果是 ABC。",
+      attachmentsJson: "[]",
+      replyToMessageId: "m1",
+    };
+    store.enqueueDelivery(base);
+    expect(store.hasRecentOverlappingDelivery("GPT", "chat1", "最终结果是 ABC。", "[]", 60_000, 8)).toBe(true);
+    expect(store.hasRecentOverlappingDelivery("GPT", "chat1", "OK", "[]", 60_000, 8)).toBe(false);
+    expect(store.hasRecentOverlappingDelivery("GPT", "chat1", "最终结果是 ABC。", JSON.stringify([{ type: "file", path: "/x" }]), 60_000, 8)).toBe(false);
+  }));
+
   it("tracks delivered replies idempotently", () => withStore((store) => {
     expect(store.hasDeliveredReply("GPT", "c1", 42)).toBe(false);
     store.markDeliveredReply("GPT", "c1", 42, "reply-1");

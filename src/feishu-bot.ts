@@ -534,6 +534,8 @@ export class FeishuBot {
 
       // --- Discuss mode: group-level multi-bot round scheduler. It takes over
       // plain human messages so normal Free mode does not duplicate Round 1.
+      // Targeted mentions must fall through to normal routing so @GPT still
+      // works while discuss mode is enabled.
       if (chatType !== "p2p" && !isBot && this.store.getChatInfo(chatId)?.discuss) {
         const mentions: any[] = message.mentions || [];
         const hasTargetedMention = mentions.some((m: any) => !this.isAllMentionItem(m));
@@ -992,10 +994,14 @@ export class FeishuBot {
 
   private async enqueueAndDispatchDelivery(chatId: string, sourceType: string, sourceId: string, text: string, attachments: BridgeAttachment[] = [], replyToMessageId?: string, deliveryKey?: string): Promise<void> {
     if (!text.trim() && attachments.length === 0) return;
-    const normalizedPayload = `${text.trim()}|${JSON.stringify(attachments)}`;
+    const attachmentsJson = JSON.stringify(attachments);
+    const normalizedPayload = `${text.trim()}|${attachmentsJson}`;
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
-    if (!deliveryKey && this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000)) return;
+    if (!deliveryKey) {
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000)) return;
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8)) return;
+    }
     const deliveryId = this.store.enqueueDelivery({
       sessionKey: this.deliverySessionKey(chatId),
       chatId,
@@ -1005,7 +1011,7 @@ export class FeishuBot {
       deliveryKey: finalDeliveryKey,
       contentHash,
       content: text,
-      attachmentsJson: JSON.stringify(attachments),
+      attachmentsJson,
       replyToMessageId: replyToMessageId || "",
     });
     if (deliveryId === null) return;
@@ -1060,22 +1066,35 @@ export class FeishuBot {
 
   private async runDiscussionTurn(chatId: string, prompt: string, meta?: { round: number; maxRounds: number }): Promise<ReplyResult> {
     const sessionKey = await this.ensureSession(chatId);
-    const reply = await this.openclawClient.chatSendWithContext({
-      sessionKey,
-      unsyncedMessages: [],
-      currentMessage: prompt,
-      currentSenderName: "Discussion Scheduler",
-      deliver: false,
-      timeoutMs: 1_800_000,
-    });
+    const releaseProactiveMute = this.openclawClient.muteProactiveDelivery(sessionKey);
+    let reply: string;
+    try {
+      reply = await this.openclawClient.chatSendWithContext({
+        sessionKey,
+        unsyncedMessages: [],
+        currentMessage: prompt,
+        currentSenderName: "Discussion Scheduler",
+        deliver: false,
+        timeoutMs: 1_800_000,
+      });
+    } finally {
+      // OpenClaw can emit the final assistant session.message shortly after
+      // chatSend/collectReply returns. Keep discussion proactive muted briefly;
+      // the discussion coordinator already owns user-visible delivery.
+      releaseProactiveMute(120_000);
+    }
     const parsedReply = this.extractBridgeAttachments(reply);
-    let visibleReply = parsedReply.text.trim();
-    const isVisible = visibleReply.length > 0 && visibleReply.toUpperCase() !== "NO_REPLY";
+    const rawVisibleReply = parsedReply.text.trim();
+    const discussionMarkerPattern = /\n*—— 第 \d+\/\d+ 轮 · .+$/;
+    const cleanVisibleReply = rawVisibleReply.replace(discussionMarkerPattern, "").trim();
+    let displayReply = cleanVisibleReply;
+    const isVisible = cleanVisibleReply.length > 0 && cleanVisibleReply.toUpperCase() !== "NO_REPLY";
     if (isVisible && meta) {
-      visibleReply = `${visibleReply}\n\n—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
+      const roundMarker = `—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
+      displayReply = `${displayReply}\n\n${roundMarker}`;
     }
     if (isVisible || parsedReply.attachments.length > 0) {
-      const storedContent = [visibleReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
+      const storedContent = [displayReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
         .filter(Boolean)
         .join("\n");
       this.store.insert({
@@ -1086,9 +1105,9 @@ export class FeishuBot {
         content: storedContent,
         timestamp: Date.now(),
       });
-      await this.enqueueAndDispatchDelivery(chatId, "discussion", `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`, isVisible ? visibleReply : "", parsedReply.attachments);
+      await this.enqueueAndDispatchDelivery(chatId, "discussion", `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`, isVisible ? displayReply : "", parsedReply.attachments);
     }
-    return { botName: this.config.name, text: visibleReply, visible: isVisible };
+    return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
   }
 
   private async replyMessage(messageId: string, text: string) {

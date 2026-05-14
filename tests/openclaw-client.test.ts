@@ -68,6 +68,23 @@ describe("OpenClawClient collectReply", () => {
   });
 });
 
+describe("OpenClawClient proactive delivery mute", () => {
+  it("drops muted proactive assistant messages and resumes after release", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("s1", callback);
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+
+    const release = client.muteProactiveDelivery("s1");
+    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "hidden" })).toBe(false);
+    expect(callback).not.toHaveBeenCalled();
+
+    release();
+    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "visible" })).toBe(true);
+    expect(callback).toHaveBeenCalledWith("visible");
+  });
+});
+
 describe("OpenClawClient bridge attachment hint", () => {
   function clientWithCapturedChatSend() {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);

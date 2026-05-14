@@ -134,10 +134,25 @@ export class DiscussionManager {
       }
       current.completedRounds.push({ round: current.currentRound, replies });
 
+      const noReplyNames = participants
+        .map((participant) => participant.name)
+        .filter((name) => {
+          const text = (replies[name] || "").trim();
+          return !text || text.toUpperCase() === "NO_REPLY";
+        });
+      const errorNames = participants
+        .map((participant) => participant.name)
+        .filter((name) => (replies[name] || "").trim().startsWith("[ERROR]"));
       const allNoReply = participants.every((participant) => {
         const text = (replies[participant.name] || "").trim();
         return !text || text.toUpperCase() === "NO_REPLY" || text.startsWith("[ERROR]");
       });
+      if (sendSystemMessage && !allNoReply && (noReplyNames.length > 0 || errorNames.length > 0)) {
+        const parts: string[] = [];
+        if (noReplyNames.length > 0) parts.push(`${noReplyNames.join("、")} 无新增回复`);
+        if (errorNames.length > 0) parts.push(`${errorNames.join("、")} 出错`);
+        await sendSystemMessage(`💬 第 ${current.currentRound}/${current.maxRounds} 轮：${parts.join("；")}`).catch(() => {});
+      }
       if (allNoReply) {
         current.status = "completed";
         this.sessions.delete(current.chatId);

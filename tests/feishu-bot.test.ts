@@ -16,6 +16,7 @@ class MockOpenClaw {
   async patchSession() {}
   async subscribeSession() {}
   onToolEvent() {}
+  muteProactiveDelivery = vi.fn(() => vi.fn());
   async chatSendWithContext(params: any) {
     this.chatCalls.push(params);
     if (this.replies.length > 0) return this.replies.shift()!;
@@ -162,6 +163,35 @@ describe("FeishuBot routing and queue behavior", () => {
       gpt.cleanup();
       claude.cleanup();
     }
+  });
+
+  it("lets targeted mentions fall through while discuss mode is enabled", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.setDiscussMode("chat1", true);
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（GPT） 你好",
+        messageId: "targeted-discuss",
+        mentions: [{ name: "万万（GPT）", id: { app_id: "app-GPT", open_id: "gpt-open-id" } }],
+      }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("targeted-discuss", "mock reply");
+    } finally { h.cleanup(); }
+  });
+
+  it("adds discussion round markers once and keeps raw text for the next round", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.replies.push("观点正文\n\n—— 第 1/3 轮 · Claude");
+      const result = await (h.bot as any).runDiscussionTurn("chat1", "prompt", { round: 1, maxRounds: 3 });
+      expect(result.text).toBe("观点正文");
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+      const sent = (h.bot as any).sendMessage.mock.calls[0][1];
+      expect(sent.match(/—— 第 1\/3 轮 · Claude/g)).toHaveLength(1);
+      expect(h.openclaw.muteProactiveDelivery).toHaveBeenCalledWith("lma-claude-chat1");
+    } finally { h.cleanup(); }
   });
 
   it("handles bridge /verbose locally and does not forward it", async () => {
@@ -371,6 +401,15 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "same proactive text", []);
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "same proactive text", []);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+    } finally { h.cleanup(); }
+  });
+
+  it("uses short-window containment dedupe for chat-final plus proactive overlap", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "我来处理。最终结果是 OK。", []);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "最终结果是 OK。", []);
       expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
     } finally { h.cleanup(); }
   });

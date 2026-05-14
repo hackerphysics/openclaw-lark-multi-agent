@@ -38,6 +38,7 @@ describe("DiscussionManager", () => {
     expect(calls[2].prompt).toContain("当前轮次：2");
     expect(calls[2].prompt).toContain("GPT: g1");
     expect(calls[2].prompt).toContain("Claude: c1");
+    expect(systemMessages).toContain("💬 第 2/2 轮：Claude 无新增回复");
     expect(systemMessages.at(-1)).toContain("已达到 2 轮");
   });
 

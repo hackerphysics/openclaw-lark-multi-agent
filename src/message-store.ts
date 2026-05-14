@@ -362,6 +362,26 @@ export class MessageStore {
     return !!row;
   }
 
+  hasRecentOverlappingDelivery(botName: string, chatId: string, content: string, attachmentsJson: string, windowMs: number, minShortLength: number = 8): boolean {
+    const normalized = content.trim();
+    if (normalized.length < minShortLength) return false;
+    const rows = this.db.prepare(`
+      SELECT content, attachments_json FROM delivery_outbox
+      WHERE bot_name = ? AND chat_id = ? AND created_at >= ? AND status IN ('pending', 'delivering', 'delivered')
+      ORDER BY created_at DESC
+      LIMIT 20
+    `).all(botName, chatId, Date.now() - windowMs) as any[];
+    for (const row of rows) {
+      if ((row.attachments_json || '[]') !== attachmentsJson) continue;
+      const existing = String(row.content || '').trim();
+      if (existing.length < minShortLength) continue;
+      const shorter = existing.length <= normalized.length ? existing : normalized;
+      const longer = existing.length <= normalized.length ? normalized : existing;
+      if (shorter.length >= minShortLength && longer.includes(shorter)) return true;
+    }
+    return false;
+  }
+
   claimDelivery(id: number): boolean {
     const result = this.db.prepare(`
       UPDATE delivery_outbox SET status = 'delivering', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'
