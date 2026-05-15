@@ -1283,6 +1283,19 @@ export class FeishuBot {
     return `${code}${msg}`.slice(0, 800);
   }
 
+  private stripReadOnlyDocxFields<T>(value: T): T {
+    if (Array.isArray(value)) return value.map((item) => this.stripReadOnlyDocxFields(item)) as T;
+    if (value && typeof value === "object") {
+      const out: Record<string, any> = {};
+      for (const [key, child] of Object.entries(value as Record<string, any>)) {
+        if (key === "merge_info") continue;
+        out[key] = this.stripReadOnlyDocxFields(child);
+      }
+      return out as T;
+    }
+    return value;
+  }
+
   private async createFeishuDocFromMarkdown(filePath: string): Promise<{ title: string; url: string }> {
     const rawTitle = basename(filePath).replace(/\.[^.]+$/, "").trim() || "Markdown Document";
     const markdown = readFileSync(filePath, "utf8");
@@ -1294,7 +1307,7 @@ export class FeishuBot {
 
     const converted = await docx.document.convert({ data: { content_type: "markdown", content: markdown } });
     const convertedData = converted?.data || converted;
-    const blocks = convertedData?.blocks || [];
+    const blocks = this.stripReadOnlyDocxFields(convertedData?.blocks || []);
     const firstLevelBlockIds = convertedData?.first_level_block_ids || [];
     if (Array.isArray(blocks) && blocks.length > 0) {
       await docx.documentBlockDescendant.create({

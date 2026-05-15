@@ -91,6 +91,14 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("strips read-only docx fields from converted blocks", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const cleaned = (h.bot as any).stripReadOnlyDocxFields([{ table: { cells: [{ merge_info: { row_span: 1 }, text: "x" }] }, merge_info: { col_span: 1 } }]);
+      expect(cleaned).toEqual([{ table: { cells: [{ text: "x" }] } }]);
+    } finally { h.cleanup(); }
+  });
+
   it("hydrates image keys embedded in rich post text into local image paths", async () => {
     const h = makeHarness("GPT");
     try {
