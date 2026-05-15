@@ -10,11 +10,12 @@ class MockOpenClaw {
   chatCalls: any[] = [];
   replies: string[] = [];
   resolvers: Array<(value: string) => void> = [];
+  sessionCallbacks = new Map<string, (text: string) => void>();
   async getSessionInfo() { return { session: { totalTokens: 0 } }; }
   async ensureModel() { return false; }
   async createSession() {}
   async patchSession() {}
-  async subscribeSession() {}
+  async subscribeSession(sessionKey: string, onMessage: (text: string) => void) { this.sessionCallbacks.set(sessionKey, onMessage); }
   onToolEvent() {}
   muteProactiveDelivery = vi.fn(() => vi.fn());
   async chatSendWithContext(params: any) {
@@ -463,6 +464,19 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(60_000);
       await Promise.resolve();
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("runtime-fail", expect.stringContaining("原因: rpc"));
+    } finally { h.cleanup(); }
+  });
+
+  it("deduplicates proactive and final delivery for the same active trigger", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const release = (h.bot as any).setActiveDeliveryTarget("chat1", 42, "reply-42");
+      const activeTarget = (h.bot as any).activeDeliveryTargets.get("chat1");
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "proactive-active", "same answer", [], activeTarget.messageId, `trigger:${activeTarget.triggerId}`);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "visible-final", "same answer", [], "reply-42", "trigger:42");
+      release();
+      expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-42", "same answer");
     } finally { h.cleanup(); }
   });
 

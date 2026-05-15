@@ -1,4 +1,5 @@
 import * as lark from "@larksuiteoapi/node-sdk";
+import { createRequire } from "module";
 import { BotConfig } from "./config.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
@@ -7,6 +8,9 @@ import { basename, extname, resolve } from "path";
 import { getBridgeAttachmentAllowedRoots, getBridgeAttachmentsDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
+
+const require = createRequire(import.meta.url);
+const LMA_VERSION = require("../package.json").version as string;
 
 const MAX_BOT_STREAK = 10;
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
@@ -50,6 +54,8 @@ export class FeishuBot {
   private delayedFailureTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
   private lastRealDeliveryAt: Map<string, number> = new Map();
+  /** Active chatSend trigger target so final replies and proactive session.message share one delivery key. */
+  private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout> }> = new Map();
   private adminOpenId: string | null;
 
   private static allBots: Map<string, FeishuBot> = new Map();
@@ -170,7 +176,16 @@ export class FeishuBot {
         console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
         const parsed = this.extractBridgeAttachments(text);
         if (parsed.text.trim() || parsed.attachments.length > 0) this.cancelDelayedFailure(chatId);
-        await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`), parsed.text.trim(), parsed.attachments);
+        const activeTarget = this.activeDeliveryTargets.get(chatId);
+        await this.enqueueAndDispatchDelivery(
+          chatId,
+          "assistant_visible",
+          this.deliverySourceId("proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`),
+          parsed.text.trim(),
+          parsed.attachments,
+          activeTarget?.messageId,
+          activeTarget ? `trigger:${activeTarget.triggerId}` : undefined
+        );
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
       }
@@ -718,16 +733,25 @@ export class FeishuBot {
       }
 
       try {
-        const reply = await this.openclawClient.chatSendWithContext({
-          sessionKey,
-          unsyncedMessages: contextMsgs,
-          currentMessage: lastHuman.content,
-          currentSenderName: lastHuman.senderName,
-          deliver: false,
-          // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
-          // instead of leaving reactions stuck forever.
-          timeoutMs: 1_800_000,
-        });
+        const releaseActiveDeliveryTarget = lastHuman.messageId ? this.setActiveDeliveryTarget(chatId, triggerId, lastHuman.messageId) : () => {};
+        let reply: string;
+        try {
+          reply = await this.openclawClient.chatSendWithContext({
+            sessionKey,
+            unsyncedMessages: contextMsgs,
+            currentMessage: lastHuman.content,
+            currentSenderName: lastHuman.senderName,
+            deliver: false,
+            // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
+            // instead of leaving reactions stuck forever.
+            timeoutMs: 1_800_000,
+          });
+        } finally {
+          // OpenClaw may emit the final assistant session.message just after
+          // collectReply returns. Keep the trigger mapping briefly so proactive
+          // and chat-final paths share the same delivery key.
+          releaseActiveDeliveryTarget();
+        }
         console.log(`[${this.config.name}] OpenClaw reply collected for ${chatId.slice(-8)} in ${Date.now() - queueStartedAt}ms`);
 
         const parsedReply = this.extractBridgeAttachments(reply);
@@ -995,6 +1019,21 @@ export class FeishuBot {
     const timer = this.delayedFailureTimers.get(chatId);
     if (timer) clearTimeout(timer);
     this.delayedFailureTimers.delete(chatId);
+  }
+
+  private setActiveDeliveryTarget(chatId: string, triggerId: number, messageId: string): () => void {
+    const existing = this.activeDeliveryTargets.get(chatId);
+    if (existing?.timer) clearTimeout(existing.timer);
+    const token = Symbol(`${chatId}:${triggerId}`);
+    this.activeDeliveryTargets.set(chatId, { triggerId, messageId, token });
+    return () => {
+      const timer = setTimeout(() => {
+        const current = this.activeDeliveryTargets.get(chatId);
+        if (current?.token === token) this.activeDeliveryTargets.delete(chatId);
+      }, 60_000);
+      const current = this.activeDeliveryTargets.get(chatId);
+      if (current?.token === token) current.timer = timer;
+    };
   }
 
   private scheduleDelayedFailure(chatId: string, replyToMessageId: string, text: string, triggerId: number): void {
@@ -1495,6 +1534,7 @@ export class FeishuBot {
       `📊 ${this.config.name} Bot Status`,
       `━━━━━━━━━━━━━━━━━━`,
       `🤖 Bot: ${this.config.name}`,
+      `🧩 LMA: ${LMA_VERSION}`,
       `🧠 模型: ${model}`,
       `💬 会话: ${chatLabel} (${chatType === "p2p" ? "私聊" : "群聊"})`,
       `📋 Session: ${sessionExists} | ${status}`,
