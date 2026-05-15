@@ -81,8 +81,8 @@ export class OpenClawClient {
                 id: "connect-1",
                 method: "connect",
                 params: {
-                  minProtocol: 3,
-                  maxProtocol: 3,
+                  minProtocol: 4,
+                  maxProtocol: 99,
                   client: {
                     id: "gateway-client",
                     version: "1.0.0",
@@ -367,8 +367,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               lifecycleStartedLogged = true;
               console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
             }
-            if (ev.stream === "assistant" && ev.data?.delta) {
-              text += ev.data.delta;
+            if (ev.stream === "assistant" && (ev.data?.deltaText || ev.data?.delta)) {
+              const chunk = ev.data.deltaText || ev.data.delta;
+              if (ev.data?.replace) {
+                // v4: non-prefix replacement — deltaText is the full replacement
+                text = chunk;
+              } else {
+                text += chunk;
+              }
             }
             if (ev.stream === "chatFinal") {
               chatFinalText = ev.data?.text || "";
