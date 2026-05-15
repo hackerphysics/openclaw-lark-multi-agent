@@ -399,7 +399,7 @@ export class FeishuBot {
         }
       } else if (messageType === "post") {
         // Rich text post - extract all text content
-        cleanText = this.extractPostText(content);
+        cleanText = await this.hydrateInlineImageKeys(this.extractPostText(content), messageId);
       } else if (messageType === "sticker") {
         cleanText = `[Sticker: ${content.file_key || "unknown"}]`;
       }
@@ -1168,6 +1168,7 @@ export class FeishuBot {
         currentSenderName: "Discussion Scheduler",
         deliver: false,
         timeoutMs: 1_800_000,
+        emptyFinalAsNoReply: true,
       });
     } finally {
       // OpenClaw can emit the final assistant session.message shortly after
@@ -1656,6 +1657,23 @@ export class FeishuBot {
   /**
    * Send a model-drift notification to the affected chat.
    */
+  private async hydrateInlineImageKeys(text: string, messageId: string): Promise<string> {
+    const imageKeyPattern = /\[Image: (img_[^\]\n]+)\]/g;
+    const replacements: Array<{ from: string; to: string }> = [];
+    for (const match of text.matchAll(imageKeyPattern)) {
+      const imageKey = match[1];
+      try {
+        const imgPath = await this.downloadResource(messageId, imageKey, "image");
+        replacements.push({ from: match[0], to: `[Image: ${imgPath}]` });
+      } catch (err) {
+        replacements.push({ from: match[0], to: `[Image: download failed - ${(err as Error).message}]` });
+      }
+    }
+    let out = text;
+    for (const r of replacements) out = out.replace(r.from, r.to);
+    return out;
+  }
+
   /**
    * Download a resource (image/file/audio) from a Feishu message.
    * Returns the local file path.

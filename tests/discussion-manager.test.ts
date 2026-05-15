@@ -42,6 +42,30 @@ describe("DiscussionManager", () => {
     expect(systemMessages.at(-1)).toContain("已达到 2 轮");
   });
 
+  it("passes only the previous round into the next discussion prompt", async () => {
+    const manager = new DiscussionManager();
+    const calls: Array<{ name: string; prompt: string }> = [];
+    const started = manager.startIfAbsent({
+      chatId: "chat1",
+      rootMessageId: "m1",
+      topic: "讨论主题",
+      maxRounds: 3,
+      participants: [participant("GPT", ["g1", "g2", "g3"], calls)],
+    });
+    expect(started).toBe(true);
+    await vi.waitUntil(() => !manager.isActive("chat1"), { timeout: 1000 });
+
+    expect(calls).toHaveLength(3);
+    expect(calls[1].prompt).toContain("当前轮次：2");
+    expect(calls[1].prompt).toContain("Round 1:");
+    expect(calls[1].prompt).toContain("GPT: g1");
+    expect(calls[2].prompt).toContain("当前轮次：3");
+    expect(calls[2].prompt).toContain("Round 2:");
+    expect(calls[2].prompt).toContain("GPT: g2");
+    expect(calls[2].prompt).not.toContain("Round 1:");
+    expect(calls[2].prompt).not.toContain("GPT: g1");
+  });
+
   it("deduplicates start by chat and root message", async () => {
     const manager = new DiscussionManager();
     const calls: Array<{ name: string; prompt: string }> = [];

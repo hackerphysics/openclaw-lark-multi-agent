@@ -91,6 +91,16 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("hydrates image keys embedded in rich post text into local image paths", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).downloadResource = vi.fn(async () => "/tmp/lma-image.png");
+      const hydrated = await (h.bot as any).hydrateInlineImageKeys("请看 [Image: img_v3_test]", "m-img");
+      expect(hydrated).toBe("请看 [Image: /tmp/lma-image.png]");
+      expect((h.bot as any).downloadResource).toHaveBeenCalledWith("m-img", "img_v3_test", "image");
+    } finally { h.cleanup(); }
+  });
+
   it("responds to @all text and sends the trigger to OpenClaw", async () => {
     const h = makeHarness();
     try {

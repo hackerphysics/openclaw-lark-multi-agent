@@ -2,7 +2,7 @@ import { loadConfig } from "./config.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 import { FeishuBot } from "./feishu-bot.js";
-import { mkdirSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "fs";
 import { dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 
@@ -24,6 +24,20 @@ export async function startApp(configPath?: string) {
     : resolve(dirname(resolvedConfigPath), "data");
   mkdirSync(dataDir, { recursive: true });
   console.log(`Data dir: ${dataDir}`);
+  const lockPath = resolve(dataDir, "lma.pid");
+  if (existsSync(lockPath)) {
+    const oldPid = Number(readFileSync(lockPath, "utf8").trim());
+    if (Number.isFinite(oldPid) && oldPid > 0) {
+      try {
+        process.kill(oldPid, 0);
+        throw new Error(`Another openclaw-lark-multi-agent instance is already running (pid ${oldPid}). Stop it before starting a new one.`);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH") throw err;
+      }
+    }
+  }
+  writeFileSync(lockPath, `${process.pid}\n`);
   const store = new MessageStore(resolve(dataDir, "messages.db"));
 
   // Connect to OpenClaw Gateway via WebSocket
@@ -48,6 +62,9 @@ export async function startApp(configPath?: string) {
     console.log("\nShutting down...");
     openclawClient.disconnect();
     store.close();
+    try {
+      if (readFileSync(lockPath, "utf8").trim() === String(process.pid)) rmSync(lockPath, { force: true });
+    } catch {}
     process.exit(0);
   };
   process.on("SIGINT", shutdown);

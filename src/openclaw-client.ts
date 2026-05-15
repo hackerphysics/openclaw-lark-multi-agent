@@ -13,6 +13,9 @@ export type ChatAttachment = {
   content: string;
 };
 
+export const GATEWAY_PROTOCOL_MIN = 3;
+export const GATEWAY_PROTOCOL_MAX = 4;
+
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 
 type PendingReq = {
@@ -40,9 +43,12 @@ export class OpenClawClient {
   private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
   /** Session keys that should be re-subscribed on reconnect */
   private subscribedKeys: Set<string> = new Set();
-  /** Session keys with active/recent chatSend — proactive is forwarded and deduped by outbox. */
+  /** Session keys whose transcript/session.message updates are currently suppressed. */
   private suppressedSessions: Set<string> = new Set();
   private suppressedSessionTimers: Map<string, NodeJS.Timeout> = new Map();
+  /** Session keys whose delivery is owned by this bridge's chatSend final path. */
+  private ownedDeliverySessions: Set<string> = new Set();
+  private ownedDeliverySessionTimers: Map<string, NodeJS.Timeout> = new Map();
   /** Session keys whose proactive messages must be dropped by the bridge (e.g. discussion scheduler owns delivery). */
   private mutedProactiveSessions: Set<string> = new Set();
   private mutedProactiveSessionCounts: Map<string, number> = new Map();
@@ -81,8 +87,8 @@ export class OpenClawClient {
                 id: "connect-1",
                 method: "connect",
                 params: {
-                  minProtocol: 4,
-                  maxProtocol: 99,
+                  minProtocol: GATEWAY_PROTOCOL_MIN,
+                  maxProtocol: GATEWAY_PROTOCOL_MAX,
                   client: {
                     id: "gateway-client",
                     version: "1.0.0",
@@ -130,8 +136,23 @@ export class OpenClawClient {
           // Normalize chat events to look like agent events for collectReply
           if (frame.event === "chat") {
             const state = frame.payload?.state;
+            this.trackChatEventSession(sk, state, frame.payload);
             const msg = frame.payload?.message;
-            if (state === "final") {
+            if (state === "delta") {
+              // v4: chat delta events carry deltaText (incremental text chunk)
+              const deltaText = frame.payload?.deltaText;
+              if (deltaText) {
+                this.agentEvents.get(sk)!.push({
+                  ...frame.payload,
+                  stream: "chatDelta",
+                  data: {
+                    deltaText,
+                    delta: deltaText,  // v3 compat
+                    replace: frame.payload?.replace || false,
+                  },
+                });
+              }
+            } else if (state === "final") {
               // Store chat final text as fallback (only used if agent stream had no text)
               const textParts: string[] = [];
               if (msg?.content) {
@@ -237,7 +258,8 @@ export class OpenClawClient {
       return false;
     }
     if (this.suppressedSessions.has(rawKey) || this.suppressedSessions.has(shortKey)) {
-      console.log(`[OpenClaw] Forwarding proactive msg for ${shortKey} during active chatSend; delivery outbox will dedupe`);
+      console.log(`[OpenClaw] Dropping proactive transcript msg for ${shortKey}; waiting for final delivery path`);
+      return false;
     }
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
     if (cb) cb(proactiveText);
@@ -287,9 +309,10 @@ export class OpenClawClient {
    * No aggressive timeout — waits for lifecycle end as the source of truth.
    * 30-minute safety net only for catastrophic WS disconnection.
    */
-private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string): Promise<string> {
+private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean }): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = "";
+      let chatDeltaText = "";
       let chatFinalText = "";
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -310,7 +333,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
             console.warn(`[OpenClaw] abort after collectReply idle timeout failed:`, (err as Error).message);
           });
-          resolve(text || chatFinalText || "(timeout: no reply received)");
+          resolve(text || chatDeltaText || chatFinalText || "(timeout: no reply received)");
         }, timeoutMs);
       };
       resetIdleTimer();
@@ -367,13 +390,20 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               lifecycleStartedLogged = true;
               console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
             }
-            if (ev.stream === "assistant" && (ev.data?.deltaText || ev.data?.delta)) {
+            if ((ev.stream === "assistant" || ev.stream === "chatDelta") && (ev.data?.deltaText || ev.data?.delta)) {
               const chunk = ev.data.deltaText || ev.data.delta;
-              if (ev.data?.replace) {
-                // v4: non-prefix replacement — deltaText is the full replacement
-                text = chunk;
+              if (ev.stream === "assistant") {
+                if (ev.data?.replace) {
+                  text = chunk;
+                } else {
+                  text += chunk;
+                }
               } else {
-                text += chunk;
+                if (ev.data?.replace) {
+                  chatDeltaText = chunk;
+                } else {
+                  chatDeltaText += chunk;
+                }
               }
             }
             if (ev.stream === "chatFinal") {
@@ -387,9 +417,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                   });
                   // Prefer final chat message over accumulated deltas: some providers may
                   // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-                  const latestFinalText = chatFinalText || text;
+                  const latestFinalText = chatFinalText || text || chatDeltaText;
                   if (latestFinalText) {
                     finish(latestFinalText);
+                  } else if (options?.emptyFinalAsNoReply) {
+                    finish("NO_REPLY");
                   } else {
                     console.warn(`[OpenClaw] collectReply: empty chatFinal fallback ignored; waiting for real text or idle timeout`);
                     chatFinalTimer = null;
@@ -400,13 +432,17 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
               // Prefer final chat message over accumulated deltas: some providers may
               // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-              const finalText = chatFinalText || text;
+              const finalText = chatFinalText || text || chatDeltaText;
               const finishFromLifecycle = () => {
-                const latestFinalText = chatFinalText || text;
+                const latestFinalText = chatFinalText || text || chatDeltaText;
                 if (!chatFinalText && latestFinalText.trim() === "N") {
                   // Some providers stream the first character of NO_REPLY ("N") but
                   // never deliver a final chat message in time. Never surface a lone
                   // "N" to the user; treat it as a suppressed reply.
+                  finish("NO_REPLY");
+                  return;
+                }
+                if (!latestFinalText && options?.emptyFinalAsNoReply) {
                   finish("NO_REPLY");
                   return;
                 }
@@ -432,7 +468,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
               // If lifecycle end beats chat final, a short delta like "N" can be a truncated
               // final reply. Wait for chatFinal before resolving; otherwise suppress lone "N".
-              if (!chatFinalText && text.length <= 1) {
+              if (!options?.emptyFinalAsNoReply && !chatFinalText && text.length <= 1) {
                 lifecycleEndTimer = setTimeout(finishFromLifecycle, 5000);
               } else {
                 finishFromLifecycle();
@@ -517,6 +553,51 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     return this.rpc("chat.abort", { sessionKey: key, runId }, 5000).catch(() => {});
   }
 
+  private sessionKeyVariants(key: string): string[] {
+    const shortKey = key.startsWith("agent:main:") ? key.slice("agent:main:".length) : key;
+    return [shortKey, `agent:main:${shortKey}`];
+  }
+
+  private trackChatEventSession(sessionKey: string, state: string | undefined, payload: any): void {
+    if (!sessionKey || sessionKey === "__default__") return;
+    const keys = this.sessionKeyVariants(sessionKey);
+    if (this.isOwnedDeliverySession(sessionKey)) {
+      // This chat event belongs to a bridge-owned chat.send run. The final answer
+      // is delivered by collectReply/processQueue, so transcript session.message
+      // mirrors must stay suppressed briefly.
+      this.suppressSessionKeys(keys);
+      if (state === "final" || state === "error" || state === "aborted") this.releaseSuppressedSessionKeysAfter(keys, 30000);
+      return;
+    }
+    // External WebChat/Control UI chat against an LMA session: do not forward
+    // streaming transcript updates, but allow the final chat message to be
+    // delivered through the proactive callback after it is committed.
+    if (state === "delta") {
+      this.suppressSessionKeys(keys);
+    } else if (state === "final") {
+      const text = this.extractTextFromChatMessage(payload?.message);
+      if (text) this.emitProactiveForSession(sessionKey, text);
+      // Keep transcript mirrors suppressed briefly; chat final already emitted
+      // the user-visible result for external WebChat/Control UI turns.
+      this.releaseSuppressedSessionKeysAfter(keys, 30000);
+    } else if (state === "error" || state === "aborted") {
+      this.releaseSuppressedSessionKeysAfter(keys, 0);
+    }
+  }
+
+  private extractTextFromChatMessage(message: any): string {
+    const parts = Array.isArray(message?.content) ? message.content : [];
+    return parts.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
+  }
+
+  private emitProactiveForSession(sessionKey: string, text: string): boolean {
+    const [shortKey, fullKey] = this.sessionKeyVariants(sessionKey);
+    const cb = this.sessionMessageCallbacks.get(fullKey) || this.sessionMessageCallbacks.get(shortKey);
+    if (!cb) return false;
+    cb(text);
+    return true;
+  }
+
   private suppressSessionKeys(keys: string[]): void {
     for (const key of keys) {
       const timer = this.suppressedSessionTimers.get(key);
@@ -536,6 +617,32 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       }, delayMs);
       this.suppressedSessionTimers.set(key, timer);
     }
+  }
+
+  private ownDeliverySessionKeys(keys: string[]): void {
+    for (const key of keys) {
+      const timer = this.ownedDeliverySessionTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.ownedDeliverySessionTimers.delete(key);
+      this.ownedDeliverySessions.add(key);
+    }
+  }
+
+  private releaseOwnedDeliverySessionKeysAfter(keys: string[], delayMs: number): void {
+    for (const key of keys) {
+      const oldTimer = this.ownedDeliverySessionTimers.get(key);
+      if (oldTimer) clearTimeout(oldTimer);
+      const timer = setTimeout(() => {
+        this.ownedDeliverySessions.delete(key);
+        this.ownedDeliverySessionTimers.delete(key);
+      }, delayMs);
+      this.ownedDeliverySessionTimers.set(key, timer);
+    }
+  }
+
+  private isOwnedDeliverySession(sessionKey: string): boolean {
+    const [shortKey, fullKey] = this.sessionKeyVariants(sessionKey);
+    return this.ownedDeliverySessions.has(shortKey) || this.ownedDeliverySessions.has(fullKey);
   }
 
   private addMutedProactiveKey(key: string): void {
@@ -577,11 +684,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     attachments?: ChatAttachment[];
     deliver?: boolean;
     timeoutMs?: number;
+    emptyFinalAsNoReply?: boolean;
   }): Promise<string> {
     const sk = params.sessionKey;
     const fullSessionKey = `agent:main:${sk}`;
     const suppressedKeys = [sk, fullSessionKey];
     this.suppressSessionKeys(suppressedKeys);
+    this.ownDeliverySessionKeys(suppressedKeys);
     try {
       // Drop stale buffered events for this session before starting a new run.
       // This prevents an old final text (e.g. previous "ok") from being consumed by
@@ -597,13 +706,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         idempotencyKey: randomUUID(),
       });
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
-      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk);
+      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply });
     } finally {
       // OpenClaw can emit the final assistant session.message a moment after
       // collectReply returns. Keep a short grace window so normal chat replies
       // are not delivered twice via the proactive-message path. Cron/LMA runs
       // are unaffected because they do not go through chatSend.
       this.releaseSuppressedSessionKeysAfter(suppressedKeys, 30000);
+      this.releaseOwnedDeliverySessionKeysAfter(suppressedKeys, 30000);
     }
   }
 
@@ -638,6 +748,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     currentSenderName: string;
     deliver?: boolean;
     timeoutMs?: number;
+    emptyFinalAsNoReply?: boolean;
   }): Promise<string> {
     const attachments = this.extractImageAttachments([
       ...params.unsyncedMessages.map((m) => m.content),
@@ -655,6 +766,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         attachments,
         deliver: params.deliver,
         timeoutMs: params.timeoutMs,
+        emptyFinalAsNoReply: params.emptyFinalAsNoReply,
       });
     }
 
@@ -681,6 +793,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       attachments,
       deliver: params.deliver,
       timeoutMs: params.timeoutMs,
+      emptyFinalAsNoReply: params.emptyFinalAsNoReply,
     });
   }
 
@@ -717,6 +830,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     this.suppressedSessions.clear();
     this.mutedProactiveSessions.clear();
     this.mutedProactiveSessionCounts.clear();
+    for (const timer of this.ownedDeliverySessionTimers.values()) clearTimeout(timer);
+    this.ownedDeliverySessionTimers.clear();
+    this.ownedDeliverySessions.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;

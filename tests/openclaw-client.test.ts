@@ -1,6 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
-import { OpenClawClient } from "../src/openclaw-client.js";
+import { GATEWAY_PROTOCOL_MAX, GATEWAY_PROTOCOL_MIN, OpenClawClient } from "../src/openclaw-client.js";
 import { getBridgeAttachmentsDir } from "../src/paths.js";
+
+describe("OpenClawClient protocol compatibility", () => {
+  it("declares compatibility with gateway protocol 3 through 4", () => {
+    expect(GATEWAY_PROTOCOL_MIN).toBe(3);
+    expect(GATEWAY_PROTOCOL_MAX).toBe(4);
+  });
+});
 
 describe("OpenClawClient collectReply", () => {
   it("ignores empty lifecycle end and waits for later real text", async () => {
@@ -35,6 +42,20 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("real reply");
   });
 
+  it("treats empty final as NO_REPLY when requested", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1", { emptyFinalAsNoReply: true });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatFinal", data: { text: "" } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
+
+    await expect(replyPromise).resolves.toBe("NO_REPLY");
+  });
+
   it("ignores empty chatFinal fallback and waits for later real text", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();
@@ -66,6 +87,57 @@ describe("OpenClawClient collectReply", () => {
 
     await expect(replyPromise).resolves.toBe("later text");
   });
+
+  it("collects v4 chatDelta deltaText and respects replace semantics", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "chatDelta",
+      data: { deltaText: "hel" },
+    });
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "chatDelta",
+      data: { deltaText: "hello", replace: true },
+    });
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "chatDelta",
+      data: { deltaText: " world" },
+    });
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end" },
+    });
+
+    await expect(replyPromise).resolves.toBe("hello world");
+  });
+
+  it("does not double-count mirrored assistant and chatDelta streams", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "hello" } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatDelta", data: { deltaText: "hello" } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
+
+    await expect(replyPromise).resolves.toBe("hello");
+  });
 });
 
 describe("OpenClawClient proactive delivery mute", () => {
@@ -82,6 +154,34 @@ describe("OpenClawClient proactive delivery mute", () => {
     release();
     expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "visible" })).toBe(true);
     expect(callback).toHaveBeenCalledWith("visible");
+  });
+
+  it("drops proactive assistant messages while chatSend owns delivery", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("s1", callback);
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+    (client as any).suppressedSessions.add("s1");
+    (client as any).suppressedSessions.add("agent:main:s1");
+
+    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "hidden" })).toBe(false);
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("drops transcript messages while external chat is streaming but emits final", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("s1", callback);
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+
+    (client as any).trackChatEventSession("agent:main:s1", "delta", { deltaText: "draft" });
+    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "hidden" })).toBe(false);
+    expect(callback).not.toHaveBeenCalled();
+
+    (client as any).trackChatEventSession("agent:main:s1", "final", { message: { content: [{ type: "text", text: "final answer" }] } });
+    expect(callback).toHaveBeenCalledWith("final answer");
+    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "final answer" })).toBe(false);
+    expect(callback).toHaveBeenCalledTimes(1);
   });
 });
 

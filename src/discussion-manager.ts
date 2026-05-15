@@ -174,10 +174,11 @@ export class DiscussionManager {
   private buildPrompt(session: DiscussionSession): string {
     const previous = session.completedRounds.length === 0
       ? "（暂无，当前是第一轮）"
-      : session.completedRounds.map((round) => {
+      : (() => {
+          const round = session.completedRounds[session.completedRounds.length - 1];
           const lines = Object.entries(round.replies).map(([bot, text]) => `- ${bot}: ${text || "NO_REPLY"}`);
           return `Round ${round.round}:\n${lines.join("\n")}`;
-        }).join("\n\n");
+        })();
 
     return [
       "这是一个多智能体结构化讨论。",
