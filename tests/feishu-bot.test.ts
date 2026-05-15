@@ -74,6 +74,22 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("atomically deduplicates concurrent duplicate Feishu events", async () => {
+    const h = makeHarness("GPT");
+    try {
+      let releaseFetch!: () => void;
+      (h.bot as any).fetchAndCacheChatInfo = vi.fn(() => new Promise<void>((resolve) => { releaseFetch = resolve; }));
+      const evt = event({ text: "@_all ping", messageId: "dup-event" });
+      const p1 = (h.bot as any).handleMessage(evt);
+      const p2 = (h.bot as any).handleMessage(evt);
+      await Promise.resolve();
+      releaseFetch();
+      await Promise.all([p1, p2]);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.store.getRecent("chat1").filter((m) => m.messageId === "dup-event")).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+
   it("responds to @all text and sends the trigger to OpenClaw", async () => {
     const h = makeHarness();
     try {

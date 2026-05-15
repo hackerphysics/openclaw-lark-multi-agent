@@ -314,8 +314,11 @@ export class FeishuBot {
 
       if (messageType !== "text" && messageType !== "image" && messageType !== "file" && messageType !== "audio" && messageType !== "sticker" && messageType !== "post") return;
 
-      // --- Dedup: skip if this bot already processed this message ---
-      if (this.store.hasBotProcessed(this.config.name, messageId)) return;
+      // --- Dedup: atomically claim this message for this bot before any await.
+      // Feishu/WebSocket can deliver the same event more than once; a separate
+      // has-then-mark sequence races and can send the same user message into
+      // OpenClaw twice.
+      if (!this.store.tryMarkBotProcessed(this.config.name, messageId)) return;
 
       // --- Cache chat info (lazy, at most once per hour) ---
       await this.fetchAndCacheChatInfo(chatId, chatType);
@@ -415,9 +418,6 @@ export class FeishuBot {
         timestamp: Date.now(),
       });
       if (insertedId < 0) insertedId = this.store.getMessageId(messageId) || -1;
-
-      // Mark as processed only after successful parse + insert
-      this.store.markBotProcessed(this.config.name, messageId);
 
       // --- Commands: in p2p always respond; in group, check shouldRespond first ---
       // Single slash commands are handled by the bridge. Double slash commands were

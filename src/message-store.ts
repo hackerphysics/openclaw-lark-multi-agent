@@ -714,6 +714,11 @@ export class MessageStore {
     this.db.prepare(`INSERT OR IGNORE INTO processed_events (bot_name, message_id) VALUES (?, ?)`).run(botName, messageId);
   }
 
+  tryMarkBotProcessed(botName: string, messageId: string): boolean {
+    const result = this.db.prepare(`INSERT OR IGNORE INTO processed_events (bot_name, message_id) VALUES (?, ?)`).run(botName, messageId);
+    return result.changes === 1;
+  }
+
   close() {
     this.db.close();
   }
