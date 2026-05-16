@@ -10,6 +10,26 @@ describe("OpenClawClient protocol compatibility", () => {
 });
 
 describe("OpenClawClient collectReply", () => {
+  it("collects terminal events from short and full session key buckets", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const fullKey = "agent:main:s1";
+    const shortKey = "s1";
+    events.set(fullKey, []);
+    events.set(shortKey, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(shortKey)!.push({
+      runId: "chat-run",
+      sessionKey: shortKey,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "aborted", stopReason: "rpc" },
+    });
+
+    await expect(replyPromise).resolves.toContain("Agent 未正常完成");
+  });
+
   it("ignores empty lifecycle end and waits for later real text", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();
@@ -86,6 +106,95 @@ describe("OpenClawClient collectReply", () => {
     }, 50);
 
     await expect(replyPromise).resolves.toBe("later text");
+  });
+
+  it("ignores stale replay events before the expected user anchor", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
+    events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
+    events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "sessionUser", data: { text: "Continue the OpenClaw runtime event." } });
+    events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "chatFinal", data: { text: "" } });
+    events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "lifecycle", data: { phase: "end", replayInvalid: true, livenessState: "working" } });
+    setTimeout(() => {
+      events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "sessionUser", data: { text: "current question" } });
+      events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
+      events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "assistant", data: { delta: "current answer" } });
+      events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+    }, 50);
+
+    await expect(replyPromise).resolves.toBe("current answer");
+  });
+
+  it("trusts exact runId events even when the user anchor is missing", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "assistant", data: { delta: "exact run answer" } });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "chatFinal", data: { text: "exact run answer" } });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+
+    await expect(replyPromise).resolves.toBe("exact run answer");
+  });
+
+  it("buffers current run events that arrive just before the expected user anchor", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
+    events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "sessionUser", data: { text: "current question" } });
+    events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "assistant", data: { delta: "anchored answer" } });
+    events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+
+    await expect(replyPromise).resolves.toBe("anchored answer");
+  });
+
+  it("keeps visible transcript text when final is empty and replay later aborts", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(key)!.push({
+      sessionKey: key,
+      stream: "assistant",
+      data: { deltaText: "real transcript reply", delta: "real transcript reply", replace: true },
+    });
+    events.get(key)!.push({ runId: "runtime-replay", sessionKey: key, stream: "chatFinal", data: { text: "" } });
+    events.get(key)!.push({
+      runId: "runtime-replay",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "abandoned", replayInvalid: true },
+    });
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", status: "cancelled", aborted: true, stopReason: "rpc" },
+    });
+
+    await expect(replyPromise).resolves.toBe("real transcript reply");
+  });
+
+  it("extracts visible assistant text from text-only transcript messages", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "visible" }] })).toBe("visible");
+    expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "text", text: "draft" }, { type: "toolCall", name: "read" }] })).toBe("");
   });
 
   it("collects v4 chatDelta deltaText and respects replace semantics", async () => {

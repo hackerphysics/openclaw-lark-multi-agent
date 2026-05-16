@@ -183,6 +183,26 @@ export class OpenClawClient {
           // Try both raw key and without agent:main: prefix
           const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
           const msg = frame.payload.message || frame.payload;
+          const visibleUserText = this.extractVisibleUserText(msg);
+          if (visibleUserText) {
+            if (!this.agentEvents.has(rawKey)) this.agentEvents.set(rawKey, []);
+            this.agentEvents.get(rawKey)!.push({
+              runId: frame.payload.runId,
+              sessionKey: rawKey,
+              stream: "sessionUser",
+              data: { text: visibleUserText },
+            });
+          }
+          const visibleAssistantText = this.extractVisibleAssistantText(msg);
+          if (visibleAssistantText) {
+            if (!this.agentEvents.has(rawKey)) this.agentEvents.set(rawKey, []);
+            this.agentEvents.get(rawKey)!.push({
+              runId: frame.payload.runId,
+              sessionKey: rawKey,
+              stream: "assistant",
+              data: { deltaText: visibleAssistantText, delta: visibleAssistantText, replace: true },
+            });
+          }
           this.handleProactiveSessionMessage(rawKey, msg);
 
           // Tool calls in assistant messages — skip, using agent item events instead
@@ -219,39 +239,49 @@ export class OpenClawClient {
     });
   }
 
+  private extractVisibleUserText(msg: any): string {
+    if (msg?.role !== "user") return "";
+    const content = msg.content;
+    if (typeof content === "string") return content.trim();
+    if (!Array.isArray(content)) return "";
+    return content
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("\n")
+      .trim();
+  }
+
+  private extractVisibleAssistantText(msg: any): string {
+    if (msg?.role !== "assistant") return "";
+    const content = msg.content;
+
+    // Extract only visible text parts and ignore thinking/tool blocks.
+    if (typeof content === "string") return content.trim();
+    if (!Array.isArray(content)) return "";
+
+    const hasToolBlock = content.some((part: any) => {
+      const type = String(part?.type || "").toLowerCase();
+      return type === "toolcall" || type === "tool_call" || type === "tooluse" || type === "tool_use" || type === "toolresult" || type === "tool_result";
+    });
+    // Do not deliver mixed text+toolCall assistant messages through the
+    // final-text path; those are usually intermediate tool-loop status.
+    if (hasToolBlock) return "";
+
+    return content
+      .filter((part: any) => part?.type === "text" && typeof part.text === "string")
+      .map((part: any) => part.text)
+      .join("\n")
+      .trim();
+  }
+
   private handleProactiveSessionMessage(rawKey: string, msg: any): boolean {
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
-    const role = msg.role;
-    const content = msg.content;
 
     // Proactive assistant text messages. Cron/session-targeted runs often emit
     // structured content arrays rather than a plain string. Extract only visible
     // text parts and ignore thinking/tool blocks so the bridge can deliver final
     // cron results via the bot.
-    let proactiveText = "";
-    if (role === "assistant") {
-      if (typeof content === "string") {
-        proactiveText = content;
-      } else if (Array.isArray(content)) {
-        const hasToolBlock = content.some((part: any) => {
-          const type = String(part?.type || "").toLowerCase();
-          return type === "toolcall" || type === "tool_call" || type === "tooluse" || type === "tool_use" || type === "toolresult" || type === "tool_result";
-        });
-        // Do not deliver mixed text+toolCall assistant messages through
-        // the proactive final-text path; those are usually intermediate
-        // reasoning/status during a tool loop. Tool calls are still
-        // delivered via the verbose channel from agent item events when
-        // /verbose is enabled. Cron final messages arrive as text-only
-        // (optionally with thinking).
-        if (!hasToolBlock) {
-          proactiveText = content
-            .filter((part: any) => part?.type === "text" && typeof part.text === "string")
-            .map((part: any) => part.text)
-            .join("\n")
-            .trim();
-        }
-      }
-    }
+    const proactiveText = this.extractVisibleAssistantText(msg);
     if (!proactiveText) return false;
     if (this.mutedProactiveSessions.has(rawKey) || this.mutedProactiveSessions.has(shortKey)) {
       console.log(`[OpenClaw] Dropping proactive msg for ${shortKey}; delivery is owned by the caller`);
@@ -309,17 +339,29 @@ export class OpenClawClient {
    * No aggressive timeout — waits for lifecycle end as the source of truth.
    * 30-minute safety net only for catastrophic WS disconnection.
    */
-private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean }): Promise<string> {
+private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string }): Promise<string> {
     return new Promise((resolve, reject) => {
       let text = "";
       let chatDeltaText = "";
       let chatFinalText = "";
-      let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey}` : "";
+      let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey.replace(/^agent:[^:]+:/, "")}` : "";
+      let shortSessionKey = targetSessionKey ? targetSessionKey.replace(/^agent:[^:]+:/, "") : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
       let replayInvalidTimer: ReturnType<typeof setTimeout> | null = null;
       const collectStartedAt = Date.now();
       let lifecycleStartedLogged = false;
+      const expectedUserText = options?.expectedUserText?.trim() || "";
+      let anchorSeen = !expectedUserText;
+      const activeRunIds = new Set<string>([runId]);
+      let preAnchorEvents: any[] = [];
+      const normalizeText = (value: string) => value.replace(/\s+/g, " ").trim();
+      const isExpectedUserText = (value: string) => {
+        const actual = normalizeText(value);
+        const expected = normalizeText(expectedUserText);
+        if (!actual || !expected) return false;
+        return actual === expected || actual.includes(expected) || expected.includes(actual);
+      };
 
       let idleTimer: ReturnType<typeof setTimeout>;
       const resetIdleTimer = () => {
@@ -349,7 +391,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
       const poller = setInterval(() => {
         const bucketsToScan = sessionKey
-          ? [sessionKey]
+          ? Array.from(new Set([sessionKey, shortSessionKey].filter(Boolean)))
           : Array.from(this.agentEvents.keys());
 
         for (const bucketKey of bucketsToScan) {
@@ -361,16 +403,72 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             const ev = bucket[i];
 
             const evRunId = typeof ev.runId === "string" ? ev.runId : "";
-            const matchesRun = evRunId ? evRunId === runId : false;
-            // OpenClaw chat.send may emit the user-facing chat runId while the actual
-            // agent lifecycle uses an internal runId. We clear this session's event buffer
-            // immediately before chat.send, so matching by sessionKey here is safe and
-            // necessary to collect the real agent output.
-            const matchesSession = sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey);
-            if (matchesRun || matchesSession) {
-              if (!sessionKey && ev.sessionKey) sessionKey = ev.sessionKey;
-            } else {
-              i++;
+            const eventSessionMatches = Boolean(sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey || ev.sessionKey === shortSessionKey));
+            const matchesRun = evRunId ? activeRunIds.has(evRunId) : false;
+
+            if (!sessionKey && ev.sessionKey) {
+              shortSessionKey = String(ev.sessionKey).replace(/^agent:[^:]+:/, "");
+              sessionKey = `agent:main:${shortSessionKey}`;
+            }
+
+            if (eventSessionMatches && ev.stream === "sessionUser") {
+              bucket.splice(i, 1);
+              if (!anchorSeen && isExpectedUserText(ev.data?.text || "")) {
+                anchorSeen = true;
+                resetIdleTimer();
+                for (const pendingEv of preAnchorEvents) {
+                  const pendingRunId = typeof pendingEv.runId === "string" ? pendingEv.runId : "";
+                  if (pendingRunId && pendingEv.stream === "lifecycle" && pendingEv.data?.phase === "start") {
+                    activeRunIds.add(pendingRunId);
+                  }
+                }
+                const replay = preAnchorEvents.filter((pendingEv) => {
+                  const pendingRunId = typeof pendingEv.runId === "string" ? pendingEv.runId : "";
+                  return !pendingRunId || activeRunIds.has(pendingRunId);
+                });
+                preAnchorEvents = [];
+                if (replay.length) bucket.splice(i, 0, ...replay);
+              } else if (!anchorSeen) {
+                // A different user/runtime continuation belongs to stale queued work;
+                // anything before it should not be attributed to the next real user turn.
+                preAnchorEvents = [];
+              }
+              continue;
+            }
+
+            if (eventSessionMatches && expectedUserText && !anchorSeen && !matchesRun) {
+              bucket.splice(i, 1);
+              preAnchorEvents.push(ev);
+              if (preAnchorEvents.length > 200) preAnchorEvents.shift();
+              continue;
+            }
+
+            let matchesSession = false;
+            if (eventSessionMatches && anchorSeen) {
+              if (!expectedUserText) {
+                // Backward-compatible mode for tests/internal callers that do not
+                // provide an anchor: allow session-key matching as before.
+                matchesSession = true;
+              } else if (!evRunId) {
+                matchesSession = true;
+              } else if (activeRunIds.has(evRunId)) {
+                matchesSession = true;
+              } else if (ev.stream === "lifecycle" && ev.data?.phase === "start") {
+                activeRunIds.add(evRunId);
+                matchesSession = true;
+              }
+            }
+
+            if (!(matchesRun || matchesSession)) {
+              // When collectReply is anchored to a specific user message, discard stale
+              // session events that arrive before that anchor (or from unrelated runIds)
+              // so replayInvalid/aborted events from older runtime continuations cannot
+              // be misattributed to the current user turn.
+              if (eventSessionMatches && expectedUserText) {
+                bucket.splice(i, 1);
+              } else {
+                i++;
+              }
               continue;
             }
 
@@ -468,7 +566,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
               // If lifecycle end beats chat final, a short delta like "N" can be a truncated
               // final reply. Wait for chatFinal before resolving; otherwise suppress lone "N".
-              if (!options?.emptyFinalAsNoReply && !chatFinalText && text.length <= 1) {
+              if (!options?.emptyFinalAsNoReply && ev.data?.livenessState === "working" && !chatFinalText && text.length <= 1) {
                 lifecycleEndTimer = setTimeout(finishFromLifecycle, 5000);
               } else {
                 finishFromLifecycle();
@@ -706,7 +804,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         idempotencyKey: randomUUID(),
       });
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
-      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply });
+      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message });
     } finally {
       // OpenClaw can emit the final assistant session.message a moment after
       // collectReply returns. Keep a short grace window so normal chat replies
