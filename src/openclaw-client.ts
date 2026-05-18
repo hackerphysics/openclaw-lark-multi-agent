@@ -1,10 +1,10 @@
 import WebSocket from "ws";
 import { randomUUID } from "crypto";
-import { readFileSync } from "fs";
-import { basename, extname } from "path";
+import { mkdirSync, readFileSync, writeFileSync } from "fs";
+import { basename, extname, join } from "path";
 import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
-import { getBridgeAttachmentsDir } from "./paths.js";
+import { getBridgeAttachmentsDir, getStateDir } from "./paths.js";
 
 export type ChatAttachment = {
   type?: string;
@@ -17,6 +17,9 @@ export const GATEWAY_PROTOCOL_MIN = 3;
 export const GATEWAY_PROTOCOL_MAX = 4;
 
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
+const CONTEXT_SYNC_DIR = join(getStateDir(), "context-sync");
+const MAX_INLINE_CONTEXT_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_MESSAGES || 1000);
+const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 8 * 1024 * 1024);
 
 type PendingReq = {
   resolve: (data: any) => void;
@@ -349,6 +352,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
       let replayInvalidTimer: ReturnType<typeof setTimeout> | null = null;
+      let pendingRuntimeFailureText = "";
+      let lastActivitySummary = "";
+      let lastActivityAt = 0;
       const collectStartedAt = Date.now();
       let lifecycleStartedLogged = false;
       const expectedUserText = options?.expectedUserText?.trim() || "";
@@ -375,8 +381,63 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
             console.warn(`[OpenClaw] abort after collectReply idle timeout failed:`, (err as Error).message);
           });
-          resolve(text || chatDeltaText || chatFinalText || "(timeout: no reply received)");
+          const visibleText = text || chatDeltaText || chatFinalText;
+          if (visibleText) {
+            resolve(visibleText);
+          } else if (pendingRuntimeFailureText) {
+            resolve(`${pendingRuntimeFailureText}\n\nLMA 已连续 ${Math.round(timeoutMs / 60000)} 分钟没有收到新的工具输出或最终回复，已停止等待。`);
+          } else if (lastActivitySummary) {
+            resolve(`⚠️ Agent 长时间没有产生最终回复\n最后活动: ${lastActivitySummary}\n时间: ${new Date(lastActivityAt).toLocaleString()}\n\nLMA 已连续 ${Math.round(timeoutMs / 60000)} 分钟没有收到新的工具输出或最终回复，已停止等待。`);
+          } else {
+            resolve("(timeout: no reply received)");
+          }
         }, timeoutMs);
+      };
+      const summarizeActivity = (ev: any): string => {
+        if (ev.stream === "item") {
+          const data = ev.data || {};
+          if (data.kind === "tool") {
+            const phase = data.phase ? ` ${data.phase}` : "";
+            const meta = typeof data.meta === "string" && data.meta.trim() ? `: ${data.meta.trim().slice(0, 300)}` : "";
+            return `工具${phase}${data.name ? ` ${data.name}` : ""}${meta}`;
+          }
+          return `运行事件 item${data.kind ? `/${data.kind}` : ""}`;
+        }
+        if (ev.stream === "assistant" || ev.stream === "chatDelta") {
+          const chunk = String(ev.data?.deltaText || ev.data?.delta || "").trim();
+          return chunk ? `模型输出片段: ${chunk.slice(0, 300)}` : "模型输出片段";
+        }
+        if (ev.stream === "chatFinal") return "收到 chat final 事件";
+        if (ev.stream === "lifecycle") {
+          const state = ev.data?.livenessState || ev.data?.status || ev.data?.phase || "unknown";
+          const reason = ev.data?.stopReason ? `, reason=${ev.data.stopReason}` : "";
+          const replay = ev.data?.replayInvalid ? ", replayInvalid" : "";
+          return `运行状态: ${state}${replay}${reason}`;
+        }
+        return `事件: ${ev.stream || "unknown"}`;
+      };
+      const rememberActivity = (ev: any) => {
+        // A replay-invalid lifecycle end is the terminal symptom, not the useful
+        // last activity. Keep the previous tool/model activity so user-visible
+        // timeout messages explain what the agent was actually doing.
+        if (ev.stream === "lifecycle" && ev.data?.phase === "end" && ev.data?.replayInvalid && lastActivitySummary) return;
+        const summary = summarizeActivity(ev);
+        if (summary) {
+          lastActivitySummary = summary;
+          lastActivityAt = Date.now();
+        }
+      };
+      const buildFailureText = (ev: any): string => {
+        const state = ev.data?.livenessState || ev.data?.status || "unknown";
+        const reason = ev.data?.stopReason || "";
+        const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
+        const lines = [`⚠️ Agent 未正常完成`, `状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}`];
+        if (lastActivitySummary) {
+          lines.push(`最后活动: ${lastActivitySummary}`);
+          lines.push(`最后活动时间: ${new Date(lastActivityAt).toLocaleString()}`);
+        }
+        lines.push("请重试，或用 /reset 重置会话");
+        return lines.join("\n");
       };
       resetIdleTimer();
 
@@ -477,11 +538,15 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             // means the agent is still alive. Use an idle timeout, not an absolute
             // wall-clock timeout, so long tool-heavy tasks are not killed while active.
             resetIdleTimer();
+            rememberActivity(ev);
             // If more events arrive after a replay-invalid lifecycle end, that lifecycle
             // was not terminal for the user-visible run. Keep waiting for the real final.
             if (replayInvalidTimer) {
               clearTimeout(replayInvalidTimer);
               replayInvalidTimer = null;
+            }
+            if (ev.stream !== "lifecycle") {
+              pendingRuntimeFailureText = "";
             }
 
             if (ev.stream === "lifecycle" && ev.data?.phase === "start" && !lifecycleStartedLogged) {
@@ -545,13 +610,10 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                   return;
                 }
                 if (!latestFinalText) {
-                  const state = ev.data?.livenessState || "unknown";
-                  const reason = ev.data?.stopReason || "";
-                  const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
-                  const failureText = `⚠️ Agent 未正常完成\n状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}\n请重试，或用 /reset 重置会话`;
+                  const failureText = buildFailureText(ev);
                   if (ev.data?.replayInvalid) {
-                    console.warn(`[OpenClaw] replayInvalid lifecycle observed for runId=${evRunId || runId}; waiting for subsequent events before surfacing failure`);
-                    replayInvalidTimer = setTimeout(() => finish(failureText), 120000);
+                    pendingRuntimeFailureText = failureText;
+                    console.warn(`[OpenClaw] replayInvalid lifecycle observed for runId=${evRunId || runId}; waiting for real text or idle timeout`);
                     return;
                   }
                   if (ev.data?.livenessState !== "working") {
@@ -868,22 +930,30 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       });
     }
 
-    // Build context block + actual message in one chat.send
-    const contextLines = params.unsyncedMessages.map((m) => {
-      const time = new Date(m.timestamp).toLocaleTimeString("zh-CN", {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
-      const tag = m.senderType === "bot" ? `${m.senderName} (AI)` : m.senderName;
-      return `[${tag} ${time}]: ${m.content}`;
-    });
+    // Build context block + actual message in one chat.send, or write the
+    // full context to a local transcript file when it is too large.
+    const contextLines = this.formatContextLines(params.unsyncedMessages);
+    const inlineContext = contextLines.join("\n");
+    const inlineBytes = Buffer.byteLength(inlineContext, "utf8");
+    const useFileContext = params.unsyncedMessages.length > MAX_INLINE_CONTEXT_MESSAGES || inlineBytes > MAX_INLINE_CONTEXT_BYTES;
 
-    const combined =
-      `[以下是你不在线期间群里的对话，请了解上下文]\n` +
-      contextLines.join("\n") +
-      `\n---\n` +
-      `[${params.currentSenderName}]: ${params.currentMessage}`;
+    let combined: string;
+    if (useFileContext) {
+      const filePath = this.writeContextSyncFile(params.sessionKey, params.unsyncedMessages, contextLines);
+      combined =
+        `[以下是你不在线期间群里的长历史上下文，因消息数或大小超过直接内联阈值，已写入本地文件]\n` +
+        `文件路径：${filePath}\n\n` +
+        `你必须先使用 read 工具读取这个文件，理解其中的完整群聊历史，再回答当前消息。\n` +
+        `如果无法读取文件，请明确说明，不能直接忽略历史上下文作答。\n` +
+        `\n---\n` +
+        `[${params.currentSenderName}]: ${params.currentMessage}`;
+    } else {
+      combined =
+        `[以下是你不在线期间群里的对话，请了解上下文]\n` +
+        inlineContext +
+        `\n---\n` +
+        `[${params.currentSenderName}]: ${params.currentMessage}`;
+    }
 
     return this.chatSend({
       sessionKey: params.sessionKey,
@@ -893,6 +963,44 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       timeoutMs: params.timeoutMs,
       emptyFinalAsNoReply: params.emptyFinalAsNoReply,
     });
+  }
+
+  private formatContextLines(messages: ChatMessage[]): string[] {
+    return messages.map((m) => {
+      const time = new Date(m.timestamp).toLocaleString("zh-CN", {
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      const tag = m.senderType === "bot" ? `${m.senderName} (AI)` : m.senderName;
+      return `[${tag} ${time}]: ${m.content}`;
+    });
+  }
+
+  private writeContextSyncFile(sessionKey: string, messages: ChatMessage[], contextLines: string[]): string {
+    const safeSessionKey = sessionKey.replace(/[^a-zA-Z0-9_.-]+/g, "_");
+    const dir = join(CONTEXT_SYNC_DIR, safeSessionKey);
+    mkdirSync(dir, { recursive: true });
+    const filePath = join(dir, `${new Date().toISOString().replace(/[:.]/g, "-")}-${randomUUID()}.md`);
+    const first = messages[0];
+    const last = messages[messages.length - 1];
+    const markdown = [
+      `# LMA 群聊历史上下文同步`,
+      ``,
+      `- Session: ${sessionKey}`,
+      `- Messages: ${messages.length}`,
+      `- Range: ${first?.id ?? "?"} → ${last?.id ?? "?"}`,
+      `- Generated: ${new Date().toISOString()}`,
+      ``,
+      `## Messages`,
+      ``,
+      contextLines.join("\n\n"),
+      ``,
+    ].join("\n");
+    writeFileSync(filePath, markdown, "utf8");
+    return filePath;
   }
 
   private extractImageAttachments(contents: string[]): ChatAttachment[] {

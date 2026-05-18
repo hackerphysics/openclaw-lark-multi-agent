@@ -75,6 +75,7 @@ export class MessageStore {
         timestamp INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
+      CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, id);
 
       CREATE TABLE IF NOT EXISTS chat_info (
         chat_id TEXT PRIMARY KEY,
@@ -88,13 +89,26 @@ export class MessageStore {
         updated_at INTEGER NOT NULL DEFAULT 0
       );
 
-      -- Tracks which messages have been synced to each bot's OpenClaw session.
+      -- Legacy high-water mark for which messages have been synced to each
+      -- bot's OpenClaw session. Kept for compatibility and quick inspection.
       CREATE TABLE IF NOT EXISTS sync_state (
         bot_name TEXT NOT NULL,
         chat_id TEXT NOT NULL,
         last_synced_msg_id INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (bot_name, chat_id)
       );
+
+      -- Per-message sync ledger. This lets a bot catch up on all missed group
+      -- messages without relying only on a coarse high-water mark.
+      CREATE TABLE IF NOT EXISTS message_sync (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        message_row_id INTEGER NOT NULL,
+        synced_at INTEGER NOT NULL,
+        sync_batch_id TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY (bot_name, chat_id, message_row_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_message_sync_bot_chat ON message_sync(bot_name, chat_id, message_row_id);
 
       -- Tracks which messages have been processed by each bot (multi-bot dedup).
       CREATE TABLE IF NOT EXISTS processed_events (
@@ -496,6 +510,49 @@ export class MessageStore {
       content: r.content,
       timestamp: r.timestamp,
     }));
+  }
+
+  /**
+   * Get all messages at or before triggerRowId that have not been synced to a
+   * bot's session yet. Ordered by timestamp ascending.
+   */
+  getUnsyncedMessagesForBot(botName: string, chatId: string, triggerRowId: number): ChatMessage[] {
+    const rows = this.db.prepare(`
+      SELECT messages.* FROM messages
+      LEFT JOIN recalled_messages ON recalled_messages.message_id = messages.message_id
+      LEFT JOIN message_sync ON message_sync.bot_name = ?
+        AND message_sync.chat_id = messages.chat_id
+        AND message_sync.message_row_id = messages.id
+      WHERE messages.chat_id = ?
+        AND messages.id <= ?
+        AND recalled_messages.message_id IS NULL
+        AND message_sync.message_row_id IS NULL
+      ORDER BY messages.timestamp ASC
+    `).all(botName, chatId, triggerRowId) as any[];
+
+    return rows.map((r: any) => ({
+      id: r.id,
+      chatId: r.chat_id,
+      messageId: r.message_id,
+      senderType: r.sender_type,
+      senderName: r.sender_name,
+      content: r.content,
+      timestamp: r.timestamp,
+    }));
+  }
+
+  markMessagesSynced(botName: string, chatId: string, messageRowIds: number[], syncBatchId: string = ''): void {
+    const ids = Array.from(new Set(messageRowIds.filter((id) => Number.isFinite(id) && id > 0)));
+    if (ids.length === 0) return;
+    const now = Date.now();
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO message_sync (bot_name, chat_id, message_row_id, synced_at, sync_batch_id)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+    const tx = this.db.transaction((rows: number[]) => {
+      for (const id of rows) stmt.run(botName, chatId, id, now, syncBatchId);
+    });
+    tx(ids);
   }
 
   /**

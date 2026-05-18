@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { existsSync, readFileSync } from "node:fs";
 import { GATEWAY_PROTOCOL_MAX, GATEWAY_PROTOCOL_MIN, OpenClawClient } from "../src/openclaw-client.js";
 import { getBridgeAttachmentsDir } from "../src/paths.js";
 
@@ -191,6 +192,62 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("real transcript reply");
   });
 
+  it("does not surface replayInvalid before the idle timeout and includes last activity when it times out", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 250, "s1");
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "item",
+      data: { kind: "tool", phase: "end", name: "exec", meta: "curl timed out after 300s; received 788MB/1.12GB" },
+    });
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "abandoned", replayInvalid: true },
+    });
+
+    const reply = await replyPromise;
+    expect(reply).toContain("Agent 未正常完成");
+    expect(reply).toContain("状态: abandoned, replayInvalid");
+    expect(reply).toContain("最后活动: 工具 end exec: curl timed out after 300s; received 788MB/1.12GB");
+    expect(reply).toContain("没有收到新的工具输出或最终回复");
+  });
+
+  it("clears a pending replayInvalid failure when later tool activity arrives", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 800, "s1");
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "abandoned", replayInvalid: true },
+    });
+    setTimeout(() => {
+      events.get(key)!.push({
+        runId: "chat-run",
+        sessionKey: key,
+        stream: "item",
+        data: { kind: "tool", phase: "start", name: "exec", meta: "curl -C - retry" },
+      });
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "download resumed" } });
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+    }, 150);
+
+    await expect(replyPromise).resolves.toBe("download resumed");
+  });
+
   it("extracts visible assistant text from text-only transcript messages", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "visible" }] })).toBe("visible");
@@ -312,6 +369,37 @@ describe("OpenClawClient bridge attachment hint", () => {
     });
     expect(chatSend).toHaveBeenCalledOnce();
     expect(result).not.toContain("LMA_BRIDGE_ATTACHMENTS");
+  });
+
+  it("writes oversized catch-up context to a local file and instructs the agent to read it", async () => {
+    const { client, chatSend } = clientWithCapturedChatSend();
+    const messages = Array.from({ length: 1001 }, (_, i) => ({
+      id: i + 1,
+      chatId: "chat1",
+      messageId: `m${i + 1}`,
+      senderType: i % 2 === 0 ? "human" as const : "bot" as const,
+      senderName: i % 2 === 0 ? "Stephen" : "GPT",
+      content: `message ${i + 1}`,
+      timestamp: 1778890000000 + i,
+    }));
+
+    const result = await client.chatSendWithContext({
+      sessionKey: "s1",
+      unsyncedMessages: messages,
+      currentMessage: "你怎么看？",
+      currentSenderName: "Stephen",
+    });
+
+    expect(chatSend).toHaveBeenCalledOnce();
+    expect(result).toContain("已写入本地文件");
+    expect(result).toContain("你必须先使用 read 工具读取这个文件");
+    const filePath = result.match(/文件路径：([^\n]+)/)?.[1]?.trim();
+    expect(filePath).toBeTruthy();
+    expect(existsSync(filePath!)).toBe(true);
+    const file = readFileSync(filePath!, "utf8");
+    expect(file).toContain("Messages: 1001");
+    expect(file).toContain("message 1");
+    expect(file).toContain("message 1001");
   });
 
   it("injects the bridge attachment hint only for likely attachment requests", async () => {

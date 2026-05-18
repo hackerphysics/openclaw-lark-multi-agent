@@ -41,6 +41,19 @@ describe("MessageStore", () => {
     expect(store.getPendingTriggerMessages("GPT", "c1").map((m) => m.id)).toEqual([oldId]);
   }));
 
+  it("tracks per-message sync independently of the legacy high-water mark", () => withStore((store) => {
+    const a = store.insert({ chatId: "c1", messageId: "a", senderType: "human", senderName: "u", content: "a", timestamp: 1 });
+    const b = store.insert({ chatId: "c1", messageId: "b", senderType: "bot", senderName: "GPT", content: "b", timestamp: 2 });
+    const c = store.insert({ chatId: "c1", messageId: "c", senderType: "human", senderName: "u", content: "c", timestamp: 3 });
+
+    store.markSynced("Claude", "c1", c);
+    expect(store.getUnsyncedMessagesForBot("Claude", "c1", c).map((m) => m.id)).toEqual([a, b, c]);
+
+    store.markMessagesSynced("Claude", "c1", [a, c], "batch-1");
+    expect(store.getUnsyncedMessagesForBot("Claude", "c1", c).map((m) => m.id)).toEqual([b]);
+    expect(store.getUnsyncedMessagesForBot("GPT", "c1", c).map((m) => m.id)).toEqual([a, b, c]);
+  }));
+
   it("keeps pending triggers separate from context messages", () => withStore((store) => {
     const contextId = store.insert({ chatId: "c1", messageId: "ctx", senderType: "human", senderName: "u", content: "context", timestamp: 1 });
     const triggerId = store.insert({ chatId: "c1", messageId: "trg", senderType: "human", senderName: "u", content: "trigger", timestamp: 2 });

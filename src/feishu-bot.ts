@@ -688,26 +688,28 @@ export class FeishuBot {
 
   private async processQueueInner(chatId: string): Promise<void> {
     while (true) {
-      const unsyncedMessages = this.store.getUnsyncedMessages(this.config.name, chatId);
       const pendingMessages = this.store.getPendingTriggerMessages(this.config.name, chatId);
-      const messageById = new Map<number, typeof unsyncedMessages[number]>();
-      for (const msg of [...unsyncedMessages, ...pendingMessages]) {
-        if (msg.id) messageById.set(msg.id, msg);
-      }
-      const allUnsynced = Array.from(messageById.values()).sort((a, b) => a.timestamp - b.timestamp);
       const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chatId);
       // Only proceed if there are pending human messages that should actively trigger this bot.
-      // Pending triggers are included even if a later bridge command has advanced sync_state.
-      const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id));
-      if (humanUnsynced.length === 0) {
+      const pendingHumanTriggers = pendingMessages
+        .filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id))
+        .sort((a, b) => a.timestamp - b.timestamp);
+      if (pendingHumanTriggers.length === 0) {
         break;
       }
 
       this.busyChats.set(chatId, Date.now());
 
-      // The last trigger message is the "current" one, everything else is context
-      const lastHuman = humanUnsynced[humanUnsynced.length - 1];
+      // The last trigger message is the "current" one, everything else is context.
+      const lastHuman = pendingHumanTriggers[pendingHumanTriggers.length - 1];
       const triggerId = lastHuman.id || 0;
+      const catchupMessages = this.store.getUnsyncedMessagesForBot(this.config.name, chatId, triggerId);
+      const messageById = new Map<number, typeof catchupMessages[number]>();
+      for (const msg of [...catchupMessages, ...pendingMessages]) {
+        if (msg.id) messageById.set(msg.id, msg);
+      }
+      const allUnsynced = Array.from(messageById.values()).sort((a, b) => a.timestamp - b.timestamp);
+      const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id));
       if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
         console.warn(`[${this.config.name}] Duplicate trigger skipped for ${chatId.slice(-8)} msgId=${triggerId}`);
         this.store.clearPendingTriggers(this.config.name, chatId, triggerId);
@@ -775,6 +777,8 @@ export class FeishuBot {
         // must remain pending for the next loop.
         const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
         const processedTriggerIds = new Set(humanUnsynced.map((m) => m.id || 0).filter(Boolean));
+        const syncBatchId = `${this.config.name}:${chatId}:${triggerId}:${Date.now()}`;
+        this.store.markMessagesSynced(this.config.name, chatId, allUnsynced.map((m) => m.id || 0), syncBatchId);
         this.store.markSynced(this.config.name, chatId, maxId);
         this.store.clearPendingTriggers(this.config.name, chatId, maxId);
         const shouldReply = trimmedReply.length > 0 && !explicitNoReply;
@@ -799,7 +803,10 @@ export class FeishuBot {
             // Do not advance sync past a human message that arrived while this
             // run was busy. Otherwise the pending trigger remains in the table
             // but getUnsyncedMessages() can no longer see it.
-            if (!hasEarlierPending) this.store.markSynced(this.config.name, chatId, replyId);
+            if (!hasEarlierPending) {
+              this.store.markMessagesSynced(this.config.name, chatId, [replyId], `${this.config.name}:${chatId}:reply:${replyId}`);
+              this.store.markSynced(this.config.name, chatId, replyId);
+            }
           }
         }
 
