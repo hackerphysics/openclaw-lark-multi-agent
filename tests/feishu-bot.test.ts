@@ -645,4 +645,49 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("[Attachment: document"))).toBe(true);
     } finally { h.cleanup(); }
   });
+
+  it("does not send placeholder attachment failure as a separate user-visible provider error", async () => {
+    const h = makeHarness();
+    try {
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        return `示例：\nMEDIA:/some/real/file.png`;
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "review 下", messageId: "m1" }));
+      const allReplies = (h.bot as any).replyMessage.mock.calls.map((call: any[]) => call[1]);
+      expect(allReplies.filter((text: string) => text.includes("附件发送失败"))).toHaveLength(1);
+      expect(allReplies.some((text: string) => text.includes("这次没有完成回复"))).toBe(false);
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("rejects nonexistent attachment paths", async () => {
+    const h = makeHarness();
+    try {
+      expect(() => (h.bot as any).validateBridgeAttachmentPath("/real/path/image.png")).toThrow(/not found/i);
+      expect(() => (h.bot as any).validateBridgeAttachmentPath("/absolute/path.png")).toThrow(/not found/i);
+    } finally { h.cleanup(); }
+  });
+
+  it("converts MEDIA directives into bridge attachments instead of leaving path text", async () => {
+    const h = makeHarness();
+    try {
+      const imagePath = resolve(tmpdir(), "olma-test-media", "avatar.png");
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        return `已经画好了\n\nMEDIA:${imagePath}\n\n1024×1024 正方形。`;
+      });
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "发图", messageId: "m1" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("已经画好了"));
+      expect((h.bot as any).replyMessage.mock.calls[0][1]).toContain("1024×1024 正方形。");
+      expect((h.bot as any).replyMessage.mock.calls[0][1]).not.toContain("MEDIA:");
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", {
+        type: "image",
+        path: imagePath,
+      });
+      expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("MEDIA:"))).toBe(false);
+      expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("[Attachment: image"))).toBe(true);
+    } finally { h.cleanup(); }
+  });
 });

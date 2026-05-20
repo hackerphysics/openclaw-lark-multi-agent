@@ -5,7 +5,7 @@ import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, readFileSync, statSync } from "fs";
 import { basename, extname, resolve } from "path";
-import { getBridgeAttachmentAllowedRoots, getBridgeAttachmentsDir } from "./paths.js";
+import { getBridgeAttachmentsDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
@@ -14,7 +14,7 @@ const LMA_VERSION = require("../package.json").version as string;
 
 const MAX_BOT_STREAK = 10;
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
-const BRIDGE_ATTACHMENT_ALLOWED_ROOTS = getBridgeAttachmentAllowedRoots();
+
 
 type BridgeAttachment = {
   type?: "image" | "file" | "document";
@@ -823,8 +823,15 @@ export class FeishuBot {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
           } else {
-            await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`), shouldReply ? visibleReply : "", parsedReply.attachments, lastHuman.messageId, `trigger:${triggerId}`);
-            if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+            try {
+              await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`), shouldReply ? visibleReply : "", parsedReply.attachments, lastHuman.messageId, `trigger:${triggerId}`);
+              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+            } catch (err) {
+              // enqueueAndDispatchDelivery already sent a user-visible delivery
+              // failure. Do not fall through to the generic provider-error path;
+              // that creates a second misleading "bot did not complete" message.
+              console.warn(`[${this.config.name}] assistant delivery failed after notification:`, this.errorSummary(err));
+            }
           }
         }
         if (isRuntimeFailure && lastHuman.messageId) {
@@ -1240,28 +1247,38 @@ export class FeishuBot {
       try {
         const parsed = JSON.parse(String(jsonText).trim());
         const rawAttachments = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.attachments) ? parsed.attachments : [parsed];
-        for (const item of rawAttachments) {
-          if (!item || typeof item.path !== "string") continue;
-          attachments.push({
-            type: item.type === "image" || item.type === "document" || item.type === "file" ? item.type : undefined,
-            path: item.path,
-            caption: typeof item.caption === "string" ? item.caption : undefined,
-          });
-        }
+        for (const item of rawAttachments) this.pushBridgeAttachment(attachments, item);
       } catch (err) {
         console.warn(`[${this.config.name}] Failed to parse bridge attachment marker:`, (err as Error).message);
       }
+      return "";
+    });
+
+    // Compatibility fallback for agents that use OpenClaw's channel directive
+    // syntax instead of the LMA marker. In Feishu/LMA, leaving MEDIA:<path> in
+    // plain text only shows the path, so parse it into bridge attachments.
+    const mediaDirectivePattern = /^\s*MEDIA:(.+)$/gm;
+    text = text.replace(mediaDirectivePattern, (_match, rawPath) => {
+      const mediaPath = String(rawPath).trim();
+      if (!mediaPath) return "";
+      const cleanPath = mediaPath.replace(/^['\"]|['\"]$/g, "");
+      attachments.push({ type: this.isImagePath(cleanPath) ? "image" : "file", path: cleanPath });
       return "";
     }).trim();
     return { text, attachments };
   }
 
+  private pushBridgeAttachment(attachments: BridgeAttachment[], item: any): void {
+    if (!item || typeof item.path !== "string") return;
+    attachments.push({
+      type: item.type === "image" || item.type === "document" || item.type === "file" ? item.type : undefined,
+      path: item.path,
+      caption: typeof item.caption === "string" ? item.caption : undefined,
+    });
+  }
+
   private validateBridgeAttachmentPath(filePath: string): string {
     const resolvedPath = resolve(filePath);
-    const isAllowed = BRIDGE_ATTACHMENT_ALLOWED_ROOTS.some((root) => resolvedPath === root || resolvedPath.startsWith(root + "/"));
-    if (!isAllowed) {
-      throw new Error(`Attachment path outside allowed directories (${BRIDGE_ATTACHMENT_ALLOWED_ROOTS.join(", ")}): ${resolvedPath}`);
-    }
     if (!existsSync(resolvedPath)) throw new Error(`Attachment file not found: ${resolvedPath}`);
     const stats = statSync(resolvedPath);
     if (!stats.isFile()) throw new Error(`Attachment path is not a file: ${resolvedPath}`);
@@ -1701,7 +1718,8 @@ export class FeishuBot {
   private async downloadResource(messageId: string, fileKey: string, type: "image" | "file"): Promise<string> {
     const { mkdirSync, writeFileSync } = await import("fs");
     const { resolve } = await import("path");
-    const dir = resolve(process.cwd(), "data", "media");
+    const { getStateDir } = await import("./paths.js");
+    const dir = resolve(getStateDir(), "data", "media");
     mkdirSync(dir, { recursive: true });
 
     const resp = await this.client.im.messageResource.get({

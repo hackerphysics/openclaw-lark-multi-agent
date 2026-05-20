@@ -415,6 +415,10 @@ describe("OpenClawClient bridge attachment hint", () => {
     expect(result).toContain(`${getBridgeAttachmentsDir()}/`);
     expect(result).toContain("LMA_BRIDGE_ATTACHMENTS");
     expect(result).toContain("Do NOT call message, sessions_send");
+    expect(result).toContain("NEVER use placeholder paths");
+    expect(result).toContain("replace-with-actual-created-file.png");
+    expect(result).not.toContain("path\":\"/absolute/path");
+    expect(result).not.toContain("path\":\"/real/path");
     expect(result).toContain("type=document for Markdown documents");
   });
 });

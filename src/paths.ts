@@ -18,7 +18,7 @@ export function getOpenClawWorkspaceDir(): string {
 }
 
 export function getBridgeAttachmentAllowedRoots(): string[] {
-  const roots = [getBridgeAttachmentsDir(), getOpenClawWorkspaceDir()];
+  const roots = [getBridgeAttachmentsDir(), getOpenClawWorkspaceDir(), resolve(getStateDir(), "data", "media")];
   const extra = process.env.OPENCLAW_LARK_MULTI_AGENT_ATTACHMENT_ALLOW_ROOTS || "";
   for (const part of extra.split(",")) {
     const trimmed = part.trim();
