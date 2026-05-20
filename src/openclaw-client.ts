@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import { basename, extname, join } from "path";
 import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
-import { getBridgeAttachmentsDir, getStateDir } from "./paths.js";
+import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 
 export type ChatAttachment = {
   type?: string;
@@ -17,7 +17,7 @@ export const GATEWAY_PROTOCOL_MIN = 3;
 export const GATEWAY_PROTOCOL_MAX = 4;
 
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
-const CONTEXT_SYNC_DIR = join(getStateDir(), "context-sync");
+const CONTEXT_SYNC_DIR = join(getDataDir(), "context-sync");
 const MAX_INLINE_CONTEXT_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_MESSAGES || 1000);
 const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 8 * 1024 * 1024);
 

@@ -1718,8 +1718,8 @@ export class FeishuBot {
   private async downloadResource(messageId: string, fileKey: string, type: "image" | "file"): Promise<string> {
     const { mkdirSync, writeFileSync } = await import("fs");
     const { resolve } = await import("path");
-    const { getStateDir } = await import("./paths.js");
-    const dir = resolve(getStateDir(), "data", "media");
+    const { getLmaMediaDir } = await import("./paths.js");
+    const dir = getLmaMediaDir();
     mkdirSync(dir, { recursive: true });
 
     const resp = await this.client.im.messageResource.get({
