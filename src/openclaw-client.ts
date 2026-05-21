@@ -611,12 +611,22 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 }
                 if (!latestFinalText) {
                   const failureText = buildFailureText(ev);
-                  if (ev.data?.replayInvalid) {
+                  const state = ev.data?.livenessState || "";
+                  const reason = ev.data?.stopReason || "";
+                  // replayInvalid, cancelled/rpc, and abandoned are often
+                  // transient runtime states — the real reply may still arrive
+                  // shortly after via session.message or a subsequent run.
+                  // Defer the failure instead of finishing immediately.
+                  const isTransient = ev.data?.replayInvalid
+                    || state === "cancelled"
+                    || state === "abandoned"
+                    || reason === "rpc";
+                  if (isTransient) {
                     pendingRuntimeFailureText = failureText;
-                    console.warn(`[OpenClaw] replayInvalid lifecycle observed for runId=${evRunId || runId}; waiting for real text or idle timeout`);
+                    console.warn(`[OpenClaw] transient lifecycle end (${state}, reason=${reason}) for runId=${evRunId || runId}; waiting for real text or idle timeout`);
                     return;
                   }
-                  if (ev.data?.livenessState !== "working") {
+                  if (state !== "working") {
                     finish(failureText);
                     return;
                   }

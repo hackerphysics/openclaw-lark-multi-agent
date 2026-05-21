@@ -248,6 +248,50 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("download resumed");
   });
 
+  it("defers cancelled/rpc lifecycle failures until idle timeout and keeps later real text", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 800, "s1");
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "cancelled", stopReason: "rpc" },
+    });
+    setTimeout(() => {
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "late real reply" } });
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+    }, 120);
+
+    await expect(replyPromise).resolves.toBe("late real reply");
+  });
+
+  it("surfaces cancelled/rpc lifecycle only after idle timeout if no real reply arrives", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 250, "s1");
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "end", livenessState: "cancelled", stopReason: "rpc" },
+    });
+
+    const reply = await replyPromise;
+    expect(reply).toContain("Agent 未正常完成");
+    expect(reply).toContain("状态: cancelled");
+    expect(reply).toContain("原因: rpc");
+    expect(reply).toContain("没有收到新的工具输出或最终回复");
+  });
+
   it("extracts visible assistant text from text-only transcript messages", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "visible" }] })).toBe("visible");
