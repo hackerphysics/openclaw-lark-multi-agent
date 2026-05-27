@@ -348,6 +348,22 @@ describe("OpenClawClient collectReply", () => {
 
     await expect(replyPromise).resolves.toBe("hello");
   });
+  it("does not concatenate transcript mirrors with streaming deltas", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "prefix" } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "transcriptAssistant", data: { deltaText: "prefix full final", replace: true } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: " full final" } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
+
+    await expect(replyPromise).resolves.toBe("prefix full final");
+  });
+
 });
 
 describe("OpenClawClient proactive delivery mute", () => {

@@ -209,7 +209,7 @@ export class OpenClawClient {
             this.agentEvents.get(rawKey)!.push({
               runId: frame.payload.runId,
               sessionKey: rawKey,
-              stream: "assistant",
+              stream: "transcriptAssistant",
               data: { deltaText: visibleAssistantText, delta: visibleAssistantText, replace: true },
             });
           }
@@ -354,6 +354,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let text = "";
       let chatDeltaText = "";
       let chatFinalText = "";
+      let transcriptAssistantText = "";
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey.replace(/^agent:[^:]+:/, "")}` : "";
       let shortSessionKey = targetSessionKey ? targetSessionKey.replace(/^agent:[^:]+:/, "") : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -388,7 +389,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
             console.warn(`[OpenClaw] abort after collectReply idle timeout failed:`, (err as Error).message);
           });
-          const visibleText = text || chatDeltaText || chatFinalText;
+          const visibleText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
           if (visibleText) {
             resolve(visibleText);
           } else if (pendingRuntimeFailureText) {
@@ -410,7 +411,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           }
           return `运行事件 item${data.kind ? `/${data.kind}` : ""}`;
         }
-        if (ev.stream === "assistant" || ev.stream === "chatDelta") {
+        if (ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") {
           const chunk = String(ev.data?.deltaText || ev.data?.delta || "").trim();
           return chunk ? `模型输出片段: ${chunk.slice(0, 300)}` : "模型输出片段";
         }
@@ -560,7 +561,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               lifecycleStartedLogged = true;
               console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
             }
-            if ((ev.stream === "assistant" || ev.stream === "chatDelta") && (ev.data?.deltaText || ev.data?.delta)) {
+            if ((ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") && (ev.data?.deltaText || ev.data?.delta)) {
               const chunk = ev.data.deltaText || ev.data.delta;
               if (ev.stream === "assistant") {
                 if (ev.data?.replace) {
@@ -568,11 +569,17 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 } else {
                   text += chunk;
                 }
-              } else {
+              } else if (ev.stream === "chatDelta") {
                 if (ev.data?.replace) {
                   chatDeltaText = chunk;
                 } else {
                   chatDeltaText += chunk;
+                }
+              } else {
+                if (ev.data?.replace) {
+                  transcriptAssistantText = chunk;
+                } else {
+                  transcriptAssistantText += chunk;
                 }
               }
             }
@@ -587,7 +594,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                   });
                   // Prefer final chat message over accumulated deltas: some providers may
                   // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-                  const latestFinalText = chatFinalText || text || chatDeltaText;
+                  const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
                   if (latestFinalText) {
                     finish(latestFinalText);
                   } else if (options?.emptyFinalAsNoReply) {
@@ -602,9 +609,9 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
               // Prefer final chat message over accumulated deltas: some providers may
               // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-              const finalText = chatFinalText || text || chatDeltaText;
+              const finalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
               const finishFromLifecycle = () => {
-                const latestFinalText = chatFinalText || text || chatDeltaText;
+                const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
                 if (!chatFinalText && latestFinalText.trim() === "N") {
                   // Some providers stream the first character of NO_REPLY ("N") but
                   // never deliver a final chat message in time. Never surface a lone
@@ -665,6 +672,17 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       }, 50);
     });
   }
+
+  private pickBestCollectedText(chatFinalText: string, assistantText: string, chatDeltaText: string, transcriptAssistantText: string): string {
+    if (chatFinalText) return chatFinalText;
+    const candidates = [assistantText, chatDeltaText, transcriptAssistantText].filter((value) => value && value.trim());
+    if (candidates.length === 0) return "";
+    // transcriptAssistant is a full transcript mirror. Keep it separate from
+    // streaming deltas to avoid concatenating the same response twice; choose
+    // the richest available non-final text as fallback.
+    return candidates.sort((a, b) => b.length - a.length)[0];
+  }
+
 
 
   // --- Session management ---
