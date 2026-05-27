@@ -55,6 +55,13 @@ export class OpenClawClient {
   /** Session keys whose proactive messages must be dropped by the bridge (e.g. discussion scheduler owns delivery). */
   private mutedProactiveSessions: Set<string> = new Set();
   private mutedProactiveSessionCounts: Map<string, number> = new Map();
+  /** Global limiter for chat.send RPC calls; large multi-bot fan-out can
+   * saturate the Gateway before collectReply even starts. The slot is released
+   * as soon as the chat.send RPC returns a runId; collectReply does not hold it.
+   */
+  private chatSendConcurrency = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_CHAT_SEND_CONCURRENCY || 3);
+  private activeChatSends = 0;
+  private chatSendWaiters: Array<() => void> = [];
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -848,6 +855,25 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     };
   }
 
+  private async acquireChatSendSlot(): Promise<() => void> {
+    const limit = Math.max(1, this.chatSendConcurrency || 1);
+    if (this.activeChatSends < limit) {
+      this.activeChatSends++;
+      return () => this.releaseChatSendSlot();
+    }
+    const startedWaitingAt = Date.now();
+    await new Promise<void>((resolve) => this.chatSendWaiters.push(resolve));
+    this.activeChatSends++;
+    console.log(`[OpenClaw] chat.send waited ${Date.now() - startedWaitingAt}ms for concurrency slot (active=${this.activeChatSends}/${limit})`);
+    return () => this.releaseChatSendSlot();
+  }
+
+  private releaseChatSendSlot(): void {
+    this.activeChatSends = Math.max(0, this.activeChatSends - 1);
+    const next = this.chatSendWaiters.shift();
+    if (next) next();
+  }
+
   async chatSend(params: {
     sessionKey: string;
     message: string;
@@ -867,14 +893,20 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       // the next message while still allowing sessionKey matching for internal runIds.
       this.agentEvents.set(fullSessionKey, []);
       this.agentEvents.set(sk, []);
+      const releaseChatSendSlot = await this.acquireChatSendSlot();
+      let result: any;
       const sendStartedAt = Date.now();
-      const result = await this.rpc("chat.send", {
-        sessionKey: sk,
-        message: params.message,
-        attachments: params.attachments,
-        deliver: params.deliver ?? false,
-        idempotencyKey: randomUUID(),
-      });
+      try {
+        result = await this.rpc("chat.send", {
+          sessionKey: sk,
+          message: params.message,
+          attachments: params.attachments,
+          deliver: params.deliver ?? false,
+          idempotencyKey: randomUUID(),
+        });
+      } finally {
+        releaseChatSendSlot();
+      }
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message });
     } finally {

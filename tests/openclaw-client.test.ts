@@ -395,6 +395,29 @@ describe("OpenClawClient proactive delivery mute", () => {
   });
 });
 
+
+describe("OpenClawClient chat.send concurrency", () => {
+  it("limits concurrent chat.send RPCs", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).chatSendConcurrency = 2;
+    (client as any).collectReply = async (runId: string) => `reply:${runId}`;
+    let active = 0;
+    let maxActive = 0;
+    (client as any).rpc = async (method: string, _params: any) => {
+      expect(method).toBe("chat.send");
+      active++;
+      maxActive = Math.max(maxActive, active);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      active--;
+      return { runId: `run-${Math.random().toString(36).slice(2)}` };
+    };
+
+    const replies = await Promise.all(Array.from({ length: 5 }, (_, i) => client.chatSend({ sessionKey: `s${i}`, message: `m${i}` })));
+    expect(replies).toHaveLength(5);
+    expect(maxActive).toBeLessThanOrEqual(2);
+  });
+});
+
 describe("OpenClawClient bridge attachment hint", () => {
   function clientWithCapturedChatSend() {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
