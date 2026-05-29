@@ -125,6 +125,26 @@ export class FeishuBot {
     return `lma-${this.config.name.toLowerCase()}-${chatId}`;
   }
 
+
+  private lmaBridgePolicy(): string {
+    return [
+      "[LMA bridge policy]",
+      "你正在 OpenClaw Lark Multi-Agent bridge 会话中。",
+      "不要调用 message、sessions_send、feishu_im_user_message 或任何主动向飞书/外部聊天发送消息的工具。",
+      "直接在当前回复中作答；LMA bridge 会负责把最终回复投递回原始飞书群。",
+    ].join("\n");
+  }
+
+  private async injectBridgePolicy(sessionKey: string): Promise<void> {
+    await this.openclawClient.injectAssistantMessage({
+      sessionKey,
+      message: this.lmaBridgePolicy(),
+      label: "LMA bridge policy",
+    }).catch((err) => {
+      console.warn(`[${this.config.name}] bridge policy inject failed:`, (err as Error).message);
+    });
+  }
+
   /**
    * Ensure the session for a given chatId exists with the correct model.
    * Lazy: only creates on first message in that chat.
@@ -162,6 +182,7 @@ export class FeishuBot {
         });
         // Always patch model after create to ensure it takes effect
         await this.openclawClient.patchSession({ key: sessionKey, model: this.config.model });
+        await this.injectBridgePolicy(sessionKey);
         console.log(`[${this.config.name}] Session created: ${sessionKey} (model: ${this.config.model})`);
       }
     } catch (err) {

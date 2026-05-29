@@ -364,6 +364,35 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("prefix full final");
   });
 
+
+  it("limits concurrent maintenance RPCs", async () => {
+    const previous = process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY;
+    process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY = "1";
+    try {
+      const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+      let active = 0;
+      let maxActive = 0;
+      (client as any).rpc = vi.fn(async (method: string) => {
+        expect(method).toBe("sessions.compact");
+        active++;
+        maxActive = Math.max(maxActive, active);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        active--;
+        return { ok: true };
+      });
+
+      await Promise.all([
+        client.compactSession("s1"),
+        client.compactSession("s2"),
+        client.compactSession("s3"),
+      ]);
+
+      expect(maxActive).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY;
+      else process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY = previous;
+    }
+  });
 });
 
 describe("OpenClawClient proactive delivery mute", () => {

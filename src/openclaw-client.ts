@@ -62,6 +62,10 @@ export class OpenClawClient {
   private chatSendConcurrency = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_CHAT_SEND_CONCURRENCY || 3);
   private activeChatSends = 0;
   private chatSendWaiters: Array<() => void> = [];
+  /** Maintenance RPCs like sessions.compact are heavy and should not fan out. */
+  private maintenanceConcurrency = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY || 1);
+  private activeMaintenanceRpcs = 0;
+  private maintenanceWaiters: Array<() => void> = [];
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -699,6 +703,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     return this.rpc("sessions.describe", { key });
   }
 
+
+  async injectAssistantMessage(params: { sessionKey: string; message: string; label?: string }): Promise<any> {
+    return this.rpc("chat.inject", params, 10000);
+  }
+
   /**
    * Get session info (model, tokens, etc.) for status display.
    */
@@ -734,7 +743,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   }
 
   async compactSession(key: string): Promise<any> {
-    return this.rpc("sessions.compact", { key });
+    const release = await this.acquireMaintenanceSlot("sessions.compact");
+    const startedAt = Date.now();
+    try {
+      return await this.rpc("sessions.compact", { key }, 10 * 60 * 1000);
+    } finally {
+      console.log(`[OpenClaw] sessions.compact finished for ${key} in ${Date.now() - startedAt}ms`);
+      release();
+    }
   }
 
   // --- Chat ---
@@ -889,6 +905,25 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   private releaseChatSendSlot(): void {
     this.activeChatSends = Math.max(0, this.activeChatSends - 1);
     const next = this.chatSendWaiters.shift();
+    if (next) next();
+  }
+
+  private async acquireMaintenanceSlot(kind: string): Promise<() => void> {
+    const limit = Math.max(1, this.maintenanceConcurrency || 1);
+    if (this.activeMaintenanceRpcs < limit) {
+      this.activeMaintenanceRpcs++;
+      return () => this.releaseMaintenanceSlot();
+    }
+    const startedWaitingAt = Date.now();
+    await new Promise<void>((resolve) => this.maintenanceWaiters.push(resolve));
+    this.activeMaintenanceRpcs++;
+    console.log(`[OpenClaw] ${kind} waited ${Date.now() - startedWaitingAt}ms for maintenance slot (active=${this.activeMaintenanceRpcs}/${limit})`);
+    return () => this.releaseMaintenanceSlot();
+  }
+
+  private releaseMaintenanceSlot(): void {
+    this.activeMaintenanceRpcs = Math.max(0, this.activeMaintenanceRpcs - 1);
+    const next = this.maintenanceWaiters.shift();
     if (next) next();
   }
 

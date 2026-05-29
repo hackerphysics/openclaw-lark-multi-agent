@@ -15,6 +15,7 @@ class MockOpenClaw {
   async ensureModel() { return false; }
   async createSession() {}
   async patchSession() {}
+  async injectAssistantMessage(_params: any) { return { ok: true }; }
   async subscribeSession(sessionKey: string, onMessage: (text: string) => void) { this.sessionCallbacks.set(sessionKey, onMessage); }
   onToolEvent() {}
   muteProactiveDelivery = vi.fn(() => vi.fn());
@@ -72,6 +73,42 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).handleMessage(event({ text: "hello" }));
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+
+  it("injects LMA bridge policy only when creating a new session", async () => {
+    const h = makeHarness();
+    try {
+      delete (h.bot as any).ensureSession;
+      h.openclaw.getSessionInfo = vi.fn(async () => null) as any;
+      h.openclaw.createSession = vi.fn(async () => ({})) as any;
+      h.openclaw.patchSession = vi.fn(async () => ({})) as any;
+      h.openclaw.injectAssistantMessage = vi.fn(async () => ({ ok: true })) as any;
+
+      const key = await (h.bot as any).ensureSession("chat1");
+      expect(key).toBe("lma-gpt-chat1");
+      expect(h.openclaw.injectAssistantMessage).toHaveBeenCalledOnce();
+      expect(h.openclaw.injectAssistantMessage).toHaveBeenCalledWith(expect.objectContaining({
+        sessionKey: "lma-gpt-chat1",
+        label: "LMA bridge policy",
+        message: expect.stringContaining("不要调用 message"),
+      }));
+
+      await (h.bot as any).ensureSession("chat1");
+      expect(h.openclaw.injectAssistantMessage).toHaveBeenCalledOnce();
+    } finally { h.cleanup(); }
+  });
+
+  it("does not inject LMA bridge policy for existing sessions", async () => {
+    const h = makeHarness();
+    try {
+      delete (h.bot as any).ensureSession;
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 123 } })) as any;
+      h.openclaw.injectAssistantMessage = vi.fn(async () => ({ ok: true })) as any;
+
+      await (h.bot as any).ensureSession("chat1");
+      expect(h.openclaw.injectAssistantMessage).not.toHaveBeenCalled();
     } finally { h.cleanup(); }
   });
 
