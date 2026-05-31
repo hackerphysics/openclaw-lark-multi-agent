@@ -1795,6 +1795,7 @@ export class FeishuBot {
       : chairman
         ? chairman === this.config.name ? `👑 是（${chairman}）` : `否（当前：${chairman}）`
         : "未设置";
+    const localeStatus = chatType === "p2p" ? this.locale : this.chatLocale(chatId);
 
     const statusText = [
       `📊 ${this.config.name} Bot Status`,
@@ -1811,6 +1812,7 @@ export class FeishuBot {
       `🔧 Verbose: ${verboseStatus}`,
       `🎛️ Mode: ${mode}`,
       `👑 Chairman: ${chairmanStatus}`,
+      `🌐 Locale: ${localeStatus}`,
     ].join("\n");
 
     await this.replyMessage(messageId, statusText);

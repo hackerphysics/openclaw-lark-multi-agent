@@ -689,6 +689,17 @@ describe("FeishuBot routing and queue behavior", () => {
       h.store.setChairmanBot("chat1", "GPT");
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /status", messageId: "status-chair" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("status-chair", expect.stringContaining("👑 Chairman: 👑 是（GPT）"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("status-chair", expect.stringContaining("🌐 Locale: zh"));
+    } finally { h.cleanup(); }
+  });
+
+
+  it("shows group locale in /status when set to English", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.setChatLocale("chat1", "en");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /status", messageId: "status-locale-en" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("status-locale-en", expect.stringContaining("🌐 Locale: en"));
     } finally { h.cleanup(); }
   });
 
