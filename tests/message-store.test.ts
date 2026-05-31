@@ -157,8 +157,8 @@ describe("MessageStore", () => {
   }));
 
   it("preserves p2p owner when upserting chat info without owner", () => withStore((store) => {
-    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm", members: "", memberNames: "", ownerBot: "GPT", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 1 });
-    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm2", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 2 });
+    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm", members: "", memberNames: "", ownerBot: "GPT", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: 1 });
+    store.upsertChatInfo({ chatId: "p2p", chatType: "p2p", chatName: "dm2", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: 2 });
     expect(store.getChatInfo("p2p")?.ownerBot).toBe("GPT");
   }));
 });

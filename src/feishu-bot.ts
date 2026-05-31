@@ -1,6 +1,7 @@
 import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
 import { BotConfig } from "./config.js";
+import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, readFileSync, statSync } from "fs";
@@ -20,6 +21,14 @@ type BridgeAttachment = {
   type?: "image" | "file" | "document";
   path: string;
   caption?: string;
+};
+
+type RoutingIntent = {
+  isAllMention: boolean;
+  targetedBotNames: string[];
+  hasTargetedMention: boolean;
+  hasHumanMention: boolean;
+  isCurrentBotMentioned: boolean;
 };
 
 /**
@@ -57,6 +66,7 @@ export class FeishuBot {
   /** Active chatSend trigger target so final replies and proactive session.message share one delivery key. */
   private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout> }> = new Map();
   private adminOpenId: string | null;
+  private locale: Locale;
 
   private static allBots: Map<string, FeishuBot> = new Map();
 
@@ -70,6 +80,7 @@ export class FeishuBot {
     this.openclawClient = openclawClient;
     this.store = store;
     this.adminOpenId = adminOpenId || null;
+    this.locale = normalizeLocale(config.locale);
     // Session keys are now per-chat: lma-<botname>-<chatId>
 
     this.client = new lark.Client({
@@ -126,13 +137,17 @@ export class FeishuBot {
   }
 
 
+
+  private chatLocale(chatId?: string): Locale {
+    return normalizeLocale(chatId ? this.store.getChatLocale(chatId) || this.locale : this.locale);
+  }
+
+  private isEn(chatId?: string): boolean {
+    return this.chatLocale(chatId) === "en";
+  }
+
   private lmaBridgePolicy(): string {
-    return [
-      "[LMA bridge policy]",
-      "你正在 OpenClaw Lark Multi-Agent bridge 会话中。",
-      "不要调用 message、sessions_send、feishu_im_user_message 或任何主动向飞书/外部聊天发送消息的工具。",
-      "直接在当前回复中作答；LMA bridge 会负责把最终回复投递回原始飞书群。",
-    ].join("\n");
+    return getI18n(this.locale).bridgePolicy;
   }
 
   private async injectBridgePolicy(sessionKey: string): Promise<void> {
@@ -427,6 +442,8 @@ export class FeishuBot {
 
       if (!cleanText.trim()) return;
 
+      const routing = this.getRoutingIntent(chatType, message, messageType === "text" ? (content.text || "") : "");
+
       // Commands may be prefixed by @all / @bot in group chats. Strip those
       // leading routing mentions before deciding whether this is a bridge command
       // or an escaped OpenClaw command.
@@ -459,14 +476,28 @@ export class FeishuBot {
       // Single slash commands are handled by the bridge. Double slash commands were
       // already unescaped above and should pass through to OpenClaw instead.
       const isBridgeCommand = !commandText.startsWith("//");
-      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free|mute|mode|discuss)/.test(cleanText.trim());
+      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free|mute|mode|discuss|chairman|locale)/.test(cleanText.trim());
       if (isCommand) {
         // In group chats, most bridge commands must be explicitly routed to this
         // bot or @all. /discuss is a group-level command, so an unmentioned
         // /discuss command is handled by one coordinator bot to avoid N replies.
         const isDiscussCommand = cleanText.trim().startsWith("/discuss");
-        if (chatType !== "p2p" && !this.shouldHandleBridgeCommand(chatType, message, isBot, message.content)) {
-          if (!(isDiscussCommand && this.isDiscussionCoordinator())) return;
+        const isChairmanCommand = cleanText.trim().startsWith("/chairman");
+        const isLocaleCommand = cleanText.trim().startsWith("/locale");
+        if (chatType !== "p2p") {
+          if (isChairmanCommand || isLocaleCommand) {
+            // Group-level settings; one coordinator handles them.
+            if (!this.isDiscussionCoordinator()) return;
+          } else if (isDiscussCommand && !routing.hasTargetedMention) {
+            // Untargeted or @all /discuss is group-level; one coordinator handles it.
+            if (!this.isDiscussionCoordinator()) return;
+          } else if (routing.hasTargetedMention) {
+            // Explicitly targeted commands belong only to the mentioned bot.
+            if (!routing.isCurrentBotMentioned) return;
+          } else if (!routing.isAllMention) {
+            // Other bridge commands in a group need an explicit target or @all.
+            return;
+          }
         }
 
         const markCommandSynced = () => {
@@ -488,10 +519,12 @@ export class FeishuBot {
             `🧹 /compact — 压缩当前 bot 的 OpenClaw session`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
-            `🔓 /free   — 切换当前 bot 的 free 模式（不 @ 也可回复）`,
+            `🔓 /free [on|off] — 开关当前 bot 的 free 模式（不 @ 也可回复）`,
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
             `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论`,
+            `👑 /chairman @Bot|off — 设置/查看/清除本群唯一 Chairman`,
+            `🌐 /locale zh|en — 设置/查看当前群语言`,
             `❓ /help    — 显示此帮助信息`,
             ``,
             `OpenClaw 原生命令（双斜杠，会转成单斜杠发给 OpenClaw）`,
@@ -553,13 +586,23 @@ export class FeishuBot {
             markCommandSynced();
             return;
           }
+          const parts = cleanText.trim().split(/\s+/).filter(Boolean);
+          const arg = (parts[1] || "toggle").toLowerCase();
+          if (!["toggle", "on", "off"].includes(arg)) {
+            await this.replyMessage(messageId, "❌ 用法：/free [on|off]");
+            markCommandSynced();
+            return;
+          }
           const current = this.store.getBotMode(this.config.name, chatId);
-          const next = current === "free" ? "normal" : "free";
+          const next = arg === "on" ? "free" : arg === "off" ? "normal" : current === "free" ? "normal" : "free";
           this.store.setBotMode(this.config.name, chatId, next);
           if (next === "free") {
-            await this.replyMessage(messageId, `🔓 ${this.config.name} 已切换到 free 模式\n不需要 @ 也可以回复普通人类消息；如果消息明确 @ 了其他 bot 或普通人，我不会抢答。\n如需多轮自动讨论，请使用群级命令 /discuss on。`);
+            await this.replyMessage(messageId, `🔓 ${this.config.name} 已切换到 free 模式
+不需要 @ 也可以回复普通人类消息；如果消息明确 @ 了其他 bot 或普通人，我不会抢答。
+如需多轮自动讨论，请使用群级命令 /discuss on。`);
           } else {
-            await this.replyMessage(messageId, `🔒 ${this.config.name} 已切换到 normal 模式\n只有明确 @ 我才会回复`);
+            await this.replyMessage(messageId, `🔒 ${this.config.name} 已切换到 normal 模式
+只有明确 @ 我才会回复`);
           }
           markCommandSynced();
           return;
@@ -597,6 +640,16 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
+        if (cleanText.trim().startsWith("/chairman")) {
+          await this.handleChairmanCommand(chatId, chatType, messageId, message.mentions || [], cleanText.trim());
+          markCommandSynced();
+          return;
+        }
+        if (cleanText.trim().startsWith("/locale")) {
+          await this.handleLocaleCommand(chatId, chatType, messageId, cleanText.trim());
+          markCommandSynced();
+          return;
+        }
       }
 
       // --- Discuss mode: group-level multi-bot round scheduler. It takes over
@@ -604,19 +657,35 @@ export class FeishuBot {
       // Targeted mentions must fall through to normal routing so @GPT still
       // works while discuss mode is enabled.
       if (chatType !== "p2p" && !isBot && this.store.getChatInfo(chatId)?.discuss) {
-        const mentions: any[] = message.mentions || [];
-        const hasTargetedMention = mentions.some((m: any) => !this.isAllMentionItem(m));
-        if (!hasTargetedMention) {
+        // Discuss mode owns ordinary and @all human messages. Explicit @bot/@human
+        // falls through to normal targeted routing.
+        if (!routing.hasTargetedMention) {
+          const discussionLocale = this.chatLocale(chatId);
+          const chairman = this.getChairmanParticipant(chatId);
           const participants = this.getDiscussionParticipants(chatId);
-          if (participants.length > 0) {
+          if (participants.length > 0 || chairman) {
             discussionManager.startIfAbsent({
               chatId,
               rootMessageId: messageId,
               topic: cleanText,
-              maxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 3,
+              maxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 10,
               participants,
+              chairman,
               sendSystemMessage: async (text) => { await this.sendMessage(chatId, text); },
+              locale: discussionLocale,
+              onComplete: async (event) => {
+                if (event.reason === "chairman_final") {
+                  this.store.setDiscussMode(event.chatId, false);
+                  await this.sendMessage(event.chatId, this.isEn(event.chatId)
+                    ? `💬 Discuss ended: Chairman ${event.chairmanName || ""} completed the final summary. Discuss mode has been turned off automatically.`
+                    : `💬 Discuss 已结束：Chairman ${event.chairmanName || ""} 已完成总结，已自动关闭 Discuss 模式。`);
+                }
+              },
             });
+          } else if (this.isDiscussionCoordinator()) {
+            await this.sendMessage(chatId, this.isEn(chatId)
+              ? "💬 Discuss is on, but there are no free bots or Chairman available. Use /free on or /chairman @Bot first."
+              : "💬 Discuss 已开启，但当前没有 free bot 或 Chairman 可参与。请先使用 /free on 或 /chairman @Bot。");
           }
           if (insertedId > 0) this.store.markSynced(this.config.name, chatId, insertedId);
           return;
@@ -625,7 +694,7 @@ export class FeishuBot {
 
       // --- Mute mode: do not forward anything to OpenClaw. Only direct mentions get a local notice. ---
       if (chatType !== "p2p" && !isBot && this.store.getBotMode(this.config.name, chatId) === "mute") {
-        if (this.isMentioned(message.mentions || [])) {
+        if (routing.isCurrentBotMentioned) {
           await this.replyMessage(messageId, `🤐 ${this.config.name} 当前处于 mute 模式，发送 /mute 可解除`);
           if (insertedId > 0) {
             this.store.markSynced(this.config.name, chatId, insertedId);
@@ -636,7 +705,7 @@ export class FeishuBot {
       }
 
       // --- Should this bot respond? ---
-      if (!this.shouldRespond(chatType, message, isBot, chatId, message.content)) return;
+      if (!this.shouldRespond(chatType, message, isBot, chatId, routing)) return;
       if (!isBot && insertedId > 0) {
         this.store.markPendingTrigger(this.config.name, chatId, insertedId);
       }
@@ -927,39 +996,51 @@ export class FeishuBot {
 
   private shouldRespond(
     chatType: string,
-    message: any,
+    _message: any,
     isBot: boolean,
-    chatId?: string,
-    rawText?: string
+    chatId: string | undefined,
+    routing: RoutingIntent
   ): boolean {
     if (chatType === "p2p") return !isBot;
 
-    const mentions: any[] = message.mentions || [];
+    // Bot messages: only respond if this bot is explicitly mentioned.
+    if (isBot) return routing.isCurrentBotMentioned;
 
-    // Bot messages: only respond if this bot is mentioned
-    if (isBot) {
-      return this.isMentioned(mentions);
-    }
+    // @all is an explicit broadcast to all non-muted bots.
+    if (routing.isAllMention) return true;
 
-    // @all in text: all bots respond
-    if (this.isAllMention(rawText, mentions)) return true;
+    // Explicit targeted mentions are exclusive. If this bot is not one of the
+    // mentioned bots, free/chairman must not steal the turn.
+    if (routing.hasTargetedMention) return routing.isCurrentBotMentioned;
 
-    // Check if this bot is explicitly mentioned
-    if (this.isMentioned(mentions)) return true;
+    // Human-only mentions are also exclusive; free/chairman should not jump in.
+    if (routing.hasHumanMention) return false;
 
-    // Targeted mentions are exclusive. If a human mentions another person or
-    // another bot, free-mode bots must not steal that message. Free mode only
-    // applies to plain human messages with no targeted mentions.
-    const hasTargetedMention = mentions.some((m: any) => !this.isAllMentionItem(m));
-    if (hasTargetedMention) return false;
-
-    // No bot mentioned: check current per-bot mode
     if (chatId) {
       if (this.store.getBotMode(this.config.name, chatId) === "free") return true;
+
+      // Chairman fallback: if nobody is in free mode, the unique chairman
+      // answers ordinary unmentioned messages for the group.
+      const chairman = this.store.getChairmanBot(chatId);
+      if (chairman === this.config.name && !this.hasFreeModeBot(chatId)) return true;
     }
 
-    // Default: don't respond without @
     return false;
+  }
+
+  private getRoutingIntent(chatType: string, message: any, rawText?: string): RoutingIntent {
+    const mentions: any[] = message.mentions || [];
+    const isAllMention = chatType !== "p2p" && this.isAllMention(rawText, mentions);
+    const targetedBotNames = this.mentionedBotNames(mentions);
+    const hasHumanMention = mentions.some((m: any) => !this.isAllMentionItem(m) && !this.mentionedBotName(m));
+    const hasTargetedMention = targetedBotNames.length > 0 || hasHumanMention;
+    return {
+      isAllMention,
+      targetedBotNames,
+      hasTargetedMention,
+      hasHumanMention,
+      isCurrentBotMentioned: targetedBotNames.includes(this.config.name),
+    };
   }
 
   private isMentioned(mentions: any[]): boolean {
@@ -979,12 +1060,23 @@ export class FeishuBot {
     if (this.isAllMentionItem(mention)) return null;
     const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this)];
     for (const bot of candidates) {
-      if (mention.id?.app_id === bot.config.appId) return bot.config.name;
-      if (bot.botOpenId && mention.id?.open_id === bot.botOpenId) return bot.config.name;
-      if (typeof mention.name === "string") {
-        const n = mention.name.toLowerCase();
-        const botName = bot.config.name.toLowerCase();
-        if (n === botName || n.includes(`（${botName}）`) || n.includes(`(${botName})`)) return bot.config.name;
+      if (mention.id?.app_id && mention.id.app_id === bot.config.appId) return bot.config.name;
+      if (bot.botOpenId && mention.id?.open_id && mention.id.open_id === bot.botOpenId) return bot.config.name;
+    }
+
+    // Name is only a fallback because Feishu should normally provide app_id/open_id.
+    // Keep it exact to avoid shared-prefix bots like 万万（GPT） / 万万（Claude）
+    // stealing each other's mentions.
+    if (typeof mention.name === "string") {
+      const raw = mention.name.trim().replace(/^@+/, "").replace(/\s+/g, "").toLowerCase();
+      for (const bot of candidates) {
+        const botName = bot.config.name.trim().replace(/\s+/g, "").toLowerCase();
+        const exactNames = [
+          botName,
+          `万万（${botName}）`,
+          `万万(${botName})`,
+        ];
+        if (exactNames.includes(raw)) return bot.config.name;
       }
     }
     return null;
@@ -1176,6 +1268,19 @@ export class FeishuBot {
     }
   }
 
+
+  private hasFreeModeBot(chatId: string): boolean {
+    return Array.from(FeishuBot.allBots.values())
+      .some((bot) => bot.store === this.store && bot.store.getBotMode(bot.config.name, chatId) === "free");
+  }
+
+  private mentionedBotNames(mentions: any[]): string[] {
+    const names = mentions
+      .map((mention: any) => this.mentionedBotName(mention))
+      .filter((name: string | null): name is string => Boolean(name));
+    return Array.from(new Set(names));
+  }
+
   private isDiscussionCoordinator(): boolean {
     const bots = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store);
     if (bots.length === 0) return true;
@@ -1183,12 +1288,24 @@ export class FeishuBot {
   }
 
   private getDiscussionParticipants(chatId: string): DiscussionParticipant[] {
+    const chairman = this.store.getChairmanBot(chatId);
     return Array.from(FeishuBot.allBots.values())
-      .filter((bot) => bot.store === this.store && bot.store.getBotMode(bot.config.name, chatId) === "free")
-      .map((bot) => ({
-        name: bot.config.name,
-        runDiscussionTurn: async (_chatId: string, prompt: string, meta?: { round: number; maxRounds: number }) => bot.runDiscussionTurn(chatId, prompt, meta),
-      }));
+      .filter((bot) => bot.store === this.store && bot.config.name !== chairman && bot.store.getBotMode(bot.config.name, chatId) === "free")
+      .map((bot) => this.asDiscussionParticipant(bot, chatId));
+  }
+
+  private getChairmanParticipant(chatId: string): DiscussionParticipant | undefined {
+    const chairman = this.store.getChairmanBot(chatId);
+    if (!chairman) return undefined;
+    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman);
+    return bot ? this.asDiscussionParticipant(bot, chatId) : undefined;
+  }
+
+  private asDiscussionParticipant(bot: FeishuBot, chatId: string): DiscussionParticipant {
+    return {
+      name: bot.config.name,
+      runDiscussionTurn: async (_chatId: string, prompt: string, meta?: { round: number; maxRounds: number }) => bot.runDiscussionTurn(chatId, prompt, meta),
+    };
   }
 
   private async runDiscussionTurn(chatId: string, prompt: string, meta?: { round: number; maxRounds: number }): Promise<ReplyResult> {
@@ -1215,8 +1332,12 @@ export class FeishuBot {
     const rawVisibleReply = parsedReply.text.trim();
     const discussionMarkerPattern = /\n*—— 第 \d+\/\d+ 轮 · .+$/;
     const cleanVisibleReply = rawVisibleReply.replace(discussionMarkerPattern, "").trim();
-    let displayReply = cleanVisibleReply;
-    const isVisible = cleanVisibleReply.length > 0 && cleanVisibleReply.toUpperCase() !== "NO_REPLY";
+    const userVisibleReply = cleanVisibleReply
+      .replace(/(^|\n)\s*(FINAL_SUMMARY|CHAIRMAN_NOTE)\s*[:：]\s*/gi, "$1")
+      .replace(/(^|\n)\s*最终总结\s*[:：]\s*/g, "$1")
+      .trim();
+    let displayReply = userVisibleReply;
+    const isVisible = userVisibleReply.length > 0 && userVisibleReply.toUpperCase() !== "NO_REPLY";
     if (isVisible && meta) {
       const roundMarker = `—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
       displayReply = `${displayReply}\n\n${roundMarker}`;
@@ -1511,48 +1632,128 @@ export class FeishuBot {
     }
   }
 
+
+  private async handleLocaleCommand(chatId: string, chatType: string, messageId: string, text: string): Promise<void> {
+    if (chatType === "p2p") {
+      await this.replyMessage(messageId, "Locale is only configurable in group chats.");
+      return;
+    }
+    const parts = text.split(/\s+/).filter(Boolean);
+    const value = (parts[1] || "").toLowerCase();
+    if (!value) {
+      const locale = this.chatLocale(chatId);
+      await this.replyMessage(messageId, locale === "en" ? "🌐 Current locale: en" : "🌐 当前语言：zh");
+      return;
+    }
+    if (value !== "zh" && value !== "en") {
+      await this.replyMessage(messageId, "Usage: /locale zh|en");
+      return;
+    }
+    this.store.setChatLocale(chatId, value);
+    await this.replyMessage(messageId, value === "en" ? "🌐 Locale set to en" : "🌐 语言已设置为 zh");
+  }
+
   private async handleDiscussCommand(chatId: string, chatType: string, messageId: string, text: string): Promise<void> {
     if (chatType === "p2p") {
-      await this.replyMessage(messageId, "❌ Discuss 模式只在群聊中可用");
+      await this.replyMessage(messageId, "Discuss mode is only available in group chats.");
       return;
     }
     const parts = text.split(/\s+/).filter(Boolean);
     const action = parts[1] || "status";
     if (action === "on") {
+      const chairman = this.store.getChairmanBot(chatId);
+      if (!chairman) {
+        await this.replyMessage(messageId, this.isEn(chatId)
+          ? "❌ You must set a Chairman before enabling Discuss.\nUsage: /chairman @Bot"
+          : "❌ 开启 Discuss 前必须先设置 Chairman。\n用法：/chairman @某个Bot");
+        return;
+      }
       this.store.setDiscussMode(chatId, true);
-      await this.replyMessage(messageId, `💬 Discuss 已开启\n参与者：当前群所有 free 模式 bot\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 3}`);
+      await this.replyMessage(messageId, this.isEn(chatId)
+        ? `💬 Discuss enabled\nChairman: ${chairman}\nParticipants: all free-mode bots in this group + Chairman\nRounds: ${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`
+        : `💬 Discuss 已开启\nChairman：${chairman}\n参与者：当前群所有 free 模式 bot + Chairman\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`);
       return;
     }
     if (action === "off") {
       this.store.setDiscussMode(chatId, false);
       discussionManager.stop(chatId);
-      await this.replyMessage(messageId, "💬 Discuss 已关闭");
+      await this.replyMessage(messageId, this.isEn(chatId) ? "💬 Discuss disabled" : "💬 Discuss 已关闭");
       return;
     }
     if (action === "stop") {
       const stopped = discussionManager.stop(chatId);
-      await this.replyMessage(messageId, stopped ? "💬 当前 discuss 已停止" : "💬 当前没有运行中的 discuss");
+      await this.replyMessage(messageId, this.isEn(chatId)
+        ? (stopped ? "💬 Current discuss stopped" : "💬 No active discuss")
+        : (stopped ? "💬 当前 discuss 已停止" : "💬 当前没有运行中的 discuss"));
       return;
     }
     if (action === "rounds") {
       const n = Number.parseInt(parts[2] || "", 10);
       if (!Number.isFinite(n)) {
-        await this.replyMessage(messageId, "❌ 用法：/discuss rounds <1-10>");
+        await this.replyMessage(messageId, "❌ Usage: /discuss rounds <1-10>");
         return;
       }
       this.store.setDiscussMaxRounds(chatId, n);
-      await this.replyMessage(messageId, `💬 Discuss 轮数已设置为 ${this.store.getChatInfo(chatId)?.discussMaxRounds || n}`);
+      await this.replyMessage(messageId, this.isEn(chatId)
+        ? `💬 Discuss rounds set to ${this.store.getChatInfo(chatId)?.discussMaxRounds || n}`
+        : `💬 Discuss 轮数已设置为 ${this.store.getChatInfo(chatId)?.discussMaxRounds || n}`);
       return;
     }
     const info = this.store.getChatInfo(chatId);
     const active = discussionManager.status(chatId);
     const participants = this.getDiscussionParticipants(chatId).map((p) => p.name);
-    await this.replyMessage(messageId, [
+    await this.replyMessage(messageId, this.isEn(chatId) ? [
       `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
-      `轮数：${info?.discussMaxRounds || 3}`,
-      `参与者：${participants.length ? participants.join(", ") : "（无 free bot）"}`,
+      `Rounds: ${info?.discussMaxRounds || 10}`,
+      `Chairman: ${info?.chairmanBot || "not set"}`,
+      `Participants: ${participants.length ? participants.join(", ") : "(no free bot / chairman)"}`,
+      active ? `Active: round ${active.currentRound}/${active.maxRounds}, topic=${active.topic.slice(0, 80)}` : "Active: none",
+    ].join("\n") : [
+      `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
+      `轮数：${info?.discussMaxRounds || 10}`,
+      `Chairman：${info?.chairmanBot || "未设置"}`,
+      `参与者：${participants.length ? participants.join(", ") : "（无 free bot / chairman）"}`,
       active ? `运行中：第 ${active.currentRound}/${active.maxRounds} 轮，topic=${active.topic.slice(0, 80)}` : "运行中：无",
     ].join("\n"));
+  }
+
+  private async handleChairmanCommand(chatId: string, chatType: string, messageId: string, mentions: any[], text: string): Promise<void> {
+    if (chatType === "p2p") {
+      await this.replyMessage(messageId, "❌ Chairman 只在群聊中可用");
+      return;
+    }
+    const parts = text.split(/\s+/).filter(Boolean);
+    const action = (parts[1] || "status").toLowerCase();
+    if (["off", "clear", "none"].includes(action)) {
+      const previous = this.store.getChairmanBot(chatId);
+      this.store.clearChairmanBot(chatId);
+      await this.replyMessage(messageId, previous ? `✅ 已清除当前群 Chairman（原 ${previous}）` : "✅ 当前群没有 Chairman");
+      return;
+    }
+
+    const botNames = this.mentionedBotNames(mentions);
+    if (botNames.length === 0) {
+      const current = this.store.getChairmanBot(chatId);
+      await this.replyMessage(messageId, current
+        ? `👑 当前 Chairman：${current}\n作用：普通消息无人 free 时由 TA 回答；Discuss 模式下负责主持、调停和最终总结。`
+        : "👑 当前没有 Chairman\n用法：/chairman @某个Bot");
+      return;
+    }
+    if (botNames.length > 1) {
+      await this.replyMessage(messageId, "❌ 一个群只能设置一个 Chairman。请只 @ 一个 bot。");
+      return;
+    }
+
+    const next = botNames[0];
+    const previous = this.store.getChairmanBot(chatId);
+    this.store.setChairmanBot(chatId, next);
+    const mode = this.store.getBotMode(next, chatId);
+    const lines = [previous && previous !== next ? `✅ Chairman 已从 ${previous} 切换为 ${next}` : `✅ Chairman 已设置为 ${next}`];
+    lines.push("作用：");
+    lines.push("- 当没有 free bot 且普通消息无人被 @ 时，Chairman 会负责回答");
+    lines.push("- Discuss 模式下，Chairman 会参与主持、调停并做最终总结");
+    if (mode === "mute") lines.push(`⚠️ ${next} 当前是 mute，但 Chairman 场景下仍会发言`);
+    await this.replyMessage(messageId, lines.join("\n"));
   }
 
   /**
@@ -1588,6 +1789,12 @@ export class FeishuBot {
 
     const verboseStatus = this.store.getBotVerbose(this.config.name, chatId) ? "🔊 开启" : "🔇 关闭";
     const mode = chatType === "p2p" ? "normal" : this.store.getBotMode(this.config.name, chatId);
+    const chairman = chatType === "p2p" ? "" : this.store.getChairmanBot(chatId);
+    const chairmanStatus = chatType === "p2p"
+      ? "不适用"
+      : chairman
+        ? chairman === this.config.name ? `👑 是（${chairman}）` : `否（当前：${chairman}）`
+        : "未设置";
 
     const statusText = [
       `📊 ${this.config.name} Bot Status`,
@@ -1603,6 +1810,7 @@ export class FeishuBot {
       `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
       `🔧 Verbose: ${verboseStatus}`,
       `🎛️ Mode: ${mode}`,
+      `👑 Chairman: ${chairmanStatus}`,
     ].join("\n");
 
     await this.replyMessage(messageId, statusText);
@@ -1664,7 +1872,7 @@ export class FeishuBot {
           freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
           verbose: this.store.getChatInfo(chatId)?.verbose || false,
           discuss: this.store.getChatInfo(chatId)?.discuss || false,
-          discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 3,
+          discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 10,
           updatedAt: Date.now(),
         });
         return;
@@ -1703,7 +1911,7 @@ export class FeishuBot {
         freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
         verbose: this.store.getChatInfo(chatId)?.verbose || false,
         discuss: this.store.getChatInfo(chatId)?.discuss || false,
-        discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 3,
+        discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 10,
         updatedAt: Date.now(),
       });
       console.log(`[${this.config.name}] Cached chat info: ${chatName} (${chatId.slice(-8)})`);

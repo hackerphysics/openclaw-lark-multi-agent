@@ -1,11 +1,13 @@
 import { readFileSync } from "fs";
 import { resolve } from "path";
+import { normalizeLocale, type Locale } from "./i18n.js";
 
 export interface BotConfig {
   name: string;
   appId: string;
   appSecret: string;
   model: string;
+  locale?: Locale;
 }
 
 export interface OpenClawConfig {
@@ -18,6 +20,8 @@ export interface AppConfig {
   bots: BotConfig[];
   /** Optional Feishu/Lark open_id for model-drift notifications */
   adminOpenId?: string;
+  /** Default UI/prompt language. Bot-level locale overrides this. */
+  locale?: Locale;
 }
 
 export function loadConfig(path?: string): AppConfig {
@@ -35,6 +39,11 @@ export function loadConfig(path?: string): AppConfig {
     if (!bot.appId || !bot.appSecret || !bot.model) {
       throw new Error(`Bot "${bot.name}" missing appId, appSecret, or model`);
     }
+  }
+
+  config.locale = normalizeLocale(config.locale);
+  for (const bot of config.bots) {
+    bot.locale = normalizeLocale(bot.locale || config.locale);
   }
 
   // Validate uniqueness

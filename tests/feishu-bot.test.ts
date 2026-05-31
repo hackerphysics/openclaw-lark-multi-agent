@@ -52,7 +52,7 @@ function makeHarness(name = "GPT") {
   const config: BotConfig = { name, appId: `app-${name}`, appSecret: "secret", model: `model-${name}` };
   const bot = new FeishuBot(config, openclaw as any, store);
   (bot as any).fetchAndCacheChatInfo = async (chatId: string, chatType: string) => {
-    store.upsertChatInfo({ chatId, chatType, chatName: chatType, members: "", memberNames: "", ownerBot: chatType === "p2p" ? name : "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: Date.now() });
+    store.upsertChatInfo({ chatId, chatType, chatName: chatType, members: "", memberNames: "", ownerBot: chatType === "p2p" ? name : "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: Date.now() });
   };
   (bot as any).ensureSession = async (chatId: string) => bot.getSessionKey(chatId);
   (bot as any).addReaction = vi.fn(async () => {});
@@ -194,12 +194,47 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+
+
+  it("supports group /locale and English discuss messages", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/locale en", messageId: "locale-en" }));
+      expect(h.store.getChatLocale("chat1")).toBe("en");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("locale-en", "🌐 Locale set to en");
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss on", messageId: "discuss-en-no-chair" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-en-no-chair", expect.stringContaining("You must set a Chairman"));
+
+      h.store.setChairmanBot("chat1", "GPT");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss on", messageId: "discuss-en" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-en", expect.stringContaining("Discuss enabled"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-en", expect.stringContaining("Chairman: GPT"));
+    } finally { h.cleanup(); }
+  });
+
+  it("requires a chairman before enabling discuss mode", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss on", messageId: "discuss-on-no-chair" }));
+      expect(h.store.getChatInfo("chat1")?.discuss).toBe(false);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-on-no-chair", expect.stringContaining("必须先设置 Chairman"));
+
+      h.store.setChairmanBot("chat1", "GPT");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss on", messageId: "discuss-on-with-chair" }));
+      expect(h.store.getChatInfo("chat1")?.discuss).toBe(true);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-on-with-chair", expect.stringContaining("Chairman：GPT"));
+    } finally { h.cleanup(); }
+  });
+
   it("handles /discuss commands locally", async () => {
     const h = makeHarness("GPT");
     try {
+      h.store.setChairmanBot("chat1", "GPT");
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss on", messageId: "discuss-on" }));
       expect(h.store.getChatInfo("chat1")?.discuss).toBe(true);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-on", expect.stringContaining("Discuss 已开启"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("discuss-on", expect.stringContaining("Chairman：GPT"));
 
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "/discuss rounds 2", messageId: "discuss-rounds" }));
       expect(h.store.getChatInfo("chat1")?.discussMaxRounds).toBe(2);
@@ -229,6 +264,75 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(claude.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
       expect(gpt.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
       expect(gpt.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
+
+
+  it("does not let coordinator steal targeted /discuss commands", async () => {
+    const gpt = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", { config: { appId: "app-Claude", name: "Claude" }, store: gpt.store, botOpenId: "claude-open-id" } as any);
+      gpt.store.setDiscussMaxRounds("chat1", 5);
+
+      await (gpt.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（Claude） /discuss rounds 10",
+        messageId: "targeted-discuss-command",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+
+      expect((gpt.bot as any).replyMessage).not.toHaveBeenCalled();
+      expect(gpt.store.getChatInfo("chat1")?.discussMaxRounds).toBe(5);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+    }
+  });
+
+
+  it("strips chairman control markers after a preface", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.replies.push("我认为可以收尾。\n\nFINAL_SUMMARY:\n最终结论");
+      const result = await (h.bot as any).runDiscussionTurn("chat1", "prompt", { round: 1, maxRounds: 10 });
+      expect(result.text).toContain("FINAL_SUMMARY");
+      expect(result.visible).toBe(true);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("我认为可以收尾。"));
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("最终结论"));
+      expect((h.bot as any).sendMessage.mock.calls.some((call: any[]) => String(call[1]).includes("FINAL_SUMMARY"))).toBe(false);
+    } finally { h.cleanup(); }
+  });
+
+  it("turns discuss off when chairman finalizes", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      gpt.store.setBotMode("GPT", "chat1", "free");
+      gpt.store.setChairmanBot("chat1", "Claude");
+      gpt.store.setDiscussMode("chat1", true);
+      gpt.store.setDiscussMaxRounds("chat1", 2);
+      gpt.openclaw.replies.push("NO_REPLY");
+      claude.openclaw.replies.push("FINAL_SUMMARY: 最终结论");
+
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic-final" }));
+      await vi.waitUntil(() => gpt.store.getChatInfo("chat1")?.discuss === false, { timeout: 1000 });
+
+      expect(gpt.store.getChatInfo("chat1")?.discuss).toBe(false);
+      expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("已自动关闭 Discuss 模式"));
+      expect((claude.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("最终结论"));
+      expect((claude.bot as any).sendMessage.mock.calls.some((call: any[]) => String(call[1]).includes("FINAL_SUMMARY"))).toBe(false);
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
       FeishuBot.getAllBots().delete("app-Claude");
@@ -300,6 +404,73 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+
+  it("sets a unique chairman and rejects multiple chairman mentions", async () => {
+    const h = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", h.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", { config: { appId: "app-Claude", name: "Claude" }, store: h.store, botOpenId: "claude-open-id" } as any);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "/chairman @万万（GPT）",
+        messageId: "chair-gpt",
+        mentions: [{ name: "万万（GPT）", id: { app_id: "app-GPT", open_id: "gpt-open-id" } }],
+      }));
+      expect(h.store.getChairmanBot("chat1")).toBe("GPT");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-gpt", expect.stringContaining("Chairman 已设置为 GPT"));
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "/chairman @万万（Claude）",
+        messageId: "chair-claude",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-claude", expect.stringContaining("Chairman 已从 GPT 切换为 Claude"));
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "/chairman @万万（GPT） @万万（Claude）",
+        messageId: "chair-two",
+        mentions: [
+          { name: "万万（GPT）", id: { app_id: "app-GPT", open_id: "gpt-open-id" } },
+          { name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } },
+        ],
+      }));
+      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-two", expect.stringContaining("只能设置一个 Chairman"));
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("lets chairman answer plain messages only when no free bot exists", async () => {
+    const chairman = makeHarness("Claude");
+    const free = makeHarness("GPT");
+    try {
+      (free.bot as any).store = chairman.store;
+      FeishuBot.getAllBots().set("app-Claude", chairman.bot as any);
+      FeishuBot.getAllBots().set("app-GPT", free.bot as any);
+      chairman.store.setChairmanBot("chat1", "Claude");
+
+      await (chairman.bot as any).handleMessage(event({ chatType: "group", text: "plain", messageId: "plain-1" }));
+      expect(chairman.openclaw.chatCalls).toHaveLength(1);
+
+      chairman.openclaw.chatCalls = [];
+      chairman.store.setBotMode("GPT", "chat1", "free");
+      await (chairman.bot as any).handleMessage(event({ chatType: "group", text: "plain again", messageId: "plain-2" }));
+      expect(chairman.openclaw.chatCalls).toHaveLength(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-Claude");
+      FeishuBot.getAllBots().delete("app-GPT");
+      chairman.cleanup();
+      free.cleanup();
+    }
+  });
+
   it("toggles free mode per bot per chat", async () => {
     const gpt = makeHarness("GPT");
     const gemini = makeHarness("Gemini");
@@ -314,6 +485,108 @@ describe("FeishuBot routing and queue behavior", () => {
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free", messageId: "free-off" }));
       expect(gpt.store.getBotMode("GPT", "chat1")).toBe("normal");
     } finally { gpt.cleanup(); gemini.cleanup(); }
+  });
+
+
+  it("supports idempotent explicit /free on and /free off", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free on", messageId: "free-explicit-on-1" }));
+      expect(h.store.getBotMode("GPT", "chat1")).toBe("free");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free on", messageId: "free-explicit-on-2" }));
+      expect(h.store.getBotMode("GPT", "chat1")).toBe("free");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free off", messageId: "free-explicit-off-1" }));
+      expect(h.store.getBotMode("GPT", "chat1")).toBe("normal");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /free off", messageId: "free-explicit-off-2" }));
+      expect(h.store.getBotMode("GPT", "chat1")).toBe("normal");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("free-explicit-off-1", expect.stringContaining("normal 模式"));
+    } finally { h.cleanup(); }
+  });
+
+
+  it("does not let free chairman or coordinator steal a targeted bot mention", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      gpt.store.setBotMode("GPT", "chat1", "free");
+      gpt.store.setChairmanBot("chat1", "GPT");
+
+      await (gpt.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "@万万（Claude） ping",
+        messageId: "target-claude-no-steal",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+
+      expect(gpt.openclaw.chatCalls).toHaveLength(0);
+      expect(gpt.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
+  it("lets all free bots answer plain messages when discuss is off", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      gpt.store.setBotMode("GPT", "chat1", "free");
+      gpt.store.setBotMode("Claude", "chat1", "free");
+
+      const msg = event({ chatType: "group", text: "plain question", messageId: "plain-free-all" });
+      await (gpt.bot as any).handleMessage(msg);
+      await (claude.bot as any).handleMessage(msg);
+
+      expect(gpt.openclaw.chatCalls).toHaveLength(1);
+      expect(claude.openclaw.chatCalls).toHaveLength(1);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
+  it("routes @all to all non-muted bots when discuss is off", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+
+      const msg = event({ chatType: "group", text: "@_all hello", messageId: "all-normal" });
+      await (gpt.bot as any).handleMessage(msg);
+      await (claude.bot as any).handleMessage(msg);
+
+      expect(gpt.openclaw.chatCalls).toHaveLength(1);
+      expect(claude.openclaw.chatCalls).toHaveLength(1);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
+  it("does not silently swallow discuss messages when no participants exist", async () => {
+    const gpt = makeHarness("GPT");
+    try {
+      gpt.store.setDiscussMode("chat1", true);
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "plain topic", messageId: "discuss-empty" }));
+      expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("没有 free bot 或 Chairman"));
+    } finally { gpt.cleanup(); }
   });
 
   it("does not let free mode respond to messages mentioning another bot", async () => {
@@ -410,6 +683,15 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("shows chairman status in /status", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /status", messageId: "status-chair" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("status-chair", expect.stringContaining("👑 Chairman: 👑 是（GPT）"));
+    } finally { h.cleanup(); }
+  });
+
   it("does not let bridge /status clear older pending triggers", async () => {
     const h = makeHarness("GLM");
     try {
@@ -423,8 +705,8 @@ describe("FeishuBot routing and queue behavior", () => {
   it("startup drain starts all pending chats without waiting for the first one to finish", async () => {
     const h = makeHarness("GPT");
     try {
-      h.store.upsertChatInfo({ chatId: "chat-a", chatType: "group", chatName: "A", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 1 });
-      h.store.upsertChatInfo({ chatId: "chat-b", chatType: "group", chatName: "B", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 3, updatedAt: 2 });
+      h.store.upsertChatInfo({ chatId: "chat-a", chatType: "group", chatName: "A", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: 1 });
+      h.store.upsertChatInfo({ chatId: "chat-b", chatType: "group", chatName: "B", members: "", memberNames: "", ownerBot: "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: 2 });
       const rowA = h.store.insert({ chatId: "chat-a", messageId: "a", senderType: "human", senderName: "u", content: "a", timestamp: 1 });
       const rowB = h.store.insert({ chatId: "chat-b", messageId: "b", senderType: "human", senderName: "u", content: "b", timestamp: 2 });
       h.store.markPendingTrigger("GPT", "chat-a", rowA);

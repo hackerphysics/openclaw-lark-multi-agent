@@ -19,6 +19,9 @@ export interface ChatInfo {
   verbose: boolean;
   discuss: boolean;
   discussMaxRounds: number;
+  /** Group-level chairman bot name. Empty means no chairman. */
+  chairmanBot?: string;
+  locale?: string;
   updatedAt: number;
 }
 
@@ -85,7 +88,9 @@ export class MessageStore {
         member_names TEXT NOT NULL DEFAULT '',
         verbose INTEGER NOT NULL DEFAULT 0,
         discuss INTEGER NOT NULL DEFAULT 0,
-        discuss_max_rounds INTEGER NOT NULL DEFAULT 3,
+        discuss_max_rounds INTEGER NOT NULL DEFAULT 10,
+        chairman_bot TEXT NOT NULL DEFAULT '',
+        locale TEXT NOT NULL DEFAULT '',
         updated_at INTEGER NOT NULL DEFAULT 0
       );
 
@@ -231,6 +236,20 @@ export class MessageStore {
       // Column already exists
     }
 
+    // Migration: add locale column if missing
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN locale TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+
+    // Migration: add chairman column if missing
+    try {
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN chairman_bot TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+
     // Migration: add discuss columns if missing
     try {
       this.db.exec(`ALTER TABLE chat_info ADD COLUMN discuss INTEGER NOT NULL DEFAULT 0`);
@@ -238,10 +257,13 @@ export class MessageStore {
       // Column already exists
     }
     try {
-      this.db.exec(`ALTER TABLE chat_info ADD COLUMN discuss_max_rounds INTEGER NOT NULL DEFAULT 3`);
+      this.db.exec(`ALTER TABLE chat_info ADD COLUMN discuss_max_rounds INTEGER NOT NULL DEFAULT 10`);
     } catch {
       // Column already exists
     }
+    // Migration: promote the old discuss default (3 rounds) to the new default
+    // (10 rounds). Explicit non-default values such as 1/2/5/8 are preserved.
+    this.db.prepare(`UPDATE chat_info SET discuss_max_rounds = 10 WHERE discuss_max_rounds = 3`).run();
 
     // Migration: add owner_bot column if missing
     try {
@@ -615,8 +637,8 @@ export class MessageStore {
 
   upsertChatInfo(info: ChatInfo): void {
     this.db.prepare(`
-      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, discuss, discuss_max_rounds, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, discuss, discuss_max_rounds, chairman_bot, locale, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = excluded.chat_type,
         chat_name = excluded.chat_name,
@@ -626,9 +648,11 @@ export class MessageStore {
         free_discussion = excluded.free_discussion,
         owner_bot = CASE WHEN excluded.owner_bot != '' THEN excluded.owner_bot ELSE chat_info.owner_bot END,
         discuss = CASE WHEN excluded.discuss != 0 THEN excluded.discuss ELSE chat_info.discuss END,
-        discuss_max_rounds = CASE WHEN excluded.discuss_max_rounds != 3 THEN excluded.discuss_max_rounds ELSE chat_info.discuss_max_rounds END,
+        discuss_max_rounds = CASE WHEN excluded.discuss_max_rounds != 10 THEN excluded.discuss_max_rounds ELSE chat_info.discuss_max_rounds END,
+        chairman_bot = CASE WHEN excluded.chairman_bot != '' THEN excluded.chairman_bot ELSE chat_info.chairman_bot END,
+        locale = CASE WHEN excluded.locale != '' THEN excluded.locale ELSE chat_info.locale END,
         updated_at = excluded.updated_at
-    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.discuss ? 1 : 0, info.discussMaxRounds || 3, info.updatedAt);
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.discuss ? 1 : 0, info.discussMaxRounds || 10, info.chairmanBot || '', info.locale || '', info.updatedAt);
   }
 
   setFreeDiscussion(chatId: string, on: boolean): void {
@@ -644,7 +668,7 @@ export class MessageStore {
   setDiscussMode(chatId: string, on: boolean): void {
     this.db.prepare(`
       INSERT INTO chat_info (chat_id, chat_type, chat_name, discuss, discuss_max_rounds, updated_at)
-      VALUES (?, 'group', '', ?, 3, ?)
+      VALUES (?, 'group', '', ?, 10, ?)
       ON CONFLICT (chat_id) DO UPDATE SET discuss = excluded.discuss, updated_at = excluded.updated_at
     `).run(chatId, on ? 1 : 0, Date.now());
   }
@@ -656,6 +680,38 @@ export class MessageStore {
       VALUES (?, 'group', '', 0, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET discuss_max_rounds = excluded.discuss_max_rounds, updated_at = excluded.updated_at
     `).run(chatId, normalized, Date.now());
+  }
+
+
+
+  setChatLocale(chatId: string, locale: string): void {
+    this.db.prepare(`
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, locale, updated_at)
+      VALUES (?, 'group', '', ?, ?)
+      ON CONFLICT (chat_id) DO UPDATE SET locale = excluded.locale, updated_at = excluded.updated_at
+    `).run(chatId, locale, Date.now());
+  }
+
+  getChatLocale(chatId: string): string {
+    const row = this.db.prepare(`SELECT locale FROM chat_info WHERE chat_id = ?`).get(chatId) as any;
+    return row?.locale || '';
+  }
+
+  setChairmanBot(chatId: string, botName: string): void {
+    this.db.prepare(`
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, chairman_bot, updated_at)
+      VALUES (?, 'group', '', ?, ?)
+      ON CONFLICT (chat_id) DO UPDATE SET chairman_bot = excluded.chairman_bot, updated_at = excluded.updated_at
+    `).run(chatId, botName, Date.now());
+  }
+
+  clearChairmanBot(chatId: string): void {
+    this.setChairmanBot(chatId, '');
+  }
+
+  getChairmanBot(chatId: string): string {
+    const row = this.db.prepare(`SELECT chairman_bot FROM chat_info WHERE chat_id = ?`).get(chatId) as any;
+    return row?.chairman_bot || '';
   }
 
   setBotVerbose(botName: string, chatId: string, verbose: boolean): void {
@@ -718,7 +774,9 @@ export class MessageStore {
       freeDiscussion: !!row.free_discussion,
       verbose: !!row.verbose,
       discuss: !!row.discuss,
-      discussMaxRounds: row.discuss_max_rounds || 3,
+      discussMaxRounds: row.discuss_max_rounds || 10,
+      chairmanBot: row.chairman_bot || '',
+      locale: row.locale || '',
       updatedAt: row.updated_at,
     };
   }
@@ -735,7 +793,9 @@ export class MessageStore {
       freeDiscussion: !!r.free_discussion,
       verbose: !!r.verbose,
       discuss: !!r.discuss,
-      discussMaxRounds: r.discuss_max_rounds || 3,
+      discussMaxRounds: r.discuss_max_rounds || 10,
+      chairmanBot: r.chairman_bot || '',
+      locale: r.locale || '',
       updatedAt: r.updated_at,
     }));
   }
