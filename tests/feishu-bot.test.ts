@@ -405,6 +405,29 @@ describe("FeishuBot routing and queue behavior", () => {
   });
 
 
+
+  it("recognizes parenthesized bot display names from other deployments", async () => {
+    const h = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", h.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", { config: { appId: "app-Claude", name: "Claude" }, store: h.store, botOpenId: "claude-open-id" } as any);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "/chairman @光子 (Claude)",
+        messageId: "chair-photon-claude",
+        mentions: [{ name: "光子 (Claude)", id: {} }],
+      }));
+
+      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-photon-claude", expect.stringContaining("Chairman 已设置为 Claude"));
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
   it("sets a unique chairman and rejects multiple chairman mentions", async () => {
     const h = makeHarness("GPT");
     try {

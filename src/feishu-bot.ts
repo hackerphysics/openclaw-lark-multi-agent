@@ -1077,9 +1077,18 @@ export class FeishuBot {
           `万万(${botName})`,
         ];
         if (exactNames.includes(raw)) return bot.config.name;
+        // Generic display-name fallback: many deployments name bots like
+        // "光子 (Claude)" or "万万（GPT）". Match only when the parenthesized
+        // suffix is exactly the configured bot name, avoiding loose substring
+        // matches that caused shared-prefix bots to steal each other's mentions.
+        if (new RegExp(`^[^()（）]+[（(]${this.escapeRegExp(botName)}[）)]$`, "i").test(raw)) return bot.config.name;
       }
     }
     return null;
+  }
+
+  private escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   }
 
   private resolveBotName(sender: any): string | null {
