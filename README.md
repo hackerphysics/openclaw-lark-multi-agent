@@ -39,6 +39,10 @@ All of them connect to the same OpenClaw Gateway while keeping sessions, queues,
 - Feishu CardKit v2 Markdown rendering, including native table elements for pipe tables
 - Bridge-level slash commands and escaped OpenClaw slash commands
 - `/discuss` mode for barrier-style multi-bot group discussion, including per-round markers and no-reply status notices
+- `/chairman` role: a single per-group chairman that answers plain messages when no bot is in Free mode, and acts as host, challenger, and summarizer inside `/discuss`
+- `/locale zh|en` per-group language, with bot-level and global locale fallbacks for discussion prompts and system notices
+- Shared group history catch-up: when a bot is newly mentioned after missing messages, it receives the unseen group messages it has not synced yet (large history is offloaded to a local file)
+- Concurrency guards: a global `chat.send` limiter and a serialized maintenance limiter (e.g. `sessions.compact`) prevent multi-bot fan-out from saturating the gateway
 - Linux systemd installer with separate runtime and state directories
 
 ## Architecture
@@ -228,10 +232,12 @@ Bridge-level commands use a single slash and are handled by this project:
 - `/compact` — compact the OpenClaw session
 - `/reset` — reset the OpenClaw session
 - `/verbose` — toggle tool-call messages for this bot in this chat
-- `/free` — toggle this bot's Free mode in the current group chat
+- `/free [on|off]` — toggle, or explicitly enable/disable, this bot's Free mode in the current group chat
 - `/mute` — toggle this bot's mute mode in the current group chat
 - `/mode` — show this bot's current mode in the current chat
-- `/discuss on|off|status|stop|rounds N` — control group-level multi-bot discussion mode
+- `/discuss on|off|status|stop|rounds N` — control group-level multi-bot discussion mode (requires a chairman to enable; default 10 rounds)
+- `/chairman [@Bot|off]` — set, view, or clear the single chairman for this group
+- `/locale [zh|en]` — set or view this group's language
 
 OpenClaw-level slash commands can be sent by escaping with a double slash:
 
@@ -298,17 +304,33 @@ the mention-only message is treated as a trigger and is combined with the previo
 
 Bot messages do not trigger other bots unless they mention them. The anti-loop guard is counted per bot per chat: other bots' replies do not consume the current bot's streak budget, and a human message resets the streak.
 
+### Context injection
+
+Catch-up context is the unseen group history a bot receives alongside the current message. It follows strict rules:
+
+- Catch-up is injected only in group chats; private chats never get it.
+- It contains messages this bot has not synced yet (both human and other-bot messages), so a mention-only reply can see the human message it refers to.
+- It excludes the current trigger(s), other pending triggers, this bot's own messages, and escaped native commands.
+- When there is nothing unseen, no context header is added; the current message is sent as-is.
+- Consecutive plain human triggers are merged into a single run instead of being processed one by one. Native commands (`//x`) are always processed on their own and never merged.
+- Escaped native commands (`//status`) are sent verbatim with no catch-up context and no attachment hint.
+- The bridge attachment hint is only injected when the message combines an action word with an artifact word (for example "generate an image and send it"), so ordinary talk that merely mentions "file" or "document" does not trigger it.
+
+Persistent constraints (such as "do not call Feishu send tools directly" and the chairman's non-discuss guidance) are injected once when a session is created or reset, never prepended to every message.
+
 ### `/discuss` mode
 
 `/discuss` is an explicit group-level multi-agent discussion scheduler. It is separate from Free mode:
 
 - `/free` controls whether a single bot may answer plain human messages.
-- `/discuss on` lets one coordinator take over plain human messages and run all Free-mode bots in barrier-style rounds.
+- `/discuss on` requires a chairman to be set first (`/chairman @Bot`). It lets one coordinator take over plain human messages and run all Free-mode bots plus the chairman in barrier-style rounds.
 - Targeted mentions still fall through to normal routing, so `@GPT hello` works even while discuss mode is enabled.
 - Each participant receives the same round prompt and does not see other participants' replies from the current round until the next round.
+- The chairman speaks last each round: it gives its own view, challenges weak points, mediates disagreements, and decides whether to continue or conclude.
 - Each visible discussion reply is annotated with a round marker such as `—— 第 2/3 轮 · Claude`.
 - If some participants return `NO_REPLY` or an empty reply, the coordinator sends a lightweight status notice such as `💬 第 3/3 轮：Qwen、Gemini 无新增回复`.
-- When the configured maximum round count is reached, the coordinator sends a completion notice.
+- When the chairman emits a `FINAL_SUMMARY:` line, the discussion ends and discuss mode is automatically turned off; control markers (`FINAL_SUMMARY:` / `CHAIRMAN_NOTE:`) are stripped from what users see.
+- The default round count is 10; reaching it forces the chairman to produce a final summary.
 
 Commands:
 
@@ -317,8 +339,35 @@ Commands:
 /discuss off
 /discuss status
 /discuss stop
-/discuss rounds 3
+/discuss rounds 10
 ```
+
+### `/chairman`
+
+Each group can have exactly one chairman, set with `/chairman @Bot`. Setting a new chairman replaces the previous one; `@`-ing more than one bot is rejected. The chairman has two roles:
+
+- Normal mode: it is only a fallback responder. When no bot is in Free mode and nobody is explicitly addressed, the chairman answers plain messages. It does not summarize, moderate, or challenge other bots outside `/discuss`.
+- Discuss mode: it participates, speaks last each round, challenges, mediates, and produces the final summary.
+
+```text
+/chairman @Bot   set the chairman
+/chairman        show the current chairman
+/chairman off    clear the chairman
+```
+
+`/chairman` is a group-level command handled by one coordinator bot, so it produces a single reply.
+
+### `/locale`
+
+Discussion prompts, chairman prompts, and system notices are localized. Language resolves as: group `/locale` setting > bot-level `locale` config > global `locale` config > `zh` (default).
+
+```text
+/locale       show the current group language
+/locale zh    set this group to Chinese
+/locale en    set this group to English
+```
+
+`/locale` is also a group-level command handled by one coordinator bot. The current language is shown in `/status`.
 
 ## Delivery outbox and duplicate prevention
 
@@ -363,8 +412,10 @@ For generated files/images/documents, agents should use the bridge attachment ma
 
 SQLite state lives in the configured data directory. Important tables:
 
-- `messages` — local conversation log and context
-- `sync_state` — per-bot/per-chat sync cursor
+- `messages` — local conversation log and context (includes a `trigger_kind` column to mark escaped native commands)
+- `sync_state` — per-bot/per-chat sync cursor (coarse high-water mark)
+- `message_sync` — per-bot/per-chat/per-message sync ledger for shared group-history catch-up
+- `chat_info` — per-chat settings such as `discuss`, `discuss_max_rounds`, `chairman_bot`, and `locale`
 - `pending_triggers` — messages that should actively trigger a bot run
 - `delivered_replies` — delivered response markers for idempotency
 - `delivery_outbox` — durable user-visible delivery ledger with claim/dedupe state
