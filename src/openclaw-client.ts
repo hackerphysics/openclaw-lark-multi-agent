@@ -973,7 +973,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   }
 
   private shouldInjectBridgeAttachmentHint(text: string): boolean {
-    return /发送|发到|发给|传|上传|附件|文件|文档|图片|图像|照片|生成图|做张图|画张图|导出|保存|pdf|docx?|xlsx?|pptx?|markdown|\bmd\b/i.test(text);
+    // Require an action word combined with an artifact word, so ordinary talk
+    // that merely mentions "文档/图片/投递" does not trigger the long hint.
+    const action = /(发送|发到|发给|发一[张份个]|上传|生成|做一?[张份个]|画一?[张份个]|创建|导出|保存|附上|附件形式|attach|upload|export|generate|create|save)/i;
+    const artifact = /(图片|图像|照片|配图|海报|封面|文件|文档|附件|表格|pdf|docx?|xlsx?|pptx?|markdown|\bmd\b|\.png|\.jpe?g|\.gif|\.webp|image|file|document)/i;
+    return action.test(text) && artifact.test(text);
   }
 
   private bridgeAttachmentHint(text: string): string {
@@ -1004,16 +1008,24 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     deliver?: boolean;
     timeoutMs?: number;
     emptyFinalAsNoReply?: boolean;
+    /** Native escaped commands (//status -> /status) should not receive catch-up context. */
+    includeContext?: boolean;
+    /** Disable bridge attachment hints for native commands and other exact pass-through messages. */
+    includeBridgeAttachmentHint?: boolean;
   }): Promise<string> {
+    const includeContext = params.includeContext !== false;
+    const includeBridgeAttachmentHint = params.includeBridgeAttachmentHint !== false;
+    const contextForAttachments = includeContext ? params.unsyncedMessages : [];
     const attachments = this.extractImageAttachments([
-      ...params.unsyncedMessages.map((m) => m.content),
+      ...contextForAttachments.map((m) => m.content),
       params.currentMessage,
     ]);
     const mediaInstruction = attachments.length > 0
       ? "\n\n[Media note: Image attachments are included with this message. If your model can inspect images directly, use the attached image input. If it cannot, use the image tool on the provided media/attachment path; do not try unrelated network or model-provider workarounds.]"
       : "";
-    const bridgeAttachmentHint = this.bridgeAttachmentHint(params.currentMessage);
-    if (params.unsyncedMessages.length === 0) {
+    const bridgeAttachmentHint = includeBridgeAttachmentHint ? this.bridgeAttachmentHint(params.currentMessage) : "";
+    const unsyncedMessages = includeContext ? params.unsyncedMessages : [];
+    if (unsyncedMessages.length === 0) {
       // No context to catch up, send directly
       return this.chatSend({
         sessionKey: params.sessionKey,
@@ -1027,24 +1039,24 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
     // Build context block + actual message in one chat.send, or write the
     // full context to a local transcript file when it is too large.
-    const contextLines = this.formatContextLines(params.unsyncedMessages);
+    const contextLines = this.formatContextLines(unsyncedMessages);
     const inlineContext = contextLines.join("\n");
     const inlineBytes = Buffer.byteLength(inlineContext, "utf8");
-    const useFileContext = params.unsyncedMessages.length > MAX_INLINE_CONTEXT_MESSAGES || inlineBytes > MAX_INLINE_CONTEXT_BYTES;
+    const useFileContext = unsyncedMessages.length > MAX_INLINE_CONTEXT_MESSAGES || inlineBytes > MAX_INLINE_CONTEXT_BYTES;
 
     let combined: string;
     if (useFileContext) {
-      const filePath = this.writeContextSyncFile(params.sessionKey, params.unsyncedMessages, contextLines);
+      const filePath = this.writeContextSyncFile(params.sessionKey, unsyncedMessages, contextLines);
       combined =
-        `[以下是你不在线期间群里的长历史上下文，因消息数或大小超过直接内联阈值，已写入本地文件]\n` +
+        `[以下是此前未同步的长历史对话上下文，因消息数或大小超过直接内联阈值，已写入本地文件]\n` +
         `文件路径：${filePath}\n\n` +
-        `你必须先使用 read 工具读取这个文件，理解其中的完整群聊历史，再回答当前消息。\n` +
+        `你必须先使用 read 工具读取这个文件，理解其中的完整历史对话，再回答当前消息。\n` +
         `如果无法读取文件，请明确说明，不能直接忽略历史上下文作答。\n` +
         `\n---\n` +
         `[${params.currentSenderName}]: ${params.currentMessage}`;
     } else {
       combined =
-        `[以下是你不在线期间群里的对话，请了解上下文]\n` +
+        `[以下是群里其他成员刚发、你还没看到的发言，供参考]\n` +
         inlineContext +
         `\n---\n` +
         `[${params.currentSenderName}]: ${params.currentMessage}`;

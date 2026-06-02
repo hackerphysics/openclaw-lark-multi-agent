@@ -483,6 +483,28 @@ describe("OpenClawClient bridge attachment hint", () => {
     expect(result).not.toContain("LMA_BRIDGE_ATTACHMENTS");
   });
 
+
+  it("uses neutral catch-up wording rather than group-chat wording", async () => {
+    const { client, chatSend } = clientWithCapturedChatSend();
+    const result = await client.chatSendWithContext({
+      sessionKey: "s1",
+      unsyncedMessages: [{
+        id: 1,
+        chatId: "c",
+        messageId: "m0",
+        senderType: "human",
+        senderName: "Alice",
+        content: "上一条",
+        timestamp: 1,
+      }],
+      currentMessage: "当前问题",
+      currentSenderName: "Alice",
+    });
+    expect(chatSend).toHaveBeenCalledOnce();
+    expect(result).toContain("群里其他成员");
+    expect(result).toContain("你还没看到");
+  });
+
   it("writes oversized catch-up context to a local file and instructs the agent to read it", async () => {
     const { client, chatSend } = clientWithCapturedChatSend();
     const messages = Array.from({ length: 1001 }, (_, i) => ({
@@ -505,6 +527,7 @@ describe("OpenClawClient bridge attachment hint", () => {
     expect(chatSend).toHaveBeenCalledOnce();
     expect(result).toContain("已写入本地文件");
     expect(result).toContain("你必须先使用 read 工具读取这个文件");
+    expect(result).not.toContain("群聊历史");
     const filePath = result.match(/文件路径：([^\n]+)/)?.[1]?.trim();
     expect(filePath).toBeTruthy();
     expect(existsSync(filePath!)).toBe(true);
@@ -512,6 +535,30 @@ describe("OpenClawClient bridge attachment hint", () => {
     expect(file).toContain("Messages: 1001");
     expect(file).toContain("message 1");
     expect(file).toContain("message 1001");
+  });
+
+
+  it("does not inject catch-up context or attachment hint when disabled", async () => {
+    const { client, chatSend } = clientWithCapturedChatSend();
+    const result = await client.chatSendWithContext({
+      sessionKey: "s1",
+      unsyncedMessages: [{
+        id: 1,
+        chatId: "c",
+        messageId: "m0",
+        senderType: "human",
+        senderName: "Alice",
+        content: "请发送图片文件",
+        timestamp: 1,
+      }],
+      currentMessage: "/status",
+      currentSenderName: "Alice",
+      includeContext: false,
+      includeBridgeAttachmentHint: false,
+    });
+    expect(chatSend).toHaveBeenCalledOnce();
+    expect(result).toBe("/status");
+    expect(chatSend.mock.calls[0][0].message).toBe("/status");
   });
 
   it("injects the bridge attachment hint only for likely attachment requests", async () => {

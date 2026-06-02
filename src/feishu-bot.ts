@@ -451,7 +451,8 @@ export class FeishuBot {
       const commandText = this.stripLeadingCommandMentions(trimmedCleanText);
       // Escape hatch: //command means send /command through to OpenClaw,
       // while /command remains a bridge-level openclaw-lark-multi-agent command.
-      if (commandText.startsWith("//")) {
+      const isNativeOpenClawCommand = commandText.startsWith("//");
+      if (isNativeOpenClawCommand) {
         cleanText = "/" + commandText.slice(2).trimStart();
       } else if (commandText.startsWith("/")) {
         cleanText = commandText;
@@ -469,6 +470,7 @@ export class FeishuBot {
         senderName,
         content: cleanText,
         timestamp: Date.now(),
+        triggerKind: isNativeOpenClawCommand ? "native_command" : "normal",
       });
       if (insertedId < 0) insertedId = this.store.getMessageId(messageId) || -1;
 
@@ -790,28 +792,68 @@ export class FeishuBot {
 
       this.busyChats.set(chatId, Date.now());
 
-      // The last trigger message is the "current" one, everything else is context.
-      const lastHuman = pendingHumanTriggers[pendingHumanTriggers.length - 1];
-      const triggerId = lastHuman.id || 0;
-      const catchupMessages = this.store.getUnsyncedMessagesForBot(this.config.name, chatId, triggerId);
-      const messageById = new Map<number, typeof catchupMessages[number]>();
-      for (const msg of [...catchupMessages, ...pendingMessages]) {
-        if (msg.id) messageById.set(msg.id, msg);
+      // Pick the batch to process this loop. Consecutive plain human messages are
+      // merged into a single run; native escaped commands (//x) are processed on
+      // their own and never merged with ordinary messages, because they are exact
+      // pass-through requests that must not receive catch-up context.
+      const firstPending = pendingHumanTriggers[0];
+      const firstIsNative = firstPending.triggerKind === "native_command";
+      let mergedTriggers: typeof pendingHumanTriggers;
+      if (firstIsNative) {
+        // One native command at a time.
+        mergedTriggers = [firstPending];
+      } else {
+        // Take the leading run of consecutive non-native messages.
+        mergedTriggers = [];
+        for (const m of pendingHumanTriggers) {
+          if (m.triggerKind === "native_command") break;
+          mergedTriggers.push(m);
+        }
       }
-      const allUnsynced = Array.from(messageById.values()).sort((a, b) => a.timestamp - b.timestamp);
-      const humanUnsynced = allUnsynced.filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id));
+      const isNativeCommandTrigger = firstIsNative;
+      const lastHuman = mergedTriggers[mergedTriggers.length - 1];
+      const triggerId = lastHuman.id || 0;
+      const mergedContent = mergedTriggers.map((m) => m.content).join("\n");
+      const mergedTriggerIds = mergedTriggers.map((m) => m.id || 0).filter(Boolean);
+      const mergedTriggerIdSet = new Set(mergedTriggerIds);
+
+      // Catch-up is only injected in group chats. p2p must never get it.
+      // Use "not p2p" rather than "=== group": chatInfo is always cached before
+      // a message reaches the queue, but if chat_type were ever missing we'd
+      // rather treat it as a group (catch-up helps in groups, harms in p2p).
+      const chatType = this.store.getChatInfo(chatId)?.chatType || "";
+      const isGroup = chatType !== "p2p";
       if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
         console.warn(`[${this.config.name}] Duplicate trigger skipped for ${chatId.slice(-8)} msgId=${triggerId}`);
-        this.store.clearPendingTriggers(this.config.name, chatId, triggerId);
+        for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
         continue;
       }
-      const contextMsgs = allUnsynced.filter((m) => m.id !== lastHuman.id);
+
+      // Catch-up context: messages this bot has not seen yet in this GROUP chat.
+      // Includes both human and other-bot messages (so mention-only replies can
+      // see the human message they refer to). Excludes:
+      //   - the merged trigger messages themselves (they are the current input)
+      //   - other pending triggers (each is current for its own run)
+      //   - this bot's own messages
+      //   - native escaped commands
+      // p2p never injects catch-up; native command runs never inject catch-up.
+      let contextMsgs: typeof pendingMessages = [];
+      if (isGroup && !isNativeCommandTrigger) {
+        const catchupMessages = this.store.getUnsyncedMessagesForBot(this.config.name, chatId, triggerId);
+        contextMsgs = catchupMessages.filter((m) =>
+          m.senderName !== this.config.name
+          && !(m.id && mergedTriggerIdSet.has(m.id))
+          && !(m.id && pendingTriggerIds.has(m.id))
+          && m.triggerKind !== "native_command"
+        );
+      }
+      const processedMessages = [...contextMsgs, ...mergedTriggers].filter((m) => m.id);
 
       const queueStartedAt = Date.now();
       const sessionKey = await this.ensureSession(chatId);
 
       console.log(
-        `[${this.config.name}] Sending ${humanUnsynced.length} trigger(s) to OpenClaw for ${chatId.slice(-8)} (context=${contextMsgs.length})`
+        `[${this.config.name}] Sending ${mergedTriggers.length} trigger(s) as 1 run to OpenClaw for ${chatId.slice(-8)} (context=${contextMsgs.length})`
       );
 
       // Update reactions: queued messages → sent (GET/了解)
@@ -831,12 +873,14 @@ export class FeishuBot {
           reply = await this.openclawClient.chatSendWithContext({
             sessionKey,
             unsyncedMessages: contextMsgs,
-            currentMessage: lastHuman.content,
+            currentMessage: mergedContent,
             currentSenderName: lastHuman.senderName,
             deliver: false,
             // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
             // instead of leaving reactions stuck forever.
             timeoutMs: 1_800_000,
+            includeContext: !isNativeCommandTrigger,
+            includeBridgeAttachmentHint: !isNativeCommandTrigger,
           });
         } finally {
           // OpenClaw may emit the final assistant session.message just after
@@ -865,12 +909,11 @@ export class FeishuBot {
         // arrive while the agent is busy may already be in pendingAckMessages,
         // but they are not part of allUnsynced/humanUnsynced for this run and
         // must remain pending for the next loop.
-        const maxId = Math.max(...allUnsynced.map((m) => m.id || 0));
-        const processedTriggerIds = new Set(humanUnsynced.map((m) => m.id || 0).filter(Boolean));
+        const maxId = Math.max(...processedMessages.map((m) => m.id || 0));
         const syncBatchId = `${this.config.name}:${chatId}:${triggerId}:${Date.now()}`;
-        this.store.markMessagesSynced(this.config.name, chatId, allUnsynced.map((m) => m.id || 0), syncBatchId);
+        this.store.markMessagesSynced(this.config.name, chatId, processedMessages.map((m) => m.id || 0), syncBatchId);
         this.store.markSynced(this.config.name, chatId, maxId);
-        this.store.clearPendingTriggers(this.config.name, chatId, maxId);
+        for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
         const shouldReply = trimmedReply.length > 0 && !explicitNoReply;
         const isRuntimeFailure = shouldReply && this.isRuntimeFailureText(trimmedReply);
 
@@ -915,7 +958,9 @@ export class FeishuBot {
           } else {
             try {
               await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`), shouldReply ? visibleReply : "", parsedReply.attachments, lastHuman.messageId, `trigger:${triggerId}`);
-              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+              // Mark every merged trigger as delivered so retries/restarts do
+              // not re-process any of them.
+              for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
             } catch (err) {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
@@ -935,7 +980,7 @@ export class FeishuBot {
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
         const remainingAcks: typeof pendingAcks = [];
         for (const ack of pendingAcks) {
-          if (processedTriggerIds.has(ack.rowId)) {
+          if (mergedTriggerIdSet.has(ack.rowId)) {
             await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
             await this.addReaction(ack.messageId, "DONE").catch(() => {});
           } else {
@@ -1295,6 +1340,7 @@ export class FeishuBot {
     if (bots.length === 0) return true;
     return bots[0] === this;
   }
+
 
   private getDiscussionParticipants(chatId: string): DiscussionParticipant[] {
     const chairman = this.store.getChairmanBot(chatId);

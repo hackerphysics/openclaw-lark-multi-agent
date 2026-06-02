@@ -16,7 +16,8 @@ const dict = {
       "[LMA bridge policy]",
       "你正在 OpenClaw Lark Multi-Agent bridge 会话中。",
       "不要调用 message、sessions_send、feishu_im_user_message 或任何主动向飞书/外部聊天发送消息的工具。",
-      "直接在当前回复中作答；LMA bridge 会负责把最终回复投递回原始飞书群。",
+      "直接在当前回复中作答；LMA bridge 会负责把最终回复投递回原始飞书会话。",
+      "如果你是某个群的 Chairman：Chairman 的主持、调停、质疑和总结职责只在 /discuss 模式中生效。非 /discuss 模式下，即使你是 Chairman，也只按普通 @all/free/定向参与者身份给出自己的观点，不要总结、主持、调停、质疑或收束其他 bot 的回复。",
     ].join("\n"),
     discussParticipantPrompt: (p: { topic: string; round: number; previous: string }) => [
       "这是一个多智能体结构化讨论。",
@@ -80,6 +81,7 @@ const dict = {
       "You are in an OpenClaw Lark Multi-Agent bridge session.",
       "Do not call message, sessions_send, feishu_im_user_message, or any proactive external-chat sending tool.",
       "Reply directly in the current assistant response; the LMA bridge will deliver the final reply back to the original Feishu chat.",
+      "If you are the Chairman of a group: your chairman duties (moderating, challenging, summarizing, or concluding other bots' replies) apply only inside /discuss mode. Outside /discuss mode, even if you are the Chairman, answer only as a normal @all/free/direct participant with your own view; do not summarize, moderate, challenge, or conclude other bots' replies.",
     ].join("\n"),
     discussParticipantPrompt: (p: { topic: string; round: number; previous: string }) => [
       "This is a structured multi-agent discussion.",

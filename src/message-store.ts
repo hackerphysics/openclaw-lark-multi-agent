@@ -33,6 +33,7 @@ export interface ChatMessage {
   senderName: string; // human name or bot name (e.g. "Claude", "GPT")
   content: string;
   timestamp: number; // unix ms
+  triggerKind?: "normal" | "native_command";
 }
 
 export interface DeliveryOutboxItem {
@@ -75,7 +76,8 @@ export class MessageStore {
         sender_type TEXT NOT NULL,
         sender_name TEXT NOT NULL,
         content TEXT NOT NULL,
-        timestamp INTEGER NOT NULL
+        timestamp INTEGER NOT NULL,
+        trigger_kind TEXT NOT NULL DEFAULT 'normal'
       );
       CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
       CREATE INDEX IF NOT EXISTS idx_messages_chat_id ON messages(chat_id, id);
@@ -272,6 +274,13 @@ export class MessageStore {
       // Column already exists
     }
 
+    // Migration: add trigger_kind column if missing
+    try {
+      this.db.exec(`ALTER TABLE messages ADD COLUMN trigger_kind TEXT NOT NULL DEFAULT 'normal'`);
+    } catch {
+      // Column already exists
+    }
+
     // Migration: add free_discussion column if missing
     try {
       this.db.exec(`ALTER TABLE chat_info ADD COLUMN free_discussion INTEGER NOT NULL DEFAULT 0`);
@@ -305,9 +314,9 @@ export class MessageStore {
   insert(msg: ChatMessage): number {
     try {
       const result = this.db.prepare(`
-        INSERT INTO messages (chat_id, message_id, sender_type, sender_name, content, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `).run(msg.chatId, msg.messageId, msg.senderType, msg.senderName, msg.content, msg.timestamp);
+        INSERT INTO messages (chat_id, message_id, sender_type, sender_name, content, timestamp, trigger_kind)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(msg.chatId, msg.messageId, msg.senderType, msg.senderName, msg.content, msg.timestamp, msg.triggerKind || "normal");
       return Number(result.lastInsertRowid);
     } catch (err: any) {
       if (err.code === "SQLITE_CONSTRAINT_UNIQUE") return -1;
@@ -365,6 +374,7 @@ export class MessageStore {
       senderName: r.sender_name,
       content: r.content,
       timestamp: r.timestamp,
+      triggerKind: r.trigger_kind || "normal",
     }));
   }
 
@@ -531,6 +541,7 @@ export class MessageStore {
       senderName: r.sender_name,
       content: r.content,
       timestamp: r.timestamp,
+      triggerKind: r.trigger_kind || "normal",
     }));
   }
 
@@ -560,6 +571,7 @@ export class MessageStore {
       senderName: r.sender_name,
       content: r.content,
       timestamp: r.timestamp,
+      triggerKind: r.trigger_kind || "normal",
     }));
   }
 
@@ -607,6 +619,7 @@ export class MessageStore {
       senderName: r.sender_name,
       content: r.content,
       timestamp: r.timestamp,
+      triggerKind: r.trigger_kind || "normal",
     }));
   }
 

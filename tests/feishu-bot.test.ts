@@ -77,6 +77,30 @@ describe("FeishuBot routing and queue behavior", () => {
   });
 
 
+
+  it("bridge policy includes chairman non-discuss guidance", async () => {
+    const h = makeHarness();
+    try {
+      const policy = (h.bot as any).lmaBridgePolicy();
+      expect(policy).toContain("Chairman");
+      expect(policy).toContain("非 /discuss 模式");
+      expect(policy).toContain("不要总结、主持、调停、质疑或收束其他 bot");
+    } finally { h.cleanup(); }
+  });
+
+  it("does not prepend per-message chairman routing notes", async () => {
+    const chairman = makeHarness("Claude");
+    try {
+      chairman.store.setChairmanBot("chat1", "Claude");
+      chairman.store.setBotMode("Claude", "chat1", "free");
+      await (chairman.bot as any).handleMessage(event({ chatType: "group", text: "@_all 各自给一个观点", messageId: "chair-no-per-message-note" }));
+      expect(chairman.openclaw.chatCalls).toHaveLength(1);
+      expect(chairman.openclaw.chatCalls[0].currentMessage).toBe("@_all 各自给一个观点");
+      expect(chairman.openclaw.chatCalls[0].currentMessage).not.toContain("桥接路由说明");
+      expect(chairman.openclaw.chatCalls[0].currentMessage).not.toContain("Bridge routing note");
+    } finally { chairman.cleanup(); }
+  });
+
   it("injects LMA bridge policy only when creating a new session", async () => {
     const h = makeHarness();
     try {
@@ -555,6 +579,7 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+
   it("lets all free bots answer plain messages when discuss is off", async () => {
     const gpt = makeHarness("GPT");
     const claude = makeHarness("Claude");
@@ -760,6 +785,42 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+
+  it("merges consecutive plain human triggers into a single run", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const first = h.store.insert({ chatId: "chat1", messageId: "first-trigger", senderType: "human", senderName: "u", content: "第一条", timestamp: 1 });
+      const second = h.store.insert({ chatId: "chat1", messageId: "second-trigger", senderType: "human", senderName: "u", content: "第二条", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", first);
+      h.store.markPendingTrigger("GPT", "chat1", second);
+      await (h.bot as any).processQueue("chat1");
+      // Two consecutive plain messages are delivered together as one run.
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("第一条\n第二条");
+      // Neither merged trigger leaks into catch-up context.
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.content)).not.toContain("第一条");
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.content)).not.toContain("第二条");
+      // Both pending triggers are cleared.
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("does not inject pending native commands as catch-up context", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const native = h.store.insert({ chatId: "chat1", messageId: "native-trigger", senderType: "human", senderName: "u", content: "/status", timestamp: 1, triggerKind: "native_command" });
+      const normal = h.store.insert({ chatId: "chat1", messageId: "normal-trigger", senderType: "human", senderName: "u", content: "正常问题", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", native);
+      h.store.markPendingTrigger("GPT", "chat1", normal);
+      await (h.bot as any).processQueue("chat1");
+      expect(h.openclaw.chatCalls).toHaveLength(2);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("/status");
+      expect(h.openclaw.chatCalls[0].includeContext).toBe(false);
+      expect(h.openclaw.chatCalls[1].currentMessage).toBe("正常问题");
+      expect(h.openclaw.chatCalls[1].unsyncedMessages.map((m: any) => m.content)).not.toContain("/status");
+    } finally { h.cleanup(); }
+  });
+
   it("processes pending triggers even if sync cursor moved past them", async () => {
     const h = makeHarness("GPT");
     try {
@@ -780,6 +841,29 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "//status", messageId: "m1" }));
       expect(h.openclaw.chatCalls).toHaveLength(1);
       expect(h.openclaw.chatCalls[0].currentMessage).toBe("/status");
+    } finally { h.cleanup(); }
+  });
+
+
+  it("passes double-slash native commands without catch-up context or attachment hint", async () => {
+    const h = makeHarness();
+    try {
+      const oldRow = h.store.insert({
+        chatId: "chat1",
+        messageId: "old-file-request",
+        senderType: "human",
+        senderName: "u",
+        content: "之前请发一个图片文件",
+        timestamp: 1,
+      });
+      // Old message remains unsynced context, but //status must bypass context/hints.
+      expect(oldRow).toBeGreaterThan(0);
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "//status", messageId: "native-status-no-context" }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("/status");
+      expect(h.openclaw.chatCalls[0].unsyncedMessages).toEqual([]);
+      expect(h.openclaw.chatCalls[0].includeContext).toBe(false);
+      expect(h.openclaw.chatCalls[0].includeBridgeAttachmentHint).toBe(false);
     } finally { h.cleanup(); }
   });
 
