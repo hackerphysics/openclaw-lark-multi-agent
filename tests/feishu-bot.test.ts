@@ -18,6 +18,7 @@ class MockOpenClaw {
   async injectAssistantMessage(_params: any) { return { ok: true }; }
   async subscribeSession(sessionKey: string, onMessage: (text: string) => void) { this.sessionCallbacks.set(sessionKey, onMessage); }
   onToolEvent() {}
+  setVerboseTranscriptDelivery = vi.fn();
   muteProactiveDelivery = vi.fn(() => vi.fn());
   async chatSendWithContext(params: any) {
     this.chatCalls.push(params);
@@ -1125,6 +1126,16 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "我来处理。最终结果是 OK。", []);
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "最终结果是 OK。", []);
       expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+    } finally { h.cleanup(); }
+  });
+
+  it("keeps verbose transcript dedupe isolated from final trigger delivery", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "verbose_transcript", "verbose-a", "我已经完成了主要分析，结论是可以合并。", []);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "final-a", "我已经完成了主要分析，结论是可以合并。", [], "reply-1", "trigger:1");
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-1", "我已经完成了主要分析，结论是可以合并。");
     } finally { h.cleanup(); }
   });
 

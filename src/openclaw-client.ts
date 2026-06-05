@@ -43,7 +43,14 @@ export class OpenClawClient {
   private shouldReconnect = true;
   /** Callbacks for tool events (verbose mode) */
   private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
-  private sessionMessageCallbacks: Map<string, (text: string) => void> = new Map();
+  private lastToolNamesByItemId: Map<string, string> = new Map();
+  private sessionMessageCallbacks: Map<string, (text: string, meta?: { sourceType?: string }) => void> = new Map();
+  /** Sessions where verbose mode should deliver visible transcript text even when mixed with tool blocks. */
+  private verboseTranscriptSessions: Set<string> = new Set();
+  private verboseAssistantTimers: Map<string, NodeJS.Timeout> = new Map();
+  private verboseAssistantLatest: Map<string, string> = new Map();
+  private verboseAssistantSent: Map<string, string> = new Map();
+  private verboseAssistantLastTouched: Map<string, number> = new Map();
   /** Session keys that should be re-subscribed on reconnect */
   private subscribedKeys: Set<string> = new Set();
   /** Session keys whose transcript/session.message updates are currently suppressed. */
@@ -225,16 +232,41 @@ export class OpenClawClient {
           // (session.message toolCall events are batched, not real-time)
         }
 
-        // Agent item events — real-time tool call tracking for verbose mode
+        // Agent assistant streams — verbose mode should expose intermediate text,
+        // while normal mode only surfaces the final result via collectReply.
+        if (frame.event === "agent" && (frame.payload?.stream === "assistant" || frame.payload?.stream === "chatDelta")) {
+          this.handleVerboseAssistantStream(frame.payload);
+        }
+
+        // Agent item / command output events — real-time tool tracking for verbose mode.
         if (frame.event === "agent" && frame.payload?.stream === "item") {
           const data = frame.payload.data || {};
           const rawKey = frame.payload.sessionKey || "";
           const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
           const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
+          if (data.itemId && data.name) this.lastToolNamesByItemId.set(String(data.itemId), String(data.name));
 
-          if (toolCb && data.kind === "tool" && data.phase === "start" && data.name) {
-            const meta = data.meta || "";
-            toolCb(data.name, meta, "");
+          if (data.kind === "tool" && data.phase === "start") {
+            this.clearVerboseAssistantState(rawKey);
+          }
+
+          if (toolCb && data.kind === "tool" && data.name && (data.phase === "start" || data.phase === "end" || data.phase === "error")) {
+            const phase = data.phase || "event";
+            const meta = data.meta || data.input || data.args || "";
+            const output = data.output || data.result || data.error || "";
+            toolCb(`${data.name} ${phase}`.trim(), String(meta || ""), String(output || ""));
+          }
+        }
+        if (frame.event === "agent" && frame.payload?.stream === "command_output") {
+          const data = frame.payload.data || {};
+          const rawKey = frame.payload.sessionKey || "";
+          const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+          const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
+          if (toolCb && process.env.OPENCLAW_LARK_MULTI_AGENT_VERBOSE_FULL === "1") {
+            const itemId = String(data.itemId || "");
+            const name = data.name || this.lastToolNamesByItemId.get(itemId.replace(/^command:/, "tool:")) || "command_output";
+            const output = data.text || data.output || data.stdout || data.stderr || data.content || data.result || JSON.stringify(data).slice(0, 2000);
+            toolCb(`${name} output`.trim(), "", String(output || ""));
           }
         }
       });
@@ -267,7 +299,7 @@ export class OpenClawClient {
       .trim();
   }
 
-  private extractVisibleAssistantText(msg: any): string {
+  private extractVisibleAssistantText(msg: any, options: { allowMixedToolText?: boolean } = {}): string {
     if (msg?.role !== "assistant") return "";
     const content = msg.content;
 
@@ -281,13 +313,84 @@ export class OpenClawClient {
     });
     // Do not deliver mixed text+toolCall assistant messages through the
     // final-text path; those are usually intermediate tool-loop status.
-    if (hasToolBlock) return "";
+    // Verbose mode opts into these visible text fragments so tool-call preface
+    // and follow-up narration are not lost while tool events are being shown.
+    if (hasToolBlock && !options.allowMixedToolText) return "";
 
     return content
       .filter((part: any) => part?.type === "text" && typeof part.text === "string")
       .map((part: any) => part.text)
       .join("\n")
       .trim();
+  }
+
+  private isVerboseTranscriptEnabled(rawKey: string): boolean {
+    const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+    return this.verboseTranscriptSessions.has(rawKey) || this.verboseTranscriptSessions.has(shortKey);
+  }
+
+  private clearVerboseAssistantState(sessionKey: string): void {
+    for (const key of [sessionKey, `agent:main:${sessionKey}`]) {
+      const timer = this.verboseAssistantTimers.get(key);
+      if (timer) clearTimeout(timer);
+      this.verboseAssistantTimers.delete(key);
+      this.verboseAssistantLatest.delete(key);
+      this.verboseAssistantSent.delete(key);
+      this.verboseAssistantLastTouched.delete(key);
+    }
+  }
+
+  private pruneVerboseCaches(now = Date.now()): void {
+    for (const [key, ts] of this.verboseAssistantLastTouched) {
+      if (now - ts > 10 * 60_000) {
+        const timer = this.verboseAssistantTimers.get(key);
+        if (timer) clearTimeout(timer);
+        this.verboseAssistantTimers.delete(key);
+        this.verboseAssistantLatest.delete(key);
+        this.verboseAssistantSent.delete(key);
+        this.verboseAssistantLastTouched.delete(key);
+      }
+    }
+    if (this.lastToolNamesByItemId.size > 1000) {
+      const overflow = this.lastToolNamesByItemId.size - 1000;
+      for (const key of Array.from(this.lastToolNamesByItemId.keys()).slice(0, overflow)) this.lastToolNamesByItemId.delete(key);
+    }
+  }
+
+  private handleVerboseAssistantStream(payload: any): void {
+    const rawKey = payload?.sessionKey || "";
+    if (!rawKey || !this.isVerboseTranscriptEnabled(rawKey)) return;
+    const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+    const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
+    if (!cb) return;
+    const data = payload.data || {};
+    const fullText = typeof data.text === "string" ? data.text : typeof data.deltaText === "string" && data.replace ? data.deltaText : "";
+    const deltaText = !fullText && typeof data.delta === "string" ? data.delta : !fullText && typeof data.deltaText === "string" ? data.deltaText : "";
+    const key = rawKey;
+    const previous = this.verboseAssistantLatest.get(key) || "";
+    const text = (fullText || (previous + deltaText)).trim();
+    if (!text) return;
+    const now = Date.now();
+    this.verboseAssistantLatest.set(key, text);
+    this.verboseAssistantLastTouched.set(key, now);
+    this.pruneVerboseCaches(now);
+    const existing = this.verboseAssistantTimers.get(key);
+    if (existing) clearTimeout(existing);
+    this.verboseAssistantTimers.set(key, setTimeout(() => {
+      this.verboseAssistantTimers.delete(key);
+      if (!this.isVerboseTranscriptEnabled(rawKey)) return;
+      const latest = this.verboseAssistantLatest.get(key)?.trim() || "";
+      if (!latest) return;
+      const sent = this.verboseAssistantSent.get(key) || "";
+      if (latest === sent) return;
+      let toSend = latest;
+      if (sent && latest.startsWith(sent)) {
+        toSend = latest.slice(sent.length).trim();
+      }
+      if (!toSend) return;
+      this.verboseAssistantSent.set(key, latest);
+      cb(toSend, { sourceType: "verbose_transcript" });
+    }, 800));
   }
 
   private handleProactiveSessionMessage(rawKey: string, msg: any): boolean {
@@ -297,7 +400,8 @@ export class OpenClawClient {
     // structured content arrays rather than a plain string. Extract only visible
     // text parts and ignore thinking/tool blocks so the bridge can deliver final
     // cron results via the bot.
-    const proactiveText = this.extractVisibleAssistantText(msg);
+    const allowVerboseTranscript = this.isVerboseTranscriptEnabled(rawKey);
+    const proactiveText = this.extractVisibleAssistantText(msg, { allowMixedToolText: allowVerboseTranscript });
     if (!proactiveText) return false;
     if (this.mutedProactiveSessions.has(rawKey) || this.mutedProactiveSessions.has(shortKey)) {
       console.log(`[OpenClaw] Dropping proactive msg for ${shortKey}; delivery is owned by the caller`);
@@ -963,6 +1067,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     const suppressedKeys = [sk, fullSessionKey];
     this.suppressSessionKeys(suppressedKeys);
     this.ownDeliverySessionKeys(suppressedKeys);
+    this.clearVerboseAssistantState(sk);
     try {
       // Drop stale buffered events for this session before starting a new run.
       // This prevents an old final text (e.g. previous "ok") from being consumed by
@@ -1049,16 +1154,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       ...contextForAttachments.map((m) => m.content),
       params.currentMessage,
     ]);
-    const mediaInstruction = attachments.length > 0
-      ? "\n\n[Media note: Image attachments are included with this message. If your model can inspect images directly, use the attached image input. If it cannot, use the image tool on the provided media/attachment path; do not try unrelated network or model-provider workarounds.]"
-      : "";
     const bridgeAttachmentHint = includeBridgeAttachmentHint ? this.bridgeAttachmentHint(params.currentMessage) : "";
     const unsyncedMessages = includeContext ? params.unsyncedMessages : [];
     if (unsyncedMessages.length === 0) {
       // No context to catch up, send directly
       return this.chatSend({
         sessionKey: params.sessionKey,
-        message: params.currentMessage + mediaInstruction + bridgeAttachmentHint,
+        message: params.currentMessage + bridgeAttachmentHint,
         attachments,
         deliver: params.deliver,
         timeoutMs: params.timeoutMs,
@@ -1095,7 +1197,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
 
     return this.chatSend({
       sessionKey: params.sessionKey,
-      message: combined + mediaInstruction + bridgeAttachmentHint,
+      message: combined + bridgeAttachmentHint,
       attachments,
       deliver: params.deliver,
       timeoutMs: params.timeoutMs,
@@ -1178,6 +1280,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     this.mutedProactiveSessionCounts.clear();
     for (const timer of this.ownedDeliverySessionTimers.values()) clearTimeout(timer);
     this.ownedDeliverySessionTimers.clear();
+    for (const timer of this.verboseAssistantTimers.values()) clearTimeout(timer);
+    this.verboseAssistantTimers.clear();
+    this.verboseAssistantLatest.clear();
+    this.verboseAssistantSent.clear();
+    this.verboseAssistantLastTouched.clear();
+    this.lastToolNamesByItemId.clear();
     this.ownedDeliverySessions.clear();
     if (this.ws) {
       this.ws.close();
@@ -1194,7 +1302,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    */
   async subscribeSession(
     sessionKey: string,
-    onMessage: (text: string) => void
+    onMessage: (text: string, meta?: { sourceType?: string }) => void
   ): Promise<void> {
     // Register under both the short key and the full key with agent:main: prefix
     this.sessionMessageCallbacks.set(sessionKey, onMessage);
@@ -1209,11 +1317,21 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     }
   }
 
+  setVerboseTranscriptDelivery(sessionKey: string, enabled: boolean): void {
+    const keys = [sessionKey, `agent:main:${sessionKey}`];
+    for (const key of keys) {
+      if (enabled) this.verboseTranscriptSessions.add(key);
+      else this.verboseTranscriptSessions.delete(key);
+    }
+    if (!enabled) this.clearVerboseAssistantState(sessionKey);
+  }
+
   async unsubscribeSession(sessionKey: string): Promise<void> {
     this.sessionMessageCallbacks.delete(sessionKey);
     this.sessionMessageCallbacks.delete(`agent:main:${sessionKey}`);
     this.toolEventCallbacks.delete(sessionKey);
     this.toolEventCallbacks.delete(`agent:main:${sessionKey}`);
+    this.setVerboseTranscriptDelivery(sessionKey, false);
     this.subscribedKeys.delete(sessionKey);
     try {
       await this.rpc("sessions.messages.unsubscribe", { key: sessionKey });

@@ -468,25 +468,27 @@ export class MessageStore {
     return rows.map((r) => this.mapDelivery(r));
   }
 
-  hasRecentSimilarDelivery(botName: string, chatId: string, contentHash: string, windowMs: number): boolean {
+  hasRecentSimilarDelivery(botName: string, chatId: string, contentHash: string, windowMs: number, sourceTypes?: string[]): boolean {
     if (!contentHash) return false;
+    const sourceFilter = sourceTypes?.length ? ` AND source_type IN (${sourceTypes.map(() => "?").join(",")})` : "";
     const row = this.db.prepare(`
       SELECT 1 FROM delivery_outbox
-      WHERE bot_name = ? AND chat_id = ? AND content_hash = ? AND created_at >= ? AND status IN ('pending', 'delivering', 'delivered')
+      WHERE bot_name = ? AND chat_id = ? AND content_hash = ? AND created_at >= ? AND status IN ('pending', 'delivering', 'delivered')${sourceFilter}
       LIMIT 1
-    `).get(botName, chatId, contentHash, Date.now() - windowMs);
+    `).get(botName, chatId, contentHash, Date.now() - windowMs, ...(sourceTypes || []));
     return !!row;
   }
 
-  hasRecentOverlappingDelivery(botName: string, chatId: string, content: string, attachmentsJson: string, windowMs: number, minShortLength: number = 8): boolean {
+  hasRecentOverlappingDelivery(botName: string, chatId: string, content: string, attachmentsJson: string, windowMs: number, minShortLength: number = 8, sourceTypes?: string[]): boolean {
     const normalized = content.trim();
     if (normalized.length < minShortLength) return false;
+    const sourceFilter = sourceTypes?.length ? ` AND source_type IN (${sourceTypes.map(() => "?").join(",")})` : "";
     const rows = this.db.prepare(`
       SELECT content, attachments_json FROM delivery_outbox
-      WHERE bot_name = ? AND chat_id = ? AND created_at >= ? AND status IN ('pending', 'delivering', 'delivered')
+      WHERE bot_name = ? AND chat_id = ? AND created_at >= ? AND status IN ('pending', 'delivering', 'delivered')${sourceFilter}
       ORDER BY created_at DESC
       LIMIT 20
-    `).all(botName, chatId, Date.now() - windowMs) as any[];
+    `).all(botName, chatId, Date.now() - windowMs, ...(sourceTypes || [])) as any[];
     for (const row of rows) {
       if ((row.attachments_json || '[]') !== attachmentsJson) continue;
       const existing = String(row.content || '').trim();

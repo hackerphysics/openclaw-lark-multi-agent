@@ -57,6 +57,7 @@ export class FeishuBot {
   private pendingAckMessages: Map<string, { messageId: string; emoji: string; rowId: number }[]> = new Map();
   /** Per-chat pending tool message sends (to await before final reply) */
   private pendingToolSends: Map<string, Promise<void>[]> = new Map();
+  private recentVerboseToolMessages: Map<string, number> = new Map();
   /** Per-chat processQueue lock to avoid duplicate concurrent chat.send runs */
   private queueRuns: Map<string, Promise<void>> = new Map();
   /** Per-chat serial send queue to guarantee message order */
@@ -212,20 +213,22 @@ export class FeishuBot {
     this.initializedSessions.add(sessionKey);
 
     // Subscribe to session events (proactive messages + tool calls)
-    await this.openclawClient.subscribeSession(sessionKey, async (text) => {
+    this.openclawClient.setVerboseTranscriptDelivery(sessionKey, this.store.getBotVerbose(this.config.name, chatId));
+    await this.openclawClient.subscribeSession(sessionKey, async (text, meta) => {
       try {
-        console.log(`[${this.config.name}] Proactive message for ${chatId.slice(-8)}`);
+        const sourceType = meta?.sourceType === "verbose_transcript" ? "verbose_transcript" : "assistant_visible";
+        console.log(`[${this.config.name}] ${sourceType === "verbose_transcript" ? "Verbose transcript" : "Proactive message"} for ${chatId.slice(-8)}`);
         const parsed = this.extractBridgeAttachments(text);
-        if (parsed.text.trim() || parsed.attachments.length > 0) this.cancelDelayedFailure(chatId);
+        if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) this.cancelDelayedFailure(chatId);
         const activeTarget = this.activeDeliveryTargets.get(chatId);
         await this.enqueueAndDispatchDelivery(
           chatId,
-          "assistant_visible",
-          this.deliverySourceId("proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`),
+          sourceType,
+          this.deliverySourceId(sourceType === "verbose_transcript" ? "verbose" : "proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`),
           parsed.text.trim(),
           parsed.attachments,
           activeTarget?.messageId,
-          activeTarget ? `trigger:${activeTarget.triggerId}` : undefined
+          undefined
         );
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
@@ -241,6 +244,14 @@ export class FeishuBot {
           const inputPreview = toolInput.length > 200 ? toolInput.substring(0, 200) + "..." : toolInput;
           const outputPreview = toolOutput.length > 300 ? toolOutput.substring(0, 300) + "..." : toolOutput;
           const msg = `🔧 Tool: ${toolName}\n📥 ${inputPreview}${toolOutput ? `\n📤 ${outputPreview}` : ""}`;
+          const dedupeKey = `${chatId}:${msg}`;
+          const now = Date.now();
+          const lastSentAt = this.recentVerboseToolMessages.get(dedupeKey) || 0;
+          if (now - lastSentAt < 5_000) return;
+          this.recentVerboseToolMessages.set(dedupeKey, now);
+          for (const [key, ts] of this.recentVerboseToolMessages) {
+            if (now - ts > 60_000) this.recentVerboseToolMessages.delete(key);
+          }
           console.log(`[${this.config.name}] [${new Date().toISOString()}] Sending tool msg to Feishu...`);
           await this.sendMessage(chatId, msg);
           console.log(`[${this.config.name}] [${new Date().toISOString()}] Tool msg sent OK`);
@@ -619,11 +630,13 @@ export class FeishuBot {
         }
         if (commandName === "/verbose") {
           const isOn = this.store.getBotVerbose(this.config.name, chatId);
-          this.store.setBotVerbose(this.config.name, chatId, !isOn);
+          const nextVerbose = !isOn;
+          this.store.setBotVerbose(this.config.name, chatId, nextVerbose);
+          this.openclawClient.setVerboseTranscriptDelivery(this.getSessionKey(chatId), nextVerbose);
           if (isOn) {
-            await this.replyMessage(messageId, `🔇 ${this.config.name} Verbose 已关闭\n只影响当前 Bot 在当前会话的 Tool call 显示`);
+            await this.replyMessage(messageId, `🔇 ${this.config.name} Verbose 已关闭\n只影响当前 Bot 在当前会话的 Tool call 和中间文本显示`);
           } else {
-            await this.replyMessage(messageId, `🔊 ${this.config.name} Verbose 已开启\n只影响当前 Bot 在当前会话的 Tool call 显示`);
+            await this.replyMessage(messageId, `🔊 ${this.config.name} Verbose 已开启\n只影响当前 Bot 在当前会话的 Tool call 和中间文本显示`);
           }
           markCommandSynced();
           return;
@@ -881,7 +894,10 @@ export class FeishuBot {
         }
         mergedTriggers = selected;
         if (droppedMergedTriggers.length > 0) {
-          console.warn(`[${this.config.name}] Dropped ${droppedMergedTriggers.length} older pending trigger(s) for ${chatId.slice(-8)} due to merge limits (kept=${mergedTriggers.length}, bytes=${bytes})`);
+          const summaries = droppedMergedTriggers
+            .map((m) => `#${m.id || "?"}:${m.content.replace(/\s+/g, " ").trim().slice(0, 120)}`)
+            .join(" | ");
+          console.warn(`[${this.config.name}] Dropped ${droppedMergedTriggers.length} older pending trigger(s) for ${chatId.slice(-8)} due to merge limits (kept=${mergedTriggers.length}, bytes=${bytes}): ${summaries}`);
         }
       }
       const isNativeCommandTrigger = firstIsNative;
@@ -1428,9 +1444,15 @@ export class FeishuBot {
     const normalizedPayload = `${text.trim()}|${attachmentsJson}`;
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
-    if (!deliveryKey) {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000)) return;
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8)) return;
+    if (sourceType === "verbose_transcript") {
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
+    } else if (!deliveryKey) {
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) return;
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) return;
+    } else if (sourceType === "assistant_visible") {
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["assistant_visible"])) return;
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 30, ["assistant_visible"])) return;
     }
     const deliveryId = this.store.enqueueDelivery({
       sessionKey: this.deliverySessionKey(chatId),
@@ -1460,7 +1482,7 @@ export class FeishuBot {
           const attachments = JSON.parse(item.attachmentsJson || "[]") as BridgeAttachment[];
           if (item.content.trim()) {
             const replyTarget = item.replyToMessageId || replyToMessageId;
-            const shouldReplyToSource = replyTarget && (item.sourceType === "assistant_visible" || item.sourceType === "provider_error" || item.sourceType === "delayed_error");
+            const shouldReplyToSource = replyTarget && (item.sourceType === "assistant_visible" || item.sourceType === "verbose_transcript" || item.sourceType === "provider_error" || item.sourceType === "delayed_error");
             if (shouldReplyToSource) {
               try {
                 await this.replyMessage(replyTarget, item.content);

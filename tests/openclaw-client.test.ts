@@ -1,6 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { GATEWAY_PROTOCOL_MAX, GATEWAY_PROTOCOL_MIN, OpenClawClient } from "../src/openclaw-client.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { getBridgeAttachmentsDir } from "../src/paths.js";
 
 describe("OpenClawClient protocol compatibility", () => {
@@ -296,6 +298,7 @@ describe("OpenClawClient collectReply", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "visible" }] })).toBe("visible");
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "text", text: "draft" }, { type: "toolCall", name: "read" }] })).toBe("");
+    expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "text", text: "draft" }, { type: "toolCall", name: "read" }] }, { allowMixedToolText: true })).toBe("draft");
   });
 
   it("collects v4 chatDelta deltaText and respects replace semantics", async () => {
@@ -409,6 +412,60 @@ describe("OpenClawClient proactive delivery mute", () => {
     release();
     expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "visible" })).toBe(true);
     expect(callback).toHaveBeenCalledWith("visible");
+  });
+
+  it("delivers verbose assistant stream text while normal mode stays quiet", async () => {
+    vi.useFakeTimers();
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("s1", callback);
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: "普通模式不投" } });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(callback).not.toHaveBeenCalled();
+
+    client.setVerboseTranscriptDelivery("s1", true);
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: "工具前文本" } });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(callback).toHaveBeenCalledWith("工具前文本", { sourceType: "verbose_transcript" });
+    vi.useRealTimers();
+  });
+
+  it("sends only new verbose assistant text and cancels pending flush when disabled", async () => {
+    vi.useFakeTimers();
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+    client.setVerboseTranscriptDelivery("s1", true);
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "工具" } });
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "前文本" } });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(callback).toHaveBeenCalledWith("工具前文本", { sourceType: "verbose_transcript" });
+
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: "工具前文本，继续处理" } });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(callback).toHaveBeenCalledWith("，继续处理", { sourceType: "verbose_transcript" });
+    expect(callback).not.toHaveBeenCalledWith("工具前文本，继续处理");
+
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: "关闭后不应投递" } });
+    client.setVerboseTranscriptDelivery("s1", false);
+    await vi.advanceTimersByTimeAsync(900);
+    expect(callback).not.toHaveBeenCalledWith("关闭后不应投递");
+    vi.useRealTimers();
+  });
+
+  it("keeps proactive transcript suppressed in verbose mode while chatSend owns delivery", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("s1", callback);
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+    (client as any).suppressedSessions.add("s1");
+    (client as any).suppressedSessions.add("agent:main:s1");
+    client.setVerboseTranscriptDelivery("s1", true);
+
+    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: [{ type: "text", text: "我先看代码" }, { type: "toolCall", name: "read" }] })).toBe(false);
+    expect(callback).not.toHaveBeenCalled();
   });
 
   it("drops proactive assistant messages while chatSend owns delivery", () => {
@@ -600,6 +657,28 @@ describe("OpenClawClient bridge attachment hint", () => {
     expect(chatSend).toHaveBeenCalledOnce();
     expect(result).toBe("/status");
     expect(chatSend.mock.calls[0][0].message).toBe("/status");
+  });
+
+  it("attaches images without injecting a media note into message text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "olma-image-"));
+    try {
+      const imagePath = join(dir, "shot.png");
+      writeFileSync(imagePath, Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+      const { client, chatSend } = clientWithCapturedChatSend();
+      const result = await client.chatSendWithContext({
+        sessionKey: "s1",
+        unsyncedMessages: [],
+        currentMessage: `[Image: ${imagePath}] 这张图说明什么？`,
+        currentSenderName: "Stephen",
+        includeBridgeAttachmentHint: false,
+      });
+      expect(chatSend).toHaveBeenCalledOnce();
+      expect(result).not.toContain("Media note");
+      expect(result).toContain("这张图说明什么？");
+      expect(chatSend.mock.calls[0][0].attachments).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("injects the bridge attachment hint only for likely attachment requests", async () => {
