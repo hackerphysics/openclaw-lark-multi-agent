@@ -481,6 +481,31 @@ describe("OpenClawClient proactive delivery mute", () => {
     vi.useRealTimers();
   });
 
+  it("flushes verbose assistant text on lifecycle end for tool-free replies", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+    client.setVerboseTranscriptDelivery("s1", true);
+
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "这是一段纯文本 verbose 回复" } });
+    (client as any).flushVerboseAssistantState("agent:main:s1");
+    (client as any).clearVerboseAssistantState("agent:main:s1");
+
+    expect(callback).toHaveBeenCalledWith("这是一段纯文本 verbose 回复", { sourceType: "verbose_transcript" });
+  });
+
+  it("force-flushes very long verbose assistant text to avoid oversized Feishu messages", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+    client.setVerboseTranscriptDelivery("s1", true);
+
+    const longText = "长".repeat(3000);
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: longText } });
+
+    expect(callback).toHaveBeenCalledWith(longText, { sourceType: "verbose_transcript" });
+  });
+
   it("keeps proactive transcript suppressed in verbose mode while chatSend owns delivery", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const callback = vi.fn();

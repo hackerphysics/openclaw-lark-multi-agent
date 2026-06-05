@@ -240,7 +240,9 @@ export class OpenClawClient {
           this.handleVerboseAssistantStream(frame.payload);
         }
         if (frame.event === "agent" && frame.payload?.stream === "lifecycle" && frame.payload?.data?.phase === "end") {
-          this.clearVerboseAssistantState(frame.payload.sessionKey || "");
+          const rawKey = frame.payload.sessionKey || "";
+          this.flushVerboseAssistantState(rawKey);
+          this.clearVerboseAssistantState(rawKey);
         }
 
         // Agent item / command output events — real-time tool tracking for verbose mode.
@@ -400,6 +402,9 @@ export class OpenClawClient {
     this.verboseAssistantLatest.set(key, text);
     this.verboseAssistantLastTouched.set(key, now);
     this.pruneVerboseCaches(now);
+    if (text.length >= 3000) {
+      this.flushVerboseAssistantState(rawKey);
+    }
   }
 
   private handleProactiveSessionMessage(rawKey: string, msg: any): boolean {
