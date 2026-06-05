@@ -247,6 +247,7 @@ export class OpenClawClient {
           if (data.itemId && data.name) this.lastToolNamesByItemId.set(String(data.itemId), String(data.name));
 
           if (data.kind === "tool" && data.phase === "start") {
+            this.flushVerboseAssistantState(rawKey);
             this.clearVerboseAssistantState(rawKey);
           }
 
@@ -357,6 +358,26 @@ export class OpenClawClient {
     }
   }
 
+  private flushVerboseAssistantState(rawKey: string): boolean {
+    if (!this.isVerboseTranscriptEnabled(rawKey)) return false;
+    const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+    const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
+    if (!cb) return false;
+    const key = rawKey;
+    const latest = this.verboseAssistantLatest.get(key)?.trim() || "";
+    if (!latest) return false;
+    const sent = this.verboseAssistantSent.get(key) || "";
+    if (latest === sent) return false;
+    let toSend = latest;
+    if (sent && latest.startsWith(sent)) {
+      toSend = latest.slice(sent.length).trim();
+    }
+    if (!toSend) return false;
+    this.verboseAssistantSent.set(key, latest);
+    cb(toSend, { sourceType: "verbose_transcript" });
+    return true;
+  }
+
   private handleVerboseAssistantStream(payload: any): void {
     const rawKey = payload?.sessionKey || "";
     if (!rawKey || !this.isVerboseTranscriptEnabled(rawKey)) return;
@@ -379,17 +400,7 @@ export class OpenClawClient {
     this.verboseAssistantTimers.set(key, setTimeout(() => {
       this.verboseAssistantTimers.delete(key);
       if (!this.isVerboseTranscriptEnabled(rawKey)) return;
-      const latest = this.verboseAssistantLatest.get(key)?.trim() || "";
-      if (!latest) return;
-      const sent = this.verboseAssistantSent.get(key) || "";
-      if (latest === sent) return;
-      let toSend = latest;
-      if (sent && latest.startsWith(sent)) {
-        toSend = latest.slice(sent.length).trim();
-      }
-      if (!toSend) return;
-      this.verboseAssistantSent.set(key, latest);
-      cb(toSend, { sourceType: "verbose_transcript" });
+      this.flushVerboseAssistantState(rawKey);
     }, 800));
   }
 

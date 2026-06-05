@@ -455,6 +455,24 @@ describe("OpenClawClient proactive delivery mute", () => {
     vi.useRealTimers();
   });
 
+  it("flushes pending verbose assistant text before clearing state on tool start", async () => {
+    vi.useFakeTimers();
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+    client.setVerboseTranscriptDelivery("s1", true);
+
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "我会先看一下，避免" } });
+    (client as any).flushVerboseAssistantState("agent:main:s1");
+    (client as any).clearVerboseAssistantState("agent:main:s1");
+    expect(callback).toHaveBeenCalledWith("我会先看一下，避免", { sourceType: "verbose_transcript" });
+
+    (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "误重启别的东西" } });
+    await vi.advanceTimersByTimeAsync(900);
+    expect(callback).toHaveBeenCalledWith("误重启别的东西", { sourceType: "verbose_transcript" });
+    vi.useRealTimers();
+  });
+
   it("keeps proactive transcript suppressed in verbose mode while chatSend owns delivery", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const callback = vi.fn();
