@@ -414,7 +414,7 @@ describe("OpenClawClient proactive delivery mute", () => {
     expect(callback).toHaveBeenCalledWith("visible");
   });
 
-  it("delivers verbose assistant stream text while normal mode stays quiet", async () => {
+  it("buffers verbose assistant stream text while normal mode stays quiet", async () => {
     vi.useFakeTimers();
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const callback = vi.fn();
@@ -428,11 +428,13 @@ describe("OpenClawClient proactive delivery mute", () => {
     client.setVerboseTranscriptDelivery("s1", true);
     (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: "工具前文本" } });
     await vi.advanceTimersByTimeAsync(900);
+    expect(callback).not.toHaveBeenCalled();
+    (client as any).flushVerboseAssistantState("agent:main:s1");
     expect(callback).toHaveBeenCalledWith("工具前文本", { sourceType: "verbose_transcript" });
     vi.useRealTimers();
   });
 
-  it("sends only new verbose assistant text and cancels pending flush when disabled", async () => {
+  it("sends only new verbose assistant text when flushed and clears buffer when disabled", async () => {
     vi.useFakeTimers();
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const callback = vi.fn();
@@ -441,10 +443,14 @@ describe("OpenClawClient proactive delivery mute", () => {
     (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "工具" } });
     (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "前文本" } });
     await vi.advanceTimersByTimeAsync(900);
+    expect(callback).not.toHaveBeenCalled();
+    (client as any).flushVerboseAssistantState("agent:main:s1");
     expect(callback).toHaveBeenCalledWith("工具前文本", { sourceType: "verbose_transcript" });
 
     (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { text: "工具前文本，继续处理" } });
     await vi.advanceTimersByTimeAsync(900);
+    expect(callback).not.toHaveBeenCalledWith("，继续处理", { sourceType: "verbose_transcript" });
+    (client as any).flushVerboseAssistantState("agent:main:s1");
     expect(callback).toHaveBeenCalledWith("，继续处理", { sourceType: "verbose_transcript" });
     expect(callback).not.toHaveBeenCalledWith("工具前文本，继续处理");
 
@@ -469,6 +475,8 @@ describe("OpenClawClient proactive delivery mute", () => {
 
     (client as any).handleVerboseAssistantStream({ sessionKey: "agent:main:s1", data: { delta: "误重启别的东西" } });
     await vi.advanceTimersByTimeAsync(900);
+    expect(callback).not.toHaveBeenCalledWith("误重启别的东西", { sourceType: "verbose_transcript" });
+    (client as any).flushVerboseAssistantState("agent:main:s1");
     expect(callback).toHaveBeenCalledWith("误重启别的东西", { sourceType: "verbose_transcript" });
     vi.useRealTimers();
   });

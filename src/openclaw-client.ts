@@ -232,10 +232,15 @@ export class OpenClawClient {
           // (session.message toolCall events are batched, not real-time)
         }
 
-        // Agent assistant streams — verbose mode should expose intermediate text,
-        // while normal mode only surfaces the final result via collectReply.
+        // Agent assistant streams — verbose mode buffers intermediate text and
+        // flushes it only on a real boundary (for example, before a tool starts).
+        // This keeps a single assistant preface together instead of leaking it
+        // as multiple debounce-sized Feishu messages.
         if (frame.event === "agent" && (frame.payload?.stream === "assistant" || frame.payload?.stream === "chatDelta")) {
           this.handleVerboseAssistantStream(frame.payload);
+        }
+        if (frame.event === "agent" && frame.payload?.stream === "lifecycle" && frame.payload?.data?.phase === "end") {
+          this.clearVerboseAssistantState(frame.payload.sessionKey || "");
         }
 
         // Agent item / command output events — real-time tool tracking for verbose mode.
@@ -395,13 +400,6 @@ export class OpenClawClient {
     this.verboseAssistantLatest.set(key, text);
     this.verboseAssistantLastTouched.set(key, now);
     this.pruneVerboseCaches(now);
-    const existing = this.verboseAssistantTimers.get(key);
-    if (existing) clearTimeout(existing);
-    this.verboseAssistantTimers.set(key, setTimeout(() => {
-      this.verboseAssistantTimers.delete(key);
-      if (!this.isVerboseTranscriptEnabled(rawKey)) return;
-      this.flushVerboseAssistantState(rawKey);
-    }, 800));
   }
 
   private handleProactiveSessionMessage(rawKey: string, msg: any): boolean {
