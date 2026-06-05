@@ -14,7 +14,7 @@ class MockOpenClaw {
   async getSessionInfo() { return { session: { totalTokens: 0 } }; }
   async ensureModel() { return false; }
   async createSession() {}
-  async patchSession() {}
+  patchSession = vi.fn(async (_params?: any) => ({}));
   async injectAssistantMessage(_params: any) { return { ok: true }; }
   async subscribeSession(sessionKey: string, onMessage: (text: string) => void) { this.sessionCallbacks.set(sessionKey, onMessage); }
   onToolEvent() {}
@@ -26,6 +26,7 @@ class MockOpenClaw {
   }
   async compactSession() { return "ok"; }
   async resetSession() { return "ok"; }
+  abortChat = vi.fn(async () => {});
 }
 
 function event(opts: { chatId?: string; chatType?: "p2p" | "group"; text: string; messageId?: string; mentions?: any[]; senderType?: "user" | "app"; openId?: string }) {
@@ -45,12 +46,12 @@ function event(opts: { chatId?: string; chatType?: "p2p" | "group"; text: string
   };
 }
 
-function makeHarness(name = "GPT") {
+function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "olma-bot-"));
   const store = new MessageStore(join(dir, "messages.db"));
   const openclaw = new MockOpenClaw();
   const config: BotConfig = { name, appId: `app-${name}`, appSecret: "secret", model: `model-${name}` };
-  const bot = new FeishuBot(config, openclaw as any, store);
+  const bot = new FeishuBot(config, openclaw as any, store, undefined, opts.configPath);
   (bot as any).fetchAndCacheChatInfo = async (chatId: string, chatType: string) => {
     store.upsertChatInfo({ chatId, chatType, chatName: chatType, members: "", memberNames: "", ownerBot: chatType === "p2p" ? name : "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: Date.now() });
   };
@@ -425,6 +426,32 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-reset", expect.stringContaining("Session 已重置"));
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("/stop force-clears a stuck run: aborts, unlocks busy, and clears pending", async () => {
+    const h = makeHarness();
+    try {
+      // Simulate a stuck run: busy lock set + queued pending triggers.
+      const r1 = h.store.insert({ chatId: "chat1", messageId: "stuck-1", senderType: "human", senderName: "u", content: "q1", timestamp: 1 });
+      const r2 = h.store.insert({ chatId: "chat1", messageId: "stuck-2", senderType: "human", senderName: "u", content: "q2", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", r1);
+      h.store.markPendingTrigger("GPT", "chat1", r2);
+      (h.bot as any).busyChats.set("chat1", Date.now());
+      (h.bot as any).pendingAckMessages.set("chat1", [{ messageId: "stuck-1", emoji: "Typing", rowId: r1 }]);
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@万万（GPT） /stop", messageId: "cmd-stop", mentions: [{ name: "万万（GPT）", id: { app_id: "app-GPT" } }] }));
+
+      // Aborted the active run.
+      expect(h.openclaw.abortChat).toHaveBeenCalled();
+      // Busy lock cleared.
+      expect((h.bot as any).busyChats.get("chat1")).toBe(0);
+      // Every pending trigger cleared.
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+      // Stuck reactions cleared.
+      expect((h.bot as any).pendingAckMessages.get("chat1")).toEqual([]);
+      // User got a confirmation.
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-stop", expect.stringContaining("已停止"));
     } finally { h.cleanup(); }
   });
 
@@ -821,6 +848,144 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("filters bridge commands and LMA control replies out of catch-up context", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.insert({ chatId: "chat1", messageId: "old-status", senderType: "human", senderName: "u", content: "/status", timestamp: 1, triggerKind: "bridge_command" });
+      h.store.insert({ chatId: "chat1", messageId: "old-stop", senderType: "human", senderName: "u", content: "/stop", timestamp: 2, triggerKind: "bridge_command" });
+      h.store.insert({ chatId: "chat1", messageId: "old-reset-reply", senderType: "bot", senderName: "Claude", content: "✅ Session reset.", timestamp: 3, triggerKind: "bridge_control_reply" });
+      h.store.insert({ chatId: "chat1", messageId: "old-models", senderType: "bot", senderName: "Claude", content: "Models (phgeek-gw · showing 1-20)\nSwitch: /model <provider/model>", timestamp: 4, triggerKind: "bridge_control_reply" });
+      h.store.insert({ chatId: "chat1", messageId: "old-normal", senderType: "human", senderName: "u", content: "你好", timestamp: 5 });
+      h.store.insert({ chatId: "chat1", messageId: "old-normal-check", senderType: "bot", senderName: "Claude", content: "✅ 赞同，这个方案可以继续。", timestamp: 6 });
+      const current = h.store.insert({ chatId: "chat1", messageId: "current-review", senderType: "human", senderName: "u", content: "review当前代码改动", timestamp: 7 });
+      h.store.markPendingTrigger("GPT", "chat1", current);
+      await (h.bot as any).processQueue("chat1");
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      const ctx = h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.content);
+      expect(ctx).toContain("你好");
+      expect(ctx).toContain("✅ 赞同，这个方案可以继续。");
+      expect(ctx).not.toContain("/status");
+      expect(ctx).not.toContain("/stop");
+      expect(ctx).not.toContain("✅ Session reset.");
+      expect(ctx.join("\n")).not.toContain("Switch: /model");
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("review当前代码改动");
+    } finally { h.cleanup(); }
+  });
+
+  it("marks incoming bridge commands and control replies with non-normal trigger kinds", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /status", messageId: "status-kind" }));
+      await (h.bot as any).handleMessage(event({ chatType: "group", senderType: "app", senderName: "Claude", text: "✅ Session reset.", messageId: "reset-kind" }));
+      const statusRow = h.store.getMessageByMessageId("status-kind");
+      const resetRow = h.store.getMessageByMessageId("reset-kind");
+      expect(statusRow?.triggerKind).toBe("bridge_command");
+      expect(resetRow?.triggerKind).toBe("bridge_control_reply");
+    } finally { h.cleanup(); }
+  });
+
+  it("includes other bot replies in catch-up for a later targeted bot run", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.store.insert({ chatId: "chat1", messageId: "human-before", senderType: "human", senderName: "u", content: "请 GPT review", timestamp: 1 });
+      const gptReply = h.store.insert({ chatId: "chat1", messageId: "self-GPT-review", senderType: "bot", senderName: "GPT", content: "GPT 的 review 结论", timestamp: 2 });
+      const current = h.store.insert({ chatId: "chat1", messageId: "ask-claude", senderType: "human", senderName: "u", content: "Claude 你看一下 GPT 的 review", timestamp: 3 });
+      h.store.markMessagesSynced("Claude", "chat1", [1], "older-context-already-seen");
+      h.store.markPendingTrigger("Claude", "chat1", current);
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("Claude 你看一下 GPT 的 review");
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.id)).toContain(gptReply);
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.content)).toContain("GPT 的 review 结论");
+    } finally { h.cleanup(); }
+  });
+
+  it("includes other bot replies stored after the trigger row but excludes later human messages", async () => {
+    const h = makeHarness("Claude");
+    try {
+      const current = h.store.insert({ chatId: "chat1", messageId: "ask-claude", senderType: "human", senderName: "u", content: "Claude 你看一下", timestamp: 1 });
+      const lateBotReply = h.store.insert({ chatId: "chat1", messageId: "self-GPT-late", senderType: "bot", senderName: "GPT", content: "GPT 刚发出的可见回复", timestamp: 2 });
+      const laterHuman = h.store.insert({ chatId: "chat1", messageId: "later-human", senderType: "human", senderName: "u", content: "下一条人类消息", timestamp: 3 });
+      h.store.markPendingTrigger("Claude", "chat1", current);
+
+      await (h.bot as any).processQueue("chat1");
+
+      const ids = h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.id);
+      expect(ids).toContain(lateBotReply);
+      expect(ids).not.toContain(laterHuman);
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.content)).toContain("GPT 刚发出的可见回复");
+    } finally { h.cleanup(); }
+  });
+
+  it("marks catch-up context synced once submitted even if the run later returns empty", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const contextId = h.store.insert({ chatId: "chat1", messageId: "old-context", senderType: "human", senderName: "u", content: "旧历史，不应重复投递", timestamp: 1 });
+      const currentId = h.store.insert({ chatId: "chat1", messageId: "current-empty", senderType: "human", senderName: "u", content: "当前问题", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", currentId);
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSubmitted?.("run-accepted");
+        return "";
+      });
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].unsyncedMessages.map((m: any) => m.id)).toContain(contextId);
+      expect(h.store.getUnsyncedMessagesForBot("GPT", "chat1", currentId).map((m) => m.id)).not.toContain(contextId);
+      expect(h.store.getUnsyncedMessagesForBot("GPT", "chat1", currentId).map((m) => m.id)).not.toContain(currentId);
+      expect(h.store.getPendingTriggerIds("GPT", "chat1")).not.toContain(currentId);
+    } finally { h.cleanup(); }
+  });
+
+  it("does not replay attempted merged triggers even if chat.send RPC throws", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const first = h.store.insert({ chatId: "chat1", messageId: "first-rpc", senderType: "human", senderName: "u", content: "第一条", timestamp: 1 });
+      const second = h.store.insert({ chatId: "chat1", messageId: "second-rpc", senderType: "human", senderName: "u", content: "第二条", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", first);
+      h.store.markPendingTrigger("GPT", "chat1", second);
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.();
+        throw new Error("lost rpc response after send attempt");
+      });
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+      const unsynced = h.store.getUnsyncedMessagesForBot("GPT", "chat1", second).map((m) => m.id);
+      expect(unsynced).not.toContain(first);
+      expect(unsynced).not.toContain(second);
+    } finally { h.cleanup(); }
+  });
+
+  it("does not replay any merged trigger after accepted empty runs", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const first = h.store.insert({ chatId: "chat1", messageId: "first", senderType: "human", senderName: "u", content: "第一条", timestamp: 1 });
+      const second = h.store.insert({ chatId: "chat1", messageId: "second", senderType: "human", senderName: "u", content: "第二条", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", first);
+      h.store.markPendingTrigger("GPT", "chat1", second);
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSubmitted?.("run-accepted");
+        return "";
+      });
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+      expect(h.store.getUnsyncedMessagesForBot("GPT", "chat1", second).map((m) => m.id)).not.toContain(first);
+      expect(h.store.getUnsyncedMessagesForBot("GPT", "chat1", second).map((m) => m.id)).not.toContain(second);
+    } finally { h.cleanup(); }
+  });
+
   it("processes pending triggers even if sync cursor moved past them", async () => {
     const h = makeHarness("GPT");
     try {
@@ -979,15 +1144,16 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("keeps truly empty replies pending instead of marking DONE", async () => {
+  it("does not replay accepted truly empty replies", async () => {
     const h = makeHarness("GLM");
     try {
       h.store.setBotMode("GLM", "chat1", "free");
       h.openclaw.replies.push("");
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "需要回答的问题", messageId: "empty-reply" }));
       const rowId = h.store.getMessageId("empty-reply")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(true);
-      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("empty-reply", "DONE");
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(false);
+      expect(h.store.getUnsyncedMessagesForBot("GLM", "chat1", rowId).map((m) => m.id)).not.toContain(rowId);
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("empty-reply", "DONE");
       expect(h.store.getChatInfo("chat1")).toBeTruthy();
     } finally { h.cleanup(); }
   });

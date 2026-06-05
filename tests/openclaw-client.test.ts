@@ -471,6 +471,46 @@ describe("OpenClawClient bridge attachment hint", () => {
     return { client, chatSend };
   }
 
+  it("calls onSendAttempt before chat.send RPC", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events: string[] = [];
+    (client as any).rpc = vi.fn(async () => {
+      events.push("rpc");
+      return { runId: "run-1" };
+    });
+    (client as any).collectReply = vi.fn(async () => "done");
+
+    await client.chatSend({
+      sessionKey: "s1",
+      message: "hello",
+      onSendAttempt: () => events.push("attempt"),
+    });
+
+    expect(events).toEqual(["attempt", "rpc"]);
+  });
+
+  it("calls onSubmitted immediately after chat.send accepts the run", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events: string[] = [];
+    (client as any).rpc = vi.fn(async () => {
+      events.push("rpc");
+      return { runId: "run-1" };
+    });
+    (client as any).collectReply = vi.fn(async () => {
+      events.push("collectReply");
+      return "done";
+    });
+
+    const result = await client.chatSend({
+      sessionKey: "s1",
+      message: "hello",
+      onSubmitted: (runId) => events.push(`submitted:${runId}`),
+    });
+
+    expect(result).toBe("done");
+    expect(events).toEqual(["rpc", "submitted:run-1", "collectReply"]);
+  });
+
   it("does not inject the bridge attachment hint into ordinary messages", async () => {
     const { client, chatSend } = clientWithCapturedChatSend();
     const result = await client.chatSendWithContext({
@@ -526,7 +566,8 @@ describe("OpenClawClient bridge attachment hint", () => {
 
     expect(chatSend).toHaveBeenCalledOnce();
     expect(result).toContain("已写入本地文件");
-    expect(result).toContain("你必须先使用 read 工具读取这个文件");
+    expect(result).toContain("如需参考历史，请使用 read 工具读取这个文件");
+    expect(result.indexOf("你怎么看？")).toBeLessThan(result.indexOf("已写入本地文件"));
     expect(result).not.toContain("群聊历史");
     const filePath = result.match(/文件路径：([^\n]+)/)?.[1]?.trim();
     expect(filePath).toBeTruthy();

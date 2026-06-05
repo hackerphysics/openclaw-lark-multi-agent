@@ -1,4 +1,4 @@
-import { readFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { resolve } from "path";
 import { normalizeLocale, type Locale } from "./i18n.js";
 
@@ -57,4 +57,20 @@ export function loadConfig(path?: string): AppConfig {
   }
 
   return config;
+}
+
+/**
+ * Persist a single bot's model into config.json without touching any other
+ * field. Reads the file, mutates only the target bot's `model`, and writes it
+ * back. Never replaces the whole config blindly.
+ */
+export function persistBotModel(configPath: string, botName: string, model: string): void {
+  const resolved = resolve(configPath);
+  const raw = readFileSync(resolved, "utf-8");
+  const json = JSON.parse(raw);
+  if (!Array.isArray(json.bots)) throw new Error("config.json has no bots array");
+  const bot = json.bots.find((b: any) => b && b.name === botName);
+  if (!bot) throw new Error(`Bot "${botName}" not found in config.json`);
+  bot.model = model;
+  writeFileSync(resolved, JSON.stringify(json, null, 2) + "\n", "utf-8");
 }

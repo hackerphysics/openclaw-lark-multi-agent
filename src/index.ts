@@ -47,7 +47,7 @@ export async function startApp(configPath?: string) {
   // Two-phase startup: register all bots first, then start WS connections
   const bots: FeishuBot[] = [];
   for (const botConfig of config.bots) {
-    const bot = new FeishuBot(botConfig, openclawClient, store, config.adminOpenId);
+    const bot = new FeishuBot(botConfig, openclawClient, store, config.adminOpenId, resolvedConfigPath);
     bots.push(bot);
     bot.register(); // Phase 1: register to allBots map
   }

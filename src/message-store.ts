@@ -33,7 +33,7 @@ export interface ChatMessage {
   senderName: string; // human name or bot name (e.g. "Claude", "GPT")
   content: string;
   timestamp: number; // unix ms
-  triggerKind?: "normal" | "native_command";
+  triggerKind?: "normal" | "native_command" | "bridge_command" | "bridge_control_reply";
 }
 
 export interface DeliveryOutboxItem {
@@ -329,6 +329,26 @@ export class MessageStore {
     return row?.id || null;
   }
 
+  getMessageByMessageId(messageId: string): ChatMessage | null {
+    const row = this.db.prepare(`SELECT * FROM messages WHERE message_id = ?`).get(messageId) as any;
+    if (!row) return null;
+    return {
+      id: row.id,
+      chatId: row.chat_id,
+      messageId: row.message_id,
+      senderType: row.sender_type,
+      senderName: row.sender_name,
+      content: row.content,
+      timestamp: row.timestamp,
+      triggerKind: row.trigger_kind || "normal",
+    };
+  }
+
+  getLatestMessageId(chatId: string): number {
+    const row = this.db.prepare(`SELECT MAX(id) as id FROM messages WHERE chat_id = ?`).get(chatId) as any;
+    return row?.id || 0;
+  }
+
   markMessageRecalled(messageId: string, chatId: string, recalledAt: number = Date.now(), recallType: string = ''): void {
     this.db.prepare(`
       INSERT INTO recalled_messages (message_id, chat_id, recalled_at, recall_type)
@@ -383,6 +403,14 @@ export class MessageStore {
       DELETE FROM pending_triggers
       WHERE bot_name = ? AND chat_id = ? AND message_row_id <= ?
     `).run(botName, chatId, upToId);
+  }
+
+  clearAllPendingTriggers(botName: string, chatId: string): number {
+    const result = this.db.prepare(`
+      DELETE FROM pending_triggers
+      WHERE bot_name = ? AND chat_id = ?
+    `).run(botName, chatId);
+    return result.changes;
   }
 
   clearPendingTrigger(botName: string, chatId: string, messageRowId: number): void {

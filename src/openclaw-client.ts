@@ -18,8 +18,8 @@ export const GATEWAY_PROTOCOL_MAX = 4;
 
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const CONTEXT_SYNC_DIR = join(getDataDir(), "context-sync");
-const MAX_INLINE_CONTEXT_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_MESSAGES || 1000);
-const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 8 * 1024 * 1024);
+const MAX_INLINE_CONTEXT_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_MESSAGES || 20);
+const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 128 * 1024);
 
 type PendingReq = {
   resolve: (data: any) => void;
@@ -55,6 +55,8 @@ export class OpenClawClient {
   /** Session keys whose proactive messages must be dropped by the bridge (e.g. discussion scheduler owns delivery). */
   private mutedProactiveSessions: Set<string> = new Set();
   private mutedProactiveSessionCounts: Map<string, number> = new Map();
+  /** Sessions force-aborted by /stop; collectReply should finish immediately instead of waiting for idle timeout. */
+  private forceAbortedSessions: Set<string> = new Set();
   /** Global limiter for chat.send RPC calls; large multi-bot fan-out can
    * saturate the Gateway before collectReply even starts. The slot is released
    * as soon as the chat.send RPC returns a runId; collectReply does not hold it.
@@ -463,6 +465,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       };
 
       const poller = setInterval(() => {
+        // /stop force-abort: finish immediately instead of waiting for the
+        // cancelled lifecycle to be treated as a transient state (idle timeout).
+        if (sessionKey && (this.forceAbortedSessions.has(sessionKey) || this.forceAbortedSessions.has(shortSessionKey))) {
+          this.forceAbortedSessions.delete(sessionKey);
+          this.forceAbortedSessions.delete(shortSessionKey);
+          finish(text || chatDeltaText || chatFinalText || transcriptAssistantText || "NO_REPLY");
+          return;
+        }
         const bucketsToScan = sessionKey
           ? Array.from(new Set([sessionKey, shortSessionKey].filter(Boolean)))
           : Array.from(this.agentEvents.keys());
@@ -759,9 +769,18 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    * Send a message to a session and get the agent reply.
    * deliver=false prevents OpenClaw from auto-posting to channels.
    */
-  async abortChat(sessionKey: string, runId: string): Promise<any> {
+  async abortChat(sessionKey: string, runId?: string): Promise<any> {
     const key = sessionKey.startsWith("agent:main:") ? sessionKey.slice("agent:main:".length) : sessionKey;
-    return this.rpc("chat.abort", { sessionKey: key, runId }, 5000).catch(() => {});
+    // chat.abort supports { sessionKey } with no runId to abort ALL active runs
+    // for that session. Used by /stop to force-clear a stuck run.
+    if (!runId) {
+      // Mark the session so any in-flight collectReply finishes immediately
+      // instead of treating the cancelled lifecycle as a transient state.
+      this.forceAbortedSessions.add(key);
+      this.forceAbortedSessions.add(`agent:main:${key}`);
+    }
+    const params: any = runId ? { sessionKey: key, runId } : { sessionKey: key };
+    return this.rpc("chat.abort", params, 5000).catch(() => {});
   }
 
   private sessionKeyVariants(key: string): string[] {
@@ -934,6 +953,10 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     deliver?: boolean;
     timeoutMs?: number;
     emptyFinalAsNoReply?: boolean;
+    /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
+    onSendAttempt?: () => void | Promise<void>;
+    /** Called after chat.send RPC succeeds and OpenClaw has accepted the user message. */
+    onSubmitted?: (runId: string) => void | Promise<void>;
   }): Promise<string> {
     const sk = params.sessionKey;
     const fullSessionKey = `agent:main:${sk}`;
@@ -950,6 +973,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let result: any;
       const sendStartedAt = Date.now();
       try {
+        await params.onSendAttempt?.();
         result = await this.rpc("chat.send", {
           sessionKey: sk,
           message: params.message,
@@ -961,6 +985,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         releaseChatSendSlot();
       }
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
+      await params.onSubmitted?.(result.runId);
       return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message });
     } finally {
       // OpenClaw can emit the final assistant session.message a moment after
@@ -1012,6 +1037,10 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     includeContext?: boolean;
     /** Disable bridge attachment hints for native commands and other exact pass-through messages. */
     includeBridgeAttachmentHint?: boolean;
+    /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
+    onSendAttempt?: () => void | Promise<void>;
+    /** Called after chat.send RPC succeeds and OpenClaw has accepted the combined message. */
+    onSubmitted?: (runId: string) => void | Promise<void>;
   }): Promise<string> {
     const includeContext = params.includeContext !== false;
     const includeBridgeAttachmentHint = params.includeBridgeAttachmentHint !== false;
@@ -1034,6 +1063,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         deliver: params.deliver,
         timeoutMs: params.timeoutMs,
         emptyFinalAsNoReply: params.emptyFinalAsNoReply,
+        onSendAttempt: params.onSendAttempt,
+        onSubmitted: params.onSubmitted,
       });
     }
 
@@ -1048,18 +1079,18 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     if (useFileContext) {
       const filePath = this.writeContextSyncFile(params.sessionKey, unsyncedMessages, contextLines);
       combined =
-        `[以下是此前未同步的长历史对话上下文，因消息数或大小超过直接内联阈值，已写入本地文件]\n` +
+        `[当前消息]\n` +
+        `[${params.currentSenderName}]: ${params.currentMessage}\n\n` +
+        `[以下是此前未同步的长历史对话上下文，因消息数或大小超过直接内联阈值，已写入本地文件，仅作参考]\n` +
         `文件路径：${filePath}\n\n` +
-        `你必须先使用 read 工具读取这个文件，理解其中的完整历史对话，再回答当前消息。\n` +
-        `如果无法读取文件，请明确说明，不能直接忽略历史上下文作答。\n` +
-        `\n---\n` +
-        `[${params.currentSenderName}]: ${params.currentMessage}`;
+        `如需参考历史，请使用 read 工具读取这个文件；如果无法读取文件，请明确说明。\n` +
+        `回答时必须优先处理上面的当前消息。`;
     } else {
       combined =
-        `[以下是群里其他成员刚发、你还没看到的发言，供参考]\n` +
-        inlineContext +
-        `\n---\n` +
-        `[${params.currentSenderName}]: ${params.currentMessage}`;
+        `[当前消息]\n` +
+        `[${params.currentSenderName}]: ${params.currentMessage}\n\n` +
+        `[以下是群里其他成员刚发、你还没看到的发言，仅作参考]\n` +
+        inlineContext;
     }
 
     return this.chatSend({
@@ -1069,6 +1100,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       deliver: params.deliver,
       timeoutMs: params.timeoutMs,
       emptyFinalAsNoReply: params.emptyFinalAsNoReply,
+      onSendAttempt: params.onSendAttempt,
+      onSubmitted: params.onSubmitted,
     });
   }
 

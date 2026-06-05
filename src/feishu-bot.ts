@@ -1,6 +1,6 @@
 import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
-import { BotConfig } from "./config.js";
+import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
@@ -14,6 +14,8 @@ const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
 
 const MAX_BOT_STREAK = 10;
+const MAX_MERGED_TRIGGER_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_MESSAGES || 100);
+const MAX_MERGED_TRIGGER_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_BYTES || 128 * 1024);
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 
 
@@ -67,6 +69,7 @@ export class FeishuBot {
   private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout> }> = new Map();
   private adminOpenId: string | null;
   private locale: Locale;
+  private configPath?: string;
 
   private static allBots: Map<string, FeishuBot> = new Map();
 
@@ -74,13 +77,15 @@ export class FeishuBot {
     config: BotConfig,
     openclawClient: OpenClawClient,
     store: MessageStore,
-    adminOpenId?: string
+    adminOpenId?: string,
+    configPath?: string
   ) {
     this.config = config;
     this.openclawClient = openclawClient;
     this.store = store;
     this.adminOpenId = adminOpenId || null;
     this.locale = normalizeLocale(config.locale);
+    this.configPath = configPath;
     // Session keys are now per-chat: lma-<botname>-<chatId>
 
     this.client = new lark.Client({
@@ -458,6 +463,10 @@ export class FeishuBot {
         cleanText = commandText;
       }
 
+      const preliminaryCommandName = cleanText.trim().split(/\s+/)[0]?.toLowerCase() || "";
+      const preliminaryBridgeCommands = new Set(["/help", "/status", "/compact", "/reset", "/stop", "/verbose", "/free", "/mute", "/mode", "/model", "/models", "/discuss", "/chairman", "/locale"]);
+      const isPreliminaryBridgeCommand = !isNativeOpenClawCommand && preliminaryBridgeCommands.has(preliminaryCommandName);
+
       // --- Record to local store (ALL messages, before command/response checks) ---
       const senderName = isBot
         ? this.resolveBotName(sender) || "Bot"
@@ -470,7 +479,13 @@ export class FeishuBot {
         senderName,
         content: cleanText,
         timestamp: Date.now(),
-        triggerKind: isNativeOpenClawCommand ? "native_command" : "normal",
+        triggerKind: isNativeOpenClawCommand
+          ? "native_command"
+          : isPreliminaryBridgeCommand
+            ? "bridge_command"
+            : isBot && this.isBridgeControlReply(cleanText)
+              ? "bridge_control_reply"
+              : "normal",
       });
       if (insertedId < 0) insertedId = this.store.getMessageId(messageId) || -1;
 
@@ -478,16 +493,30 @@ export class FeishuBot {
       // Single slash commands are handled by the bridge. Double slash commands were
       // already unescaped above and should pass through to OpenClaw instead.
       const isBridgeCommand = !commandText.startsWith("//");
-      const isCommand = isBridgeCommand && /^\/(help|status|compact|reset|verbose|free|mute|mode|discuss|chairman|locale)/.test(cleanText.trim());
+      const commandName = preliminaryCommandName;
+      const bridgeCommands = preliminaryBridgeCommands;
+      const isCommand = isBridgeCommand && bridgeCommands.has(commandName);
       if (isCommand) {
         // In group chats, most bridge commands must be explicitly routed to this
         // bot or @all. /discuss is a group-level command, so an unmentioned
         // /discuss command is handled by one coordinator bot to avoid N replies.
-        const isDiscussCommand = cleanText.trim().startsWith("/discuss");
-        const isChairmanCommand = cleanText.trim().startsWith("/chairman");
-        const isLocaleCommand = cleanText.trim().startsWith("/locale");
+        const isDiscussCommand = commandName === "/discuss";
+        const isChairmanCommand = commandName === "/chairman";
+        const isLocaleCommand = commandName === "/locale";
+        const isModelCommand = commandName === "/model";
+        const rejectModelAll = chatType !== "p2p" && isModelCommand && routing.isAllMention;
         if (chatType !== "p2p") {
-          if (isChairmanCommand || isLocaleCommand) {
+          if (isModelCommand) {
+            // Model switching is per-bot. @all is rejected by one coordinator;
+            // otherwise group /model must explicitly target this bot.
+            if (routing.isAllMention) {
+              if (!this.isDiscussionCoordinator()) return;
+            } else if (routing.hasTargetedMention) {
+              if (!routing.isCurrentBotMentioned) return;
+            } else {
+              return;
+            }
+          } else if (isChairmanCommand || isLocaleCommand) {
             // Group-level settings; one coordinator handles them.
             if (!this.isDiscussionCoordinator()) return;
           } else if (isDiscussCommand && !routing.hasTargetedMention) {
@@ -512,7 +541,7 @@ export class FeishuBot {
           }
         };
 
-        if (cleanText.trim().startsWith("/help")) {
+        if (commandName === "/help") {
           const helpText = [
             `📚 ${this.config.name} Bot 命令列表`,
             `━━━━━━━━━━━━━━━━━━`,
@@ -520,10 +549,12 @@ export class FeishuBot {
             `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
             `🧹 /compact — 压缩当前 bot 的 OpenClaw session`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
+            `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
             `🔓 /free [on|off] — 开关当前 bot 的 free 模式（不 @ 也可回复）`,
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
+            `🤖 /model [id] — 查看/切换当前 bot 绑定模型（持久化）`,
             `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论`,
             `👑 /chairman @Bot|off — 设置/查看/清除本群唯一 Chairman`,
             `🌐 /locale zh|en — 设置/查看当前群语言`,
@@ -553,25 +584,40 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/status")) {
+        if (commandName === "/status") {
           await this.ensureSession(chatId);
           await this.handleStatusCommand(chatId, chatType, messageId);
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/compact")) {
+        if (commandName === "/compact") {
           await this.ensureSession(chatId);
           await this.handleCompactCommand(chatId, messageId);
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/reset")) {
+        if (commandName === "/reset") {
           await this.ensureSession(chatId);
           await this.handleResetCommand(chatId, messageId);
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/verbose")) {
+        if (commandName === "/stop") {
+          await this.handleStopCommand(chatId, messageId);
+          markCommandSynced();
+          return;
+        }
+        if (rejectModelAll) {
+          await this.replyMessage(messageId, "❌ /model 是单 bot 设置，不能 @所有人。请明确 @ 一个 bot，例如：@Claude /model provider/model-id");
+          markCommandSynced();
+          return;
+        }
+        if (commandName === "/model") {
+          await this.handleModelCommand(chatId, messageId, cleanText.trim());
+          markCommandSynced();
+          return;
+        }
+        if (commandName === "/verbose") {
           const isOn = this.store.getBotVerbose(this.config.name, chatId);
           this.store.setBotVerbose(this.config.name, chatId, !isOn);
           if (isOn) {
@@ -582,7 +628,7 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/free")) {
+        if (commandName === "/free") {
           if (chatType === "p2p") {
             await this.replyMessage(messageId, "❌ Free 模式只在群聊中可用");
             markCommandSynced();
@@ -609,7 +655,7 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/mute")) {
+        if (commandName === "/mute") {
           if (chatType === "p2p") {
             await this.replyMessage(messageId, "❌ Mute 模式只在群聊中可用");
             markCommandSynced();
@@ -626,7 +672,7 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/mode")) {
+        if (commandName === "/mode") {
           if (chatType === "p2p") {
             await this.replyMessage(messageId, `🎛️ ${this.config.name} 当前模式：normal（私聊总是响应）`);
           } else {
@@ -637,17 +683,17 @@ export class FeishuBot {
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/discuss")) {
+        if (commandName === "/discuss") {
           await this.handleDiscussCommand(chatId, chatType, messageId, cleanText.trim());
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/chairman")) {
+        if (commandName === "/chairman") {
           await this.handleChairmanCommand(chatId, chatType, messageId, message.mentions || [], cleanText.trim());
           markCommandSynced();
           return;
         }
-        if (cleanText.trim().startsWith("/locale")) {
+        if (commandName === "/locale") {
           await this.handleLocaleCommand(chatId, chatType, messageId, cleanText.trim());
           markCommandSynced();
           return;
@@ -810,12 +856,42 @@ export class FeishuBot {
           mergedTriggers.push(m);
         }
       }
+      // Bound the merged current message payload. When a bot is stuck, many
+      // human triggers can accumulate; sending all of them can exceed OpenClaw's
+      // single-message/payload limit. Keep the most recent messages and drop the
+      // older ones from this batch (marking them synced/cleared below so they do
+      // not clog the queue forever).
+      const originalMergedTriggers = mergedTriggers;
+      const droppedMergedTriggers: typeof pendingHumanTriggers = [];
+      if (!firstIsNative) {
+        const selected: typeof pendingHumanTriggers = [];
+        let bytes = 0;
+        for (let i = originalMergedTriggers.length - 1; i >= 0; i--) {
+          const m = originalMergedTriggers[i];
+          const addBytes = Buffer.byteLength((selected.length ? "\n" : "") + m.content, "utf8");
+          if (selected.length > 0 && (selected.length >= MAX_MERGED_TRIGGER_MESSAGES || bytes + addBytes > MAX_MERGED_TRIGGER_BYTES)) {
+            droppedMergedTriggers.unshift(m);
+            continue;
+          }
+          // Always keep at least the newest trigger, even if it is individually
+          // too large; OpenClaw will return a real payload error instead of us
+          // silently dropping the current user request.
+          selected.unshift(m);
+          bytes += addBytes;
+        }
+        mergedTriggers = selected;
+        if (droppedMergedTriggers.length > 0) {
+          console.warn(`[${this.config.name}] Dropped ${droppedMergedTriggers.length} older pending trigger(s) for ${chatId.slice(-8)} due to merge limits (kept=${mergedTriggers.length}, bytes=${bytes})`);
+        }
+      }
       const isNativeCommandTrigger = firstIsNative;
       const lastHuman = mergedTriggers[mergedTriggers.length - 1];
       const triggerId = lastHuman.id || 0;
       const mergedContent = mergedTriggers.map((m) => m.content).join("\n");
       const mergedTriggerIds = mergedTriggers.map((m) => m.id || 0).filter(Boolean);
+      const droppedTriggerIds = droppedMergedTriggers.map((m) => m.id || 0).filter(Boolean);
       const mergedTriggerIdSet = new Set(mergedTriggerIds);
+      const completedTriggerIdSet = new Set([...droppedTriggerIds, ...mergedTriggerIds]);
 
       // Catch-up is only injected in group chats. p2p must never get it.
       // Use "not p2p" rather than "=== group": chatInfo is always cached before
@@ -825,8 +901,13 @@ export class FeishuBot {
       const isGroup = chatType !== "p2p";
       if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
         console.warn(`[${this.config.name}] Duplicate trigger skipped for ${chatId.slice(-8)} msgId=${triggerId}`);
-        for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
+        for (const id of [...droppedTriggerIds, ...mergedTriggerIds]) this.store.clearPendingTrigger(this.config.name, chatId, id);
         continue;
+      }
+      if (droppedTriggerIds.length > 0) {
+        const dropBatchId = `${this.config.name}:${chatId}:dropped:${Date.now()}`;
+        this.store.markMessagesSynced(this.config.name, chatId, droppedTriggerIds, dropBatchId);
+        for (const id of droppedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
       }
 
       // Catch-up context: messages this bot has not seen yet in this GROUP chat.
@@ -839,12 +920,21 @@ export class FeishuBot {
       // p2p never injects catch-up; native command runs never inject catch-up.
       let contextMsgs: typeof pendingMessages = [];
       if (isGroup && !isNativeCommandTrigger) {
-        const catchupMessages = this.store.getUnsyncedMessagesForBot(this.config.name, chatId, triggerId);
+        // Use a processing-time snapshot upper bound rather than the current
+        // trigger id. In multi-bot groups, another bot's visible reply may be
+        // stored locally after the human trigger row even though it is already
+        // relevant context for this run. The snapshot captures all messages the
+        // bridge knows about at dispatch time, while the filters below still
+        // exclude current/pending triggers and this bot's own messages.
+        const contextUpperBoundId = Math.max(triggerId, this.store.getLatestMessageId(chatId));
+        const catchupMessages = this.store.getUnsyncedMessagesForBot(this.config.name, chatId, contextUpperBoundId);
         contextMsgs = catchupMessages.filter((m) =>
           m.senderName !== this.config.name
+          && !(m.senderType === "human" && m.id && m.id > triggerId)
           && !(m.id && mergedTriggerIdSet.has(m.id))
           && !(m.id && pendingTriggerIds.has(m.id))
-          && m.triggerKind !== "native_command"
+          && (m.triggerKind === "normal" || !m.triggerKind)
+          && !this.isLegacyBridgeControlMessage(m.content)
         );
       }
       const processedMessages = [...contextMsgs, ...mergedTriggers].filter((m) => m.id);
@@ -853,7 +943,7 @@ export class FeishuBot {
       const sessionKey = await this.ensureSession(chatId);
 
       console.log(
-        `[${this.config.name}] Sending ${mergedTriggers.length} trigger(s) as 1 run to OpenClaw for ${chatId.slice(-8)} (context=${contextMsgs.length})`
+        `[${this.config.name}] Sending ${mergedTriggers.length} trigger(s) as 1 run to OpenClaw for ${chatId.slice(-8)} (context=${contextMsgs.length}, dropped=${droppedTriggerIds.length})`
       );
 
       // Update reactions: queued messages → sent (GET/了解)
@@ -866,9 +956,24 @@ export class FeishuBot {
         }
       }
 
+      let runAcceptedByOpenClaw = false;
       try {
         const releaseActiveDeliveryTarget = lastHuman.messageId ? this.setActiveDeliveryTarget(chatId, triggerId, lastHuman.messageId) : () => {};
         let reply: string;
+        let contextMarkedSubmitted = false;
+        let currentMarkedSubmitted = false;
+        const markSubmittedBatch = (suffix: string) => {
+          const contextIds = contextMsgs.map((m) => m.id || 0).filter(Boolean);
+          if (!contextMarkedSubmitted && contextIds.length > 0) {
+            this.store.markMessagesSynced(this.config.name, chatId, contextIds, `${this.config.name}:${chatId}:${triggerId}:context-${suffix}`);
+            contextMarkedSubmitted = true;
+          }
+          if (!currentMarkedSubmitted && mergedTriggerIds.length > 0) {
+            this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, `${this.config.name}:${chatId}:${triggerId}:current-${suffix}`);
+            for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
+            currentMarkedSubmitted = true;
+          }
+        };
         try {
           reply = await this.openclawClient.chatSendWithContext({
             sessionKey,
@@ -881,6 +986,19 @@ export class FeishuBot {
             timeoutMs: 1_800_000,
             includeContext: !isNativeCommandTrigger,
             includeBridgeAttachmentHint: !isNativeCommandTrigger,
+            onSendAttempt: () => {
+              // At-most-once: as soon as we begin issuing chat.send, do not let
+              // this batch auto-replay. If the RPC response is lost after
+              // OpenClaw accepts it, retrying would duplicate the same message.
+              markSubmittedBatch("send-attempt");
+            },
+            onSubmitted: (runId: string) => {
+              runAcceptedByOpenClaw = true;
+              // Refine state for logs/idempotent sync rows when OpenClaw returns
+              // a runId. markSubmittedBatch is idempotent due to local flags and
+              // INSERT OR IGNORE in message_sync.
+              markSubmittedBatch(`submitted:${runId}`);
+            },
           });
         } finally {
           // OpenClaw may emit the final assistant session.message just after
@@ -899,19 +1017,38 @@ export class FeishuBot {
         if (trulyEmptyReply) {
           // Empty final text is not the same as an explicit NO_REPLY. It often
           // means the upstream session/run was interrupted, raced, or collected
-          // incorrectly. Do not mark sync, clear pending triggers, or mark DONE.
-          // Leave the trigger pending for a later retry/new message.
-          console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; keeping pending for retry`);
+          // incorrectly. But if chatSendWithContext returned, the content was
+          // submitted far enough that auto-replaying risks duplicate delivery.
+          // The user can resend a new message if they want to retry.
+          markSubmittedBatch("empty-returned");
+          console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; not replaying submitted message(s)`);
+          const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+          const remainingAcks: typeof pendingAcks = [];
+          for (const ack of pendingAcks) {
+            if (completedTriggerIdSet.has(ack.rowId)) {
+              await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+              await this.addReaction(ack.messageId, "DONE").catch(() => {});
+            } else {
+              remainingAcks.push(ack);
+            }
+          }
+          this.pendingAckMessages.set(chatId, remainingAcks);
           break;
         }
 
-        // Mark only the snapshot processed in this run as synced. Messages that
-        // arrive while the agent is busy may already be in pendingAckMessages,
-        // but they are not part of allUnsynced/humanUnsynced for this run and
-        // must remain pending for the next loop.
+        // Mark current triggers only after the run produced a non-empty result.
+        // Catch-up context is marked as soon as chat.send is accepted (above),
+        // because it has already been delivered even if the run later times out
+        // or is stopped. Messages that arrive while the agent is busy must remain
+        // pending for the next loop.
         const maxId = Math.max(...processedMessages.map((m) => m.id || 0));
         const syncBatchId = `${this.config.name}:${chatId}:${triggerId}:${Date.now()}`;
-        this.store.markMessagesSynced(this.config.name, chatId, processedMessages.map((m) => m.id || 0), syncBatchId);
+        if (!currentMarkedSubmitted) this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, syncBatchId);
+        if (!contextMarkedSubmitted && contextMsgs.length > 0) {
+          // Defensive fallback for mocked clients or older implementations that
+          // do not call onSubmitted: avoid duplicate context on successful runs.
+          this.store.markMessagesSynced(this.config.name, chatId, contextMsgs.map((m) => m.id || 0), `${syncBatchId}:context-success`);
+        }
         this.store.markSynced(this.config.name, chatId, maxId);
         for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
         const shouldReply = trimmedReply.length > 0 && !explicitNoReply;
@@ -980,7 +1117,7 @@ export class FeishuBot {
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
         const remainingAcks: typeof pendingAcks = [];
         for (const ack of pendingAcks) {
-          if (mergedTriggerIdSet.has(ack.rowId)) {
+          if (completedTriggerIdSet.has(ack.rowId)) {
             await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
             await this.addReaction(ack.messageId, "DONE").catch(() => {});
           } else {
@@ -999,15 +1136,18 @@ export class FeishuBot {
             .catch(() => {});
         }
         if (triggerId) {
-          // The run failed after OpenClaw/provider rejected it. Notify the user
-          // and clear only this failed trigger so later messages can continue.
-          this.store.clearPendingTrigger(this.config.name, chatId, triggerId);
-          this.store.markSynced(this.config.name, chatId, triggerId);
+          // At-most-once: if anything after send attempt failed, this batch has
+          // already been marked/cleared by onSendAttempt. If failure happened
+          // before the callback (e.g. before acquiring the slot), clear only this
+          // processing batch to avoid startup/drain loops; the user can resend.
+          for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
+          this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, `${this.config.name}:${chatId}:${triggerId}:${runAcceptedByOpenClaw ? "failed-submitted" : "failed-attempt"}`);
+          this.store.markSynced(this.config.name, chatId, Math.max(...mergedTriggerIds));
         }
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
         const remainingAcks: typeof pendingAcks = [];
         for (const ack of pendingAcks) {
-          if (ack.rowId === triggerId) {
+          if (completedTriggerIdSet.has(ack.rowId)) {
             await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
             await this.addReaction(ack.messageId, "FAIL").catch(() => {});
           } else {
@@ -1190,6 +1330,34 @@ export class FeishuBot {
       reason = reason.slice(0, 220) + "...";
     }
     return `⚠️ ${this.config.name} 这次没有完成回复。\n原因：${reason}`;
+  }
+
+  private isBridgeControlReply(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    return /^✅ Session reset\.?$/i.test(t)
+      || /^✅ Session 已重置/m.test(t)
+      || /^✅ Session 已压缩/m.test(t)
+      || /^❌ (重置|压缩|stop|模型切换|无法持久化|用法|Free 模式|Mute 模式|一个群只能设置一个 Chairman)/m.test(t)
+      || /^⏹️ .*已停止/m.test(t)
+      || /^📊 /m.test(t)
+      || /^🤖 .*当前模型：/m.test(t)
+      || /^Models \(/m.test(t)
+      || /^(Switch|More|All): \/models?/m.test(t)
+      || /^🎛️ .*当前模式：/m.test(t)
+      || /^🌐 (当前语言|Current locale|Locale set|语言已设置)/m.test(t)
+      || /^👑 /m.test(t)
+      || /^💬 Discuss /m.test(t);
+  }
+
+  // Backward-compatibility for rows stored before trigger_kind distinguished
+  // bridge_command / bridge_control_reply. Keep this intentionally narrow to
+  // avoid hiding ordinary AI replies that happen to start with ✅/❌/🤖.
+  private isLegacyBridgeControlMessage(text: string): boolean {
+    const t = text.trim();
+    if (!t) return false;
+    return /^\/(help|status|compact|reset|stop|verbose|free|mute|mode|model|models|discuss|chairman|locale)(\s|$)/i.test(t)
+      || this.isBridgeControlReply(t);
   }
 
   private isRuntimeFailureText(text: string): boolean {
@@ -1812,6 +1980,40 @@ export class FeishuBot {
   }
 
   /**
+   * Handle /model command: show or switch this bot's bound model.
+   */
+  private async handleModelCommand(chatId: string, messageId: string, text: string): Promise<void> {
+    const parts = text.split(/\s+/).filter(Boolean);
+    const nextModel = parts[1];
+    if (!nextModel) {
+      await this.replyMessage(messageId, `🤖 ${this.config.name} 当前模型：${this.config.model}\n用法：/model <provider/model-id>`);
+      return;
+    }
+    if (nextModel === this.config.model) {
+      await this.replyMessage(messageId, `🤖 ${this.config.name} 已经在使用：${this.config.model}`);
+      return;
+    }
+    if (!this.configPath) {
+      await this.replyMessage(messageId, "❌ 无法持久化模型设置：运行时没有 configPath");
+      return;
+    }
+
+    const previous = this.config.model;
+    const sessionKey = await this.ensureSession(chatId);
+    try {
+      // Validate/apply to the current session first. If OpenClaw rejects the
+      // model, do not persist a bad config.
+      await this.openclawClient.patchSession({ key: sessionKey, model: nextModel });
+      persistBotModel(this.configPath, this.config.name, nextModel);
+      this.config.model = nextModel;
+      await this.replyMessage(messageId, `✅ ${this.config.name} 模型已切换并持久化\n之前：${previous}\n现在：${nextModel}`);
+    } catch (err) {
+      await this.openclawClient.patchSession({ key: sessionKey, model: previous }).catch(() => {});
+      await this.replyMessage(messageId, `❌ 模型切换失败，配置未修改\n目标：${nextModel}\n原因：${(err as Error).message}`);
+    }
+  }
+
+  /**
    * Handle /status command: show current session info.
    */
   private async handleStatusCommand(chatId: string, chatType: string, messageId: string): Promise<void> {
@@ -1904,6 +2106,36 @@ export class FeishuBot {
       await this.replyMessage(messageId, `✅ Session 已重置\n模型: ${this.config.model}`);
     } catch (err) {
       await this.replyMessage(messageId, `❌ 重置失败: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Force-stop a stuck run for this bot in this chat. Aborts all active OpenClaw
+   * runs for the session, clears the busy lock and every pending trigger, and
+   * resets stuck reactions so new messages are processed normally again.
+   */
+  private async handleStopCommand(chatId: string, messageId: string): Promise<void> {
+    const sessionKey = this.getSessionKey(chatId);
+    try {
+      // Abort all active runs for this session (chat.abort with no runId).
+      await this.openclawClient.abortChat(sessionKey).catch(() => {});
+      // Force-unlock the busy gate so queued messages can be processed.
+      this.busyChats.set(chatId, 0);
+      // Drop every pending trigger for this bot/chat so the stuck run is not retried.
+      const cleared = this.store.clearAllPendingTriggers(this.config.name, chatId);
+      // Clear stuck Typing/Get reactions on queued messages.
+      const acks = this.pendingAckMessages.get(chatId) || [];
+      for (const ack of acks) {
+        await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+      }
+      this.pendingAckMessages.set(chatId, []);
+      const locale = this.chatLocale(chatId);
+      await this.replyMessage(messageId, locale === "en"
+        ? `⏹️ Stopped. Aborted the active run, unlocked the queue, and cleared ${cleared} pending message(s). You can send a new message now.`
+        : `⏹️ 已停止。已中止当前 run、解锁队列，并清掉 ${cleared} 条待处理消息。现在可以重新发消息了。`);
+      console.log(`[${this.config.name}] /stop force-cleared ${chatId.slice(-8)}: aborted run, cleared ${cleared} pending`);
+    } catch (err) {
+      await this.replyMessage(messageId, `❌ stop 失败: ${(err as Error).message}`);
     }
   }
 
