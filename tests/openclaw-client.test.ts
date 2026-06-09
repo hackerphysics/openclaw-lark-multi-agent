@@ -732,6 +732,27 @@ describe("OpenClawClient bridge attachment hint", () => {
     }
   });
 
+  it("attaches hydrated Feishu doc markdown markers as text/markdown files", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "olma-feishu-doc-"));
+    try {
+      const mdPath = join(dir, "doc.md");
+      writeFileSync(mdPath, "# 文档\n\n正文");
+      const { client, chatSend } = clientWithCapturedChatSend();
+      await client.chatSendWithContext({
+        sessionKey: "s1",
+        unsyncedMessages: [],
+        currentMessage: `[FeishuDoc: 测试文档 -> ${mdPath}] 请总结`,
+        currentSenderName: "Stephen",
+        includeBridgeAttachmentHint: false,
+      });
+      expect(chatSend.mock.calls[0][0].attachments).toEqual([
+        { type: "file", mimeType: "text/markdown", fileName: "doc.md", content: "# 文档\n\n正文" },
+      ]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("injects the bridge attachment hint only for likely attachment requests", async () => {
     const { client, chatSend } = clientWithCapturedChatSend();
     const result = await client.chatSendWithContext({

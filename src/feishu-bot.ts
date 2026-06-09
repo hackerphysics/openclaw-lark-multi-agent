@@ -4,9 +4,9 @@ import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { MessageStore } from "./message-store.js";
-import { existsSync, readFileSync, statSync } from "fs";
-import { basename, extname, resolve } from "path";
-import { getBridgeAttachmentsDir } from "./paths.js";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { basename, extname, join, resolve } from "path";
+import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
@@ -17,12 +17,24 @@ const MAX_BOT_STREAK = 10;
 const MAX_MERGED_TRIGGER_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_MESSAGES || 100);
 const MAX_MERGED_TRIGGER_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_BYTES || 128 * 1024);
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
+const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
 
 
 type BridgeAttachment = {
   type?: "image" | "file" | "document";
   path: string;
   caption?: string;
+};
+
+type FeishuDocRef = {
+  type: "docx" | "doc" | "wiki";
+  token: string;
+  title?: string;
+  url?: string;
+};
+
+type HydratedFeishuDoc = FeishuDocRef & {
+  markdownPath: string;
 };
 
 type RoutingIntent = {
@@ -379,7 +391,7 @@ export class FeishuBot {
         }
       }
 
-      if (messageType !== "text" && messageType !== "image" && messageType !== "file" && messageType !== "audio" && messageType !== "sticker" && messageType !== "post") return;
+      if (messageType !== "text" && messageType !== "image" && messageType !== "file" && messageType !== "audio" && messageType !== "sticker" && messageType !== "post" && messageType !== "share_doc") return;
 
       // --- Dedup: atomically claim this message for this bot before any await.
       // Feishu/WebSocket can deliver the same event more than once; a separate
@@ -452,9 +464,13 @@ export class FeishuBot {
       } else if (messageType === "post") {
         // Rich text post - extract all text content
         cleanText = await this.hydrateInlineImageKeys(this.extractPostText(content), messageId);
+      } else if (messageType === "share_doc") {
+        cleanText = content.title || content.name || content.text || content.url || "[Feishu document]";
       } else if (messageType === "sticker") {
         cleanText = `[Sticker: ${content.file_key || "unknown"}]`;
       }
+
+      cleanText = await this.hydrateFeishuDocsInMessage(cleanText, content, messageId);
 
       if (!cleanText.trim()) return;
 
@@ -2249,6 +2265,121 @@ export class FeishuBot {
     let out = text;
     for (const r of replacements) out = out.replace(r.from, r.to);
     return out;
+  }
+
+  private async hydrateFeishuDocsInMessage(text: string, content: any, messageId: string): Promise<string> {
+    const refs = this.extractFeishuDocRefs(text, content);
+    if (refs.length === 0) return text;
+    const hydrated: string[] = [];
+    for (const ref of refs.slice(0, 5)) {
+      try {
+        const doc = await this.hydrateFeishuDoc(ref, messageId);
+        hydrated.push(`[FeishuDoc: ${doc.title || doc.token} -> ${doc.markdownPath}]`);
+      } catch (err) {
+        hydrated.push(`[FeishuDoc: ${ref.title || ref.token} - hydration failed: ${this.errorSummary(err)}]`);
+      }
+    }
+    return `${text.trim()}\n\n[飞书文档已由 LMA 用机器人权限读取并转换为 Markdown 附件，OpenClaw 可直接读取附件内容。]\n${hydrated.join("\n")}`.trim();
+  }
+
+  private extractFeishuDocRefs(text: string, content: any): FeishuDocRef[] {
+    const refs: FeishuDocRef[] = [];
+    const add = (ref: FeishuDocRef) => {
+      if (!ref.token || refs.some((r) => r.type === ref.type && r.token === ref.token)) return;
+      refs.push(ref);
+    };
+    const scanValue = (value: any, title?: string) => {
+      if (!value) return;
+      if (typeof value === "string") {
+        for (const ref of this.extractFeishuDocRefsFromText(value, title)) add(ref);
+        return;
+      }
+      if (Array.isArray(value)) {
+        for (const item of value) scanValue(item, title);
+        return;
+      }
+      if (typeof value !== "object") return;
+      const nextTitle = value.title || value.name || value.file_name || title;
+      const explicitType = String(value.obj_type || value.doc_type || value.type || "").toLowerCase();
+      const docxToken = value.docx_token || value.document_id || (explicitType === "docx" ? value.token : undefined);
+      const docToken = value.doc_token || (explicitType === "doc" ? value.token : undefined);
+      const wikiToken = value.wiki_token || value.node_token || (explicitType === "wiki" ? value.token : undefined);
+      if (docxToken) add({ type: "docx", token: String(docxToken), title: nextTitle, url: value.url || value.href });
+      if (docToken) add({ type: "doc", token: String(docToken), title: nextTitle, url: value.url || value.href });
+      if (wikiToken) add({ type: "wiki", token: String(wikiToken), title: nextTitle, url: value.url || value.href });
+      for (const v of Object.values(value)) scanValue(v, nextTitle);
+    };
+    scanValue(content);
+    for (const ref of this.extractFeishuDocRefsFromText(text)) add(ref);
+    return refs;
+  }
+
+  private extractFeishuDocRefsFromText(text: string, title?: string): FeishuDocRef[] {
+    const refs: FeishuDocRef[] = [];
+    const pattern = /https?:\/\/[^\s)\]>"']+\/(docx|docs|wiki)\/([A-Za-z0-9_-]+)/g;
+    for (const match of text.matchAll(pattern)) {
+      const kind = match[1] === "docs" ? "doc" : (match[1] as "docx" | "wiki");
+      refs.push({ type: kind, token: match[2], title, url: match[0] });
+    }
+    return refs;
+  }
+
+  private async hydrateFeishuDoc(ref: FeishuDocRef, messageId: string): Promise<HydratedFeishuDoc> {
+    let resolved = ref;
+    if (ref.type === "wiki") resolved = await this.resolveWikiDocRef(ref);
+    const markdown = await this.fetchFeishuDocMarkdown(resolved);
+    const title = resolved.title || ref.title || `${resolved.type}-${resolved.token}`;
+    mkdirSync(FEISHU_DOCS_DIR, { recursive: true });
+    const fileName = `${messageId}-${this.safeFileName(title)}-${resolved.token.slice(0, 8)}.md`;
+    const markdownPath = join(FEISHU_DOCS_DIR, fileName);
+    const body = [
+      `# ${title}`,
+      ``,
+      `- Source type: ${ref.type}${resolved.type !== ref.type ? ` -> ${resolved.type}` : ""}`,
+      `- Token: ${ref.token}`,
+      resolved.url || ref.url ? `- URL: ${resolved.url || ref.url}` : "",
+      `- Hydrated at: ${new Date().toISOString()}`,
+      ``,
+      markdown.trim(),
+      ``,
+    ].filter(Boolean).join("\n");
+    writeFileSync(markdownPath, body, "utf8");
+    return { ...resolved, title, markdownPath };
+  }
+
+  private async resolveWikiDocRef(ref: FeishuDocRef): Promise<FeishuDocRef> {
+    const resp = await (this.client as any).wiki.v2.space.getNode({ params: { token: ref.token } });
+    const node = resp?.data?.node;
+    if (!node?.obj_token || !node?.obj_type) throw new Error(`Wiki node not readable: ${resp?.msg || "missing obj_token"}`);
+    const objType = String(node.obj_type).toLowerCase();
+    if (objType !== "docx" && objType !== "doc") throw new Error(`Unsupported wiki object type: ${objType}`);
+    return { type: objType as "docx" | "doc", token: node.obj_token, title: node.title || ref.title, url: ref.url };
+  }
+
+  private async fetchFeishuDocMarkdown(ref: FeishuDocRef): Promise<string> {
+    let contentErr: unknown;
+    const docs = (this.client as any).docs;
+    if ((ref.type === "docx" || ref.type === "doc") && docs?.v1?.content?.get) {
+      try {
+        const resp = await docs.v1.content.get({ params: { doc_token: ref.token, doc_type: ref.type, content_type: "markdown", lang: "zh" } } as any);
+        const content = resp?.data?.content;
+        if (content) return content;
+        contentErr = new Error(`docs content empty: ${resp?.msg || "unknown"}`);
+      } catch (err) {
+        contentErr = err;
+      }
+    }
+    if (ref.type === "docx") {
+      const resp = await (this.client as any).docx.document.rawContent({ path: { document_id: ref.token } });
+      const content = resp?.data?.content;
+      if (content) return content;
+      throw new Error(`docx raw content empty: ${resp?.msg || this.errorSummary(contentErr)}`);
+    }
+    throw new Error(`Legacy doc markdown hydration failed: ${this.errorSummary(contentErr)}`);
+  }
+
+  private safeFileName(name: string): string {
+    return name.replace(/[\\/:*?\"<>|\s]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "feishu-doc";
   }
 
   /**

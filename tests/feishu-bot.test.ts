@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
@@ -87,6 +87,24 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(policy).toContain("Chairman");
       expect(policy).toContain("非 /discuss 模式");
       expect(policy).toContain("不要总结、主持、调停、质疑或收束其他 bot");
+    } finally { h.cleanup(); }
+  });
+
+  it("hydrates forwarded Feishu docx links into markdown markers before sending to OpenClaw", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).client = {
+        docs: { v1: { content: { get: vi.fn(async () => ({ data: { content: "# 飞书正文\n\n内容" } })) } } },
+        docx: { document: { rawContent: vi.fn() } },
+      };
+      await (h.bot as any).handleMessage(event({ text: "@_all 请读这个 https://example.feishu.cn/docx/DOCXtoken123", messageId: "docx-msg" }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      const msg = h.openclaw.chatCalls[0].currentMessage;
+      expect(msg).toContain("[飞书文档已由 LMA 用机器人权限读取并转换为 Markdown 附件");
+      const path = msg.match(/\[FeishuDoc: [^\]]+ -> ([^\]]+\.md)\]/)?.[1];
+      expect(path).toBeTruthy();
+      expect(existsSync(path!)).toBe(true);
+      expect(readFileSync(path!, "utf8")).toContain("# 飞书正文");
     } finally { h.cleanup(); }
   });
 

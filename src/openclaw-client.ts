@@ -1263,6 +1263,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     const attachments: ChatAttachment[] = [];
     const seen = new Set<string>();
     const imagePattern = /\[Image: ([^\]\n]+)\]/g;
+    const docPattern = /\[FeishuDoc: [^\]\n]*? -> ([^\]\n]+\.md)\]/g;
     for (const content of contents) {
       for (const match of content.matchAll(imagePattern)) {
         const imagePath = match[1]?.trim();
@@ -1279,6 +1280,21 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           });
         } catch (err) {
           console.warn(`[OpenClaw] failed to attach image ${imagePath}:`, (err as Error).message);
+        }
+      }
+      for (const match of content.matchAll(docPattern)) {
+        const docPath = match[1]?.trim();
+        if (!docPath || seen.has(docPath)) continue;
+        seen.add(docPath);
+        try {
+          attachments.push({
+            type: "file",
+            mimeType: "text/markdown",
+            fileName: basename(docPath),
+            content: readFileSync(docPath, "utf8"),
+          });
+        } catch (err) {
+          console.warn(`[OpenClaw] failed to attach Feishu doc markdown ${docPath}:`, (err as Error).message);
         }
       }
     }
