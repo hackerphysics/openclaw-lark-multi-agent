@@ -2327,7 +2327,7 @@ export class FeishuBot {
   private async hydrateFeishuDoc(ref: FeishuDocRef, messageId: string): Promise<HydratedFeishuDoc> {
     let resolved = ref;
     if (ref.type === "wiki") resolved = await this.resolveWikiDocRef(ref);
-    const markdown = await this.fetchFeishuDocMarkdown(resolved);
+    const markdown = this.cleanupFeishuMarkdown(await this.fetchFeishuDocMarkdown(resolved));
     const title = resolved.title || ref.title || `${resolved.type}-${resolved.token}`;
     mkdirSync(FEISHU_DOCS_DIR, { recursive: true });
     const fileName = `${messageId}-${this.safeFileName(title)}-${resolved.token.slice(0, 8)}.md`;
@@ -2354,6 +2354,32 @@ export class FeishuBot {
     const objType = String(node.obj_type).toLowerCase();
     if (objType !== "docx" && objType !== "doc") throw new Error(`Unsupported wiki object type: ${objType}`);
     return { type: objType as "docx" | "doc", token: node.obj_token, title: node.title || ref.title, url: ref.url };
+  }
+
+  private cleanupFeishuMarkdown(markdown: string): string {
+    return markdown
+      .replace(/\\&\\#/g, "&#")
+      .replace(/\\&#/g, "&#")
+      .replace(/\\&amp;#/g, "&#")
+      .replace(/&amp;#/g, "&#")
+      .replace(/&#(\d+);/g, (_, code) => {
+        const n = Number(code);
+        return Number.isFinite(n) ? String.fromCodePoint(n) : _;
+      })
+      .replace(/&#x([0-9a-fA-F]+);/g, (_, code) => {
+        const n = Number.parseInt(code, 16);
+        return Number.isFinite(n) ? String.fromCodePoint(n) : _;
+      })
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&amp;/g, "&")
+      .replace(/\\([+\-=(){}[\].!,，。；：！？、])/g, "$1")
+      .replace(/\\\*/g, "*")
+      .replace(/\\_/g, "_")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
   }
 
   private async fetchFeishuDocMarkdown(ref: FeishuDocRef): Promise<string> {

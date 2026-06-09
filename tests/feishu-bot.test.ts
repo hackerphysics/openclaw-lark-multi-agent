@@ -90,6 +90,22 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("cleans up common Feishu markdown escaping artifacts", () => {
+    const h = makeHarness("GPT");
+    try {
+      const cleaned = (h.bot as any).cleanupFeishuMarkdown(String.raw`# 顺顺安全防护清单（居家 \+ 户外）
+
+核心理念：不可能让孩子零磕碰，但可以把\&\#34;严重伤害\&\#34;的概率降到最低。
+
+- 10\-15 分钟
+- \*\*有软质地面\*\*`);
+      expect(cleaned).toContain("居家 + 户外");
+      expect(cleaned).toContain('把"严重伤害"的概率降到最低');
+      expect(cleaned).toContain("10-15 分钟");
+      expect(cleaned).toContain("**有软质地面**");
+    } finally { h.cleanup(); }
+  });
+
   it("hydrates forwarded Feishu docx links into markdown markers before sending to OpenClaw", async () => {
     const h = makeHarness("GPT");
     try {
