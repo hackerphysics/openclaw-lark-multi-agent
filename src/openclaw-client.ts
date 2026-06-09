@@ -1,7 +1,7 @@
 import WebSocket from "ws";
 import { randomUUID } from "crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "fs";
-import { basename, extname, join } from "path";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { basename, extname, join, resolve, sep } from "path";
 import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
@@ -18,6 +18,8 @@ export const GATEWAY_PROTOCOL_MAX = 4;
 
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const CONTEXT_SYNC_DIR = join(getDataDir(), "context-sync");
+const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
+const MAX_FEISHU_DOC_ATTACHMENT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_FEISHU_DOC_ATTACHMENT_BYTES || 1024 * 1024);
 const MAX_INLINE_CONTEXT_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_MESSAGES || 20);
 const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 128 * 1024);
 
@@ -1287,11 +1289,22 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         if (!docPath || seen.has(docPath)) continue;
         seen.add(docPath);
         try {
+          const resolvedDocPath = resolve(docPath);
+          const allowedRoot = resolve(FEISHU_DOCS_DIR);
+          if (resolvedDocPath !== allowedRoot && !resolvedDocPath.startsWith(`${allowedRoot}${sep}`)) {
+            throw new Error(`Feishu doc markdown path outside hydration dir: ${docPath}`);
+          }
+          const size = statSync(resolvedDocPath).size;
+          let docContent = readFileSync(resolvedDocPath, "utf8");
+          if (size > MAX_FEISHU_DOC_ATTACHMENT_BYTES) {
+            const truncated = Buffer.from(docContent, "utf8").subarray(0, MAX_FEISHU_DOC_ATTACHMENT_BYTES).toString("utf8");
+            docContent = `${truncated}\n\n---\n[文档过大，LMA 已截断到 ${MAX_FEISHU_DOC_ATTACHMENT_BYTES} bytes；如需完整内容，请让 LMA 扩大 OPENCLAW_LARK_MULTI_AGENT_MAX_FEISHU_DOC_ATTACHMENT_BYTES 或改用本地路径读取。]`;
+          }
           attachments.push({
             type: "file",
             mimeType: "text/markdown",
-            fileName: basename(docPath),
-            content: readFileSync(docPath, "utf8"),
+            fileName: basename(resolvedDocPath),
+            content: docContent,
           });
         } catch (err) {
           console.warn(`[OpenClaw] failed to attach Feishu doc markdown ${docPath}:`, (err as Error).message);
