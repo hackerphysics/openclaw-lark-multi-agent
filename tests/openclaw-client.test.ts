@@ -747,9 +747,11 @@ describe("OpenClawClient bridge attachment hint", () => {
         currentSenderName: "Stephen",
         includeBridgeAttachmentHint: false,
       });
-      expect(chatSend.mock.calls[0][0].attachments).toEqual([
-        { type: "file", mimeType: "text/markdown", fileName: "doc.md", content: "# 文档\n\n正文" },
-      ]);
+      const attachment = chatSend.mock.calls[0][0].attachments[0];
+      expect(attachment.type).toBe("file");
+      expect(attachment.mimeType).toBe("text/markdown");
+      expect(attachment.fileName).toBe("doc.md");
+      expect(Buffer.from(attachment.content, "base64").toString("utf8")).toBe("# 文档\n\n正文");
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -790,8 +792,9 @@ describe("OpenClawClient bridge attachment hint", () => {
         includeBridgeAttachmentHint: false,
       });
       const attachment = chatSend.mock.calls[0][0].attachments[0];
-      expect(attachment.content).toContain("文档过大，LMA 已截断");
-      expect(Buffer.byteLength(attachment.content, "utf8")).toBeLessThan(1_100_000);
+      const decoded = Buffer.from(attachment.content, "base64").toString("utf8");
+      expect(decoded).toContain("文档过大，LMA 已截断");
+      expect(Buffer.byteLength(decoded, "utf8")).toBeLessThan(1_100_000);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -1304,7 +1304,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             type: "file",
             mimeType: "text/markdown",
             fileName: basename(resolvedDocPath),
-            content: docContent,
+            content: Buffer.from(docContent, "utf8").toString("base64"),
           });
         } catch (err) {
           console.warn(`[OpenClaw] failed to attach Feishu doc markdown ${docPath}:`, (err as Error).message);
