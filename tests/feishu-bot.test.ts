@@ -378,7 +378,7 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("discuss mode takes over plain human messages and runs free participants", async () => {
+  it("discuss mode ignores free mode and runs all non-muted participants", async () => {
     const gpt = makeHarness("GPT");
     const claude = makeHarness("Claude");
     try {
@@ -387,8 +387,7 @@ describe("FeishuBot routing and queue behavior", () => {
       (claude.bot as any).openclawClient = claude.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
       FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
-      gpt.store.setBotMode("GPT", "chat1", "free");
-      gpt.store.setBotMode("Claude", "chat1", "free");
+      // Neither bot is free; Discuss should still include both because only mute matters.
       gpt.store.setDiscussMode("chat1", true);
       gpt.store.setDiscussMaxRounds("chat1", 1);
 
@@ -406,13 +405,37 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+  it("excludes muted bots from discuss even when they are chairman", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      gpt.store.setChairmanBot("chat1", "Claude");
+      gpt.store.setBotMode("Claude", "chat1", "mute");
+      gpt.store.setDiscussMode("chat1", true);
+      gpt.store.setDiscussMaxRounds("chat1", 1);
+
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic-muted" }));
+      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect(claude.openclaw.chatCalls).toHaveLength(0);
+      expect(gpt.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
 
 
   it("notifies when a new discuss topic preempts an active discussion", async () => {
     const h = makeHarness("GPT");
     try {
       FeishuBot.getAllBots().set("app-GPT", h.bot as any);
-      h.store.setBotMode("GPT", "chat1", "free");
       h.store.setDiscussMode("chat1", true);
       h.store.setDiscussMaxRounds("chat1", 10);
       let releaseFirstRun!: () => void;
@@ -918,7 +941,7 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       gpt.store.setDiscussMode("chat1", true);
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "plain topic", messageId: "discuss-empty" }));
-      expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("没有 free bot 或 Chairman"));
+      expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("所有 bot 都是 mute"));
     } finally { gpt.cleanup(); }
   });
 

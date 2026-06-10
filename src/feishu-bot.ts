@@ -836,8 +836,8 @@ export class FeishuBot {
             }
           } else if (this.isDiscussionCoordinator()) {
             await this.sendMessage(chatId, this.isEn(chatId)
-              ? "💬 Discuss is on, but there are no free bots or Chairman available. Use /free on or /chairman @Bot first."
-              : "💬 Discuss 已开启，但当前没有 free bot 或 Chairman 可参与。请先使用 /free on 或 /chairman @Bot。");
+              ? "💬 Discuss is on, but all bots are muted. Unmute at least one bot before discussing."
+              : "💬 Discuss 已开启，但当前所有 bot 都是 mute，无法参与讨论。请至少解除一个 bot 的禁言。");
           }
           if (insertedId > 0) this.store.markSynced(this.config.name, chatId, insertedId);
           return;
@@ -1750,14 +1750,14 @@ export class FeishuBot {
   private getDiscussionParticipants(chatId: string): DiscussionParticipant[] {
     const chairman = this.store.getChairmanBot(chatId);
     return Array.from(FeishuBot.allBots.values())
-      .filter((bot) => bot.store === this.store && bot.config.name !== chairman && bot.store.getBotMode(bot.config.name, chatId) === "free")
+      .filter((bot) => bot.store === this.store && bot.config.name !== chairman && bot.store.getBotMode(bot.config.name, chatId) !== "mute")
       .map((bot) => this.asDiscussionParticipant(bot, chatId));
   }
 
   private getChairmanParticipant(chatId: string): DiscussionParticipant | undefined {
     const chairman = this.store.getChairmanBot(chatId);
     if (!chairman) return undefined;
-    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman);
+    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman && candidate.store.getBotMode(candidate.config.name, chatId) !== "mute");
     return bot ? this.asDiscussionParticipant(bot, chatId) : undefined;
   }
 
@@ -2130,8 +2130,8 @@ export class FeishuBot {
       }
       this.store.setDiscussMode(chatId, true);
       await this.replyMessage(messageId, this.isEn(chatId)
-        ? `💬 Discuss enabled\nChairman: ${chairman}\nParticipants: all free-mode bots in this group + Chairman\nRounds: ${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`
-        : `💬 Discuss 已开启\nChairman：${chairman}\n参与者：当前群所有 free 模式 bot + Chairman\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`);
+        ? `💬 Discuss enabled\nChairman: ${chairman}\nParticipants: all non-muted bots; free mode is ignored in Discuss\nRounds: ${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`
+        : `💬 Discuss 已开启\nChairman：${chairman}\n参与者：当前群所有非 mute bot（Discuss 模式忽略 free 开关）\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`);
       return;
     }
     if (action === "off") {
