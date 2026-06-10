@@ -18,6 +18,14 @@ const MAX_MERGED_TRIGGER_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT
 const MAX_MERGED_TRIGGER_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_BYTES || 128 * 1024);
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
+const SESSION_HEALTH_POLL_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_POLL_MS || 5_000);
+
+class UnhealthySessionError extends Error {
+  constructor(readonly status: string) {
+    super(`unhealthy session: ${status}`);
+    this.name = "UnhealthySessionError";
+  }
+}
 
 
 type BridgeAttachment = {
@@ -944,6 +952,28 @@ export class FeishuBot {
     console.warn(`[${this.config.name}] unhealthy session ${sessionKey} status=${status}; cleared ${cleared} pending trigger(s) for ${chatId.slice(-8)}`);
   }
 
+  private async withSessionHealthMonitor<T>(chatId: string, messageId: string, insertedId: number, work: Promise<T>): Promise<T> {
+    let done = false;
+    const monitoredWork = work.finally(() => { done = true; });
+    const monitor = (async () => {
+      while (!done) {
+        await new Promise((resolve) => setTimeout(resolve, SESSION_HEALTH_POLL_MS));
+        if (done) break;
+        const unhealthy = await this.getUnhealthySessionStatus(chatId);
+        if (unhealthy) {
+          await this.recoverFromUnhealthySession(chatId, messageId, insertedId, unhealthy);
+          throw new UnhealthySessionError(unhealthy);
+        }
+      }
+      return undefined as never;
+    })();
+    try {
+      return await Promise.race([monitoredWork, monitor]);
+    } finally {
+      done = true;
+    }
+  }
+
   /**
    * Process queued messages for a chat: batch all unsynced messages and send to OpenClaw.
    * Loops until no more unsynced human messages remain.
@@ -1132,7 +1162,7 @@ export class FeishuBot {
           }
         };
         try {
-          reply = await this.openclawClient.chatSendWithContext({
+          reply = await this.withSessionHealthMonitor(chatId, lastHuman.messageId || "", triggerId, this.openclawClient.chatSendWithContext({
             sessionKey,
             unsyncedMessages: contextMsgs,
             currentMessage: mergedContent,
@@ -1156,7 +1186,7 @@ export class FeishuBot {
               // INSERT OR IGNORE in message_sync.
               markSubmittedBatch(`submitted:${runId}`);
             },
-          });
+          }));
         } finally {
           // OpenClaw may emit the final assistant session.message just after
           // collectReply returns. Keep the trigger mapping briefly so proactive
@@ -1283,6 +1313,10 @@ export class FeishuBot {
         }
         this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
+        if (err instanceof UnhealthySessionError) {
+          console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
+          break;
+        }
         console.error(`[${this.config.name}] processQueue error:`, err);
         const errorText = this.formatUserVisibleError(err);
         if (lastHuman.messageId) {

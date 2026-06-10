@@ -1450,6 +1450,43 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+  it("monitors active runs and reports when the session becomes killed while waiting", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      const sessionStatuses = ["active", "active", "killed"];
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "killed" } }));
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onSendAttempt?.();
+        await new Promise(() => {});
+        return "never";
+      });
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      const run = (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "等回复中途挂掉",
+        messageId: "killed-mid-run",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(5_000);
+      await run;
+
+      expect(h.openclaw.abortChat).toHaveBeenCalled();
+      expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "FAIL");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("session 状态异常（killed）"));
+      expect((h.bot as any).busyChats.get("chat1")).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
   it("reports killed sessions during queue drain and clears existing waiting reactions", async () => {
     const h = makeHarness("Claude");
     try {
