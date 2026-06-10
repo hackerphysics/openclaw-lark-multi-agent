@@ -639,12 +639,12 @@ export class FeishuBot {
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
-            `🔓 /free [on|off] — 开关当前 bot 的 free 模式（不 @ 也可回复）`,
+            `🔓 /free [on|off] — 开关当前 bot 的 free 模式（仅非 Discuss 模式下影响普通消息主动回复）`,
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
             `🤖 /model [id] — 查看/切换当前 bot 绑定模型（持久化）`,
-            `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论`,
-            `👑 /chairman @Bot|off — 设置/查看/清除本群唯一 Chairman`,
+            `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论（所有非 mute bot 参与，忽略 free）`,
+            `👑 /chairman @Bot|off — 设置/清除本群唯一 Chairman（状态见 /status）`,
             `🌐 /locale zh|en — 设置/查看当前群语言`,
             `❓ /help    — 显示此帮助信息`,
             ``,
@@ -2166,13 +2166,13 @@ export class FeishuBot {
       `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
       `Rounds: ${info?.discussMaxRounds || 10}`,
       `Chairman: ${info?.chairmanBot || "not set"}`,
-      `Participants: ${participants.length ? participants.join(", ") : "(no free bot / chairman)"}`,
+      `Participants: ${participants.length ? participants.join(", ") : "(all bots muted)"}`,
       active ? `Active: round ${active.currentRound}/${active.maxRounds}, topic=${active.topic.slice(0, 80)}` : "Active: none",
     ].join("\n") : [
       `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
       `轮数：${info?.discussMaxRounds || 10}`,
       `Chairman：${info?.chairmanBot || "未设置"}`,
-      `参与者：${participants.length ? participants.join(", ") : "（无 free bot / chairman）"}`,
+      `参与者：${participants.length ? participants.join(", ") : "（所有 bot 都是 mute）"}`,
       active ? `运行中：第 ${active.currentRound}/${active.maxRounds} 轮，topic=${active.topic.slice(0, 80)}` : "运行中：无",
     ].join("\n"));
   }
@@ -2222,8 +2222,9 @@ export class FeishuBot {
     const mode = this.store.getBotMode(next, chatId);
     const lines = [previous && previous !== next ? `✅ Chairman 已从 ${previous} 切换为 ${next}` : `✅ Chairman 已设置为 ${next}`];
     lines.push("作用：");
-    lines.push("- 当没有 free bot 且普通消息无人被 @ 时，Chairman 会负责回答");
-    lines.push("- Discuss 模式下，Chairman 会参与主持、调停并做最终总结");
+    lines.push("- 非 Discuss 模式下：free bot 会主动回答普通消息；没有 free bot 时由 Chairman 兜底");
+    lines.push("- Discuss 模式下：所有非 mute bot 参与讨论，free 开关会被忽略");
+    lines.push("- Chairman 非 mute 时会参与主持、调停并做最终总结");
     if (mode === "mute") lines.push(`⚠️ ${next} 当前是 mute，但 Chairman 场景下仍会发言`);
     await this.replyMessage(messageId, lines.join("\n"));
   }
