@@ -90,6 +90,50 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("does not treat @all substrings as @all broadcasts", () => {
+    const h = makeHarness("GPT");
+    try {
+      expect((h.bot as any).isAllMention("@allen 你好", [])).toBe(false);
+      expect((h.bot as any).isAllMention("foo@all.example.com", [])).toBe(false);
+      expect((h.bot as any).isAllMention("请看 @all", [])).toBe(true);
+      expect((h.bot as any).isAllMention("@_all 大家", [])).toBe(true);
+    } finally { h.cleanup(); }
+  });
+
+  it("delivers identical assistant_visible content for different trigger keys", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-1", "同样的回复内容", [], "m1", "trigger:1");
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-2", "同样的回复内容", [], "m2", "trigger:2");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(2);
+      expect((h.bot as any).replyMessage).toHaveBeenNthCalledWith(1, "m1", "同样的回复内容");
+      expect((h.bot as any).replyMessage).toHaveBeenNthCalledWith(2, "m2", "同样的回复内容");
+    } finally { h.cleanup(); }
+  });
+
+  it("recovers stale delivering outbox rows on startup", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const id = h.store.enqueueDelivery({
+        sessionKey: "s1",
+        chatId: "chat1",
+        botName: "GPT",
+        sourceType: "assistant_visible",
+        sourceId: "source-stale",
+        deliveryKey: "trigger:stale",
+        contentHash: "hash-stale",
+        content: "stale reply",
+        attachmentsJson: "[]",
+        replyToMessageId: "m-stale",
+      })!;
+      expect(h.store.claimDelivery(id)).toBe(true);
+      (h.store as any).db.prepare("UPDATE delivery_outbox SET updated_at = ? WHERE id = ?").run(Date.now() - 600_000, id);
+      expect(h.store.resetStaleDeliveries("GPT", 5 * 60_000, 5)).toEqual({ restored: 1, failed: 0 });
+      await (h.bot as any).dispatchPendingDeliveries("chat1");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m-stale", "stale reply");
+    } finally { h.cleanup(); }
+  });
+
   it("cleans up common Feishu markdown escaping artifacts", () => {
     const h = makeHarness("GPT");
     try {
@@ -580,6 +624,61 @@ describe("FeishuBot routing and queue behavior", () => {
       FeishuBot.getAllBots().delete("app-Claude");
       coordinator.cleanup();
       target.cleanup();
+    }
+  });
+
+  it("gives an actionable bot list when /chairman target cannot be resolved at all", async () => {
+    const coordinator = makeHarness("GPT");
+    const target = makeHarness("Claude");
+    try {
+      (target.bot as any).store = coordinator.store;
+      FeishuBot.getAllBots().set("app-GPT", coordinator.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", target.bot as any);
+
+      // Worst case: the user @-ed a bot but the client sent no mention metadata
+      // and the placeholder left no readable name in the text.
+      const cmd = event({
+        chatType: "group",
+        text: "/chairman",
+        messageId: "chair-noresolve",
+        mentions: [],
+      });
+
+      await (target.bot as any).handleMessage(cmd);
+      // Non-coordinator stays silent; no chairman set from an unresolved target.
+      expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
+      expect((target.bot as any).replyMessage).not.toHaveBeenCalled();
+
+      await (coordinator.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
+      const reply = (coordinator.bot as any).replyMessage.mock.calls.at(-1)?.[1] || "";
+      expect(reply).toContain("/chairman GPT");
+      expect(reply).toContain("/chairman Claude");
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      coordinator.cleanup();
+      target.cleanup();
+    }
+  });
+
+  it("defaults /chairman to the only bot in a single-bot group", async () => {
+    const h = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", h.bot as any);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "/chairman",
+        messageId: "chair-single",
+        mentions: [{ name: "万万（GPT）", id: {} }],
+      }));
+
+      expect(h.store.getChairmanBot("chat1")).toBe("GPT");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-single", expect.stringContaining("Chairman 已设置为 GPT"));
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      h.cleanup();
     }
   });
 

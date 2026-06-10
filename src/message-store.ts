@@ -500,6 +500,21 @@ export class MessageStore {
     return false;
   }
 
+  resetStaleDeliveries(botName: string, staleMs: number, maxAttempts: number): { restored: number; failed: number } {
+    const cutoff = Date.now() - staleMs;
+    const fail = this.db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'failed', updated_at = ?
+      WHERE bot_name = ? AND status = 'delivering' AND updated_at < ? AND attempts >= ?
+    `).run(Date.now(), botName, cutoff, maxAttempts);
+    const restore = this.db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'pending', updated_at = ?
+      WHERE bot_name = ? AND status = 'delivering' AND updated_at < ? AND attempts < ?
+    `).run(Date.now(), botName, cutoff, maxAttempts);
+    return { restored: restore.changes, failed: fail.changes };
+  }
+
   claimDelivery(id: number): boolean {
     const result = this.db.prepare(`
       UPDATE delivery_outbox SET status = 'delivering', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'

@@ -321,6 +321,10 @@ export class FeishuBot {
    */
   private async drainOnStartup(): Promise<void> {
     try {
+      const restoredDeliveries = this.store.resetStaleDeliveries(this.config.name, 5 * 60_000, 5);
+      if (restoredDeliveries.restored > 0 || restoredDeliveries.failed > 0) {
+        console.warn(`[${this.config.name}] Startup delivery recovery: restored=${restoredDeliveries.restored}, failed=${restoredDeliveries.failed}`);
+      }
       const chats = this.store.getAllChatInfo();
       const drainTasks: Promise<void>[] = [];
       for (const chat of chats) {
@@ -335,6 +339,12 @@ export class FeishuBot {
         // Drain only messages that were explicitly marked as reply triggers.
         // Context-only messages should not start an OpenClaw run after restart.
         const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chat.chatId);
+        const pendingDeliveries = this.store.getPendingDeliveries(chat.chatId, this.config.name, 1);
+        if (pendingDeliveries.length > 0) {
+          drainTasks.push(this.dispatchPendingDeliveries(chat.chatId).catch((err) => {
+            console.warn(`[${this.config.name}] Startup delivery drain failed for ${chat.chatId.slice(-8)}:`, (err as Error).message);
+          }));
+        }
         if (pendingTriggerIds.size > 0) {
           console.log(
             `[${this.config.name}] Startup drain: ${pendingTriggerIds.size} pending trigger(s) in ${chat.chatName || chat.chatId.slice(-8)}`
@@ -534,15 +544,18 @@ export class FeishuBot {
         const isModelCommand = commandName === "/model";
         const rejectModelAll = chatType !== "p2p" && isModelCommand && routing.isAllMention;
         if (chatType !== "p2p") {
+          const groupBotCount = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store).length;
+          const singleBotGroup = groupBotCount === 1;
           if (isModelCommand) {
             // Model switching is per-bot. @all is rejected by one coordinator;
-            // otherwise group /model must explicitly target this bot.
+            // otherwise group /model must explicitly target this bot. A single-bot
+            // group treats the sole bot as the implicit target.
             if (routing.isAllMention) {
               if (!this.isDiscussionCoordinator()) return;
             } else if (routing.hasTargetedMention) {
               if (!routing.isCurrentBotMentioned) return;
-            } else {
-              return;
+            } else if (!singleBotGroup) {
+              if (!this.isDiscussionCoordinator()) return;
             }
           } else if (isChairmanCommand) {
             // /chairman @Bot is owned by the mentioned bot itself. This avoids
@@ -590,8 +603,9 @@ export class FeishuBot {
           } else if (routing.hasTargetedMention) {
             // Explicitly targeted commands belong only to the mentioned bot.
             if (!routing.isCurrentBotMentioned) return;
-          } else if (!routing.isAllMention) {
-            // Other bridge commands in a group need an explicit target or @all.
+          } else if (!routing.isAllMention && !singleBotGroup) {
+            // Other bridge commands in a multi-bot group need an explicit target or @all.
+            // A single-bot group treats the sole bot as the implicit target.
             return;
           }
         }
@@ -678,6 +692,14 @@ export class FeishuBot {
           return;
         }
         if (commandName === "/model") {
+          if (chatType !== "p2p" && !routing.isAllMention && !routing.hasTargetedMention) {
+            const groupBotCount = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store).length;
+            if (groupBotCount > 1) {
+              await this.replyMessage(messageId, "❌ /model 是单 bot 设置，请明确 @ 一个 bot，例如：@Claude /model provider/model-id");
+              markCommandSynced();
+              return;
+            }
+          }
           await this.handleModelCommand(chatId, messageId, cleanText.trim());
           markCommandSynced();
           return;
@@ -1313,7 +1335,7 @@ export class FeishuBot {
   }
 
   private isAllMention(rawText?: string, mentions: any[] = []): boolean {
-    if (rawText && (rawText.includes("@_all") || rawText.includes("@all") || rawText.includes("@所有人"))) return true;
+    if (rawText && /(^|\s)@(?:_all|all|所有人)(?=\s|$)/i.test(rawText)) return true;
     return mentions.some((m: any) => this.isAllMentionItem(m));
   }
 
@@ -1514,9 +1536,6 @@ export class FeishuBot {
     } else if (!deliveryKey) {
       if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) return;
       if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) return;
-    } else if (sourceType === "assistant_visible") {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["assistant_visible"])) return;
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 30, ["assistant_visible"])) return;
     }
     const deliveryId = this.store.enqueueDelivery({
       sessionKey: this.deliverySessionKey(chatId),
@@ -2041,7 +2060,7 @@ export class FeishuBot {
     }
     if (action === "rounds") {
       const n = Number.parseInt(parts[2] || "", 10);
-      if (!Number.isFinite(n)) {
+      if (!Number.isInteger(n) || n < 1 || n > 10) {
         await this.replyMessage(messageId, "❌ Usage: /discuss rounds <1-10>");
         return;
       }
@@ -2308,7 +2327,7 @@ export class FeishuBot {
           chatName: "私聊",
           members: "",
           memberNames: "",
-          ownerBot: this.config.name,
+          ownerBot: existing?.ownerBot || this.config.name,
           freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
           verbose: this.store.getChatInfo(chatId)?.verbose || false,
           discuss: this.store.getChatInfo(chatId)?.discuss || false,
