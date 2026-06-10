@@ -420,8 +420,9 @@ export class FeishuBot {
 
       // --- Extract text content based on message type ---
       let cleanText = "";
+      let rawText = "";
       if (messageType === "text") {
-        const rawText: string = content.text || "";
+        rawText = content.text || "";
         cleanText = this.cleanMentions(rawText);
         // A mention-only text message is still a valid routing trigger. Feishu may
         // expose mentions as display text like "@万万（Claude）" rather than @_user_xxx,
@@ -543,7 +544,16 @@ export class FeishuBot {
             } else {
               return;
             }
-          } else if (isChairmanCommand || isLocaleCommand) {
+          } else if (isChairmanCommand) {
+            // /chairman @Bot is owned by the mentioned bot itself. This avoids
+            // requiring a coordinator to parse another bot's mention metadata,
+            // which can vary across Feishu clients/bridges. Untargeted/status,
+            // @all, and clear/off remain coordinator-owned group commands.
+            const targetedSelf = routing.isCurrentBotMentioned;
+            const hasSingleOtherTarget = routing.targetedBotNames.length === 1 && !targetedSelf;
+            if (hasSingleOtherTarget) return;
+            if (!targetedSelf && !this.isDiscussionCoordinator()) return;
+          } else if (isLocaleCommand) {
             // Group-level settings; one coordinator handles them.
             if (!this.isDiscussionCoordinator()) return;
           } else if (isDiscussCommand && !routing.hasTargetedMention) {
@@ -718,7 +728,7 @@ export class FeishuBot {
           return;
         }
         if (commandName === "/chairman") {
-          await this.handleChairmanCommand(chatId, chatType, messageId, message.mentions || [], cleanText.trim());
+          await this.handleChairmanCommand(chatId, chatType, messageId, message.mentions || [], cleanText.trim(), rawText);
           markCommandSynced();
           return;
         }
@@ -1541,6 +1551,34 @@ export class FeishuBot {
     return Array.from(new Set(names));
   }
 
+  private mentionedBotNamesFromChairmanText(...texts: string[]): string[] {
+    const normalizedTexts = texts
+      .filter(Boolean)
+      .map((text) => text.replace(/^\s*\/chairman\b/i, "").trim())
+      .filter(Boolean)
+      .map((text) => text.replace(/^@+/, "").replace(/\s+/g, "").toLowerCase());
+    if (normalizedTexts.length === 0) return [];
+    const names: string[] = [];
+    const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this && bot.store === this.store)];
+    for (const raw of normalizedTexts) {
+      for (const bot of candidates) {
+        const botName = bot.config.name.trim().replace(/\s+/g, "").toLowerCase();
+        const displayNames = [
+          botName,
+          `@${botName}`,
+          `万万（${botName}）`,
+          `@万万（${botName}）`,
+          `万万(${botName})`,
+          `@万万(${botName})`,
+        ];
+        if (displayNames.includes(raw) || new RegExp(`^@?[^()（）]+[（(]${this.escapeRegExp(botName)}[）)]$`, "i").test(raw)) {
+          names.push(bot.config.name);
+        }
+      }
+    }
+    return Array.from(new Set(names));
+  }
+
   private isDiscussionCoordinator(): boolean {
     const bots = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store);
     if (bots.length === 0) return true;
@@ -1978,7 +2016,7 @@ export class FeishuBot {
     ].join("\n"));
   }
 
-  private async handleChairmanCommand(chatId: string, chatType: string, messageId: string, mentions: any[], text: string): Promise<void> {
+  private async handleChairmanCommand(chatId: string, chatType: string, messageId: string, mentions: any[], text: string, rawText = ""): Promise<void> {
     if (chatType === "p2p") {
       await this.replyMessage(messageId, "❌ Chairman 只在群聊中可用");
       return;
@@ -1993,19 +2031,20 @@ export class FeishuBot {
     }
 
     const botNames = this.mentionedBotNames(mentions);
-    if (botNames.length === 0) {
+    const resolvedBotNames = botNames.length > 0 ? botNames : this.mentionedBotNamesFromChairmanText(text, rawText);
+    if (resolvedBotNames.length === 0) {
       const current = this.store.getChairmanBot(chatId);
       await this.replyMessage(messageId, current
         ? `👑 当前 Chairman：${current}\n作用：普通消息无人 free 时由 TA 回答；Discuss 模式下负责主持、调停和最终总结。`
         : "👑 当前没有 Chairman\n用法：/chairman @某个Bot");
       return;
     }
-    if (botNames.length > 1) {
+    if (resolvedBotNames.length > 1) {
       await this.replyMessage(messageId, "❌ 一个群只能设置一个 Chairman。请只 @ 一个 bot。");
       return;
     }
 
-    const next = botNames[0];
+    const next = resolvedBotNames[0];
     const previous = this.store.getChairmanBot(chatId);
     this.store.setChairmanBot(chatId, next);
     const mode = this.store.getBotMode(next, chatId);

@@ -493,6 +493,64 @@ describe("FeishuBot routing and queue behavior", () => {
 
 
   it("recognizes parenthesized bot display names from other deployments", async () => {
+    const coordinator = makeHarness("GPT");
+    const target = makeHarness("Claude");
+    try {
+      (target.bot as any).store = coordinator.store;
+      FeishuBot.getAllBots().set("app-GPT", coordinator.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", target.bot as any);
+
+      const cmd = event({
+        chatType: "group",
+        text: "/chairman @光子 (Claude)",
+        messageId: "chair-photon-claude",
+        mentions: [{ name: "光子 (Claude)", id: {} }],
+      });
+      await (coordinator.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
+
+      await (target.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((target.bot as any).replyMessage).toHaveBeenCalledWith("chair-photon-claude", expect.stringContaining("Chairman 已设置为 Claude"));
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      coordinator.cleanup();
+      target.cleanup();
+    }
+  });
+
+  it("lets the targeted bot handle /chairman @Bot and set itself as chairman", async () => {
+    const coordinator = makeHarness("GPT");
+    const target = makeHarness("Claude");
+    try {
+      (target.bot as any).store = coordinator.store;
+      FeishuBot.getAllBots().set("app-GPT", coordinator.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", target.bot as any);
+
+      const cmd = event({
+        chatType: "group",
+        text: "/chairman @_user_1",
+        messageId: "chair-targeted-claude",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      });
+
+      await (coordinator.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
+      expect((coordinator.bot as any).replyMessage).not.toHaveBeenCalled();
+
+      await (target.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((target.bot as any).replyMessage).toHaveBeenCalledWith("chair-targeted-claude", expect.stringContaining("Chairman 已设置为 Claude"));
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      coordinator.cleanup();
+      target.cleanup();
+    }
+  });
+
+  it("falls back to explicit text names for /chairman when mention metadata is unavailable", async () => {
     const h = makeHarness("GPT");
     try {
       FeishuBot.getAllBots().set("app-GPT", h.bot as any);
@@ -500,13 +558,13 @@ describe("FeishuBot routing and queue behavior", () => {
 
       await (h.bot as any).handleMessage(event({
         chatType: "group",
-        text: "/chairman @光子 (Claude)",
-        messageId: "chair-photon-claude",
-        mentions: [{ name: "光子 (Claude)", id: {} }],
+        text: "/chairman Claude",
+        messageId: "chair-text-claude",
+        mentions: [],
       }));
 
       expect(h.store.getChairmanBot("chat1")).toBe("Claude");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-photon-claude", expect.stringContaining("Chairman 已设置为 Claude"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-text-claude", expect.stringContaining("Chairman 已设置为 Claude"));
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
       FeishuBot.getAllBots().delete("app-Claude");
@@ -531,15 +589,6 @@ describe("FeishuBot routing and queue behavior", () => {
 
       await (h.bot as any).handleMessage(event({
         chatType: "group",
-        text: "/chairman @万万（Claude）",
-        messageId: "chair-claude",
-        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
-      }));
-      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-claude", expect.stringContaining("Chairman 已从 GPT 切换为 Claude"));
-
-      await (h.bot as any).handleMessage(event({
-        chatType: "group",
         text: "/chairman @万万（GPT） @万万（Claude）",
         messageId: "chair-two",
         mentions: [
@@ -547,7 +596,7 @@ describe("FeishuBot routing and queue behavior", () => {
           { name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } },
         ],
       }));
-      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
+      expect(h.store.getChairmanBot("chat1")).toBe("GPT");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-two", expect.stringContaining("只能设置一个 Chairman"));
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
