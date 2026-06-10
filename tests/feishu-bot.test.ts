@@ -317,6 +317,36 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("routes explicitly mentioned group-level commands to the mentioned bot", async () => {
+    const coordinator = makeHarness("GPT");
+    const target = makeHarness("Claude");
+    try {
+      (target.bot as any).store = coordinator.store;
+      FeishuBot.getAllBots().set("app-GPT", coordinator.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", target.bot as any);
+
+      const localeCmd = event({
+        chatType: "group",
+        text: "/locale en @_user_1",
+        messageId: "locale-target-claude",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      });
+
+      await (coordinator.bot as any).handleMessage(localeCmd);
+      expect(coordinator.store.getChatLocale("chat1")).toBe("");
+      expect((coordinator.bot as any).replyMessage).not.toHaveBeenCalled();
+
+      await (target.bot as any).handleMessage(localeCmd);
+      expect(coordinator.store.getChatLocale("chat1")).toBe("en");
+      expect((target.bot as any).replyMessage).toHaveBeenCalledWith("locale-target-claude", "🌐 Locale set to en");
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      coordinator.cleanup();
+      target.cleanup();
+    }
+  });
+
   it("requires a chairman before enabling discuss mode", async () => {
     const h = makeHarness("GPT");
     try {

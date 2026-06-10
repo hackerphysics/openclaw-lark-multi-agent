@@ -594,8 +594,9 @@ export class FeishuBot {
               // fallback so the user still gets an actionable reply.
               if (!this.isDiscussionCoordinator()) return;
             }
-          } else if (isLocaleCommand) {
-            // Group-level settings; one coordinator handles them.
+          } else if (isLocaleCommand && !routing.hasTargetedMention) {
+            // Untargeted or @all locale is a group-level setting; one coordinator handles it.
+            // If the user explicitly @s a bot, the targeted bot should execute and answer.
             if (!this.isDiscussionCoordinator()) return;
           } else if (isDiscussCommand && !routing.hasTargetedMention) {
             // Untargeted or @all /discuss is group-level; one coordinator handles it.
