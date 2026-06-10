@@ -682,6 +682,8 @@ describe("FeishuBot routing and queue behavior", () => {
       await (coordinator.bot as any).handleMessage(cmd);
       expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
       const reply = (coordinator.bot as any).replyMessage.mock.calls.at(-1)?.[1] || "";
+      expect(reply).toContain("/chairman 只用于设置/切换 Chairman");
+      expect(reply).toContain("/status");
       expect(reply).toContain("/chairman GPT");
       expect(reply).toContain("/chairman Claude");
     } finally {
@@ -692,7 +694,7 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
-  it("defaults /chairman to the only bot in a single-bot group", async () => {
+  it("does not use bare /chairman as status or implicit single-bot setup", async () => {
     const h = makeHarness("GPT");
     try {
       FeishuBot.getAllBots().set("app-GPT", h.bot as any);
@@ -701,11 +703,14 @@ describe("FeishuBot routing and queue behavior", () => {
         chatType: "group",
         text: "/chairman",
         messageId: "chair-single",
-        mentions: [{ name: "万万（GPT）", id: {} }],
+        mentions: [],
       }));
 
-      expect(h.store.getChairmanBot("chat1")).toBe("GPT");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-single", expect.stringContaining("Chairman 已设置为 GPT"));
+      expect(h.store.getChairmanBot("chat1")).toBeFalsy();
+      const reply = (h.bot as any).replyMessage.mock.calls.at(-1)?.[1] || "";
+      expect(reply).toContain("/chairman 只用于设置/切换 Chairman");
+      expect(reply).toContain("/status");
+      expect(reply).toContain("/chairman GPT");
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
       h.cleanup();

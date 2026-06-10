@@ -2095,7 +2095,7 @@ export class FeishuBot {
       return;
     }
     const parts = text.split(/\s+/).filter(Boolean);
-    const action = (parts[1] || "status").toLowerCase();
+    const action = (parts[1] || "").toLowerCase();
     if (["off", "clear", "none"].includes(action)) {
       const previous = this.store.getChairmanBot(chatId);
       this.store.clearChairmanBot(chatId);
@@ -2105,32 +2105,22 @@ export class FeishuBot {
 
     const resolvedBotNames = this.resolveChairmanTargets(mentions, text, rawText);
     if (resolvedBotNames.length === 0) {
-      const current = this.store.getChairmanBot(chatId);
-      // Terminal fallback so a /chairman with a missing/unpar. target still
-      // produces an actionable result instead of silently failing:
-      //   - Single-bot group: default to that one bot.
-      //   - Multi-bot group: list the bots so the user can pick explicitly.
+      // /chairman is intentionally not a status query. Status lives in /status;
+      // this command is only for switching or clearing the Chairman. Keeping the
+      // two meanings separate prevents failed mention parsing from being masked
+      // as a harmless "current status" response.
       const groupBots = Array.from(FeishuBot.allBots.values())
         .filter((bot) => bot.store === this.store)
         .map((bot) => bot.config.name);
       const uniqueGroupBots = Array.from(new Set(groupBots));
-      if (uniqueGroupBots.length === 1) {
-        const only = uniqueGroupBots[0];
-        if (only !== this.config.name) return; // let the single bot own it
-        const previous = this.store.getChairmanBot(chatId);
-        this.store.setChairmanBot(chatId, only);
-        await this.replyMessage(messageId, previous && previous !== only
-          ? `✅ Chairman 已从 ${previous} 切换为 ${only}`
-          : `✅ Chairman 已设置为 ${only}`);
-        return;
-      }
-      // Multi-bot group: only the coordinator answers, to avoid N identical
-      // "please pick a bot" replies.
-      if (!this.isDiscussionCoordinator()) return;
-      const choices = uniqueGroupBots.map((name) => `/chairman ${name}`).join("\n");
-      await this.replyMessage(messageId, current
-        ? `👑 当前 Chairman：${current}\n要切换请直接发（可复制）：\n${choices}`
-        : `👑 当前没有 Chairman\n未能识别你 @ 的 bot（可能是客户端没传 mention 信息）。\n请直接发以下任一指令设置（可复制）：\n${choices}`);
+      const choices = uniqueGroupBots.length > 0
+        ? uniqueGroupBots.map((name) => `/chairman ${name}`).join("\n")
+        : "/chairman @某个Bot";
+      await this.replyMessage(messageId,
+        `❌ /chairman 只用于设置/切换 Chairman，不再用于状态查询。\n` +
+        `查看当前 Chairman 请用 /status。\n` +
+        `切换请 @ 一个 bot，或直接发（可复制）：\n${choices}\n` +
+        `清除请用：/chairman off`);
       return;
     }
     if (resolvedBotNames.length > 1) {
