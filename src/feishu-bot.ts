@@ -549,10 +549,38 @@ export class FeishuBot {
             // requiring a coordinator to parse another bot's mention metadata,
             // which can vary across Feishu clients/bridges. Untargeted/status,
             // @all, and clear/off remain coordinator-owned group commands.
-            const targetedSelf = routing.isCurrentBotMentioned;
-            const hasSingleOtherTarget = routing.targetedBotNames.length === 1 && !targetedSelf;
-            if (hasSingleOtherTarget) return;
-            if (!targetedSelf && !this.isDiscussionCoordinator()) return;
+            //
+            // Target resolution uses both Feishu mention metadata AND a text
+            // fallback (parsing "@Bot" / "Bot" from the raw message), so a
+            // /chairman that arrives without mention metadata still routes to
+            // the intended bot instead of silently failing.
+            const chairmanArg = this.stripLeadingCommandMentions(this.cleanMentions(rawText)).replace(/^\s*\/chairman\b/i, "").trim().toLowerCase();
+            const isClearArg = ["off", "clear", "none"].includes(chairmanArg.split(/\s+/)[0] || "");
+            const hasMentionMeta = (message.mentions || []).some((m: any) => !this.isAllMentionItem(m));
+            const targets = this.resolveChairmanTargets(message.mentions || [], cleanText, rawText);
+            // A pure status query: no clear keyword, no mention metadata, and no
+            // textual argument at all. Anything else is a set/route attempt.
+            const isStatusArg = !isClearArg && !hasMentionMeta && chairmanArg.length === 0;
+            if (isClearArg || isStatusArg) {
+              // Group-level status/clear: one coordinator handles it.
+              if (!this.isDiscussionCoordinator()) return;
+            } else if (targets.length >= 1) {
+              // Targets resolved: only the (single) targeted bot acts. If
+              // multiple distinct targets resolved, the coordinator handles
+              // the "only one chairman" error once.
+              const uniqueTargets = Array.from(new Set(targets));
+              const targetedSelf = uniqueTargets.includes(this.config.name);
+              if (uniqueTargets.length > 1) {
+                if (!this.isDiscussionCoordinator()) return;
+              } else if (!targetedSelf) {
+                return;
+              }
+            } else {
+              // A set attempt whose target could not be resolved at all (missing
+              // metadata AND no readable name in text): coordinator handles the
+              // fallback so the user still gets an actionable reply.
+              if (!this.isDiscussionCoordinator()) return;
+            }
           } else if (isLocaleCommand) {
             // Group-level settings; one coordinator handles them.
             if (!this.isDiscussionCoordinator()) return;
@@ -926,6 +954,16 @@ export class FeishuBot {
           console.warn(`[${this.config.name}] Dropped ${droppedMergedTriggers.length} older pending trigger(s) for ${chatId.slice(-8)} due to merge limits (kept=${mergedTriggers.length}, bytes=${bytes}): ${summaries}`);
         }
       }
+      const deliveredTriggerIds = mergedTriggers
+        .map((m) => m.id || 0)
+        .filter((id) => id > 0 && this.store.hasDeliveredReply(this.config.name, chatId, id));
+      if (deliveredTriggerIds.length > 0) {
+        console.warn(`[${this.config.name}] Clearing ${deliveredTriggerIds.length} stale delivered pending trigger(s) for ${chatId.slice(-8)}: ${deliveredTriggerIds.join(",")}`);
+        for (const id of deliveredTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
+        mergedTriggers = mergedTriggers.filter((m) => !m.id || !deliveredTriggerIds.includes(m.id));
+        if (mergedTriggers.length === 0) continue;
+      }
+
       const isNativeCommandTrigger = firstIsNative;
       const lastHuman = mergedTriggers[mergedTriggers.length - 1];
       const triggerId = lastHuman.id || 0;
@@ -1315,7 +1353,7 @@ export class FeishuBot {
   }
 
   private escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return value.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
   }
 
   private resolveBotName(sender: any): string | null {
@@ -1577,6 +1615,21 @@ export class FeishuBot {
       }
     }
     return Array.from(new Set(names));
+  }
+
+  /**
+   * Resolve the target bot name(s) for a /chairman command using every signal
+   * available, in priority order:
+   *   1. Feishu mention metadata (app_id / open_id / name).
+   *   2. Text fallback: "@Bot" or "Bot" written in the message body.
+   *
+   * This keeps /chairman working even when a Feishu client or bridge omits
+   * mention metadata. Returns a de-duplicated, order-preserving list.
+   */
+  private resolveChairmanTargets(mentions: any[], text: string, rawText = ""): string[] {
+    const fromMeta = this.mentionedBotNames(mentions);
+    if (fromMeta.length > 0) return fromMeta;
+    return this.mentionedBotNamesFromChairmanText(text, rawText);
   }
 
   private isDiscussionCoordinator(): boolean {
@@ -2030,13 +2083,34 @@ export class FeishuBot {
       return;
     }
 
-    const botNames = this.mentionedBotNames(mentions);
-    const resolvedBotNames = botNames.length > 0 ? botNames : this.mentionedBotNamesFromChairmanText(text, rawText);
+    const resolvedBotNames = this.resolveChairmanTargets(mentions, text, rawText);
     if (resolvedBotNames.length === 0) {
       const current = this.store.getChairmanBot(chatId);
+      // Terminal fallback so a /chairman with a missing/unpar. target still
+      // produces an actionable result instead of silently failing:
+      //   - Single-bot group: default to that one bot.
+      //   - Multi-bot group: list the bots so the user can pick explicitly.
+      const groupBots = Array.from(FeishuBot.allBots.values())
+        .filter((bot) => bot.store === this.store)
+        .map((bot) => bot.config.name);
+      const uniqueGroupBots = Array.from(new Set(groupBots));
+      if (uniqueGroupBots.length === 1) {
+        const only = uniqueGroupBots[0];
+        if (only !== this.config.name) return; // let the single bot own it
+        const previous = this.store.getChairmanBot(chatId);
+        this.store.setChairmanBot(chatId, only);
+        await this.replyMessage(messageId, previous && previous !== only
+          ? `✅ Chairman 已从 ${previous} 切换为 ${only}`
+          : `✅ Chairman 已设置为 ${only}`);
+        return;
+      }
+      // Multi-bot group: only the coordinator answers, to avoid N identical
+      // "please pick a bot" replies.
+      if (!this.isDiscussionCoordinator()) return;
+      const choices = uniqueGroupBots.map((name) => `/chairman ${name}`).join("\n");
       await this.replyMessage(messageId, current
-        ? `👑 当前 Chairman：${current}\n作用：普通消息无人 free 时由 TA 回答；Discuss 模式下负责主持、调停和最终总结。`
-        : "👑 当前没有 Chairman\n用法：/chairman @某个Bot");
+        ? `👑 当前 Chairman：${current}\n要切换请直接发（可复制）：\n${choices}`
+        : `👑 当前没有 Chairman\n未能识别你 @ 的 bot（可能是客户端没传 mention 信息）。\n请直接发以下任一指令设置（可复制）：\n${choices}`);
       return;
     }
     if (resolvedBotNames.length > 1) {

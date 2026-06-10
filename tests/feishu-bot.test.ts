@@ -551,24 +551,35 @@ describe("FeishuBot routing and queue behavior", () => {
   });
 
   it("falls back to explicit text names for /chairman when mention metadata is unavailable", async () => {
-    const h = makeHarness("GPT");
+    const coordinator = makeHarness("GPT");
+    const target = makeHarness("Claude");
     try {
-      FeishuBot.getAllBots().set("app-GPT", h.bot as any);
-      FeishuBot.getAllBots().set("app-Claude", { config: { appId: "app-Claude", name: "Claude" }, store: h.store, botOpenId: "claude-open-id" } as any);
+      (target.bot as any).store = coordinator.store;
+      FeishuBot.getAllBots().set("app-GPT", coordinator.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", target.bot as any);
 
-      await (h.bot as any).handleMessage(event({
+      const cmd = event({
         chatType: "group",
         text: "/chairman Claude",
         messageId: "chair-text-claude",
         mentions: [],
-      }));
+      });
 
-      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("chair-text-claude", expect.stringContaining("Chairman 已设置为 Claude"));
+      // Coordinator (GPT) must not claim a target resolved purely from text
+      // that points at another bot; the targeted bot owns it.
+      await (coordinator.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
+      expect((coordinator.bot as any).replyMessage).not.toHaveBeenCalled();
+
+      // The targeted bot resolves itself from the text fallback and sets it.
+      await (target.bot as any).handleMessage(cmd);
+      expect(coordinator.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((target.bot as any).replyMessage).toHaveBeenCalledWith("chair-text-claude", expect.stringContaining("Chairman 已设置为 Claude"));
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
       FeishuBot.getAllBots().delete("app-Claude");
-      h.cleanup();
+      coordinator.cleanup();
+      target.cleanup();
     }
   });
 
@@ -1289,6 +1300,25 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).processQueue("chat1");
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("drops stale delivered triggers inside a merged batch but keeps newer pending triggers", async () => {
+    const h = makeHarness();
+    try {
+      const oldId = h.store.insert({ chatId: "chat1", messageId: "old", senderType: "human", senderName: "u", content: "old delivered", timestamp: 1 });
+      const newId = h.store.insert({ chatId: "chat1", messageId: "new", senderType: "human", senderName: "u", content: "new pending", timestamp: 2 });
+      h.store.markPendingTrigger("GPT", "chat1", oldId);
+      h.store.markPendingTrigger("GPT", "chat1", newId);
+      h.store.markDeliveredReply("GPT", "chat1", oldId, "old");
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("new pending");
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+      expect(h.store.hasDeliveredReply("GPT", "chat1", oldId)).toBe(true);
+      expect(h.store.hasDeliveredReply("GPT", "chat1", newId)).toBe(true);
     } finally { h.cleanup(); }
   });
 
