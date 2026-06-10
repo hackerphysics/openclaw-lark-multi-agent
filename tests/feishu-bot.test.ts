@@ -405,7 +405,7 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
-  it("excludes muted bots from discuss even when they are chairman", async () => {
+  it("keeps muted chairman in discuss because chairman outranks mute", async () => {
     const gpt = makeHarness("GPT");
     const claude = makeHarness("Claude");
     try {
@@ -419,9 +419,9 @@ describe("FeishuBot routing and queue behavior", () => {
       gpt.store.setDiscussMaxRounds("chat1", 1);
 
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic-muted" }));
-      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      expect(claude.openclaw.chatCalls).toHaveLength(0);
+      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1 && claude.openclaw.chatCalls.length === 1, { timeout: 1000 });
       expect(gpt.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
+      expect(claude.openclaw.chatCalls[0].currentMessage).toContain("你是本群的 Chairman");
     } finally {
       FeishuBot.getAllBots().delete("app-GPT");
       FeishuBot.getAllBots().delete("app-Claude");
@@ -802,6 +802,29 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+  it("lets muted chairman answer plain messages when no free bot exists", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      gpt.store.setChairmanBot("chat1", "Claude");
+      gpt.store.setBotMode("Claude", "chat1", "mute");
+
+      await (claude.bot as any).handleMessage(event({ chatType: "group", text: "无人被@的普通消息", messageId: "plain-muted-chairman" }));
+
+      expect(claude.openclaw.chatCalls).toHaveLength(1);
+      expect(claude.openclaw.chatCalls[0].currentMessage).toBe("无人被@的普通消息");
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
   it("lets chairman answer plain messages only when no free bot exists", async () => {
     const chairman = makeHarness("Claude");
     const free = makeHarness("GPT");
@@ -941,7 +964,7 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       gpt.store.setDiscussMode("chat1", true);
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "plain topic", messageId: "discuss-empty" }));
-      expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("所有 bot 都是 mute"));
+      expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("没有可参与者"));
     } finally { gpt.cleanup(); }
   });
 

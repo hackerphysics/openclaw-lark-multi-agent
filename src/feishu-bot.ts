@@ -643,7 +643,7 @@ export class FeishuBot {
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
             `🤖 /model [id] — 查看/切换当前 bot 绑定模型（持久化）`,
-            `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论（所有非 mute bot 参与，忽略 free）`,
+            `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论（所有非 mute bot + Chairman 参与，忽略 free）`,
             `👑 /chairman @Bot|off — 设置/清除本群唯一 Chairman（状态见 /status）`,
             `🌐 /locale zh|en — 设置/查看当前群语言`,
             `❓ /help    — 显示此帮助信息`,
@@ -836,16 +836,18 @@ export class FeishuBot {
             }
           } else if (this.isDiscussionCoordinator()) {
             await this.sendMessage(chatId, this.isEn(chatId)
-              ? "💬 Discuss is on, but all bots are muted. Unmute at least one bot before discussing."
-              : "💬 Discuss 已开启，但当前所有 bot 都是 mute，无法参与讨论。请至少解除一个 bot 的禁言。");
+              ? "💬 Discuss is on, but there is no available participant. Unmute at least one bot or set a Chairman."
+              : "💬 Discuss 已开启，但当前没有可参与者。请至少解除一个 bot 的禁言，或设置 Chairman。");
           }
           if (insertedId > 0) this.store.markSynced(this.config.name, chatId, insertedId);
           return;
         }
       }
 
-      // --- Mute mode: do not forward anything to OpenClaw. Only direct mentions get a local notice. ---
-      if (chatType !== "p2p" && !isBot && this.store.getBotMode(this.config.name, chatId) === "mute") {
+      // --- Mute mode: do not forward ordinary muted bots to OpenClaw. Chairman
+      // intentionally outranks mute, so a muted Chairman can still answer/facilitate
+      // in Chairman paths.
+      if (chatType !== "p2p" && !isBot && this.store.getBotMode(this.config.name, chatId) === "mute" && this.store.getChairmanBot(chatId) !== this.config.name) {
         if (routing.isCurrentBotMentioned) {
           await this.replyMessage(messageId, `🤐 ${this.config.name} 当前处于 mute 模式，发送 /mute 可解除`);
           if (insertedId > 0) {
@@ -1757,7 +1759,7 @@ export class FeishuBot {
   private getChairmanParticipant(chatId: string): DiscussionParticipant | undefined {
     const chairman = this.store.getChairmanBot(chatId);
     if (!chairman) return undefined;
-    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman && candidate.store.getBotMode(candidate.config.name, chatId) !== "mute");
+    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman);
     return bot ? this.asDiscussionParticipant(bot, chatId) : undefined;
   }
 
@@ -2130,8 +2132,8 @@ export class FeishuBot {
       }
       this.store.setDiscussMode(chatId, true);
       await this.replyMessage(messageId, this.isEn(chatId)
-        ? `💬 Discuss enabled\nChairman: ${chairman}\nParticipants: all non-muted bots; free mode is ignored in Discuss\nRounds: ${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`
-        : `💬 Discuss 已开启\nChairman：${chairman}\n参与者：当前群所有非 mute bot（Discuss 模式忽略 free 开关）\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`);
+        ? `💬 Discuss enabled\nChairman: ${chairman}\nParticipants: all non-muted bots + Chairman; free mode is ignored in Discuss\nRounds: ${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`
+        : `💬 Discuss 已开启\nChairman：${chairman}\n参与者：当前群所有非 mute bot + Chairman（Discuss 模式忽略 free 开关）\n轮数：${this.store.getChatInfo(chatId)?.discussMaxRounds || 10}`);
       return;
     }
     if (action === "off") {
@@ -2166,13 +2168,13 @@ export class FeishuBot {
       `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
       `Rounds: ${info?.discussMaxRounds || 10}`,
       `Chairman: ${info?.chairmanBot || "not set"}`,
-      `Participants: ${participants.length ? participants.join(", ") : "(all bots muted)"}`,
+      `Participants: ${[...participants, info?.chairmanBot].filter(Boolean).length ? [...participants, info?.chairmanBot].filter(Boolean).join(", ") : "(none available)"}`,
       active ? `Active: round ${active.currentRound}/${active.maxRounds}, topic=${active.topic.slice(0, 80)}` : "Active: none",
     ].join("\n") : [
       `💬 Discuss: ${info?.discuss ? "on" : "off"}`,
       `轮数：${info?.discussMaxRounds || 10}`,
       `Chairman：${info?.chairmanBot || "未设置"}`,
-      `参与者：${participants.length ? participants.join(", ") : "（所有 bot 都是 mute）"}`,
+      `参与者：${[...participants, info?.chairmanBot].filter(Boolean).length ? [...participants, info?.chairmanBot].filter(Boolean).join(", ") : "（无可参与者）"}`,
       active ? `运行中：第 ${active.currentRound}/${active.maxRounds} 轮，topic=${active.topic.slice(0, 80)}` : "运行中：无",
     ].join("\n"));
   }
@@ -2223,8 +2225,8 @@ export class FeishuBot {
     const lines = [previous && previous !== next ? `✅ Chairman 已从 ${previous} 切换为 ${next}` : `✅ Chairman 已设置为 ${next}`];
     lines.push("作用：");
     lines.push("- 非 Discuss 模式下：free bot 会主动回答普通消息；没有 free bot 时由 Chairman 兜底");
-    lines.push("- Discuss 模式下：所有非 mute bot 参与讨论，free 开关会被忽略");
-    lines.push("- Chairman 非 mute 时会参与主持、调停并做最终总结");
+    lines.push("- Discuss 模式下：所有非 mute bot + Chairman 参与讨论，free 开关会被忽略");
+    lines.push("- Chairman 优先级高于 mute，会参与兜底回答、主持、调停并做最终总结");
     if (mode === "mute") lines.push(`⚠️ ${next} 当前是 mute，但 Chairman 场景下仍会发言`);
     await this.replyMessage(messageId, lines.join("\n"));
   }
