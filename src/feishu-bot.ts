@@ -857,6 +857,12 @@ export class FeishuBot {
       // Track this message for reaction status updates
       const pending = this.pendingAckMessages.get(chatId) || [];
 
+      const unhealthy = await this.getUnhealthySessionStatus(chatId);
+      if (unhealthy) {
+        await this.recoverFromUnhealthySession(chatId, messageId, insertedId, unhealthy);
+        return;
+      }
+
       // Anti-loop
       const streak = this.store.getBotStreak(chatId, this.config.name);
       if (streak >= MAX_BOT_STREAK) {
@@ -903,6 +909,41 @@ export class FeishuBot {
     }
   }
 
+  private async getUnhealthySessionStatus(chatId: string): Promise<string | null> {
+    const sessionKey = this.getSessionKey(chatId);
+    try {
+      const resp = await this.openclawClient.getSessionInfo(sessionKey);
+      const status = String(resp?.session?.status || "").toLowerCase();
+      if (!status) return null;
+      if (["killed", "kill", "dead", "crashed", "crash", "failed", "failure", "error", "errored", "invalid"].some((bad) => status.includes(bad))) {
+        return status;
+      }
+    } catch {
+      // Absence/transient describe failures should not block a new run; chat.send
+      // will create/report the session as usual.
+    }
+    return null;
+  }
+
+  private async recoverFromUnhealthySession(chatId: string, messageId: string, insertedId: number, status: string): Promise<void> {
+    const sessionKey = this.getSessionKey(chatId);
+    await this.openclawClient.abortChat(sessionKey).catch(() => {});
+    this.busyChats.set(chatId, 0);
+    const cleared = this.store.clearAllPendingTriggers(this.config.name, chatId);
+    if (insertedId > 0) this.store.markMessagesSynced(this.config.name, chatId, [insertedId], `${this.config.name}:${chatId}:${insertedId}:unhealthy-session`);
+    const acks = this.pendingAckMessages.get(chatId) || [];
+    for (const ack of acks) {
+      await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+      await this.addReaction(ack.messageId, "FAIL").catch(() => {});
+    }
+    this.pendingAckMessages.set(chatId, []);
+    await this.addReaction(messageId, "FAIL").catch(() => {});
+    await this.replyMessage(messageId, this.isEn(chatId)
+      ? `⚠️ ${this.config.name} session is unhealthy (${status}). Cleared ${cleared} pending message(s) and stopped waiting. Please send /reset and retry.`
+      : `⚠️ ${this.config.name} 的 session 状态异常（${status}）。已停止等待、清掉 ${cleared} 条待处理消息并关闭等待反应。请先发送 /reset 后重试。`);
+    console.warn(`[${this.config.name}] unhealthy session ${sessionKey} status=${status}; cleared ${cleared} pending trigger(s) for ${chatId.slice(-8)}`);
+  }
+
   /**
    * Process queued messages for a chat: batch all unsynced messages and send to OpenClaw.
    * Loops until no more unsynced human messages remain.
@@ -929,6 +970,13 @@ export class FeishuBot {
         .filter((m) => m.senderType === "human" && m.id && pendingTriggerIds.has(m.id))
         .sort((a, b) => a.timestamp - b.timestamp);
       if (pendingHumanTriggers.length === 0) {
+        break;
+      }
+
+      const unhealthy = await this.getUnhealthySessionStatus(chatId);
+      if (unhealthy) {
+        const latest = pendingHumanTriggers[pendingHumanTriggers.length - 1];
+        await this.recoverFromUnhealthySession(chatId, latest.messageId, latest.id || 0, unhealthy);
         break;
       }
 

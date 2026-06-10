@@ -1426,6 +1426,50 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("reports killed sessions immediately instead of queueing behind a dead run", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: "killed" } }));
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "你在吗",
+        messageId: "killed-session-msg",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-session-msg", "FAIL");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-session-msg", expect.stringContaining("session 状态异常（killed）"));
+      expect((h.bot as any).busyChats.get("chat1")).toBe(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("reports killed sessions during queue drain and clears existing waiting reactions", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: "active | killed" } }));
+      const id = h.store.insert({ chatId: "chat1", messageId: "pending-killed", senderType: "human", senderName: "u", content: "pending", timestamp: 1 });
+      h.store.markPendingTrigger("Claude", "chat1", id);
+      (h.bot as any).pendingAckMessages.set("chat1", [{ messageId: "pending-killed", emoji: "Typing", rowId: id }]);
+      (h.bot as any).busyChats.set("chat1", Date.now());
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
+      expect((h.bot as any).removeReaction).toHaveBeenCalledWith("pending-killed", "Typing");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("pending-killed", "FAIL");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("pending-killed", expect.stringContaining("active | killed"));
+      expect((h.bot as any).busyChats.get("chat1")).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
   it("does not mark queued mid-run messages DONE or synced before processing", async () => {
     const h = makeHarness("GLM");
     try {
