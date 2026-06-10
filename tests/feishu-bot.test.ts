@@ -408,6 +408,35 @@ describe("FeishuBot routing and queue behavior", () => {
 
 
 
+  it("notifies when a new discuss topic preempts an active discussion", async () => {
+    const h = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", h.bot as any);
+      h.store.setBotMode("GPT", "chat1", "free");
+      h.store.setDiscussMode("chat1", true);
+      h.store.setDiscussMaxRounds("chat1", 10);
+      let releaseFirstRun!: () => void;
+      const firstRunBlocked = new Promise<void>((resolve) => { releaseFirstRun = resolve; });
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        if (h.openclaw.chatCalls.length === 1) await firstRunBlocked;
+        return "mock reply";
+      });
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "第一个话题", messageId: "topic-1" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect((h.bot as any).sendMessage).not.toHaveBeenCalledWith("chat1", expect.stringContaining("已停止上一轮 Discuss"));
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "第二个话题", messageId: "topic-2" }));
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("已停止上一轮 Discuss 并开启新讨论"));
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("第一个话题"));
+      releaseFirstRun();
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      h.cleanup();
+    }
+  });
+
   it("does not let coordinator steal targeted /discuss commands", async () => {
     const gpt = makeHarness("GPT");
     try {

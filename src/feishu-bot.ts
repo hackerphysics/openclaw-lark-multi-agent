@@ -802,7 +802,8 @@ export class FeishuBot {
           const chairman = this.getChairmanParticipant(chatId);
           const participants = this.getDiscussionParticipants(chatId);
           if (participants.length > 0 || chairman) {
-            discussionManager.startIfAbsent({
+            const preempted = discussionManager.status(chatId);
+            const started = discussionManager.startIfAbsent({
               chatId,
               rootMessageId: messageId,
               topic: cleanText,
@@ -820,6 +821,11 @@ export class FeishuBot {
                 }
               },
             });
+            if (started && preempted) {
+              await this.sendMessage(chatId, this.isEn(chatId)
+                ? `💬 New topic received; stopped the previous Discuss session and started a new one. Previous topic: ${preempted.topic.slice(0, 80)}`
+                : `💬 收到新话题，已停止上一轮 Discuss 并开启新讨论。上一话题：${preempted.topic.slice(0, 80)}`);
+            }
           } else if (this.isDiscussionCoordinator()) {
             await this.sendMessage(chatId, this.isEn(chatId)
               ? "💬 Discuss is on, but there are no free bots or Chairman available. Use /free on or /chairman @Bot first."
