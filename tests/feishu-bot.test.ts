@@ -1551,13 +1551,13 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(1000);
       await run;
 
-      // Live status placeholder is created as a separate message with a
-      // progress bar + edit count + elapsed timer + detail.
+      // Live status placeholder is created as a separate message and only shows
+      // meaningful tool-start progress (no timer/progress bar/edit count noise).
       expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude"));
       const placeholderText = (h.bot as any).replyTextMessage.mock.calls[0][1];
-      expect(placeholderText).toMatch(/[\u2B1C]|\uD83D[\uDFE9\uDFE8\uDFE5]/); // colored progress bar cells
-      expect(placeholderText).toMatch(/\d+\/20/); // edit budget count
-      expect(placeholderText).toMatch(/\d+:\d{2}/); // elapsed mm:ss
+      expect(placeholderText).toBe("Claude 正在执行：read: 读取 src/feishu-bot.ts");
+      expect(placeholderText).not.toMatch(/\d+\/20/);
+      expect(placeholderText).not.toMatch(/\d+:\d{2}/);
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");
       // ...and the live status message is marked done (not overwritten with the answer).
