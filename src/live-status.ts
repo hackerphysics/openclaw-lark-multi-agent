@@ -17,7 +17,6 @@ const PROGRESS_BAR_CELLS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STA
 export type LiveStatusCallbacks = {
   create: (text: string) => Promise<string | undefined>;
   edit: (messageId: string, text: string) => Promise<void>;
-  remove?: (messageId: string) => Promise<void>;
   warn?: (message: string, err?: unknown) => void;
 };
 
@@ -75,22 +74,14 @@ export class LiveStatusController {
    * Finish the live status when the real (final) reply is delivered separately.
    * The final answer is sent by the normal interactive-card path, so the status
    * message must NOT be overwritten with the answer (text type does not render
-   * Markdown). Instead: delete the status message if possible; otherwise mark it
-   * as done so the group is not left with a stale "processing" message.
+   * Markdown). Feishu renders message deletion as a visible "recalled a message"
+   * tombstone, so keep the status message and mark it done instead.
    */
   async complete(): Promise<void> {
     this.finalized = true;
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
-    if (this.callbacks.remove) {
-      try {
-        await this.callbacks.remove(this.messageId);
-        return;
-      } catch (err) {
-        this.callbacks.warn?.("live status delete failed; marking done instead", err);
-      }
-    }
     const doneText = this.opts.locale === "en"
       ? `\u2705 ${this.opts.botName} done (${this.formatElapsed()})`
       : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210\uff08\u7528\u65f6 ${this.formatElapsed()}\uff09`;
@@ -99,7 +90,7 @@ export class LiveStatusController {
 
   /**
    * Finish the live status when the run failed and the error is delivered by the
-   * normal path. Same policy as complete(): delete if possible, else mark done.
+   * normal path. Same policy as complete(): mark the status message done.
    */
   async fail(): Promise<void> {
     await this.complete();

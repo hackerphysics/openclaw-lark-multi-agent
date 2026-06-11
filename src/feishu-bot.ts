@@ -965,10 +965,10 @@ export class FeishuBot {
     const acks = this.pendingAckMessages.get(chatId) || [];
     for (const ack of acks) {
       await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
-      await this.addReaction(ack.messageId, "FAIL").catch(() => {});
+      await this.addReaction(ack.messageId, "DONE").catch(() => {});
     }
     this.pendingAckMessages.set(chatId, []);
-    await this.addReaction(messageId, "FAIL").catch(() => {});
+    await this.addReaction(messageId, "DONE").catch(() => {});
     await this.replyMessage(messageId, this.isEn(chatId)
       ? `⚠️ ${this.config.name} session is unhealthy (${status}). Cleared ${cleared} pending message(s) and stopped waiting. Please send /reset and retry.`
       : `⚠️ ${this.config.name} 的 session 状态异常（${status}）。已停止等待、清掉 ${cleared} 条待处理消息并关闭等待反应。请先发送 /reset 后重试。`);
@@ -1189,7 +1189,6 @@ export class FeishuBot {
           ? new LiveStatusController({
               create: (text) => this.sendOrdered(chatId, () => this.replyTextMessage(lastHuman.messageId || "", text)),
               edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
-              remove: (messageId) => this.sendOrdered(chatId, () => this.deleteMessageById(messageId)),
               warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
             }, { botName: this.config.name, locale: this.isEn(chatId) ? "en" : "zh" })
           : undefined;
@@ -1370,7 +1369,7 @@ export class FeishuBot {
             ? `⚠️ ${this.config.name} session is unhealthy (${err.status}). Stopped waiting. Please send /reset and retry.`
             : `⚠️ ${this.config.name} 的 session 状态异常（${err.status}）。已停止等待，请先发送 /reset 后重试。`;
           // recoverFromUnhealthySession already replied to the user; just finish
-          // the live status message (delete or mark done).
+          // the live status message (mark done).
           void errorText;
           await liveStatus?.complete().catch(() => {});
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
@@ -1380,7 +1379,7 @@ export class FeishuBot {
         const errorText = this.formatUserVisibleError(err);
         if (lastHuman.messageId) {
           // Error message goes through the normal delivery path; the live status
-          // is a separate message that we finish (delete/mark done) afterwards.
+          // is a separate message that we finish (mark done) afterwards.
           await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
             .then(() => {
               if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
@@ -1404,7 +1403,7 @@ export class FeishuBot {
         for (const ack of pendingAcks) {
           if (completedTriggerIdSet.has(ack.rowId)) {
             await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
-            await this.addReaction(ack.messageId, "FAIL").catch(() => {});
+            await this.addReaction(ack.messageId, "DONE").catch(() => {});
           } else {
             remainingAcks.push(ack);
           }

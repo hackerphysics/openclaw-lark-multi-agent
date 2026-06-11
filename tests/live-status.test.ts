@@ -2,51 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import { LiveStatusController } from "../src/live-status.js";
 
 describe("LiveStatusController", () => {
-  it("deletes the status message on complete when remove is available", async () => {
-    vi.useFakeTimers();
-    const removed: string[] = [];
-    const edits: string[] = [];
-    const live = new LiveStatusController({
-      create: vi.fn(async () => "msg1"),
-      edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      remove: vi.fn(async (id) => { removed.push(id); }),
-    }, { botName: "Claude", delayMs: 0 });
-
-    live.start("starting");
-    await vi.advanceTimersByTimeAsync(0);
-    await live.complete();
-
-    expect(removed).toEqual(["msg1"]);
-    // No "done" edit needed because delete succeeded.
-    expect(edits).toEqual([]);
-    vi.useRealTimers();
-  });
-
-  it("marks the status message done when delete is unavailable", async () => {
+  it("marks the status message done on complete", async () => {
     vi.useFakeTimers();
     const edits: string[] = [];
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      // no remove callback
-    }, { botName: "Claude", delayMs: 0 });
-
-    live.start("starting");
-    await vi.advanceTimersByTimeAsync(0);
-    await live.complete();
-
-    expect(edits.length).toBe(1);
-    expect(edits[0]).toContain("已完成");
-    vi.useRealTimers();
-  });
-
-  it("falls back to a done edit when delete fails", async () => {
-    vi.useFakeTimers();
-    const edits: string[] = [];
-    const live = new LiveStatusController({
-      create: vi.fn(async () => "msg1"),
-      edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      remove: vi.fn(async () => { throw new Error("recall not allowed"); }),
     }, { botName: "Claude", delayMs: 0 });
 
     live.start("starting");
@@ -64,7 +25,6 @@ describe("LiveStatusController", () => {
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      remove: vi.fn(async () => {}),
     }, { botName: "Claude", delayMs: 0 });
 
     live.start("starting");
@@ -72,8 +32,9 @@ describe("LiveStatusController", () => {
     await live.complete();
     await live.progress("late progress");
 
-    // complete() deleted the message; the late progress must not edit anything.
-    expect(edits).toEqual([]);
+    // complete() marks the message done once; late progress must not edit again.
+    expect(edits.length).toBe(1);
+    expect(edits[0]).toContain("已完成");
     vi.useRealTimers();
   });
 
@@ -83,7 +44,6 @@ describe("LiveStatusController", () => {
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      remove: vi.fn(async () => {}),
     }, { botName: "Claude", delayMs: 0, stepMs: 5000, maxEdits: 20 });
 
     live.start("等待 OpenClaw 回复");
@@ -111,7 +71,6 @@ describe("LiveStatusController", () => {
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      remove: vi.fn(async () => {}),
     }, { botName: "Claude", delayMs: 0, stepMs: 5000, maxEdits: 20 });
 
     live.start("starting");
@@ -134,11 +93,9 @@ describe("LiveStatusController", () => {
   it("stops the ticker after complete()", async () => {
     vi.useFakeTimers();
     const edits: string[] = [];
-    const removes: string[] = [];
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
-      remove: vi.fn(async (id) => { removes.push(id); }),
     }, { botName: "Claude", delayMs: 0, stepMs: 1000, maxEdits: 20 });
 
     live.start("working");
@@ -146,10 +103,9 @@ describe("LiveStatusController", () => {
     await vi.advanceTimersByTimeAsync(1000);
     const editsAfterOneTick = edits.length;
     await live.complete();
-    expect(removes).toEqual(["msg1"]);
-    // No more tick edits after complete.
+    // One completion edit, then no more tick edits after complete.
     await vi.advanceTimersByTimeAsync(5000);
-    expect(edits.length).toBe(editsAfterOneTick);
+    expect(edits.length).toBe(editsAfterOneTick + 1);
     vi.useRealTimers();
   });
 });

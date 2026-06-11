@@ -1506,7 +1506,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const rowId = h.store.getMessageId("quota-error")!;
       expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(false);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("quota-error", expect.stringContaining("额度已用尽"));
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("quota-error", "FAIL");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("quota-error", "DONE");
     } finally { h.cleanup(); }
   });
 
@@ -1560,8 +1560,9 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(placeholderText).toMatch(/\d+:\d{2}/); // elapsed mm:ss
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");
-      // ...and the live status message is deleted (not overwritten with the answer).
-      expect((h.bot as any).deleteMessageById).toHaveBeenCalledWith("live-status-msg");
+      // ...and the live status message is marked done (not overwritten with the answer).
+      expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", expect.stringContaining("已完成"));
       expect((h.bot as any).editTextMessage).not.toHaveBeenCalledWith("live-status-msg", "最终回复");
       expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
     } finally {
@@ -1615,7 +1616,7 @@ describe("FeishuBot routing and queue behavior", () => {
 
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-session-msg", "FAIL");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-session-msg", "DONE");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-session-msg", expect.stringContaining("session 状态异常（killed）"));
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
@@ -1656,11 +1657,12 @@ describe("FeishuBot routing and queue behavior", () => {
 
       expect(h.openclaw.abortChat).toHaveBeenCalled();
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "FAIL");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "DONE");
       // recoverFromUnhealthySession replies the error via the normal path...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("session 状态异常（killed）"));
-      // ...and the live status placeholder is deleted (not overwritten with the error).
-      expect((h.bot as any).deleteMessageById).toHaveBeenCalledWith("live-killed-msg");
+      // ...and the live status placeholder is marked done (not overwritten with the error).
+      expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("已完成"));
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -1683,7 +1685,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
       expect((h.bot as any).removeReaction).toHaveBeenCalledWith("pending-killed", "Typing");
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("pending-killed", "FAIL");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("pending-killed", "DONE");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("pending-killed", expect.stringContaining("active | killed"));
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally { h.cleanup(); }
