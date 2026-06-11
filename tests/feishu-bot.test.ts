@@ -1524,12 +1524,13 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("uses a live status message in non-verbose mode and overwrites it with the final reply", async () => {
+  it("uses a live status message in non-verbose mode and finishes it after the final reply", async () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
     try {
       (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
       (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).deleteMessageById = vi.fn(async () => {});
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         await params.onSendAttempt?.();
@@ -1550,9 +1551,17 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(1000);
       await run;
 
-      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude 正在处理"));
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", "最终回复");
-      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("live-trigger", "最终回复");
+      // Live status placeholder is created as a separate message with colorful
+      // round spinner + elapsed timer + detail.
+      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude"));
+      const placeholderText = (h.bot as any).replyTextMessage.mock.calls[0][1];
+      expect(placeholderText).toMatch(/[\uD83D\uDD35\uD83D\uDFE2\uD83D\uDFE1\uD83D\uDFE0\uD83D\uDD34\uD83D\uDFE3]/); // colorful round emoji
+      expect(placeholderText).toMatch(/\d+:\d{2}/); // elapsed mm:ss
+      // ...the final reply goes through the normal interactive-card path (renders Markdown)...
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");
+      // ...and the live status message is deleted (not overwritten with the answer).
+      expect((h.bot as any).deleteMessageById).toHaveBeenCalledWith("live-status-msg");
+      expect((h.bot as any).editTextMessage).not.toHaveBeenCalledWith("live-status-msg", "最终回复");
       expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -1620,6 +1629,7 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       (h.bot as any).replyTextMessage = vi.fn(async () => "live-killed-msg");
       (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).deleteMessageById = vi.fn(async () => {});
       const sessionStatuses = ["active", "active", "killed"];
       h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "killed" } }));
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
@@ -1646,8 +1656,10 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.openclaw.abortChat).toHaveBeenCalled();
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "FAIL");
+      // recoverFromUnhealthySession replies the error via the normal path...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("session 状态异常（killed）"));
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("session 状态异常（killed）"));
+      // ...and the live status placeholder is deleted (not overwritten with the error).
+      expect((h.bot as any).deleteMessageById).toHaveBeenCalledWith("live-killed-msg");
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
       vi.useRealTimers();

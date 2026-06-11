@@ -1189,6 +1189,7 @@ export class FeishuBot {
           ? new LiveStatusController({
               create: (text) => this.sendOrdered(chatId, () => this.replyTextMessage(lastHuman.messageId || "", text)),
               edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
+              remove: (messageId) => this.sendOrdered(chatId, () => this.deleteMessageById(messageId)),
               warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
             }, { botName: this.config.name, locale: this.isEn(chatId) ? "en" : "zh" })
           : undefined;
@@ -1315,26 +1316,28 @@ export class FeishuBot {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
           } else {
             try {
-              const finalizedLive = shouldReply ? await liveStatus?.finalize(visibleReply) : false;
-              if (hasAttachments || !finalizedLive) {
-                if (!finalizedLive) liveStatus?.dispose();
-                await this.enqueueAndDispatchDelivery(
-                  chatId,
-                  "assistant_visible",
-                  this.deliverySourceId("visible", `${(finalizedLive ? "" : shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`),
-                  finalizedLive ? "" : shouldReply ? visibleReply : "",
-                  parsedReply.attachments,
-                  lastHuman.messageId,
-                  `trigger:${triggerId}`
-                );
-              }
+              // Final answer always goes through the normal interactive-card
+              // delivery path so Markdown renders correctly. The live status is a
+              // SEPARATE message: once the final reply is enqueued, finish the
+              // status message by deleting it (or marking it done as fallback).
+              await this.enqueueAndDispatchDelivery(
+                chatId,
+                "assistant_visible",
+                this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`),
+                shouldReply ? visibleReply : "",
+                parsedReply.attachments,
+                lastHuman.messageId,
+                `trigger:${triggerId}`
+              );
+              await liveStatus?.complete();
               // Mark every merged trigger as delivered so retries/restarts do
               // not re-process any of them.
-              for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, finalizedLive && liveStatus?.id ? liveStatus.id : lastHuman.messageId);
+              for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
             } catch (err) {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
               // that creates a second misleading "bot did not complete" message.
+              await liveStatus?.complete().catch(() => {});
               console.warn(`[${this.config.name}] assistant delivery failed after notification:`, this.errorSummary(err));
             }
           }
@@ -1366,23 +1369,26 @@ export class FeishuBot {
           const errorText = this.isEn(chatId)
             ? `⚠️ ${this.config.name} session is unhealthy (${err.status}). Stopped waiting. Please send /reset and retry.`
             : `⚠️ ${this.config.name} 的 session 状态异常（${err.status}）。已停止等待，请先发送 /reset 后重试。`;
-          await liveStatus?.fail(errorText);
+          // recoverFromUnhealthySession already replied to the user; just finish
+          // the live status message (delete or mark done).
+          void errorText;
+          await liveStatus?.complete().catch(() => {});
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
           break;
         }
         console.error(`[${this.config.name}] processQueue error:`, err);
         const errorText = this.formatUserVisibleError(err);
         if (lastHuman.messageId) {
-          const finalizedLiveError = await liveStatus?.fail(errorText);
-          if (finalizedLiveError) {
-            if (triggerId && liveStatus?.id) this.store.markDeliveredReply(this.config.name, chatId, triggerId, liveStatus.id);
-          } else {
-            await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
-              .then(() => {
-                if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
-              })
-              .catch(() => {});
-          }
+          // Error message goes through the normal delivery path; the live status
+          // is a separate message that we finish (delete/mark done) afterwards.
+          await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
+            .then(() => {
+              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+            })
+            .catch(() => {});
+          await liveStatus?.complete().catch(() => {});
+        } else {
+          await liveStatus?.complete().catch(() => {});
         }
         if (triggerId) {
           // At-most-once: if anything after send attempt failed, this batch has
@@ -1896,6 +1902,10 @@ export class FeishuBot {
         msg_type: "text",
       },
     });
+  }
+
+  private async deleteMessageById(messageId: string): Promise<void> {
+    await this.client.im.v1.message.delete({ path: { message_id: messageId } });
   }
 
   private async replyMessage(messageId: string, text: string): Promise<string | undefined> {
