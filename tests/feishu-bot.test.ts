@@ -1555,7 +1555,7 @@ describe("FeishuBot routing and queue behavior", () => {
       // meaningful tool-start progress (no timer/progress bar/edit count noise).
       expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude"));
       const placeholderText = (h.bot as any).replyTextMessage.mock.calls[0][1];
-      expect(placeholderText).toBe("Claude 正在执行：read: 读取 src/feishu-bot.ts");
+      expect(placeholderText).toBe("Claude 正在执行：read: 读取 src/feishu-bot.ts\n提示：调用 /livestatus off 关闭该状态提示");
       expect(placeholderText).not.toMatch(/\d+\/20/);
       expect(placeholderText).not.toMatch(/\d+:\d{2}/);
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...

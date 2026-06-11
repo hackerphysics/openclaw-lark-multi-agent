@@ -19,6 +19,7 @@ export type LiveStatusOptions = {
   delayMs?: number;
   maxChars?: number;
   maxEdits?: number;
+  disableHint?: string;
 };
 
 export class LiveStatusController {
@@ -119,7 +120,7 @@ export class LiveStatusController {
 
   private async ensureCreated(): Promise<void> {
     if (this.disabled || this.finalized || this.messageId) return;
-    const text = this.formatStatus();
+    const text = this.formatStatus(true);
     try {
       const id = await this.callbacks.create(text);
       if (!id) {
@@ -171,18 +172,14 @@ export class LiveStatusController {
     return detail ? `${event.name}: ${detail}` : event.name;
   }
 
-  private formatStatus(): string {
+  private formatStatus(includeDisableHint = false): string {
     const maxChars = this.opts.maxChars ?? DEFAULT_MAX_CHARS;
     const clean = (this.detail || "").replace(/\s+/g, " ").trim();
     const clipped = clean.length > maxChars ? `${clean.slice(0, Math.max(0, maxChars - 1))}\u2026` : clean;
-    if (!clipped) {
-      return this.opts.locale === "en"
-        ? `${this.opts.botName} is working`
-        : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
-    }
-    return this.opts.locale === "en"
-      ? `${this.opts.botName} is working: ${clipped}`
-      : `${this.opts.botName} \u6b63\u5728\u6267\u884c\uff1a${clipped}`;
+    const base = !clipped
+      ? (this.opts.locale === "en" ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`)
+      : (this.opts.locale === "en" ? `${this.opts.botName} is working: ${clipped}` : `${this.opts.botName} \u6b63\u5728\u6267\u884c\uff1a${clipped}`);
+    return includeDisableHint && this.opts.disableHint ? `${base}\n${this.opts.disableHint}` : base;
   }
 
   private formatLimitNotice(): string {

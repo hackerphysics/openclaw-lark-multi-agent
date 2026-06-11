@@ -640,7 +640,7 @@ export class FeishuBot {
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
-            `📡 /livestatus [on|off] — 开关非 verbose 下的单条覆盖式运行状态消息（默认开启）`,
+            `📡 /livestatus [on|off] — 开关非 verbose 下的单条覆盖式运行状态消息（默认开启；/livestatus off 可关闭）`,
             `🔓 /free [on|off] — 开关当前 bot 的 free 模式（仅非 Discuss 模式下影响普通消息主动回复）`,
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
@@ -1194,7 +1194,13 @@ export class FeishuBot {
               create: (text) => this.sendOrdered(chatId, () => this.replyTextMessage(lastHuman.messageId || "", text)),
               edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
               warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
-            }, { botName: this.config.name, locale: this.isEn(chatId) ? "en" : "zh" })
+            }, {
+              botName: this.config.name,
+              locale: this.isEn(chatId) ? "en" : "zh",
+              disableHint: this.isEn(chatId)
+                ? `Tip: send /livestatus off to hide this status message`
+                : `提示：调用 /livestatus off 关闭该状态提示`,
+            })
           : undefined;
         liveStatus?.start(this.isEn(chatId) ? "waiting for OpenClaw" : "等待 OpenClaw 回复");
         try {

@@ -74,6 +74,24 @@ describe("LiveStatusController", () => {
     vi.useRealTimers();
   });
 
+  it("adds the disable hint only to the first status message", async () => {
+    vi.useFakeTimers();
+    const created: string[] = [];
+    const edits: string[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async (text) => { created.push(text); return "msg1"; }),
+      edit: vi.fn(async (_id, text) => { edits.push(text); }),
+    }, { botName: "Claude", delayMs: 0, disableHint: "提示：调用 /livestatus off 关闭该状态提示" });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(created).toEqual(["Claude 正在执行\n提示：调用 /livestatus off 关闭该状态提示"]);
+
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: src/live-status.ts" });
+    expect(edits).toEqual(["Claude 正在执行：read: src/live-status.ts"]);
+    vi.useRealTimers();
+  });
+
   it("forces creation immediately when the first tool start arrives before delay", async () => {
     vi.useFakeTimers();
     const created: string[] = [];
