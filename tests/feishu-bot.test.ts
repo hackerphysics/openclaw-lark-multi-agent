@@ -1661,9 +1661,9 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "DONE");
       // stopForUnhealthySession warns but does not force /reset.
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("可以直接再发一条继续尝试"));
-      // ...and the live status placeholder is marked done (not overwritten with the error).
+      // ...and the live status placeholder is marked interrupted (not overwritten with the error).
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("已完成"));
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("执行中断"));
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
       vi.useRealTimers();

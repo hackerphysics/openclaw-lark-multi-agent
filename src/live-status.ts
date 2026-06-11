@@ -85,10 +85,18 @@ export class LiveStatusController {
 
   /**
    * Finish the live status when the run failed and the error is delivered by the
-   * normal path. Same policy as complete(): mark the status message done.
+   * normal path. Use a neutral/negative marker so it does not contradict the
+   * separately delivered error message.
    */
   async fail(): Promise<void> {
-    await this.complete();
+    this.finalized = true;
+    this.stopTimers();
+    if (this.createPromise) await this.createPromise.catch(() => {});
+    if (!this.messageId || this.disabled) return;
+    const failedText = this.opts.locale === "en"
+      ? `\u26A0\uFE0F ${this.opts.botName} stopped`
+      : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
+    await this.safeEdit(failedText, true);
   }
 
   dispose(): void {

@@ -18,6 +18,22 @@ describe("LiveStatusController", () => {
     vi.useRealTimers();
   });
 
+  it("marks the status message interrupted on fail", async () => {
+    vi.useFakeTimers();
+    const edits: string[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, text) => { edits.push(text); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start("starting");
+    await vi.advanceTimersByTimeAsync(0);
+    await live.fail();
+
+    expect(edits).toEqual(["⚠️ Claude 执行中断"]);
+    vi.useRealTimers();
+  });
+
   it("does not let a late progress edit run after complete()", async () => {
     vi.useFakeTimers();
     const edits: string[] = [];

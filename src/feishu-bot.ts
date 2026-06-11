@@ -1321,8 +1321,8 @@ export class FeishuBot {
             try {
               // Final answer always goes through the normal interactive-card
               // delivery path so Markdown renders correctly. The live status is a
-              // SEPARATE message: once the final reply is enqueued, finish the
-              // status message by deleting it (or marking it done as fallback).
+              // SEPARATE message: once the final reply is enqueued, mark the
+              // status message done.
               await this.enqueueAndDispatchDelivery(
                 chatId,
                 "assistant_visible",
@@ -1340,7 +1340,7 @@ export class FeishuBot {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
               // that creates a second misleading "bot did not complete" message.
-              await liveStatus?.complete().catch(() => {});
+              await liveStatus?.fail().catch(() => {});
               console.warn(`[${this.config.name}] assistant delivery failed after notification:`, this.errorSummary(err));
             }
           }
@@ -1369,10 +1369,10 @@ export class FeishuBot {
         this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
         if (err instanceof UnhealthySessionError) {
-          // stopForUnhealthySession already warned the user; just finish the live
-          // status message. The user can send another message to retry without
-          // being forced through /reset.
-          await liveStatus?.complete().catch(() => {});
+          // stopForUnhealthySession already warned the user; mark the live
+          // status as interrupted. The user can send another message to retry
+          // without being forced through /reset.
+          await liveStatus?.fail().catch(() => {});
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
           break;
         }
@@ -1380,15 +1380,15 @@ export class FeishuBot {
         const errorText = this.formatUserVisibleError(err);
         if (lastHuman.messageId) {
           // Error message goes through the normal delivery path; the live status
-          // is a separate message that we finish (mark done) afterwards.
+          // is a separate message that we mark interrupted afterwards.
           await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
             .then(() => {
               if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
             })
             .catch(() => {});
-          await liveStatus?.complete().catch(() => {});
+          await liveStatus?.fail().catch(() => {});
         } else {
-          await liveStatus?.complete().catch(() => {});
+          await liveStatus?.fail().catch(() => {});
         }
         if (triggerId) {
           // At-most-once: if anything after send attempt failed, this batch has
