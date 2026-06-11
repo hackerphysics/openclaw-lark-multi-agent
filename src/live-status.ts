@@ -1,11 +1,16 @@
 import type { ProgressEvent } from "./openclaw-client";
 
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
-const DEFAULT_THROTTLE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_THROTTLE_MS || 1200);
+// Minimum gap between progress-driven edits. Feishu caps a single message at 20
+// edits total (shared with the auto-tick below), so keep progress edits spaced
+// out to avoid burning the budget on a tool-heavy run.
+const DEFAULT_THROTTLE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_THROTTLE_MS || 5000);
 const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS || 120);
 // How often the status message auto-refreshes (elapsed time + spinner) even when
 // no new progress event arrives, so the user sees a live, advancing timer.
-const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS || 1000);
+// Feishu allows a message to be edited at most 20 times (code=230072 once
+// exhausted), so a 10s default keeps a single status message live for ~200s.
+const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS || 10000);
 // Colorful round spinner frames (instead of the black/white ◐◓◑◒).
 const SPINNER = ["\uD83D\uDD35", "\uD83D\uDFE2", "\uD83D\uDFE1", "\uD83D\uDFE0", "\uD83D\uDD34", "\uD83D\uDFE3"];
 
