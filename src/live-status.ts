@@ -1,10 +1,9 @@
 import type { ProgressEvent } from "./openclaw-client";
 
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
-// Minimum gap between progress-driven edits. Feishu caps a single message at 20
-// edits total (shared with the auto-tick below), so keep progress edits spaced
-// out to avoid burning the budget on a tool-heavy run.
-const DEFAULT_THROTTLE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_THROTTLE_MS || 5000);
+// Minimum gap between any two status edits. Feishu caps a single message at 20
+// edits total, so both progress-driven edits and auto-ticks share this budget.
+const DEFAULT_THROTTLE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_THROTTLE_MS || 10000);
 const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS || 120);
 // How often the status message auto-refreshes (elapsed time + spinner) even when
 // no new progress event arrives, so the user sees a live, advancing timer.
@@ -150,6 +149,7 @@ export class LiveStatusController {
     if (!this.messageId || this.disabled) return false;
     if (!force && this.finalized) return false;
     if (!force && text === this.lastSentText) return true;
+    if (!force && Date.now() - this.lastSentAt < (this.opts.throttleMs ?? DEFAULT_THROTTLE_MS)) return false;
     try {
       await this.callbacks.edit(this.messageId, text);
       this.lastSentText = text;

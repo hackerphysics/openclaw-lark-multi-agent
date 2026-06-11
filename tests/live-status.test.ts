@@ -102,6 +102,31 @@ describe("LiveStatusController", () => {
     vi.useRealTimers();
   });
 
+  it("shares the throttle budget between progress edits and auto-ticks", async () => {
+    vi.useFakeTimers();
+    const edits: string[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, text) => { edits.push(text); }),
+      remove: vi.fn(async () => {}),
+    }, { botName: "Claude", delayMs: 0, throttleMs: 10000, tickMs: 10000 });
+
+    live.start("starting");
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress("progress at 5s should be throttled");
+    await vi.advanceTimersByTimeAsync(5000);
+    await live.progress("still throttled before 10s");
+    expect(edits).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(edits.length).toBe(1);
+    await live.progress("immediate progress after tick should also be throttled");
+    expect(edits.length).toBe(1);
+
+    await live.complete();
+    vi.useRealTimers();
+  });
+
   it("stops the ticker after complete()", async () => {
     vi.useFakeTimers();
     const edits: string[] = [];
