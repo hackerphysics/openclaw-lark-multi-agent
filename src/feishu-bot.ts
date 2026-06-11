@@ -511,7 +511,7 @@ export class FeishuBot {
       }
 
       const preliminaryCommandName = cleanText.trim().split(/\s+/)[0]?.toLowerCase() || "";
-      const preliminaryBridgeCommands = new Set(["/help", "/status", "/compact", "/reset", "/stop", "/verbose", "/free", "/mute", "/mode", "/model", "/models", "/discuss", "/chairman", "/locale"]);
+      const preliminaryBridgeCommands = new Set(["/help", "/status", "/compact", "/reset", "/stop", "/verbose", "/livestatus", "/free", "/mute", "/mode", "/model", "/models", "/discuss", "/chairman", "/locale"]);
       const isPreliminaryBridgeCommand = !isNativeOpenClawCommand && preliminaryBridgeCommands.has(preliminaryCommandName);
 
       // --- Record to local store (ALL messages, before command/response checks) ---
@@ -640,6 +640,7 @@ export class FeishuBot {
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
+            `📡 /livestatus [on|off] — 开关非 verbose 下的单条覆盖式运行状态消息（默认开启）`,
             `🔓 /free [on|off] — 开关当前 bot 的 free 模式（仅非 Discuss 模式下影响普通消息主动回复）`,
             `🤐 /mute   — 切换当前 bot 的 mute 模式（禁言，不转发 OpenClaw）`,
             `🎛️ /mode   — 查看当前 bot 在当前群聊的模式`,
@@ -724,6 +725,18 @@ export class FeishuBot {
           } else {
             await this.replyMessage(messageId, `🔊 ${this.config.name} Verbose 已开启\n只影响当前 Bot 在当前会话的 Tool call 和中间文本显示`);
           }
+          markCommandSynced();
+          return;
+        }
+        if (commandName === "/livestatus") {
+          const current = this.store.getBotLiveStatus(this.config.name, chatId);
+          const parts = cleanText.trim().split(/\s+/);
+          const arg = (parts[1] || "toggle").toLowerCase();
+          const next = arg === "on" ? true : arg === "off" ? false : !current;
+          this.store.setBotLiveStatus(this.config.name, chatId, next);
+          await this.replyMessage(messageId, next
+            ? `📡 ${this.config.name} Live Status 已开启\n非 verbose 模式下会用一条可覆盖消息显示运行状态，并在最终回复时覆盖成答案。`
+            : `📡 ${this.config.name} Live Status 已关闭\n非 verbose 模式下只发送最终回复。`);
           markCommandSynced();
           return;
         }
@@ -923,6 +936,7 @@ export class FeishuBot {
   private shouldUseLiveStatus(chatId: string, isNativeCommandTrigger = false): boolean {
     if (isNativeCommandTrigger) return false;
     if (this.store.getBotVerbose(this.config.name, chatId)) return false;
+    if (!this.store.getBotLiveStatus(this.config.name, chatId)) return false;
     return process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS !== "0";
   }
 
@@ -1173,8 +1187,8 @@ export class FeishuBot {
         };
         liveStatus = this.shouldUseLiveStatus(chatId, isNativeCommandTrigger)
           ? new LiveStatusController({
-              create: (text) => this.replyTextMessage(lastHuman.messageId || "", text),
-              edit: (messageId, text) => this.editTextMessage(messageId, text),
+              create: (text) => this.sendOrdered(chatId, () => this.replyTextMessage(lastHuman.messageId || "", text)),
+              edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
               warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
             }, { botName: this.config.name, locale: this.isEn(chatId) ? "en" : "zh" })
           : undefined;
@@ -1587,7 +1601,7 @@ export class FeishuBot {
   private isLegacyBridgeControlMessage(text: string): boolean {
     const t = text.trim();
     if (!t) return false;
-    return /^\/(help|status|compact|reset|stop|verbose|free|mute|mode|model|models|discuss|chairman|locale)(\s|$)/i.test(t)
+    return /^\/(help|status|compact|reset|stop|verbose|livestatus|free|mute|mode|model|models|discuss|chairman|locale)(\s|$)/i.test(t)
       || this.isBridgeControlReply(t);
   }
 
@@ -2113,10 +2127,10 @@ export class FeishuBot {
    * Enqueue a message send to guarantee ordering per chat.
    * All sends for a chat are serialized through this.
    */
-  private sendOrdered(chatId: string, fn: () => Promise<void>): Promise<void> {
+  private sendOrdered<T = void>(chatId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.sendQueue.get(chatId) || Promise.resolve();
     const next = prev.then(fn, fn); // run even if previous failed
-    this.sendQueue.set(chatId, next);
+    this.sendQueue.set(chatId, next.then(() => undefined, () => undefined));
     return next;
   }
 
@@ -2360,6 +2374,7 @@ export class FeishuBot {
     const status = session?.status || "unknown";
 
     const verboseStatus = this.store.getBotVerbose(this.config.name, chatId) ? "🔊 开启" : "🔇 关闭";
+    const liveStatus = this.store.getBotLiveStatus(this.config.name, chatId) ? "📡 开启" : "📴 关闭";
     const mode = chatType === "p2p" ? "normal" : this.store.getBotMode(this.config.name, chatId);
     const chairman = chatType === "p2p" ? "" : this.store.getChairmanBot(chatId);
     const chairmanStatus = chatType === "p2p"
@@ -2382,6 +2397,7 @@ export class FeishuBot {
       `🧮 上下文: ${fmtK(totalTokens)} / ${fmtK(contextTokens)} (${usedPct}%)${tokenNote}`,
       `📥 输入: ${fmtK(inputTokens)} | 📤 输出: ${fmtK(outputTokens)}`,
       `🔧 Verbose: ${verboseStatus}`,
+      `📡 Live Status: ${liveStatus}`,
       `🎛️ Mode: ${mode}`,
       `👑 Chairman: ${chairmanStatus}`,
       `🌐 Locale: ${localeStatus}`,

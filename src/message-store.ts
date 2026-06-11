@@ -160,6 +160,7 @@ export class MessageStore {
         bot_name TEXT NOT NULL,
         chat_id TEXT NOT NULL,
         verbose INTEGER NOT NULL DEFAULT 0,
+        live_status INTEGER NOT NULL DEFAULT 1,
         free_discussion INTEGER NOT NULL DEFAULT 0,
         mode TEXT NOT NULL DEFAULT 'normal',
         updated_at INTEGER NOT NULL DEFAULT 0,
@@ -191,6 +192,13 @@ export class MessageStore {
       );
       CREATE INDEX IF NOT EXISTS idx_delivery_outbox_pending ON delivery_outbox(status, created_at);
     `);
+
+    // Migration: add per-bot live status toggle if missing
+    try {
+      this.db.exec(`ALTER TABLE bot_chat_settings ADD COLUMN live_status INTEGER NOT NULL DEFAULT 1`);
+    } catch {
+      // Column already exists
+    }
 
     // Migration: add delivery_outbox delivery key columns if missing
     try {
@@ -788,6 +796,24 @@ export class MessageStore {
       WHERE bot_name = ? AND chat_id = ?
     `).get(botName, chatId) as any;
     return !!row?.verbose;
+  }
+
+  setBotLiveStatus(botName: string, chatId: string, on: boolean): void {
+    this.db.prepare(`
+      INSERT INTO bot_chat_settings (bot_name, chat_id, live_status, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT (bot_name, chat_id) DO UPDATE SET
+        live_status = excluded.live_status,
+        updated_at = excluded.updated_at
+    `).run(botName, chatId, on ? 1 : 0, Date.now());
+  }
+
+  getBotLiveStatus(botName: string, chatId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT live_status FROM bot_chat_settings
+      WHERE bot_name = ? AND chat_id = ?
+    `).get(botName, chatId) as any;
+    return row ? row.live_status !== 0 : true;
   }
 
   setBotMode(botName: string, chatId: string, mode: BotChatMode): void {

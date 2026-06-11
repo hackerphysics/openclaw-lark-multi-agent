@@ -1052,6 +1052,58 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("toggles live status per bot per chat and reports it in status", async () => {
+    const h = makeHarness("Claude");
+    try {
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/livestatus off", messageId: "live-off" }));
+      expect(h.store.getBotLiveStatus("Claude", "chat1")).toBe(false);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-off", expect.stringContaining("Live Status 已关闭"));
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/status", messageId: "live-status" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-status", expect.stringContaining("📡 Live Status: 📴 关闭"));
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/livestatus on", messageId: "live-on" }));
+      expect(h.store.getBotLiveStatus("Claude", "chat1")).toBe(true);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-on", expect.stringContaining("Live Status 已开启"));
+    } finally {
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("does not create live status when /livestatus is off", async () => {
+    const h = makeHarness("Claude");
+    try {
+      h.store.setBotLiveStatus("Claude", "chat1", false);
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.();
+        await params.onSubmitted?.("run-live-off");
+        await params.onProgress?.({ kind: "tool", phase: "start", name: "read", text: "读取文件" });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return "最终回复";
+      });
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "看一下代码",
+        messageId: "live-off-trigger",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+
+      expect((h.bot as any).replyTextMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).editTextMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-off-trigger", "最终回复");
+    } finally {
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
   it("reports mode locally", async () => {
     const h = makeHarness("GPT");
     try {
