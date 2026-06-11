@@ -10,7 +10,7 @@ describe("LiveStatusController", () => {
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       remove: vi.fn(async (id) => { removed.push(id); }),
-    }, { botName: "Claude", delayMs: 0, throttleMs: 0 });
+    }, { botName: "Claude", delayMs: 0 });
 
     live.start("starting");
     await vi.advanceTimersByTimeAsync(0);
@@ -29,7 +29,7 @@ describe("LiveStatusController", () => {
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       // no remove callback
-    }, { botName: "Claude", delayMs: 0, throttleMs: 0 });
+    }, { botName: "Claude", delayMs: 0 });
 
     live.start("starting");
     await vi.advanceTimersByTimeAsync(0);
@@ -47,7 +47,7 @@ describe("LiveStatusController", () => {
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       remove: vi.fn(async () => { throw new Error("recall not allowed"); }),
-    }, { botName: "Claude", delayMs: 0, throttleMs: 0 });
+    }, { botName: "Claude", delayMs: 0 });
 
     live.start("starting");
     await vi.advanceTimersByTimeAsync(0);
@@ -65,7 +65,7 @@ describe("LiveStatusController", () => {
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       remove: vi.fn(async () => {}),
-    }, { botName: "Claude", delayMs: 0, throttleMs: 0 });
+    }, { botName: "Claude", delayMs: 0 });
 
     live.start("starting");
     await vi.advanceTimersByTimeAsync(0);
@@ -77,51 +77,55 @@ describe("LiveStatusController", () => {
     vi.useRealTimers();
   });
 
-  it("auto-refreshes elapsed time on a tick even without new progress", async () => {
+  it("auto-refreshes on an arithmetic-progression schedule (5s, 10s, 15s ...)", async () => {
     vi.useFakeTimers();
     const edits: string[] = [];
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       remove: vi.fn(async () => {}),
-    }, { botName: "Claude", delayMs: 0, throttleMs: 0, tickMs: 1000 });
+    }, { botName: "Claude", delayMs: 0, stepMs: 5000, maxEdits: 20 });
 
     live.start("等待 OpenClaw 回复");
     await vi.advanceTimersByTimeAsync(0); // fire create timer
-    // No progress() calls at all — only the ticker should refresh.
+    // First refresh gap = 1*5s.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(edits.length).toBe(1);
+    // Second refresh gap = 2*5s = 10s.
+    await vi.advanceTimersByTimeAsync(9000);
+    expect(edits.length).toBe(1); // not yet (only 9s elapsed since 1st)
     await vi.advanceTimersByTimeAsync(1000);
-    await vi.advanceTimersByTimeAsync(1000);
+    expect(edits.length).toBe(2);
 
-    // At least two tick edits happened, and elapsed advanced (0:01, 0:02 ...).
-    expect(edits.length).toBeGreaterThanOrEqual(2);
-    expect(edits.some((t) => /0:0[12]/.test(t))).toBe(true);
-    // Colorful round spinner present.
-    expect(edits.every((t) => /[\uD83D\uDD35\uD83D\uDFE2\uD83D\uDFE1\uD83D\uDFE0\uD83D\uDD34\uD83D\uDFE3]/.test(t))).toBe(true);
+    // Progress bar present, elapsed advanced, edit count shown.
+    expect(edits.every((t) => /[\u2588\u2591]/.test(t))).toBe(true);
+    expect(edits.some((t) => /\d+\/20/.test(t))).toBe(true);
 
     await live.complete();
     vi.useRealTimers();
   });
 
-  it("shares the throttle budget between progress edits and auto-ticks", async () => {
+  it("progress() only updates detail; edits are driven by the scheduler", async () => {
     vi.useFakeTimers();
     const edits: string[] = [];
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       remove: vi.fn(async () => {}),
-    }, { botName: "Claude", delayMs: 0, throttleMs: 10000, tickMs: 10000 });
+    }, { botName: "Claude", delayMs: 0, stepMs: 5000, maxEdits: 20 });
 
     live.start("starting");
     await vi.advanceTimersByTimeAsync(0);
-    await live.progress("progress at 5s should be throttled");
-    await vi.advanceTimersByTimeAsync(5000);
-    await live.progress("still throttled before 10s");
-    expect(edits).toEqual([]);
+    // A burst of progress events must NOT each trigger an edit.
+    await live.progress("step a");
+    await live.progress("step b");
+    await live.progress("step c");
+    expect(edits).toEqual([]); // no scheduled tick has fired yet
 
+    // First scheduled refresh at 5s picks up the latest detail.
     await vi.advanceTimersByTimeAsync(5000);
     expect(edits.length).toBe(1);
-    await live.progress("immediate progress after tick should also be throttled");
-    expect(edits.length).toBe(1);
+    expect(edits[0]).toContain("step c");
 
     await live.complete();
     vi.useRealTimers();
@@ -135,7 +139,7 @@ describe("LiveStatusController", () => {
       create: vi.fn(async () => "msg1"),
       edit: vi.fn(async (_id, text) => { edits.push(text); }),
       remove: vi.fn(async (id) => { removes.push(id); }),
-    }, { botName: "Claude", delayMs: 0, throttleMs: 0, tickMs: 1000 });
+    }, { botName: "Claude", delayMs: 0, stepMs: 1000, maxEdits: 20 });
 
     live.start("working");
     await vi.advanceTimersByTimeAsync(0);

@@ -1551,11 +1551,12 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(1000);
       await run;
 
-      // Live status placeholder is created as a separate message with colorful
-      // round spinner + elapsed timer + detail.
+      // Live status placeholder is created as a separate message with a
+      // progress bar + edit count + elapsed timer + detail.
       expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude"));
       const placeholderText = (h.bot as any).replyTextMessage.mock.calls[0][1];
-      expect(placeholderText).toMatch(/[\uD83D\uDD35\uD83D\uDFE2\uD83D\uDFE1\uD83D\uDFE0\uD83D\uDD34\uD83D\uDFE3]/); // colorful round emoji
+      expect(placeholderText).toMatch(/[\u2588\u2591]/); // progress bar cells
+      expect(placeholderText).toMatch(/\d+\/20/); // edit budget count
       expect(placeholderText).toMatch(/\d+:\d{2}/); // elapsed mm:ss
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");
