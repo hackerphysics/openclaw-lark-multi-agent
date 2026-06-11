@@ -1555,7 +1555,7 @@ describe("FeishuBot routing and queue behavior", () => {
       // progress bar + edit count + elapsed timer + detail.
       expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude"));
       const placeholderText = (h.bot as any).replyTextMessage.mock.calls[0][1];
-      expect(placeholderText).toMatch(/[\u2588\u2591]/); // progress bar cells
+      expect(placeholderText).toMatch(/[\u2B1C]|\uD83D[\uDFE9\uDFE8\uDFE5]/); // colored progress bar cells
       expect(placeholderText).toMatch(/\d+\/20/); // edit budget count
       expect(placeholderText).toMatch(/\d+:\d{2}/); // elapsed mm:ss
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...

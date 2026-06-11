@@ -10,8 +10,9 @@ const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STAT
 const DEFAULT_STEP_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_STEP_MS || 5000);
 const DEFAULT_MAX_EDITS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_EDITS || 20);
 // Width (in cells) of the horizontal progress bar that shows how much of the
-// edit-refresh budget has been consumed.
-const PROGRESS_BAR_CELLS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_BAR_CELLS || 10);
+// edit-refresh budget has been consumed. Colored emoji blocks are wider than
+// plain block chars, so keep this modest to avoid line wrapping on mobile.
+const PROGRESS_BAR_CELLS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_BAR_CELLS || 8);
 
 export type LiveStatusCallbacks = {
   create: (text: string) => Promise<string | undefined>;
@@ -194,13 +195,25 @@ export class LiveStatusController {
     return `${m}:${String(s).padStart(2, "0")}`;
   }
 
-  /** Horizontal progress bar showing how much of the edit budget is consumed. */
+  /**
+   * Horizontal progress bar showing how much of the edit budget is consumed.
+   * Uses colored emoji blocks (Feishu text cannot color plain characters): the
+   * filled portion shifts green -> yellow -> red as the budget runs out, so the
+   * bar doubles as a "refresh budget almost gone" signal.
+   */
   private progressBar(): string {
     const maxEdits = this.opts.maxEdits ?? DEFAULT_MAX_EDITS;
     const cells = PROGRESS_BAR_CELLS;
     const ratio = maxEdits > 0 ? Math.min(1, this.editCount / maxEdits) : 1;
     const filled = Math.min(cells, Math.round(ratio * cells));
-    return `${"\u2588".repeat(filled)}${"\u2591".repeat(Math.max(0, cells - filled))}`;
+    let bar = "";
+    for (let i = 0; i < cells; i++) {
+      if (i >= filled) { bar += "\u2B1C"; continue; } // ⬜ white box (empty)
+      const r = i / cells;
+      // 🟩 green / 🟨 yellow / 🟥 red
+      bar += r < 0.5 ? "\uD83D\uDFE9" : r < 0.8 ? "\uD83D\uDFE8" : "\uD83D\uDFE5";
+    }
+    return bar;
   }
 
   private formatStatus(exhausted = false): string {

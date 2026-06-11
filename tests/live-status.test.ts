@@ -98,7 +98,7 @@ describe("LiveStatusController", () => {
     expect(edits.length).toBe(2);
 
     // Progress bar present, elapsed advanced, edit count shown.
-    expect(edits.every((t) => /[\u2588\u2591]/.test(t))).toBe(true);
+    expect(edits.every((t) => /[\u2B1C]|\uD83D[\uDFE9\uDFE8\uDFE5]/.test(t))).toBe(true);
     expect(edits.some((t) => /\d+\/20/.test(t))).toBe(true);
 
     await live.complete();
