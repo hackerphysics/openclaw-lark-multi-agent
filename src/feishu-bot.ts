@@ -1363,6 +1363,10 @@ export class FeishuBot {
         this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
         if (err instanceof UnhealthySessionError) {
+          const errorText = this.isEn(chatId)
+            ? `⚠️ ${this.config.name} session is unhealthy (${err.status}). Stopped waiting. Please send /reset and retry.`
+            : `⚠️ ${this.config.name} 的 session 状态异常（${err.status}）。已停止等待，请先发送 /reset 后重试。`;
+          await liveStatus?.fail(errorText);
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
           break;
         }

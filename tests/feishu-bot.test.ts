@@ -1618,6 +1618,8 @@ describe("FeishuBot routing and queue behavior", () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
     try {
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-killed-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
       const sessionStatuses = ["active", "active", "killed"];
       h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "killed" } }));
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
@@ -1636,6 +1638,8 @@ describe("FeishuBot routing and queue behavior", () => {
       }));
       await vi.advanceTimersByTimeAsync(0);
       expect(h.openclaw.chatCalls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(800);
+      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("等待 OpenClaw 回复"));
       await vi.advanceTimersByTimeAsync(5_000);
       await run;
 
@@ -1643,6 +1647,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "FAIL");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("session 状态异常（killed）"));
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("session 状态异常（killed）"));
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
       vi.useRealTimers();

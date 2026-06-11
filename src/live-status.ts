@@ -101,6 +101,7 @@ export class LiveStatusController {
 
   private async safeEdit(text: string, force = false): Promise<boolean> {
     if (!this.messageId || this.disabled) return false;
+    if (!force && this.finalized) return false;
     if (!force && text === this.lastSentText) return true;
     try {
       await this.callbacks.edit(this.messageId, text);
