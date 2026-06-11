@@ -6,6 +6,11 @@ import { OpenClawConfig } from "./config.js";
 import { ChatMessage } from "./message-store.js";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 
+export type ProgressEvent =
+  | { kind: "tool"; phase: "start" | "end" | "error"; name: string; text: string }
+  | { kind: "assistant_note"; text: string }
+  | { kind: "lifecycle"; text: string };
+
 export type ChatAttachment = {
   type?: string;
   mimeType?: string;
@@ -47,6 +52,7 @@ export class OpenClawClient {
   private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
   private lastToolNamesByItemId: Map<string, string> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: { sourceType?: string }) => void> = new Map();
+  private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
   /** Sessions where verbose mode should deliver visible transcript text even when mixed with tool blocks. */
   private verboseTranscriptSessions: Set<string> = new Set();
   private verboseAssistantTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -260,11 +266,16 @@ export class OpenClawClient {
             this.clearVerboseAssistantState(rawKey);
           }
 
-          if (toolCb && data.kind === "tool" && data.name && (data.phase === "start" || data.phase === "end" || data.phase === "error")) {
+          if (data.kind === "tool" && data.name && (data.phase === "start" || data.phase === "end" || data.phase === "error")) {
             const phase = data.phase || "event";
             const meta = data.meta || data.input || data.args || "";
             const output = data.output || data.result || data.error || "";
-            toolCb(`${data.name} ${phase}`.trim(), String(meta || ""), String(output || ""));
+            if (toolCb) toolCb(`${data.name} ${phase}`.trim(), String(meta || ""), String(output || ""));
+            const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+            if (progressCb) {
+              const detail = phase === "start" ? String(meta || "") : String(output || meta || "");
+              void progressCb({ kind: "tool", phase, name: String(data.name), text: `${data.name} ${phase}${detail ? `: ${detail}` : ""}` });
+            }
           }
         }
         if (frame.event === "agent" && frame.payload?.stream === "command_output") {
@@ -368,10 +379,11 @@ export class OpenClawClient {
   }
 
   private flushVerboseAssistantState(rawKey: string): boolean {
-    if (!this.isVerboseTranscriptEnabled(rawKey)) return false;
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-    if (!cb) return false;
+    const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+    if (!this.isVerboseTranscriptEnabled(rawKey) && !progressCb) return false;
+    if (!cb && !progressCb) return false;
     const key = rawKey;
     const latest = this.verboseAssistantLatest.get(key)?.trim() || "";
     if (!latest) return false;
@@ -383,16 +395,19 @@ export class OpenClawClient {
     }
     if (!toSend) return false;
     this.verboseAssistantSent.set(key, latest);
-    cb(toSend, { sourceType: "verbose_transcript" });
+    if (this.isVerboseTranscriptEnabled(rawKey) && cb) cb(toSend, { sourceType: "verbose_transcript" });
+    if (progressCb) void progressCb({ kind: "assistant_note", text: toSend });
     return true;
   }
 
   private handleVerboseAssistantStream(payload: any): void {
     const rawKey = payload?.sessionKey || "";
-    if (!rawKey || !this.isVerboseTranscriptEnabled(rawKey)) return;
+    if (!rawKey) return;
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-    if (!cb) return;
+    const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+    if (!this.isVerboseTranscriptEnabled(rawKey) && !progressCb) return;
+    if (!cb && !progressCb) return;
     const data = payload.data || {};
     const fullText = typeof data.text === "string" ? data.text : typeof data.deltaText === "string" && data.replace ? data.deltaText : "";
     const deltaText = !fullText && typeof data.delta === "string" ? data.delta : !fullText && typeof data.deltaText === "string" ? data.deltaText : "";
@@ -1077,6 +1092,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     onSendAttempt?: () => void | Promise<void>;
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the user message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
+    onProgress?: (event: ProgressEvent) => void | Promise<void>;
   }): Promise<string> {
     const sk = params.sessionKey;
     const fullSessionKey = `agent:main:${sk}`;
@@ -1107,12 +1123,19 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       }
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       await params.onSubmitted?.(result.runId);
+      if (params.onProgress) {
+        this.progressCallbacks.set(sk, params.onProgress);
+        this.progressCallbacks.set(fullSessionKey, params.onProgress);
+        void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
+      }
       return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message });
     } finally {
       // OpenClaw can emit the final assistant session.message a moment after
       // collectReply returns. Keep a short grace window so normal chat replies
       // are not delivered twice via the proactive-message path. Cron/LMA runs
       // are unaffected because they do not go through chatSend.
+      this.progressCallbacks.delete(sk);
+      this.progressCallbacks.delete(fullSessionKey);
       this.releaseSuppressedSessionKeysAfter(suppressedKeys, 30000);
       this.releaseOwnedDeliverySessionKeysAfter(suppressedKeys, 30000);
     }
@@ -1162,6 +1185,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     onSendAttempt?: () => void | Promise<void>;
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the combined message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
+    onProgress?: (event: ProgressEvent) => void | Promise<void>;
   }): Promise<string> {
     const includeContext = params.includeContext !== false;
     const includeBridgeAttachmentHint = params.includeBridgeAttachmentHint !== false;
@@ -1183,6 +1207,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         emptyFinalAsNoReply: params.emptyFinalAsNoReply,
         onSendAttempt: params.onSendAttempt,
         onSubmitted: params.onSubmitted,
+        onProgress: params.onProgress,
       });
     }
 
@@ -1220,6 +1245,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       emptyFinalAsNoReply: params.emptyFinalAsNoReply,
       onSendAttempt: params.onSendAttempt,
       onSubmitted: params.onSubmitted,
+      onProgress: params.onProgress,
     });
   }
 

@@ -3,6 +3,7 @@ import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
+import { LiveStatusController } from "./live-status.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve } from "path";
@@ -919,6 +920,12 @@ export class FeishuBot {
     }
   }
 
+  private shouldUseLiveStatus(chatId: string, isNativeCommandTrigger = false): boolean {
+    if (isNativeCommandTrigger) return false;
+    if (this.store.getBotVerbose(this.config.name, chatId)) return false;
+    return process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS !== "0";
+  }
+
   private async getUnhealthySessionStatus(chatId: string): Promise<string | null> {
     const sessionKey = this.getSessionKey(chatId);
     try {
@@ -1146,6 +1153,7 @@ export class FeishuBot {
       }
 
       let runAcceptedByOpenClaw = false;
+      let liveStatus: LiveStatusController | undefined;
       try {
         const releaseActiveDeliveryTarget = lastHuman.messageId ? this.setActiveDeliveryTarget(chatId, triggerId, lastHuman.messageId) : () => {};
         let reply: string;
@@ -1163,6 +1171,14 @@ export class FeishuBot {
             currentMarkedSubmitted = true;
           }
         };
+        liveStatus = this.shouldUseLiveStatus(chatId, isNativeCommandTrigger)
+          ? new LiveStatusController({
+              create: (text) => this.replyTextMessage(lastHuman.messageId || "", text),
+              edit: (messageId, text) => this.editTextMessage(messageId, text),
+              warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
+            }, { botName: this.config.name, locale: this.isEn(chatId) ? "en" : "zh" })
+          : undefined;
+        liveStatus?.start(this.isEn(chatId) ? "waiting for OpenClaw" : "等待 OpenClaw 回复");
         try {
           reply = await this.withSessionHealthMonitor(chatId, lastHuman.messageId || "", triggerId, this.openclawClient.chatSendWithContext({
             sessionKey,
@@ -1188,6 +1204,7 @@ export class FeishuBot {
               // INSERT OR IGNORE in message_sync.
               markSubmittedBatch(`submitted:${runId}`);
             },
+            onProgress: (event) => liveStatus?.progress(event),
           }));
         } finally {
           // OpenClaw may emit the final assistant session.message just after
@@ -1210,6 +1227,7 @@ export class FeishuBot {
           // submitted far enough that auto-replaying risks duplicate delivery.
           // The user can resend a new message if they want to retry.
           markSubmittedBatch("empty-returned");
+          liveStatus?.dispose();
           console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; not replaying submitted message(s)`);
           const pendingAcks = this.pendingAckMessages.get(chatId) || [];
           const remainingAcks: typeof pendingAcks = [];
@@ -1283,10 +1301,22 @@ export class FeishuBot {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
           } else {
             try {
-              await this.enqueueAndDispatchDelivery(chatId, "assistant_visible", this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`), shouldReply ? visibleReply : "", parsedReply.attachments, lastHuman.messageId, `trigger:${triggerId}`);
+              const finalizedLive = shouldReply ? await liveStatus?.finalize(visibleReply) : false;
+              if (hasAttachments || !finalizedLive) {
+                if (!finalizedLive) liveStatus?.dispose();
+                await this.enqueueAndDispatchDelivery(
+                  chatId,
+                  "assistant_visible",
+                  this.deliverySourceId("visible", `${(finalizedLive ? "" : shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`),
+                  finalizedLive ? "" : shouldReply ? visibleReply : "",
+                  parsedReply.attachments,
+                  lastHuman.messageId,
+                  `trigger:${triggerId}`
+                );
+              }
               // Mark every merged trigger as delivered so retries/restarts do
               // not re-process any of them.
-              for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
+              for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, finalizedLive && liveStatus?.id ? liveStatus.id : lastHuman.messageId);
             } catch (err) {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
@@ -1296,7 +1326,10 @@ export class FeishuBot {
           }
         }
         if (isRuntimeFailure && lastHuman.messageId) {
+          liveStatus?.dispose();
           this.scheduleDelayedFailure(chatId, lastHuman.messageId, visibleReply, triggerId);
+        } else if (!shouldReply && !hasAttachments) {
+          liveStatus?.dispose();
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 
@@ -1322,11 +1355,16 @@ export class FeishuBot {
         console.error(`[${this.config.name}] processQueue error:`, err);
         const errorText = this.formatUserVisibleError(err);
         if (lastHuman.messageId) {
-          await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
-            .then(() => {
-              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
-            })
-            .catch(() => {});
+          const finalizedLiveError = await liveStatus?.fail(errorText);
+          if (finalizedLiveError) {
+            if (triggerId && liveStatus?.id) this.store.markDeliveredReply(this.config.name, chatId, triggerId, liveStatus.id);
+          } else {
+            await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
+              .then(() => {
+                if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+              })
+              .catch(() => {});
+          }
         }
         if (triggerId) {
           // At-most-once: if anything after send attempt failed, this batch has
@@ -1821,26 +1859,49 @@ export class FeishuBot {
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
   }
 
-  private async replyMessage(messageId: string, text: string) {
+  private async replyTextMessage(messageId: string, text: string): Promise<string | undefined> {
+    const res = await this.client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify({ text }),
+        msg_type: "text",
+      },
+    });
+    return (res as any)?.data?.message_id || (res as any)?.message_id;
+  }
+
+  private async editTextMessage(messageId: string, text: string): Promise<void> {
+    await this.client.im.v1.message.update({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify({ text }),
+        msg_type: "text",
+      },
+    });
+  }
+
+  private async replyMessage(messageId: string, text: string): Promise<string | undefined> {
     // Use Feishu CardKit v2 markdown component for full Markdown rendering.
     const card = this.buildMarkdownCard(text);
     try {
-      await this.client.im.message.reply({
+      const res = await this.client.im.message.reply({
         path: { message_id: messageId },
         data: {
           content: JSON.stringify(card),
           msg_type: "interactive",
         },
       });
+      return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch {
       // Fallback to plain text if card fails
-      await this.client.im.message.reply({
+      const res = await this.client.im.message.reply({
         path: { message_id: messageId },
         data: {
           content: JSON.stringify({ text }),
           msg_type: "text",
         },
       });
+      return (res as any)?.data?.message_id || (res as any)?.message_id;
     }
   }
 
@@ -2016,10 +2077,10 @@ export class FeishuBot {
   /**
    * Send a proactive message to a chat (not a reply).
    */
-  private async sendMessage(chatId: string, text: string) {
+  private async sendMessage(chatId: string, text: string): Promise<string | undefined> {
     const card = this.buildMarkdownCard(text);
     try {
-      await this.client.im.message.create({
+      const res = await this.client.im.message.create({
         params: { receive_id_type: "chat_id" },
         data: {
           receive_id: chatId,
@@ -2027,11 +2088,12 @@ export class FeishuBot {
           msg_type: "interactive",
         },
       });
+      return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch (err) {
       console.warn(`[${this.config.name}] sendMessage interactive failed:`, JSON.stringify((err as any)?.response?.data || (err as any)?.data || { message: (err as Error).message }));
       // Fallback to plain text
       try {
-        await this.client.im.message.create({
+        const res = await this.client.im.message.create({
           params: { receive_id_type: "chat_id" },
           data: {
             receive_id: chatId,
@@ -2039,6 +2101,7 @@ export class FeishuBot {
             msg_type: "text",
           },
         });
+        return (res as any)?.data?.message_id || (res as any)?.message_id;
       } catch (fallbackErr) {
         console.warn(`[${this.config.name}] sendMessage text failed:`, JSON.stringify((fallbackErr as any)?.response?.data || (fallbackErr as any)?.data || { message: (fallbackErr as Error).message }));
         throw fallbackErr;

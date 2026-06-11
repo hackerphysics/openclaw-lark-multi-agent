@@ -1472,6 +1472,72 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("uses a live status message in non-verbose mode and overwrites it with the final reply", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.();
+        await params.onSubmitted?.("run-live");
+        await params.onProgress?.({ kind: "tool", phase: "start", name: "read", text: "读取 src/feishu-bot.ts" });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return "最终回复";
+      });
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      const run = (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "看一下代码",
+        messageId: "live-trigger",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      await vi.advanceTimersByTimeAsync(800);
+      await vi.advanceTimersByTimeAsync(1000);
+      await run;
+
+      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude 正在处理"));
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", "最终回复");
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("live-trigger", "最终回复");
+      expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("does not create live status for fast replies", async () => {
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.();
+        await params.onSubmitted?.("run-fast");
+        return "快速回复";
+      });
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      await (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "快速问题",
+        messageId: "fast-trigger",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+
+      expect((h.bot as any).replyTextMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).editTextMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("fast-trigger", "快速回复");
+    } finally {
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
   it("reports killed sessions immediately instead of queueing behind a dead run", async () => {
     const h = makeHarness("Claude");
     try {
