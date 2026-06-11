@@ -883,8 +883,7 @@ export class FeishuBot {
 
       const unhealthy = await this.getUnhealthySessionStatus(chatId);
       if (unhealthy) {
-        await this.recoverFromUnhealthySession(chatId, messageId, insertedId, unhealthy);
-        return;
+        await this.warnUnhealthySessionAndContinue(chatId, messageId, unhealthy);
       }
 
       // Anti-loop
@@ -956,23 +955,29 @@ export class FeishuBot {
     return null;
   }
 
-  private async recoverFromUnhealthySession(chatId: string, messageId: string, insertedId: number, status: string): Promise<void> {
+  private async warnUnhealthySessionAndContinue(chatId: string, messageId: string, status: string): Promise<void> {
+    await this.replyMessage(messageId, this.isEn(chatId)
+      ? `⚠️ ${this.config.name} session is currently unhealthy (${status}). I will still try this message. If it keeps failing, send /reset and retry.`
+      : `⚠️ ${this.config.name} 的 session 当前状态异常（${status}）。我会继续尝试处理这条消息；如果连续失败，再发送 /reset 后重试。`);
+    console.warn(`[${this.config.name}] unhealthy session ${this.getSessionKey(chatId)} status=${status}; warning user but allowing retry for ${chatId.slice(-8)}`);
+  }
+
+  private async stopForUnhealthySession(chatId: string, messageId: string, status: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     await this.openclawClient.abortChat(sessionKey).catch(() => {});
     this.busyChats.set(chatId, 0);
-    const cleared = this.store.clearAllPendingTriggers(this.config.name, chatId);
-    if (insertedId > 0) this.store.markMessagesSynced(this.config.name, chatId, [insertedId], `${this.config.name}:${chatId}:${insertedId}:unhealthy-session`);
     const acks = this.pendingAckMessages.get(chatId) || [];
+    const remainingAcks: typeof acks = [];
     for (const ack of acks) {
       await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
       await this.addReaction(ack.messageId, "DONE").catch(() => {});
     }
-    this.pendingAckMessages.set(chatId, []);
+    this.pendingAckMessages.set(chatId, remainingAcks);
     await this.addReaction(messageId, "DONE").catch(() => {});
     await this.replyMessage(messageId, this.isEn(chatId)
-      ? `⚠️ ${this.config.name} session is unhealthy (${status}). Cleared ${cleared} pending message(s) and stopped waiting. Please send /reset and retry.`
-      : `⚠️ ${this.config.name} 的 session 状态异常（${status}）。已停止等待、清掉 ${cleared} 条待处理消息并关闭等待反应。请先发送 /reset 后重试。`);
-    console.warn(`[${this.config.name}] unhealthy session ${sessionKey} status=${status}; cleared ${cleared} pending trigger(s) for ${chatId.slice(-8)}`);
+      ? `⚠️ ${this.config.name} session became unhealthy while waiting (${status}). I stopped this attempt. You can send another message to try again; if it keeps failing, send /reset.`
+      : `⚠️ ${this.config.name} 的 session 在等待过程中变成异常状态（${status}）。我已停止这次等待。你可以直接再发一条继续尝试；如果连续失败，再发送 /reset。`);
+    console.warn(`[${this.config.name}] unhealthy session ${sessionKey} status=${status}; stopped current attempt for ${chatId.slice(-8)}`);
   }
 
   private async withSessionHealthMonitor<T>(chatId: string, messageId: string, insertedId: number, work: Promise<T>): Promise<T> {
@@ -984,7 +989,7 @@ export class FeishuBot {
         if (done) break;
         const unhealthy = await this.getUnhealthySessionStatus(chatId);
         if (unhealthy) {
-          await this.recoverFromUnhealthySession(chatId, messageId, insertedId, unhealthy);
+          await this.stopForUnhealthySession(chatId, messageId, unhealthy);
           throw new UnhealthySessionError(unhealthy);
         }
       }
@@ -1026,12 +1031,11 @@ export class FeishuBot {
         break;
       }
 
-      const unhealthy = await this.getUnhealthySessionStatus(chatId);
-      if (unhealthy) {
-        const latest = pendingHumanTriggers[pendingHumanTriggers.length - 1];
-        await this.recoverFromUnhealthySession(chatId, latest.messageId, latest.id || 0, unhealthy);
-        break;
-      }
+      // Do not preflight-block a retry just because the previous session status
+      // is still marked unhealthy. handleMessage already warns the user; the
+      // current chat.send attempt should be allowed so users can choose to try
+      // again without being forced through /reset. The in-flight health monitor
+      // below still stops a run that becomes unhealthy while waiting.
 
       this.busyChats.set(chatId, Date.now());
 
@@ -1365,12 +1369,9 @@ export class FeishuBot {
         this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
         if (err instanceof UnhealthySessionError) {
-          const errorText = this.isEn(chatId)
-            ? `⚠️ ${this.config.name} session is unhealthy (${err.status}). Stopped waiting. Please send /reset and retry.`
-            : `⚠️ ${this.config.name} 的 session 状态异常（${err.status}）。已停止等待，请先发送 /reset 后重试。`;
-          // recoverFromUnhealthySession already replied to the user; just finish
-          // the live status message (mark done).
-          void errorText;
+          // stopForUnhealthySession already warned the user; just finish the live
+          // status message. The user can send another message to retry without
+          // being forced through /reset.
           await liveStatus?.complete().catch(() => {});
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
           break;

@@ -1601,10 +1601,11 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
-  it("reports killed sessions immediately instead of queueing behind a dead run", async () => {
+  it("warns about killed sessions but still lets the user retry", async () => {
     const h = makeHarness("Claude");
     try {
-      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: "killed" } }));
+      const statuses = ["killed", "active"];
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: statuses.shift() || "active" } }));
       FeishuBot.getAllBots().set("app-Claude", h.bot as any);
 
       await (h.bot as any).handleMessage(event({
@@ -1614,10 +1615,10 @@ describe("FeishuBot routing and queue behavior", () => {
         mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
       }));
 
-      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-session-msg", "DONE");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-session-msg", expect.stringContaining("session 状态异常（killed）"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-session-msg", expect.stringContaining("我会继续尝试处理这条消息"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-session-msg", "mock reply");
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
       FeishuBot.getAllBots().delete("app-Claude");
@@ -1632,7 +1633,7 @@ describe("FeishuBot routing and queue behavior", () => {
       (h.bot as any).replyTextMessage = vi.fn(async () => "live-killed-msg");
       (h.bot as any).editTextMessage = vi.fn(async () => {});
       (h.bot as any).deleteMessageById = vi.fn(async () => {});
-      const sessionStatuses = ["active", "active", "killed"];
+      const sessionStatuses = ["active", "killed"];
       h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "killed" } }));
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -1658,8 +1659,8 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.openclaw.abortChat).toHaveBeenCalled();
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("killed-mid-run", "DONE");
-      // recoverFromUnhealthySession replies the error via the normal path...
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("session 状态异常（killed）"));
+      // stopForUnhealthySession warns but does not force /reset.
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("可以直接再发一条继续尝试"));
       // ...and the live status placeholder is marked done (not overwritten with the error).
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
       expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("已完成"));
@@ -1671,7 +1672,7 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
-  it("reports killed sessions during queue drain and clears existing waiting reactions", async () => {
+  it("queue drain does not preflight-block retries when previous session status is killed", async () => {
     const h = makeHarness("Claude");
     try {
       h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: "active | killed" } }));
@@ -1682,11 +1683,11 @@ describe("FeishuBot routing and queue behavior", () => {
 
       await (h.bot as any).processQueue("chat1");
 
-      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
       expect((h.bot as any).removeReaction).toHaveBeenCalledWith("pending-killed", "Typing");
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("pending-killed", "DONE");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("pending-killed", expect.stringContaining("active | killed"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("pending-killed", "mock reply");
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally { h.cleanup(); }
   });
