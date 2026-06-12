@@ -1738,7 +1738,7 @@ describe("FeishuBot routing and queue behavior", () => {
       (h.bot as any).replyTextMessage = vi.fn(async () => "live-killed-msg");
       (h.bot as any).editTextMessage = vi.fn(async () => {});
       (h.bot as any).deleteMessageById = vi.fn(async () => {});
-      const sessionStatuses = ["active", "killed"];
+      const sessionStatuses = ["active", "killed", "killed"];
       h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "killed" } }));
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -1759,6 +1759,7 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(800);
       expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("等待 OpenClaw 回复"));
       await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(2_000);
       await run;
 
       expect(h.openclaw.abortChat).toHaveBeenCalled();
@@ -1770,6 +1771,125 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
       expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("执行中断"));
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
+    } finally {
+      vi.useRealTimers();
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("does not report transient killed status if the session recovers before confirmation", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      const sessionStatuses = ["active", "killed", "active"];
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "active" } }));
+      let resolveReply!: (value: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onSendAttempt?.();
+        return await new Promise<string>((resolve) => { resolveReply = resolve; });
+      });
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-transient-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      const run = (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "运行中短暂状态异常",
+        messageId: "transient-killed",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(7_000);
+      resolveReply("mock reply");
+      await vi.advanceTimersByTimeAsync(250);
+      await run;
+
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("transient-killed", expect.stringContaining("状态异常"));
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("treats run-level failure statuses (aborted/error/timeout) as a live session, not a dead one", async () => {
+    // Root cause of the false "session 状态异常 (killed)" report: sessions.describe
+    // returns the LAST RUN's status. An idle-timeout/aborted run leaves the session
+    // usable, so these run-level statuses must NOT be surfaced as session death.
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      // Session keeps reporting a run-level failure status the whole time.
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: "aborted" } }));
+      let resolveReply!: (value: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onSendAttempt?.();
+        return await new Promise<string>((resolve) => { resolveReply = resolve; });
+      });
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-runfail-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      const run = (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "上一次 run 超时但 session 还活着",
+        messageId: "runfail-msg",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      // Let the health monitor poll several times; 'aborted' must never trip it.
+      await vi.advanceTimersByTimeAsync(20_000);
+      resolveReply("mock reply");
+      await vi.advanceTimersByTimeAsync(250);
+      await run;
+
+      // No preflight warning, no mid-run "unhealthy" notice, no forced abort.
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runfail-msg", expect.stringContaining("状态异常"));
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("runfail-msg", expect.stringContaining("unhealthy"));
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("still reports a genuinely dead session (killed) as unhealthy", async () => {
+    // Guard the other direction: a real session-death status must still be caught.
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: "killed" } }));
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onSendAttempt?.();
+        await new Promise(() => {}); // never resolves; monitor must stop it
+        return "never";
+      });
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-dead-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      const run = (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "session 真的死了",
+        messageId: "dead-msg",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      await vi.advanceTimersByTimeAsync(0);
+      // Preflight already sees killed and warns (warn-but-continue).
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("dead-msg", expect.stringContaining("状态异常"));
+      // Mid-run monitor confirms killed and aborts the stuck run.
+      await vi.advanceTimersByTimeAsync(5_000);
+      await vi.advanceTimersByTimeAsync(2_000);
+      await run;
+      expect(h.openclaw.abortChat).toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
       FeishuBot.getAllBots().delete("app-Claude");

@@ -20,6 +20,7 @@ const MAX_MERGED_TRIGGER_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MA
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
 const SESSION_HEALTH_POLL_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_POLL_MS || 5_000);
+const SESSION_HEALTH_CONFIRM_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_CONFIRM_MS || 2_000);
 
 class UnhealthySessionError extends Error {
   constructor(readonly status: string) {
@@ -954,14 +955,33 @@ export class FeishuBot {
       const resp = await this.openclawClient.getSessionInfo(sessionKey);
       const status = String(resp?.session?.status || "").toLowerCase();
       if (!status) return null;
-      if (["killed", "kill", "dead", "crashed", "crash", "failed", "failure", "error", "errored", "invalid"].some((bad) => status.includes(bad))) {
-        return status;
-      }
+      if (this.isSessionDeadStatus(status)) return status;
     } catch {
       // Absence/transient describe failures should not block a new run; chat.send
       // will create/report the session as usual.
     }
     return null;
+  }
+
+  /**
+   * Distinguish SESSION death from RUN failure. `sessions.describe` reports the
+   * status of the most recent run, not whether the session is usable. A run can
+   * end as `aborted`/`error`/`failed`/`timeout` (e.g. an LLM idle timeout) while
+   * the session itself stays perfectly usable for the next message — confirmed in
+   * the wild: LMA reported "killed" but `/status` immediately showed running.
+   *
+   * Only treat the session as dead for statuses that mean the session itself is
+   * gone and a new run cannot start without /reset. Use word-boundary matching so
+   * a run-level "error" substring never trips this. Run-level failures are NOT
+   * surfaced here: the work promise will either return the (possibly empty) reply
+   * or throw, and that is handled by the normal delivery/error path.
+   */
+  private isSessionDeadStatus(status: string): boolean {
+    const s = status.toLowerCase();
+    // Session-level death tokens only. Notably excludes aborted/error/errored/
+    // failed/failure/timeout, which are run-level outcomes on a live session.
+    const deadTokens = ["killed", "dead", "crashed", "destroyed", "terminated", "gone"];
+    return deadTokens.some((tok) => new RegExp(`(^|[^a-z])${tok}([^a-z]|$)`).test(s));
   }
 
   private async warnUnhealthySessionAndContinue(chatId: string, messageId: string, status: string): Promise<void> {
@@ -998,8 +1018,17 @@ export class FeishuBot {
         if (done) break;
         const unhealthy = await this.getUnhealthySessionStatus(chatId);
         if (unhealthy) {
-          await this.stopForUnhealthySession(chatId, messageId, unhealthy);
-          throw new UnhealthySessionError(unhealthy);
+          // Session status can briefly report killed/aborted while the final
+          // response is still racing back to the bridge. Confirm once before
+          // surfacing a user-visible failure, otherwise users can see both a
+          // successful reply and a misleading "session became unhealthy" notice.
+          await new Promise((resolve) => setTimeout(resolve, SESSION_HEALTH_CONFIRM_MS));
+          if (done) break;
+          const confirmedUnhealthy = await this.getUnhealthySessionStatus(chatId);
+          if (confirmedUnhealthy) {
+            await this.stopForUnhealthySession(chatId, messageId, confirmedUnhealthy);
+            throw new UnhealthySessionError(confirmedUnhealthy);
+          }
         }
       }
       return undefined as never;
@@ -1332,6 +1361,7 @@ export class FeishuBot {
         if ((shouldReply || hasAttachments) && lastHuman.messageId && !isRuntimeFailure) {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
+            await liveStatus?.complete().catch(() => {});
           } else {
             try {
               // Final answer always goes through the normal interactive-card
