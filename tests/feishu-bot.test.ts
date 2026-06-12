@@ -25,7 +25,7 @@ class MockOpenClaw {
     if (this.replies.length > 0) return this.replies.shift()!;
     return "mock reply";
   }
-  async compactSession() { return "ok"; }
+  compactSession = vi.fn(async () => "ok");
   async resetSession() { return "ok"; }
   abortChat = vi.fn(async () => {});
 }
@@ -580,12 +580,39 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("answers bare /help once from the coordinator in multi-bot groups", async () => {
+    const h = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", h.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", { config: { appId: "app-Claude", name: "Claude" }, store: h.store } as any);
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "/help", messageId: "cmd-help" }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-help", expect.stringContaining("Bot 命令列表"));
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally {
+      FeishuBot.getAllBots().delete("app-GPT");
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
   it("handles @all-prefixed bridge commands locally", async () => {
     const h = makeHarness();
     try {
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "@_all /reset", messageId: "cmd-reset" }));
       expect(h.openclaw.chatCalls).toHaveLength(0);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-reset", expect.stringContaining("Session 已重置"));
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("treats Feishu's bare @ slash-command shape as @all for bridge commands", async () => {
+    const h = makeHarness();
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@ /compact", messageId: "cmd-compact-bare-at" }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect(h.openclaw.compactSession).toHaveBeenCalled();
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-compact-bare-at", expect.stringContaining("Session 已压缩"));
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
     } finally { h.cleanup(); }
   });

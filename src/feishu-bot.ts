@@ -500,6 +500,7 @@ export class FeishuBot {
       // leading routing mentions before deciding whether this is a bridge command
       // or an escaped OpenClaw command.
       const trimmedCleanText = cleanText.trim();
+      const commandHasBareAllPrefix = /^@\s+(?=\/)/u.test(trimmedCleanText);
       const commandText = this.stripLeadingCommandMentions(trimmedCleanText);
       // Escape hatch: //command means send /command through to OpenClaw,
       // while /command remains a bridge-level openclaw-lark-multi-agent command.
@@ -551,7 +552,9 @@ export class FeishuBot {
         const isChairmanCommand = commandName === "/chairman";
         const isLocaleCommand = commandName === "/locale";
         const isModelCommand = commandName === "/model";
-        const rejectModelAll = chatType !== "p2p" && isModelCommand && routing.isAllMention;
+        const isHelpCommand = commandName === "/help";
+        const commandIsAllMention = routing.isAllMention || commandHasBareAllPrefix;
+        const rejectModelAll = chatType !== "p2p" && isModelCommand && commandIsAllMention;
         if (chatType !== "p2p") {
           const groupBotCount = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store).length;
           const singleBotGroup = groupBotCount === 1;
@@ -559,7 +562,7 @@ export class FeishuBot {
             // Model switching is per-bot. @all is rejected by one coordinator;
             // otherwise group /model must explicitly target this bot. A single-bot
             // group treats the sole bot as the implicit target.
-            if (routing.isAllMention) {
+            if (commandIsAllMention) {
               if (!this.isDiscussionCoordinator()) return;
             } else if (routing.hasTargetedMention) {
               if (!routing.isCurrentBotMentioned) return;
@@ -607,15 +610,22 @@ export class FeishuBot {
             // Untargeted or @all locale is a group-level setting; one coordinator handles it.
             // If the user explicitly @s a bot, the targeted bot should execute and answer.
             if (!this.isDiscussionCoordinator()) return;
+          } else if (isHelpCommand && !routing.hasTargetedMention) {
+            // Bare or @all /help in a multi-bot group should never be silent or
+            // spammy. Let the coordinator answer once instead of requiring users
+            // to know they must @ a bot before they can discover the command list.
+            if (!this.isDiscussionCoordinator()) return;
           } else if (isDiscussCommand && !routing.hasTargetedMention) {
             // Untargeted or @all /discuss is group-level; one coordinator handles it.
             if (!this.isDiscussionCoordinator()) return;
           } else if (routing.hasTargetedMention) {
             // Explicitly targeted commands belong only to the mentioned bot.
             if (!routing.isCurrentBotMentioned) return;
-          } else if (!routing.isAllMention && !singleBotGroup) {
+          } else if (!commandIsAllMention && !singleBotGroup) {
             // Other bridge commands in a multi-bot group need an explicit target or @all.
-            // A single-bot group treats the sole bot as the implicit target.
+            // Some Feishu clients render @all in text as a bare "@" before the
+            // slash command (for example "@ /compact"); commandIsAllMention
+            // treats that shape as @all so maintenance commands fan out.
             return;
           }
         }
@@ -1561,6 +1571,7 @@ export class FeishuBot {
       prev = s;
       s = s
         .replace(/^(@_all|@all|@所有人|所有人)\s*/i, "")
+        .replace(/^@\s+(?=\/)/u, "")
         .replace(/^@\S+\s*/u, "")
         .trimStart();
     }
