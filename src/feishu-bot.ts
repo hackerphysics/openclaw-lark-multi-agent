@@ -89,7 +89,7 @@ export class FeishuBot {
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
   private lastRealDeliveryAt: Map<string, number> = new Map();
   /** Active chatSend trigger target so final replies and proactive session.message share one delivery key. */
-  private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout> }> = new Map();
+  private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout>; liveStatus?: LiveStatusController }> = new Map();
   private adminOpenId: string | null;
   private locale: Locale;
   private configPath?: string;
@@ -245,15 +245,23 @@ export class FeishuBot {
         const parsed = this.extractBridgeAttachments(text);
         if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) this.cancelDelayedFailure(chatId);
         const activeTarget = this.activeDeliveryTargets.get(chatId);
-        await this.enqueueAndDispatchDelivery(
-          chatId,
-          sourceType,
-          this.deliverySourceId(sourceType === "verbose_transcript" ? "verbose" : "proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`),
-          parsed.text.trim(),
-          parsed.attachments,
-          activeTarget?.messageId,
-          undefined
-        );
+        try {
+          await this.enqueueAndDispatchDelivery(
+            chatId,
+            sourceType,
+            this.deliverySourceId(sourceType === "verbose_transcript" ? "verbose" : "proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`),
+            parsed.text.trim(),
+            parsed.attachments,
+            activeTarget?.messageId,
+            undefined
+          );
+          if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
+            await activeTarget?.liveStatus?.complete().catch(() => {});
+          }
+        } catch (err) {
+          if (sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
+          throw err;
+        }
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
       }
@@ -1241,6 +1249,8 @@ export class FeishuBot {
             })
           : undefined;
         liveStatus?.start(this.isEn(chatId) ? "waiting for OpenClaw" : "等待 OpenClaw 回复");
+        const activeTargetForStatus = this.activeDeliveryTargets.get(chatId);
+        if (activeTargetForStatus?.triggerId === triggerId && liveStatus) activeTargetForStatus.liveStatus = liveStatus;
         try {
           reply = await this.withSessionHealthMonitor(chatId, lastHuman.messageId || "", triggerId, this.openclawClient.chatSendWithContext({
             sessionKey,
@@ -1391,7 +1401,7 @@ export class FeishuBot {
           }
         }
         if (isRuntimeFailure && lastHuman.messageId) {
-          liveStatus?.dispose();
+          await liveStatus?.fail().catch(() => {});
           this.scheduleDelayedFailure(chatId, lastHuman.messageId, visibleReply, triggerId);
         } else if (!shouldReply && !hasAttachments) {
           liveStatus?.dispose();

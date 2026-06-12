@@ -1582,6 +1582,23 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("marks live status complete when a proactive visible reply is delivered for the active trigger", async () => {
+    const h = makeHarness("GPT");
+    try {
+      delete (h.bot as any).ensureSession;
+      await (h.bot as any).ensureSession("chat1");
+      const release = (h.bot as any).setActiveDeliveryTarget("chat1", 42, "reply-42");
+      const activeTarget = (h.bot as any).activeDeliveryTargets.get("chat1");
+      activeTarget.liveStatus = { complete: vi.fn(async () => {}), fail: vi.fn(async () => {}) };
+      const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
+      await cb("proactive answer");
+      release();
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-42", "proactive answer");
+      expect(activeTarget.liveStatus.complete).toHaveBeenCalledTimes(1);
+      expect(activeTarget.liveStatus.fail).not.toHaveBeenCalled();
+    } finally { h.cleanup(); }
+  });
+
   it("deduplicates proactive and final delivery for the same active trigger", async () => {
     const h = makeHarness("GPT");
     try {
@@ -1704,6 +1721,41 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", expect.stringContaining("已完成"));
       expect((h.bot as any).editTextMessage).not.toHaveBeenCalledWith("live-status-msg", "最终回复");
       expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      FeishuBot.getAllBots().delete("app-Claude");
+      h.cleanup();
+    }
+  });
+
+  it("marks live status interrupted for runtime failure replies", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
+      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.();
+        await params.onSubmitted?.("run-runtime-failure");
+        await params.onProgress?.({ kind: "tool", phase: "start", name: "exec", text: "exec start: npm test" });
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        return "⚠️ Agent 未正常完成\n状态: unknown\n原因: rpc\n请重试";
+      });
+      FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+
+      const run = (h.bot as any).handleMessage(event({
+        chatType: "group",
+        text: "跑一下",
+        messageId: "runtime-live-trigger",
+        mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+      }));
+      await vi.advanceTimersByTimeAsync(800);
+      await vi.advanceTimersByTimeAsync(1000);
+      await run;
+
+      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("runtime-live-trigger", expect.stringContaining("Claude 正在执行"));
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", expect.stringContaining("执行中断"));
     } finally {
       vi.useRealTimers();
       FeishuBot.getAllBots().delete("app-Claude");
