@@ -1748,6 +1748,7 @@ export class FeishuBot {
           for (const attachment of attachments) await this.sendBridgeAttachment(chatId, attachment);
           if (item.id) this.store.markDeliveryDelivered(item.id);
         } catch (err) {
+          if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
           if (item.id) this.store.markDeliveryFailed(item.id);
           const errorText = `⚠️ 附件发送失败：${this.errorSummary(err)}`;
           const replyTarget = item.replyToMessageId || replyToMessageId;
@@ -1842,6 +1843,7 @@ export class FeishuBot {
     // delivered a message successfully in this chat. Otherwise LMA may generate
     // "ghost" participants and Feishu will reject delivery with 230002
     // (Bot/User can NOT be out of the chat).
+    if (this.store.isBotUnavailableInChat(bot.config.name, chatId)) return false;
     return FeishuBot.seenBotChats.get(bot.config.name)?.has(chatId)
       || this.store.hasAnyDeliveredToChat(bot.config.name, chatId);
   }
@@ -2035,6 +2037,18 @@ export class FeishuBot {
     return `${code}${msg}`.slice(0, 800);
   }
 
+  private isOutOfChatError(err: any): boolean {
+    const data = err?.response?.data || err?.data;
+    const code = data?.code;
+    const msg = data?.msg || data?.message || err?.message || String(err);
+    return Number(code) === 230002 || /Bot\/User can NOT be out of the chat/i.test(String(msg));
+  }
+
+  private markCurrentBotUnavailable(chatId: string, err: any): void {
+    this.store.markBotUnavailableInChat(this.config.name, chatId, this.errorSummary(err));
+    console.warn(`[${this.config.name}] Marked unavailable in chat ${chatId.slice(-8)} after Feishu out-of-chat error`);
+  }
+
   private stripReadOnlyDocxFields<T>(value: T): T {
     if (Array.isArray(value)) return value.map((item) => this.stripReadOnlyDocxFields(item)) as T;
     if (value && typeof value === "object") {
@@ -2151,9 +2165,11 @@ export class FeishuBot {
           msg_type: "interactive",
         },
       });
+      this.store.clearBotUnavailableInChat(this.config.name, chatId);
       return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch (err) {
       console.warn(`[${this.config.name}] sendMessage interactive failed:`, JSON.stringify((err as any)?.response?.data || (err as any)?.data || { message: (err as Error).message }));
+      if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
       // Fallback to plain text
       try {
         const res = await this.client.im.message.create({
@@ -2164,9 +2180,11 @@ export class FeishuBot {
             msg_type: "text",
           },
         });
+        this.store.clearBotUnavailableInChat(this.config.name, chatId);
         return (res as any)?.data?.message_id || (res as any)?.message_id;
       } catch (fallbackErr) {
         console.warn(`[${this.config.name}] sendMessage text failed:`, JSON.stringify((fallbackErr as any)?.response?.data || (fallbackErr as any)?.data || { message: (fallbackErr as Error).message }));
+        if (this.isOutOfChatError(fallbackErr)) this.markCurrentBotUnavailable(chatId, fallbackErr);
         throw fallbackErr;
       }
     }

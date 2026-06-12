@@ -471,6 +471,29 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+  it("excludes a bot from discuss after Feishu reports it is out of the chat", async () => {
+    const gpt = makeHarness("GPT");
+    const ghost = makeHarness("Ghost");
+    try {
+      (ghost.bot as any).store = gpt.store;
+      (ghost.bot as any).openclawClient = ghost.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Ghost", ghost.bot as any);
+      markBotSeen("GPT");
+      markBotSeen("Ghost");
+      gpt.store.markBotUnavailableInChat("Ghost", "chat1", "code=230002 Bot/User can NOT be out of the chat");
+      gpt.store.setDiscussMode("chat1", true);
+      gpt.store.setDiscussMaxRounds("chat1", 1);
+
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic-ghost-unavailable" }));
+      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect(ghost.openclaw.chatCalls).toHaveLength(0);
+    } finally {
+      gpt.cleanup();
+      ghost.cleanup();
+    }
+  });
+
   it("notifies when a new discuss topic preempts an active discussion", async () => {
     const h = makeHarness("GPT");
     try {

@@ -167,6 +167,17 @@ export class MessageStore {
         PRIMARY KEY (bot_name, chat_id)
       );
 
+      -- Durable negative membership cache. Feishu message create returns 230002
+      -- when a bot app is not in a chat; cache that so discussion scheduling and
+      -- later proactive deliveries do not keep generating ghost participants.
+      CREATE TABLE IF NOT EXISTS bot_chat_unavailable (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (bot_name, chat_id)
+      );
+
       -- Durable delivery ledger for user-visible assistant outputs. All final
       -- text/attachment outputs should be inserted here first and dispatched
       -- once, regardless of whether they came from chat final, proactive
@@ -474,6 +485,23 @@ export class MessageStore {
       SELECT * FROM delivery_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?
     `).all(maxCount) as any[];
     return rows.map((r) => this.mapDelivery(r));
+  }
+
+  markBotUnavailableInChat(botName: string, chatId: string, reason = ''): void {
+    this.db.prepare(`
+      INSERT INTO bot_chat_unavailable(bot_name, chat_id, reason, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(bot_name, chat_id) DO UPDATE SET reason = excluded.reason, updated_at = excluded.updated_at
+    `).run(botName, chatId, reason, Date.now());
+  }
+
+  clearBotUnavailableInChat(botName: string, chatId: string): void {
+    this.db.prepare(`DELETE FROM bot_chat_unavailable WHERE bot_name = ? AND chat_id = ?`).run(botName, chatId);
+  }
+
+  isBotUnavailableInChat(botName: string, chatId: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM bot_chat_unavailable WHERE bot_name = ? AND chat_id = ? LIMIT 1`).get(botName, chatId);
+    return !!row;
   }
 
   hasAnyDeliveredToChat(botName: string, chatId: string): boolean {

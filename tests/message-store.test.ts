@@ -71,6 +71,14 @@ describe("MessageStore", () => {
     expect([...store.getPendingTriggerIds("GPT", "c1")]).toEqual([triggerId]);
   }));
 
+  it("tracks per-bot chat unavailability", () => withStore((store) => {
+    expect(store.isBotUnavailableInChat("Ghost", "chat1")).toBe(false);
+    store.markBotUnavailableInChat("Ghost", "chat1", "code=230002 Bot/User can NOT be out of the chat");
+    expect(store.isBotUnavailableInChat("Ghost", "chat1")).toBe(true);
+    store.clearBotUnavailableInChat("Ghost", "chat1");
+    expect(store.isBotUnavailableInChat("Ghost", "chat1")).toBe(false);
+  }));
+
   it("deduplicates and claims delivery outbox items", () => withStore((store) => {
     const base = {
       sessionKey: "lma-gpt-chat1",
