@@ -94,6 +94,8 @@ export class FeishuBot {
   private configPath?: string;
 
   private static allBots: Map<string, FeishuBot> = new Map();
+  /** Chats where this bot app has actually received an event in this process. */
+  private static seenBotChats: Map<string, Set<string>> = new Map();
 
   constructor(
     config: BotConfig,
@@ -395,6 +397,7 @@ export class FeishuBot {
       const sender = event.sender;
 
       const chatId: string = message.chat_id;
+      FeishuBot.markBotSeenInChat(this.config.name, chatId);
       const chatType: string = message.chat_type;
       const messageType: string = message.message_type;
       const messageId: string = message.message_id;
@@ -1823,17 +1826,37 @@ export class FeishuBot {
   }
 
 
+  private static markBotSeenInChat(botName: string, chatId: string): void {
+    let set = FeishuBot.seenBotChats.get(botName);
+    if (!set) {
+      set = new Set<string>();
+      FeishuBot.seenBotChats.set(botName, set);
+    }
+    set.add(chatId);
+  }
+
+  private isBotAvailableInChat(bot: FeishuBot, chatId: string): boolean {
+    // A bot can be globally configured but not actually installed in this Feishu
+    // group. Discuss participants must be restricted to bots that either have
+    // received an event in this chat during this process, or have previously
+    // delivered a message successfully in this chat. Otherwise LMA may generate
+    // "ghost" participants and Feishu will reject delivery with 230002
+    // (Bot/User can NOT be out of the chat).
+    return FeishuBot.seenBotChats.get(bot.config.name)?.has(chatId)
+      || this.store.hasAnyDeliveredToChat(bot.config.name, chatId);
+  }
+
   private getDiscussionParticipants(chatId: string): DiscussionParticipant[] {
     const chairman = this.store.getChairmanBot(chatId);
     return Array.from(FeishuBot.allBots.values())
-      .filter((bot) => bot.store === this.store && bot.config.name !== chairman && bot.store.getBotMode(bot.config.name, chatId) !== "mute")
+      .filter((bot) => bot.store === this.store && bot.config.name !== chairman && bot.store.getBotMode(bot.config.name, chatId) !== "mute" && this.isBotAvailableInChat(bot, chatId))
       .map((bot) => this.asDiscussionParticipant(bot, chatId));
   }
 
   private getChairmanParticipant(chatId: string): DiscussionParticipant | undefined {
     const chairman = this.store.getChairmanBot(chatId);
     if (!chairman) return undefined;
-    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman);
+    const bot = Array.from(FeishuBot.allBots.values()).find((candidate) => candidate.store === this.store && candidate.config.name === chairman && this.isBotAvailableInChat(candidate, chatId));
     return bot ? this.asDiscussionParticipant(bot, chatId) : undefined;
   }
 

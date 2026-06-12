@@ -64,8 +64,20 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   return { bot, store, openclaw, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
+function markBotSeen(botName: string, chatId = "chat1") {
+  const seen = (FeishuBot as any).seenBotChats as Map<string, Set<string>>;
+  let set = seen.get(botName);
+  if (!set) {
+    set = new Set<string>();
+    seen.set(botName, set);
+  }
+  set.add(chatId);
+}
+
 afterEach(() => {
   vi.useRealTimers();
+  FeishuBot.getAllBots().clear();
+  ((FeishuBot as any).seenBotChats as Map<string, Set<string>> | undefined)?.clear();
 });
 
 describe("FeishuBot routing and queue behavior", () => {
@@ -388,6 +400,8 @@ describe("FeishuBot routing and queue behavior", () => {
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
       FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
       // Neither bot is free; Discuss should still include both because only mute matters.
+      markBotSeen("GPT");
+      markBotSeen("Claude");
       gpt.store.setDiscussMode("chat1", true);
       gpt.store.setDiscussMaxRounds("chat1", 1);
 
@@ -413,6 +427,8 @@ describe("FeishuBot routing and queue behavior", () => {
       (claude.bot as any).openclawClient = claude.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
       FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      markBotSeen("GPT");
+      markBotSeen("Claude");
       gpt.store.setChairmanBot("chat1", "Claude");
       gpt.store.setBotMode("Claude", "chat1", "mute");
       gpt.store.setDiscussMode("chat1", true);
@@ -431,6 +447,29 @@ describe("FeishuBot routing and queue behavior", () => {
   });
 
 
+
+  it("does not include globally configured bots that are not available in the current Feishu chat", async () => {
+    const gpt = makeHarness("GPT");
+    const ghost = makeHarness("Ghost");
+    try {
+      (ghost.bot as any).store = gpt.store;
+      (ghost.bot as any).openclawClient = ghost.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Ghost", ghost.bot as any);
+      // GPT received this chat's event; Ghost is globally configured but has
+      // never received or successfully delivered in this chat.
+      markBotSeen("GPT");
+      gpt.store.setDiscussMode("chat1", true);
+      gpt.store.setDiscussMaxRounds("chat1", 1);
+
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic-no-ghost" }));
+      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect(ghost.openclaw.chatCalls).toHaveLength(0);
+    } finally {
+      gpt.cleanup();
+      ghost.cleanup();
+    }
+  });
 
   it("notifies when a new discuss topic preempts an active discussion", async () => {
     const h = makeHarness("GPT");
@@ -505,6 +544,8 @@ describe("FeishuBot routing and queue behavior", () => {
       (claude.bot as any).openclawClient = claude.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
       FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      markBotSeen("GPT");
+      markBotSeen("Claude");
       gpt.store.setBotMode("GPT", "chat1", "free");
       gpt.store.setChairmanBot("chat1", "Claude");
       gpt.store.setDiscussMode("chat1", true);

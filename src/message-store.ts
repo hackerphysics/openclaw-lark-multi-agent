@@ -476,6 +476,15 @@ export class MessageStore {
     return rows.map((r) => this.mapDelivery(r));
   }
 
+  hasAnyDeliveredToChat(botName: string, chatId: string): boolean {
+    const row = this.db.prepare(`
+      SELECT 1 FROM delivery_outbox
+      WHERE bot_name = ? AND chat_id = ? AND status = 'delivered'
+      LIMIT 1
+    `).get(botName, chatId);
+    return !!row;
+  }
+
   hasRecentSimilarDelivery(botName: string, chatId: string, contentHash: string, windowMs: number, sourceTypes?: string[]): boolean {
     if (!contentHash) return false;
     const sourceFilter = sourceTypes?.length ? ` AND source_type IN (${sourceTypes.map(() => "?").join(",")})` : "";
