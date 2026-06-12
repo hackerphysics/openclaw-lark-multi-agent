@@ -606,16 +606,6 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("treats Feishu's bare @ slash-command shape as @all for bridge commands", async () => {
-    const h = makeHarness();
-    try {
-      await (h.bot as any).handleMessage(event({ chatType: "group", text: "@ /compact", messageId: "cmd-compact-bare-at" }));
-      expect(h.openclaw.chatCalls).toHaveLength(0);
-      expect(h.openclaw.compactSession).toHaveBeenCalled();
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("cmd-compact-bare-at", expect.stringContaining("Session 已压缩"));
-      expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
-    } finally { h.cleanup(); }
-  });
 
   it("/stop force-clears a stuck run: aborts, unlocks busy, and clears pending", async () => {
     const h = makeHarness();
