@@ -841,24 +841,24 @@ export class FeishuBot {
               maxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 10,
               participants,
               chairman,
-              sendSystemMessage: async (text) => { await this.sendMessage(chatId, text); },
+              sendSystemMessage: async (text) => { await this.sendSystemDelivery(chatId, text); },
               locale: discussionLocale,
               onComplete: async (event) => {
                 if (event.reason === "chairman_final") {
                   this.store.setDiscussMode(event.chatId, false);
-                  await this.sendMessage(event.chatId, this.isEn(event.chatId)
+                  await this.sendSystemDelivery(event.chatId, this.isEn(event.chatId)
                     ? `💬 Discuss ended: Chairman ${event.chairmanName || ""} completed the final summary. Discuss mode has been turned off automatically.`
                     : `💬 Discuss 已结束：Chairman ${event.chairmanName || ""} 已完成总结，已自动关闭 Discuss 模式。`);
                 }
               },
             });
             if (started && preempted) {
-              await this.sendMessage(chatId, this.isEn(chatId)
+              await this.sendSystemDelivery(chatId, this.isEn(chatId)
                 ? `💬 New topic received; stopped the previous Discuss session and started a new one. Previous topic: ${preempted.topic.slice(0, 80)}`
                 : `💬 收到新话题，已停止上一轮 Discuss 并开启新讨论。上一话题：${preempted.topic.slice(0, 80)}`);
             }
           } else if (this.isDiscussionCoordinator()) {
-            await this.sendMessage(chatId, this.isEn(chatId)
+            await this.sendSystemDelivery(chatId, this.isEn(chatId)
               ? "💬 Discuss is on, but there is no available participant. Unmute at least one bot or set a Chairman."
               : "💬 Discuss 已开启，但当前没有可参与者。请至少解除一个 bot 的禁言，或设置 Chairman。");
           }
@@ -1690,6 +1690,11 @@ export class FeishuBot {
 
   private deliverySourceId(kind: string, text: string): string {
     return `${kind}:${this.stableHash(text)}`;
+  }
+
+  private async sendSystemDelivery(chatId: string, text: string): Promise<void> {
+    const sourceId = `discussion-system:${Date.now()}:${Math.random().toString(36).slice(2)}`;
+    await this.enqueueAndDispatchDelivery(chatId, "discussion_system", sourceId, text);
   }
 
   private async enqueueAndDispatchDelivery(chatId: string, sourceType: string, sourceId: string, text: string, attachments: BridgeAttachment[] = [], replyToMessageId?: string, deliveryKey?: string): Promise<void> {
