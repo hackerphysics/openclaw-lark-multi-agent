@@ -61,6 +61,8 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   (bot as any).removeReaction = vi.fn(async () => {});
   (bot as any).replyMessage = vi.fn(async () => {});
   (bot as any).sendMessage = vi.fn(async () => {});
+  (bot as any).sendTextMessage = vi.fn(async () => "live-status-msg");
+  (bot as any).editTextMessage = vi.fn(async () => {});
   return { bot, store, openclaw, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -605,6 +607,28 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("targeted-discuss", "mock reply");
     } finally { h.cleanup(); }
+  });
+
+  it("uses live status during discussion turns", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onProgress?.({ kind: "tool", phase: "start", name: "read", text: "read start: spec.md" });
+        await vi.advanceTimersByTimeAsync(900);
+        return "讨论回复";
+      });
+
+      const result = await (h.bot as any).runDiscussionTurn("chat1", "prompt", { round: 1, maxRounds: 10 });
+      expect(result.visible).toBe(true);
+      expect((h.bot as any).sendTextMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("Claude 正在执行：read: spec.md"));
+      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", "✅ Claude 已完成");
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("讨论回复"));
+    } finally {
+      vi.useRealTimers();
+      h.cleanup();
+    }
   });
 
   it("adds discussion round markers once and keeps raw text for the next round", async () => {

@@ -1872,6 +1872,21 @@ export class FeishuBot {
   private async runDiscussionTurn(chatId: string, prompt: string, meta?: { round: number; maxRounds: number }): Promise<ReplyResult> {
     const sessionKey = await this.ensureSession(chatId);
     const releaseProactiveMute = this.openclawClient.muteProactiveDelivery(sessionKey);
+    const liveStatusEnabled = this.store.getBotLiveStatus(this.config.name, chatId) && !this.store.getBotVerbose(this.config.name, chatId);
+    const liveStatus = liveStatusEnabled
+      ? new LiveStatusController({
+          create: (text) => this.sendOrdered(chatId, () => this.sendTextMessage(chatId, text)),
+          edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
+          warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, err instanceof Error ? err.message : err),
+        }, {
+          botName: this.config.name,
+          locale: this.isEn(chatId) ? "en" : "zh",
+          disableHint: this.isEn(chatId)
+            ? `Tip: send /livestatus off to hide this status message`
+            : `提示：调用 /livestatus off 关闭该状态提示`,
+        })
+      : undefined;
+    liveStatus?.start(meta ? `第 ${meta.round}/${meta.maxRounds} 轮讨论` : "讨论中");
     let reply: string;
     try {
       reply = await this.openclawClient.chatSendWithContext({
@@ -1882,7 +1897,11 @@ export class FeishuBot {
         deliver: false,
         timeoutMs: 1_800_000,
         emptyFinalAsNoReply: true,
+        onProgress: (event) => { void liveStatus?.progress(event).catch((err) => console.warn(`[${this.config.name}] live status progress failed:`, err instanceof Error ? err.message : err)); },
       });
+    } catch (err) {
+      await liveStatus?.fail().catch(() => {});
+      throw err;
     } finally {
       // OpenClaw can emit the final assistant session.message shortly after
       // chatSend/collectReply returns. Keep discussion proactive muted briefly;
@@ -1915,9 +1934,33 @@ export class FeishuBot {
         content: storedContent,
         timestamp: Date.now(),
       });
-      await this.enqueueAndDispatchDelivery(chatId, "discussion", `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`, isVisible ? displayReply : "", parsedReply.attachments);
+      try {
+        await this.enqueueAndDispatchDelivery(chatId, "discussion", `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`, isVisible ? displayReply : "", parsedReply.attachments);
+      } catch (err) {
+        await liveStatus?.fail().catch(() => {});
+        throw err;
+      }
     }
+    await liveStatus?.complete().catch(() => {});
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
+  }
+
+  private async sendTextMessage(chatId: string, text: string): Promise<string | undefined> {
+    try {
+      const res = await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify({ text }),
+          msg_type: "text",
+        },
+      });
+      this.store.clearBotUnavailableInChat(this.config.name, chatId);
+      return (res as any)?.data?.message_id || (res as any)?.message_id;
+    } catch (err) {
+      if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
+      throw err;
+    }
   }
 
   private async replyTextMessage(messageId: string, text: string): Promise<string | undefined> {
