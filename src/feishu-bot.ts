@@ -2066,7 +2066,11 @@ export class FeishuBot {
 
   private extractBridgeAttachments(reply: string): { text: string; attachments: BridgeAttachment[] } {
     const attachments: BridgeAttachment[] = [];
-    const markerPattern = /<LMA_BRIDGE_ATTACHMENTS>([\s\S]*?)<\/LMA_BRIDGE_ATTACHMENTS>/g;
+    // Some models occasionally corrupt the closing tag from
+    // </LMA_BRIDGE_ATTACHMENTS> to </parameter> while preserving the exact JSON
+    // payload. Treat that as a recoverable marker shape; otherwise the whole
+    // marker leaks as user-visible text and attachments are not sent.
+    const markerPattern = /<LMA_BRIDGE_ATTACHMENTS>([\s\S]*?)(?:<\/LMA_BRIDGE_ATTACHMENTS>|<\/parameter>)/g;
     let text = reply.replace(markerPattern, (_match, jsonText) => {
       try {
         const parsed = JSON.parse(String(jsonText).trim());

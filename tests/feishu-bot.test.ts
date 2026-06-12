@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
 import { MessageStore } from "../src/message-store.js";
 import type { BotConfig } from "../src/config.js";
@@ -2133,6 +2133,24 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       expect(() => (h.bot as any).validateBridgeAttachmentPath("/real/path/image.png")).toThrow(/not found/i);
       expect(() => (h.bot as any).validateBridgeAttachmentPath("/absolute/path.png")).toThrow(/not found/i);
+    } finally { h.cleanup(); }
+  });
+
+  it("parses bridge attachment markers even when the closing tag is corrupted to parameter", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const attachmentPath = resolve(tmpdir(), "olma-test-attachments", "bad-close.png");
+      mkdirSync(dirname(attachmentPath), { recursive: true });
+      writeFileSync(attachmentPath, "fake-image");
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        return `正文\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</parameter>`;
+      });
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "生成图", messageId: "bad-close-marker" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("bad-close-marker", "正文");
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath, caption: "图" }));
+      expect((h.bot as any).replyMessage.mock.calls.map((c: any[]) => c[1]).join("\n")).not.toContain("LMA_BRIDGE_ATTACHMENTS");
     } finally { h.cleanup(); }
   });
 
