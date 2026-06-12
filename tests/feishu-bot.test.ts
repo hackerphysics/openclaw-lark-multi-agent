@@ -473,6 +473,29 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+  it("includes a bot in discuss after restart if it had durably seen the chat", async () => {
+    const gpt = makeHarness("GPT");
+    const claude = makeHarness("Claude");
+    try {
+      (claude.bot as any).store = gpt.store;
+      (claude.bot as any).openclawClient = claude.openclaw;
+      FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
+      FeishuBot.getAllBots().set("app-Claude", claude.bot as any);
+      markBotSeen("GPT");
+      // Simulate process restart: Claude's in-memory seen set is gone, but the
+      // durable bot_chat_seen signal remains from a previous received event.
+      gpt.store.markBotSeenInChat("Claude", "chat1");
+      gpt.store.setDiscussMode("chat1", true);
+      gpt.store.setDiscussMaxRounds("chat1", 1);
+
+      await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic-cold-start" }));
+      await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1 && claude.openclaw.chatCalls.length === 1, { timeout: 1000 });
+    } finally {
+      gpt.cleanup();
+      claude.cleanup();
+    }
+  });
+
   it("excludes a bot from discuss after Feishu reports it is out of the chat", async () => {
     const gpt = makeHarness("GPT");
     const ghost = makeHarness("Ghost");
@@ -655,6 +678,17 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.isMessageRecalled("recall-me")).toBe(true);
       expect((h.bot as any).pendingAckMessages.get("chat1")).toEqual([]);
       expect((h.bot as any).removeReaction).toHaveBeenCalledWith("recall-me", "Typing");
+    } finally { h.cleanup(); }
+  });
+
+  it("clears out-of-chat cache when the bot receives a new event from that chat", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.markBotUnavailableInChat("GPT", "chat1", "code=230002 Bot/User can NOT be out of the chat");
+      expect(h.store.isBotUnavailableInChat("GPT", "chat1")).toBe(true);
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "/status", messageId: "status-after-readd" }));
+      expect(h.store.hasBotSeenInChat("GPT", "chat1")).toBe(true);
+      expect(h.store.isBotUnavailableInChat("GPT", "chat1")).toBe(false);
     } finally { h.cleanup(); }
   });
 

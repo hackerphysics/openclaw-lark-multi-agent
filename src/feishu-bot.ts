@@ -398,7 +398,7 @@ export class FeishuBot {
       const sender = event.sender;
 
       const chatId: string = message.chat_id;
-      FeishuBot.markBotSeenInChat(this.config.name, chatId);
+      this.markCurrentBotSeenInChat(chatId);
       const chatType: string = message.chat_type;
       const messageType: string = message.message_type;
       const messageId: string = message.message_id;
@@ -1871,6 +1871,11 @@ export class FeishuBot {
     set.add(chatId);
   }
 
+  private markCurrentBotSeenInChat(chatId: string): void {
+    FeishuBot.markBotSeenInChat(this.config.name, chatId);
+    this.store.markBotSeenInChat(this.config.name, chatId);
+  }
+
   private isBotAvailableInChat(bot: FeishuBot, chatId: string): boolean {
     // A bot can be globally configured but not actually installed in this Feishu
     // group. Discuss participants must be restricted to bots that either have
@@ -1880,6 +1885,7 @@ export class FeishuBot {
     // (Bot/User can NOT be out of the chat).
     if (this.store.isBotUnavailableInChat(bot.config.name, chatId)) return false;
     return FeishuBot.seenBotChats.get(bot.config.name)?.has(chatId)
+      || this.store.hasBotSeenInChat(bot.config.name, chatId)
       || this.store.hasAnyDeliveredToChat(bot.config.name, chatId);
   }
 

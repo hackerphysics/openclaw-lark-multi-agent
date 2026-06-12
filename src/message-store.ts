@@ -167,6 +167,16 @@ export class MessageStore {
         PRIMARY KEY (bot_name, chat_id)
       );
 
+      -- Durable positive membership signal. Feishu does not reliably expose bot
+      -- members via chat_members, so receiving an event in a chat is the strongest
+      -- proof that this bot app is actually installed in that group.
+      CREATE TABLE IF NOT EXISTS bot_chat_seen (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY (bot_name, chat_id)
+      );
+
       -- Durable negative membership cache. Feishu message create returns 230002
       -- when a bot app is not in a chat; cache that so discussion scheduling and
       -- later proactive deliveries do not keep generating ghost participants.
@@ -485,6 +495,22 @@ export class MessageStore {
       SELECT * FROM delivery_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT ?
     `).all(maxCount) as any[];
     return rows.map((r) => this.mapDelivery(r));
+  }
+
+  markBotSeenInChat(botName: string, chatId: string): void {
+    this.db.prepare(`
+      INSERT INTO bot_chat_seen(bot_name, chat_id, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(bot_name, chat_id) DO UPDATE SET updated_at = excluded.updated_at
+    `).run(botName, chatId, Date.now());
+    // If the bot is receiving events from this chat again, it is no longer out
+    // of the chat. This recovers automatically when a bot is re-added to a group.
+    this.clearBotUnavailableInChat(botName, chatId);
+  }
+
+  hasBotSeenInChat(botName: string, chatId: string): boolean {
+    const row = this.db.prepare(`SELECT 1 FROM bot_chat_seen WHERE bot_name = ? AND chat_id = ? LIMIT 1`).get(botName, chatId);
+    return !!row;
   }
 
   markBotUnavailableInChat(botName: string, chatId: string, reason = ''): void {

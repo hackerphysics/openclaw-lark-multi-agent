@@ -71,11 +71,13 @@ describe("MessageStore", () => {
     expect([...store.getPendingTriggerIds("GPT", "c1")]).toEqual([triggerId]);
   }));
 
-  it("tracks per-bot chat unavailability", () => withStore((store) => {
+  it("tracks per-bot chat seen/unavailability and recovers when a bot is re-added", () => withStore((store) => {
+    expect(store.hasBotSeenInChat("Ghost", "chat1")).toBe(false);
     expect(store.isBotUnavailableInChat("Ghost", "chat1")).toBe(false);
     store.markBotUnavailableInChat("Ghost", "chat1", "code=230002 Bot/User can NOT be out of the chat");
     expect(store.isBotUnavailableInChat("Ghost", "chat1")).toBe(true);
-    store.clearBotUnavailableInChat("Ghost", "chat1");
+    store.markBotSeenInChat("Ghost", "chat1");
+    expect(store.hasBotSeenInChat("Ghost", "chat1")).toBe(true);
     expect(store.isBotUnavailableInChat("Ghost", "chat1")).toBe(false);
   }));
 
