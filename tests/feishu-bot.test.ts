@@ -2154,6 +2154,24 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("parses bridge attachment markers even when the opening tag loses the LMA prefix", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const attachmentPath = resolve(tmpdir(), "olma-test-attachments", "bad-open.png");
+      mkdirSync(dirname(attachmentPath), { recursive: true });
+      writeFileSync(attachmentPath, "fake-image");
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        return `正文\n_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</LMA_BRIDGE_ATTACHMENTS>`;
+      });
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "生成图", messageId: "bad-open-marker" }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("bad-open-marker", "正文");
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath, caption: "图" }));
+      expect((h.bot as any).replyMessage.mock.calls.map((c: any[]) => c[1]).join("\n")).not.toContain("BRIDGE_ATTACHMENTS");
+    } finally { h.cleanup(); }
+  });
+
   it("converts MEDIA directives into bridge attachments instead of leaving path text", async () => {
     const h = makeHarness();
     try {
