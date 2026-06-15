@@ -65,6 +65,48 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("real reply");
   });
 
+  it("does not reject on a recoverable context-overflow error; a later final wins", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
+    // OpenClaw emits a recoverable error, then auto-compacts and keeps running,
+    // eventually delivering a real final on the same run.
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "error", error: "Context overflow: prompt too large for the model. Try /reset" },
+    });
+    setTimeout(() => {
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatFinal", data: { text: "recovered reply" } });
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
+    }, 50);
+
+    await expect(replyPromise).resolves.toBe("recovered reply");
+  });
+
+  it("still rejects immediately on a non-recoverable agent error", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
+    events.get(key)!.push({
+      runId: "chat-run",
+      sessionKey: key,
+      stream: "lifecycle",
+      data: { phase: "error", error: "Tool execution failed: permission denied" },
+    });
+
+    await expect(replyPromise).rejects.toThrow(/permission denied/);
+  });
+
   it("treats empty final as NO_REPLY when requested", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();

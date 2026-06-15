@@ -809,17 +809,50 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               return;
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
+              const errText = String(ev.data?.error || "unknown");
+              // Some agent errors are recoverable: OpenClaw emits a lifecycle
+              // error (e.g. "Context overflow: prompt too large") and then
+              // auto-compacts and KEEPS RUNNING the same run, eventually emitting
+              // a real final. If we reject immediately the user sees a scary
+              // "没有完成回复" while the agent is in fact still working. So for
+              // recoverable errors we defer: record the failure text and keep
+              // waiting. Subsequent delta/item events reset the idle timer, so a
+              // real final wins; if the run truly stalls, the idle timeout falls
+              // back to this text.
+              if (this.isRecoverableAgentError(errText)) {
+                pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
+                resetIdleTimer();
+                console.warn(`[OpenClaw] recoverable lifecycle error for runId=${evRunId || runId}; deferring (agent may auto-recover): ${errText.slice(0, 120)}`);
+                return;
+              }
               clearTimeout(idleTimer);
               clearInterval(poller);
               if (chatFinalTimer) clearTimeout(chatFinalTimer);
               if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
-              reject(new Error(`Agent error: ${ev.data?.error || "unknown"}`));
+              reject(new Error(`Agent error: ${errText}`));
               return;
             }
           }
         }
       }, 50);
     });
+  }
+
+  /**
+   * Recoverable agent errors are lifecycle errors that OpenClaw can self-heal
+   * (it auto-compacts and keeps running the same run, then emits a real final).
+   * For these we must not reject collectReply immediately, or the bridge reports
+   * "没有完成回复" while the agent is still working. Currently this covers
+   * context-overflow / prompt-too-large, which OpenClaw recovers from via its
+   * context-overflow-recovery + auto-compaction path.
+   */
+  private isRecoverableAgentError(errText: string): boolean {
+    const t = (errText || "").toLowerCase();
+    return t.includes("context overflow")
+      || t.includes("prompt too large")
+      || t.includes("context length")
+      || t.includes("too many tokens")
+      || t.includes("maximum context");
   }
 
   private pickBestCollectedText(chatFinalText: string, assistantText: string, chatDeltaText: string, transcriptAssistantText: string): string {
