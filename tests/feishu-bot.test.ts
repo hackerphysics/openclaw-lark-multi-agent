@@ -1717,7 +1717,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).replyLiveStatusCard).toHaveBeenCalledWith("live-trigger", expect.objectContaining({ title: "Claude 正在执行" }), "chat1");
       const placeholderView = (h.bot as any).replyLiveStatusCard.mock.calls[0][1];
       expect(placeholderView.lines.map((l: any) => l.text)).toContain("read: 读取 src/feishu-bot.ts");
-      expect(placeholderView.hint).toContain("/livestatus off");
+      expect(placeholderView.hint).toBeUndefined();
       expect(placeholderView.elapsed).toMatch(/\d+:\d{2}/);
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");

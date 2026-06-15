@@ -190,4 +190,66 @@ describe("LiveStatusController (interactive card)", () => {
     expect(last.lines[0].text).toBe(`exec: ${"x".repeat(17)}…`);
     vi.useRealTimers();
   });
+
+  it("records a relative timestamp (seconds since start) on each line", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await vi.advanceTimersByTimeAsync(12_000);
+    await live.progress({ kind: "tool", phase: "start", name: "exec", text: "exec start: npm test" });
+
+    const last = views[views.length - 1];
+    expect(last.lines[0].at).toBe(0);
+    expect(last.lines[1].at).toBe(12);
+    vi.useRealTimers();
+  });
+
+  it("shows a tool-call + elapsed summary line on complete instead of recent messages", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await live.progress({ kind: "tool", phase: "end", name: "read", text: "read end: ok" });
+    await live.progress({ kind: "tool", phase: "start", name: "exec", text: "exec start: npm test" });
+    await live.complete();
+
+    const last = views[views.length - 1];
+    expect(last.state).toBe("done");
+    // Content is a single summary line, not the recent activity window.
+    expect(last.lines).toHaveLength(1);
+    expect(last.lines[0].kind).toBe("summary");
+    // Two tool starts (read, exec) => count is 2; tool_end does not count.
+    expect(last.lines[0].text).toContain("2");
+    expect(last.lines[0].text).toMatch(/共调用工具 2 次/);
+    vi.useRealTimers();
+  });
+
+  it("does not include a disable hint in the view", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async (view) => { views.push(view); return "msg1"; }),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+
+    expect((views[views.length - 1] as any).hint).toBeUndefined();
+    vi.useRealTimers();
+  });
 });

@@ -11,22 +11,22 @@ const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS
 
 /** One activity line shown in the card content area. */
 export type LiveStatusLine = {
-  kind: "tool_start" | "tool_end" | "text" | "lifecycle";
+  kind: "tool_start" | "tool_end" | "text" | "lifecycle" | "summary";
   text: string;
+  /** Relative time (seconds since run start) when this line was produced. */
+  at: number;
 };
 
 /** Structured snapshot the renderer turns into a Feishu interactive card. */
 export type LiveStatusView = {
   /** Card title, e.g. "Claude 正在执行" / "✅ Claude 已完成". */
   title: string;
-  /** Up to `historySize` most-recent activity lines (oldest first). */
+  /** Activity lines (oldest first); when finished this holds a summary instead. */
   lines: LiveStatusLine[];
   /** Footer: elapsed time like "0:42". */
   elapsed: string;
   /** Footer: model name, e.g. "phgeek-gw/claude-opus-4.8". */
   model?: string;
-  /** Optional one-line hint (e.g. how to disable). */
-  hint?: string;
   /** Terminal state: running / done / failed (lets renderer pick color). */
   state: "running" | "done" | "failed";
 };
@@ -50,8 +50,6 @@ export type LiveStatusOptions = {
   historySize?: number;
   /** Footer/auto-refresh cadence in ms. */
   tickMs?: number;
-  /** Optional hint line (e.g. "调用 /livestatus off 关闭该状态提示"). */
-  disableHint?: string;
 };
 
 export class LiveStatusController {
@@ -66,6 +64,8 @@ export class LiveStatusController {
   private finalized = false;
   private disabled = false;
   private state: "running" | "done" | "failed" = "running";
+  /** Total tool calls (tool_start events) seen during the run, for the summary. */
+  private toolCallCount = 0;
 
   constructor(private readonly callbacks: LiveStatusCallbacks, private readonly opts: LiveStatusOptions) {}
 
@@ -95,7 +95,7 @@ export class LiveStatusController {
       if (!t) return;
       this.pushLine("text", t);
     } else if (event.kind === "tool") {
-      if (event.phase === "start") this.pushLine("tool_start", this.formatTool(event));
+      if (event.phase === "start") { this.toolCallCount++; this.pushLine("tool_start", this.formatTool(event)); }
       else if (event.phase === "end") this.pushLine("tool_end", this.formatTool(event));
       else return; // tool error -> normal error path
     } else if (event.kind === "assistant_note") {
@@ -140,7 +140,8 @@ export class LiveStatusController {
     // Collapse consecutive lifecycle placeholders (e.g. repeated "等待 OpenClaw").
     const last = this.lines[this.lines.length - 1];
     if (last && last.kind === kind && last.text === clipped) return;
-    this.lines.push({ kind, text: clipped });
+    const at = Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000));
+    this.lines.push({ kind, text: clipped, at });
     const limit = this.opts.historySize ?? DEFAULT_HISTORY;
     if (this.lines.length > limit) this.lines = this.lines.slice(this.lines.length - limit);
   }
@@ -208,7 +209,7 @@ export class LiveStatusController {
   /** Dedupe key: ignore elapsed (it always changes) so ticks without new
    *  activity still refresh the footer, but identical content is skipped. */
   private signature(view: LiveStatusView): string {
-    return `${view.state}|${view.title}|${view.lines.map((l) => `${l.kind}:${l.text}`).join("|")}`;
+    return `${view.state}|${view.title}|${view.lines.map((l) => `${l.kind}@${l.at}:${l.text}`).join("|")}`;
   }
 
   private formatTool(event: Extract<ProgressEvent, { kind: "tool" }>): string {
@@ -232,13 +233,25 @@ export class LiveStatusController {
     if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
     else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
     else title = en ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
+    // When finished, replace the recent-activity window with a run summary
+    // (total tool calls + total time) instead of the last few messages.
+    const lines: LiveStatusLine[] = this.state === "running"
+      ? [...this.lines]
+      : [this.buildSummaryLine(en)];
     return {
       title,
-      lines: [...this.lines],
+      lines,
       elapsed: this.formatElapsed(),
       model: this.opts.model,
-      hint: this.opts.disableHint,
       state: this.state,
     };
+  }
+
+  private buildSummaryLine(en: boolean): LiveStatusLine {
+    const elapsed = this.formatElapsed();
+    const text = en
+      ? `${this.toolCallCount} tool call${this.toolCallCount === 1 ? "" : "s"} \u00b7 ${elapsed}`
+      : `\u5171\u8c03\u7528\u5de5\u5177 ${this.toolCallCount} \u6b21 \u00b7 \u8017\u65f6 ${elapsed}`;
+    return { kind: "summary", text, at: Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000)) };
   }
 }

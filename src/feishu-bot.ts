@@ -1244,9 +1244,6 @@ export class FeishuBot {
               botName: this.config.name,
               model: this.config.model,
               locale: this.isEn(chatId) ? "en" : "zh",
-              disableHint: this.isEn(chatId)
-                ? `Tip: send /livestatus off to hide this status message`
-                : `提示：调用 /livestatus off 关闭该状态提示`,
             })
           : undefined;
         liveStatus?.start(this.isEn(chatId) ? "waiting for OpenClaw" : "等待 OpenClaw 回复");
@@ -1934,9 +1931,6 @@ export class FeishuBot {
           botName: this.config.name,
           model: this.config.model,
           locale: this.isEn(chatId) ? "en" : "zh",
-          disableHint: this.isEn(chatId)
-            ? `Tip: send /livestatus off to hide this status message`
-            : `提示：调用 /livestatus off 关闭该状态提示`,
         })
       : undefined;
     liveStatus?.start(meta ? `第 ${meta.round}/${meta.maxRounds} 轮讨论` : "讨论中");
@@ -2001,29 +1995,33 @@ export class FeishuBot {
   private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
     const en = this.isEn(chatId);
     const elements: any[] = [];
-    // Content area: recent activity lines (oldest first). Each line is one
-    // message: tool start / tool end / intermediate text.
+    // Content area. While running: recent activity lines (each prefixed with the
+    // relative time mm:ss since the run started). When finished: a single run
+    // summary line (total tool calls + elapsed) instead of recent messages.
     if (view.lines.length > 0) {
       const iconFor = (kind: string): string =>
         kind === "tool_start" ? "▸"
         : kind === "tool_end" ? "✓"
         : kind === "lifecycle" ? "⋯"
+        : kind === "summary" ? "📊"
         : "•";
+      const fmtAt = (sec: number): string => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
       const content = view.lines
-        .map((l) => `${iconFor(l.kind)} ${this.escapeCardText(l.text)}`)
+        .map((l) => {
+          const stamp = l.kind === "summary" ? "" : `\`${fmtAt(l.at)}\` `;
+          return `${stamp}${iconFor(l.kind)} ${this.escapeCardText(l.text)}`;
+        })
         .join("\n");
       elements.push({ tag: "markdown", content });
     } else {
       elements.push({ tag: "markdown", content: en ? "_working…_" : "_正在启动…_" });
     }
     elements.push({ tag: "hr" });
-    // Footer: elapsed time + model name (+ optional disable hint).
+    // Footer: elapsed time + model name.
     const footerBits: string[] = [];
     footerBits.push(en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`);
     if (view.model) footerBits.push(`🧠 ${this.escapeCardText(view.model)}`);
-    const footerParts = [`<font color='grey'>${footerBits.join("  ·  ")}</font>`];
-    if (view.hint) footerParts.push(`<font color='grey'>${this.escapeCardText(view.hint)}</font>`);
-    elements.push({ tag: "markdown", content: footerParts.join("\n") });
+    elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
     // Title color reflects state.
     const template = view.state === "done" ? "green" : view.state === "failed" ? "orange" : "blue";
     return {
