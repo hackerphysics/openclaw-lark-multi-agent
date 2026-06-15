@@ -5,9 +5,9 @@ const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STAT
 // How many recent activity lines to keep in the card content area.
 const DEFAULT_HISTORY = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_HISTORY || 6);
 // How often to refresh the elapsed-time footer even when no new activity arrives,
-// so the "已用时间" keeps advancing. Card patch has no 20-edit cap (unlike text
-// edit), so a modest cadence is safe.
-const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS || 3000);
+// so the "已用时间" ticks like a live timer. Interactive-card patch has no 20-edit
+// cap (unlike text edit), so a 1s cadence is fine.
+const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS || 1000);
 
 /** One activity line shown in the card content area. */
 export type LiveStatusLine = {
