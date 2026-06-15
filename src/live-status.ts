@@ -3,7 +3,7 @@ import type { ProgressEvent } from "./openclaw-client";
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
 const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS || 120);
 // How many recent activity lines to keep in the card content area.
-const DEFAULT_HISTORY = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_HISTORY || 3);
+const DEFAULT_HISTORY = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_HISTORY || 6);
 // How often to refresh the elapsed-time footer even when no new activity arrives,
 // so the "已用时间" keeps advancing. Card patch has no 20-edit cap (unlike text
 // edit), so a modest cadence is safe.
