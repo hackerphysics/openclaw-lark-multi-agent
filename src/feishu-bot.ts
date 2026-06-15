@@ -1991,7 +1991,13 @@ export class FeishuBot {
         throw err;
       }
     }
-    await liveStatus?.complete().catch(() => {});
+    // Mirror the normal path: a NO_REPLY/empty discussion turn should finish the
+    // status card with a "no content" summary, not a plain done summary.
+    if (!isVisible && parsedReply.attachments.length === 0) {
+      await liveStatus?.noReply().catch(() => {});
+    } else {
+      await liveStatus?.complete().catch(() => {});
+    }
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
   }
 

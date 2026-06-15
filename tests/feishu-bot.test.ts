@@ -659,6 +659,31 @@ describe("FeishuBot routing and queue behavior", () => {
     }
   });
 
+  it("finishes the discussion live status with a no-content summary on NO_REPLY", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onProgress?.({ kind: "tool", phase: "start", name: "read", text: "read start: spec.md" });
+        await vi.advanceTimersByTimeAsync(900);
+        return "NO_REPLY";
+      });
+
+      const result = await (h.bot as any).runDiscussionTurn("chat1", "prompt", { round: 1, maxRounds: 10 });
+      expect(result.visible).toBe(false);
+      // NO_REPLY discussion turn must not be delivered to the group...
+      expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+      // ...and the status card finishes with the "no content" summary.
+      const lastPatch = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1)[1];
+      expect(lastPatch.state).toBe("done");
+      expect(lastPatch.lines[0].text).toContain("模型没有回复内容");
+    } finally {
+      vi.useRealTimers();
+      h.cleanup();
+    }
+  });
+
   it("adds discussion round markers once and keeps raw text for the next round", async () => {
     const h = makeHarness("Claude");
     try {

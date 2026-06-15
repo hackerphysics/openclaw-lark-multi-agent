@@ -311,4 +311,27 @@ describe("LiveStatusController (interactive card)", () => {
     expect(create).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
+
+  it("ticker patches the card to advance the elapsed footer without new activity", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0, tickMs: 3000 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    const countAfterActivity = views.length;
+
+    // No new activity, just time passing: the ticker must still patch so the
+    // elapsed footer advances (signature now includes elapsed).
+    await vi.advanceTimersByTimeAsync(3000);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(views.length).toBeGreaterThan(countAfterActivity);
+    const elapsedValues = views.slice(countAfterActivity).map((v) => v.elapsed);
+    expect(new Set(elapsedValues).size).toBeGreaterThan(1); // elapsed actually changed
+    vi.useRealTimers();
+  });
 });

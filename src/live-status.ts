@@ -223,10 +223,10 @@ export class LiveStatusController {
     }
   }
 
-  /** Dedupe key: ignore elapsed (it always changes) so ticks without new
-   *  activity still refresh the footer, but identical content is skipped. */
+  /** Dedupe key includes elapsed so the footer timer ticks even without new
+   *  activity, while identical content within the same second is still skipped. */
   private signature(view: LiveStatusView): string {
-    return `${view.state}|${view.title}|${view.lines.map((l) => `${l.kind}@${l.at}:${l.text}`).join("|")}`;
+    return `${view.state}|${view.title}|${view.elapsed}|${view.lines.map((l) => `${l.kind}@${l.at}:${l.text}`).join("|")}`;
   }
 
   private isNoReplyText(text: string): boolean {
