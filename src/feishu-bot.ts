@@ -2008,7 +2008,9 @@ export class FeishuBot {
     // total elapsed. This avoids taking up much screen space after the run ends.
     if (view.state !== "running") {
       const statusEmoji = view.state === "failed" ? "⚠️" : view.noReply ? "💤" : "✅";
-      const compact = `${statusEmoji}  🔧 ${view.toolCalls}  ·  ⏱ ${view.elapsed}`;
+      const compact = en
+        ? `${statusEmoji} ${view.toolCalls} tool call${view.toolCalls === 1 ? "" : "s"} · ⏱ ${view.elapsed}`
+        : `${statusEmoji} 累计${view.toolCalls} 次工具调用 · ⏱ 耗时${view.elapsed}`;
       return {
         schema: "2.0",
         config: { update_multi: true, width_mode: "fill" },

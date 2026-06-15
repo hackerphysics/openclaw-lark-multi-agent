@@ -1720,8 +1720,8 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(doneCard.body.elements).toHaveLength(1);
       const doneText = doneCard.body.elements[0].content;
       expect(doneText).toContain("✅");
-      expect(doneText).toContain("🔧 7");
-      expect(doneText).toContain("⏱ 2:15");
+      expect(doneText).toContain("累计7 次工具调用");
+      expect(doneText).toContain("⏱ 耗时2:15");
       expect(doneText).not.toMatch(/已用|\bfont\b/); // no footer styling
       // Failed uses a different status emoji
       const failCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "failed", title: "⚠️ Claude 执行中断" }, "chat1");
@@ -1729,7 +1729,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(failCard.body.elements[0].content).toContain("⚠️");
       // NO_REPLY marker
       const noReplyCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done", noReply: true, toolCalls: 2, elapsed: "0:11" }, "chat1");
-      expect(noReplyCard.body.elements[0].content).toContain("🔧 2");
+      expect(noReplyCard.body.elements[0].content).toContain("累计2 次工具调用");
       // Running card still has header + footer
       const runningCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "running", title: "Claude 正在执行", lines: [{ kind: "tool_start", text: "read: a.ts", at: 2 }] }, "chat1");
       expect(runningCard.header).toBeDefined();
