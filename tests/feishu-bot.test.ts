@@ -1710,6 +1710,33 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("renders a minimal finished card (no header/footer, one compact line)", () => {
+    const h = makeHarness("Claude");
+    try {
+      const baseView = { title: "✅ Claude 已完成", lines: [], elapsed: "2:15", model: "phgeek-gw/claude-opus-4.8", toolCalls: 7, noReply: false };
+      // Done
+      const doneCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done" }, "chat1");
+      expect(doneCard.header).toBeUndefined();
+      expect(doneCard.body.elements).toHaveLength(1);
+      const doneText = doneCard.body.elements[0].content;
+      expect(doneText).toContain("✅");
+      expect(doneText).toContain("🔧 7");
+      expect(doneText).toContain("⏱ 2:15");
+      expect(doneText).not.toMatch(/已用|\bfont\b/); // no footer styling
+      // Failed uses a different status emoji
+      const failCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "failed", title: "⚠️ Claude 执行中断" }, "chat1");
+      expect(failCard.header).toBeUndefined();
+      expect(failCard.body.elements[0].content).toContain("⚠️");
+      // NO_REPLY marker
+      const noReplyCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done", noReply: true, toolCalls: 2, elapsed: "0:11" }, "chat1");
+      expect(noReplyCard.body.elements[0].content).toContain("🔧 2");
+      // Running card still has header + footer
+      const runningCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "running", title: "Claude 正在执行", lines: [{ kind: "tool_start", text: "read: a.ts", at: 2 }] }, "chat1");
+      expect(runningCard.header).toBeDefined();
+      expect(runningCard.body.elements.length).toBeGreaterThan(1); // content + hr + footer
+    } finally { h.cleanup(); }
+  });
+
   it("uses a live status message in non-verbose mode and finishes it after the final reply", async () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");

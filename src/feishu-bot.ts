@@ -2003,10 +2003,21 @@ export class FeishuBot {
 
   private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
     const en = this.isEn(chatId);
+    // Finished (done/failed): keep it minimal — no header, no footer, just one
+    // compact body line with three signals: status emoji + tool-call count +
+    // total elapsed. This avoids taking up much screen space after the run ends.
+    if (view.state !== "running") {
+      const statusEmoji = view.state === "failed" ? "⚠️" : view.noReply ? "💤" : "✅";
+      const compact = `${statusEmoji}  🔧 ${view.toolCalls}  ·  ⏱ ${view.elapsed}`;
+      return {
+        schema: "2.0",
+        config: { update_multi: true, width_mode: "fill" },
+        body: { elements: [{ tag: "markdown", content: compact }] },
+      };
+    }
     const elements: any[] = [];
-    // Content area. While running: recent activity lines (each prefixed with the
-    // relative time mm:ss since the run started). When finished: a single run
-    // summary line (total tool calls + elapsed) instead of recent messages.
+    // Running: recent activity lines (each prefixed with the relative time mm:ss
+    // since the run started).
     if (view.lines.length > 0) {
       const iconFor = (kind: string): string =>
         kind === "tool_start" ? "▸"
@@ -2031,8 +2042,6 @@ export class FeishuBot {
     footerBits.push(en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`);
     if (view.model) footerBits.push(`🧠 ${this.escapeCardText(view.model)}`);
     elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
-    // Title color reflects state.
-    const template = view.state === "done" ? "green" : view.state === "failed" ? "orange" : "blue";
     return {
       schema: "2.0",
       // update_multi is REQUIRED for im.message.patch to update the card; Feishu
@@ -2040,7 +2049,7 @@ export class FeishuBot {
       config: { update_multi: true, width_mode: "fill" },
       header: {
         title: { tag: "plain_text", content: view.title },
-        template,
+        template: "blue",
       },
       body: { elements },
     };

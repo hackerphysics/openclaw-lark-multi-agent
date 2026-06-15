@@ -27,6 +27,10 @@ export type LiveStatusView = {
   elapsed: string;
   /** Footer: model name, e.g. "phgeek-gw/claude-opus-4.8". */
   model?: string;
+  /** Total tool calls in the run (for the compact finished summary). */
+  toolCalls: number;
+  /** True when finished via noReply(): the model produced no user-visible reply. */
+  noReply: boolean;
   /** Terminal state: running / done / failed (lets renderer pick color). */
   state: "running" | "done" | "failed";
 };
@@ -289,6 +293,8 @@ export class LiveStatusController {
       lines,
       elapsed: this.formatElapsed(),
       model: this.opts.model,
+      toolCalls: this.toolCallCount,
+      noReply: this.noReplyResult,
       state: this.state,
     };
   }
