@@ -80,6 +80,53 @@ describe("LiveStatusController (interactive card)", () => {
     vi.useRealTimers();
   });
 
+  it("merges consecutive assistant text fragments into one line (no tool between)", async () => {
+    // Repro: a long assistant message (e.g. a Markdown table) is flushed as
+    // multiple incremental fragments. Without a tool event between them they all
+    // belong to one thought and must NOT become separate lines.
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0, historySize: 6, maxChars: 500 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "assistant_note", text: "| card patch 频率 | P2/监控 |" });
+    await live.progress({ kind: "assistant_note", text: "项" });
+    await live.progress({ kind: "assistant_note", text: "| 暂无问题 | | interactive reply 兼容性" });
+    await live.progress({ kind: "assistant_note", text: "低风险 | 已实测基本可用 | |" });
+
+    const last = views[views.length - 1];
+    const textLines = last.lines.filter((l) => l.kind === "text");
+    expect(textLines).toHaveLength(1);
+    expect(textLines[0].text).toContain("card patch 频率");
+    expect(textLines[0].text).toContain("已实测基本可用");
+    vi.useRealTimers();
+  });
+
+  it("starts a fresh text line after a tool event", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0, historySize: 6 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "assistant_note", text: "先看一下" });
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await live.progress({ kind: "assistant_note", text: "现在明白了" });
+
+    const last = views[views.length - 1];
+    expect(last.lines.map((l) => l.kind)).toEqual(["text", "tool_start", "text"]);
+    expect(last.lines[0].text).toBe("先看一下");
+    expect(last.lines[2].text).toBe("现在明白了");
+    vi.useRealTimers();
+  });
+
   it("keeps only the most recent N lines (default 3)", async () => {
     vi.useFakeTimers();
     const views: LiveStatusView[] = [];

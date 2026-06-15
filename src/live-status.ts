@@ -95,7 +95,7 @@ export class LiveStatusController {
     if (typeof event === "string") {
       const t = event.trim();
       if (!t || this.isNoReplyText(t)) return;
-      this.pushLine("text", t);
+      this.appendText(t);
     } else if (event.kind === "tool") {
       if (event.phase === "start") { this.toolCallCount++; this.pushLine("tool_start", this.formatTool(event)); }
       else if (event.phase === "end") this.pushLine("tool_end", this.formatTool(event));
@@ -103,7 +103,7 @@ export class LiveStatusController {
     } else if (event.kind === "assistant_note") {
       const t = (event.text || "").trim();
       if (!t || this.isNoReplyText(t)) return;
-      this.pushLine("text", t);
+      this.appendText(t);
     } else {
       return; // lifecycle ticks: ignore (footer timer already advances)
     }
@@ -149,12 +149,37 @@ export class LiveStatusController {
     this.stopTimers();
   }
 
-  private pushLine(kind: LiveStatusLine["kind"], text: string): void {
+  /**
+   * Intermediate assistant text arrives as incremental fragments (each flush
+   * sends only the newly-added slice). Consecutive fragments with no tool event
+   * in between belong to the same thought, so merge them into ONE line instead
+   * of showing each fragment (or each table row) as a separate message. A tool
+   * event resets this, so the next text starts a fresh line.
+   */
+  private appendText(fragment: string): void {
+    const last = this.lines[this.lines.length - 1];
+    if (last && last.kind === "text") {
+      const merged = `${last.text} ${this.normalizeText(fragment)}`.replace(/\s+/g, " ").trim();
+      last.text = this.clip(merged);
+      return;
+    }
+    this.pushLine("text", fragment);
+  }
+
+  private normalizeText(text: string): string {
+    return text.replace(/\s+/g, " ").trim();
+  }
+
+  private clip(text: string): string {
     const maxChars = this.opts.maxChars ?? DEFAULT_MAX_CHARS;
-    const clean = text.replace(/\s+/g, " ").trim();
+    return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1))}\u2026` : text;
+  }
+
+  private pushLine(kind: LiveStatusLine["kind"], text: string): void {
+    const clean = this.normalizeText(text);
     if (!clean) return;
-    const clipped = clean.length > maxChars ? `${clean.slice(0, Math.max(0, maxChars - 1))}\u2026` : clean;
-    // Collapse consecutive lifecycle placeholders (e.g. repeated "等待 OpenClaw").
+    const clipped = this.clip(clean);
+    // Collapse consecutive identical lines (e.g. repeated "等待 OpenClaw").
     const last = this.lines[this.lines.length - 1];
     if (last && last.kind === kind && last.text === clipped) return;
     const at = Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000));
