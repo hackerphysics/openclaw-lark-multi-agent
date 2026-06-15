@@ -66,6 +66,8 @@ export class LiveStatusController {
   private state: "running" | "done" | "failed" = "running";
   /** Total tool calls (tool_start events) seen during the run, for the summary. */
   private toolCallCount = 0;
+  /** True when finished via noReply(): show a "no content" summary. */
+  private noReplyResult = false;
 
   constructor(private readonly callbacks: LiveStatusCallbacks, private readonly opts: LiveStatusOptions) {}
 
@@ -92,7 +94,7 @@ export class LiveStatusController {
     // lifecycle ticks after the first.
     if (typeof event === "string") {
       const t = event.trim();
-      if (!t) return;
+      if (!t || this.isNoReplyText(t)) return;
       this.pushLine("text", t);
     } else if (event.kind === "tool") {
       if (event.phase === "start") { this.toolCallCount++; this.pushLine("tool_start", this.formatTool(event)); }
@@ -100,7 +102,7 @@ export class LiveStatusController {
       else return; // tool error -> normal error path
     } else if (event.kind === "assistant_note") {
       const t = (event.text || "").trim();
-      if (!t) return;
+      if (!t || this.isNoReplyText(t)) return;
       this.pushLine("text", t);
     } else {
       return; // lifecycle ticks: ignore (footer timer already advances)
@@ -120,6 +122,21 @@ export class LiveStatusController {
 
   async fail(): Promise<void> {
     this.state = "failed";
+    this.finalized = true;
+    this.stopTimers();
+    if (this.createPromise) await this.createPromise.catch(() => {});
+    if (!this.messageId || this.disabled) return;
+    await this.safeEdit(this.buildView(), true);
+  }
+
+  /**
+   * Finish when the model explicitly produced no reply (NO_REPLY) or an empty
+   * final. Mark the card done but show a "no content" summary instead of the
+   * activity window, so the user understands the run finished without output.
+   */
+  async noReply(): Promise<void> {
+    this.state = "done";
+    this.noReplyResult = true;
     this.finalized = true;
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
@@ -212,6 +229,10 @@ export class LiveStatusController {
     return `${view.state}|${view.title}|${view.lines.map((l) => `${l.kind}@${l.at}:${l.text}`).join("|")}`;
   }
 
+  private isNoReplyText(text: string): boolean {
+    return text.trim().toUpperCase() === "NO_REPLY";
+  }
+
   private formatTool(event: Extract<ProgressEvent, { kind: "tool" }>): string {
     const raw = event.text || event.name || "";
     const prefix = `${event.name} ${event.phase}`;
@@ -249,9 +270,16 @@ export class LiveStatusController {
 
   private buildSummaryLine(en: boolean): LiveStatusLine {
     const elapsed = this.formatElapsed();
+    const at = Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000));
+    if (this.noReplyResult) {
+      const text = en
+        ? `Model returned no content \u00b7 ${this.toolCallCount} tool call${this.toolCallCount === 1 ? "" : "s"} \u00b7 ${elapsed}`
+        : `\u6a21\u578b\u6ca1\u6709\u56de\u590d\u5185\u5bb9 \u00b7 \u5171\u8c03\u7528\u5de5\u5177 ${this.toolCallCount} \u6b21 \u00b7 \u8017\u65f6 ${elapsed}`;
+      return { kind: "summary", text, at };
+    }
     const text = en
       ? `${this.toolCallCount} tool call${this.toolCallCount === 1 ? "" : "s"} \u00b7 ${elapsed}`
       : `\u5171\u8c03\u7528\u5de5\u5177 ${this.toolCallCount} \u6b21 \u00b7 \u8017\u65f6 ${elapsed}`;
-    return { kind: "summary", text, at: Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000)) };
+    return { kind: "summary", text, at };
   }
 }

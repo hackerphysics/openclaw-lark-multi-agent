@@ -1297,7 +1297,7 @@ export class FeishuBot {
           // submitted far enough that auto-replaying risks duplicate delivery.
           // The user can resend a new message if they want to retry.
           markSubmittedBatch("empty-returned");
-          liveStatus?.dispose();
+          await liveStatus?.noReply().catch(() => {});
           console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; not replaying submitted message(s)`);
           const pendingAcks = this.pendingAckMessages.get(chatId) || [];
           const remainingAcks: typeof pendingAcks = [];
@@ -1402,7 +1402,10 @@ export class FeishuBot {
           await liveStatus?.fail().catch(() => {});
           this.scheduleDelayedFailure(chatId, lastHuman.messageId, visibleReply, triggerId);
         } else if (!shouldReply && !hasAttachments) {
-          liveStatus?.dispose();
+          // Explicit NO_REPLY (or empty visible text): the model finished without
+          // producing a user-visible reply. Mark the status card done with a
+          // "no content" summary instead of leaving it stuck on "正在执行".
+          await liveStatus?.noReply().catch(() => {});
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 

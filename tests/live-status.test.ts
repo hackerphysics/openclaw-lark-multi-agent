@@ -252,4 +252,63 @@ describe("LiveStatusController (interactive card)", () => {
     expect((views[views.length - 1] as any).hint).toBeUndefined();
     vi.useRealTimers();
   });
+
+  it("marks done with a 'no content' summary on noReply()", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start("等待 OpenClaw 回复");
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await live.noReply();
+
+    const last = views[views.length - 1];
+    expect(last.state).toBe("done");
+    expect(last.title).toBe("✅ Claude 已完成");
+    expect(last.lines).toHaveLength(1);
+    expect(last.lines[0].kind).toBe("summary");
+    expect(last.lines[0].text).toContain("模型没有回复内容");
+    vi.useRealTimers();
+  });
+
+  it("filters out NO_REPLY text so it never shows as an activity line", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const created: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async (v) => { created.push(v); return "msg1"; }),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await live.progress({ kind: "assistant_note", text: "NO_REPLY" });
+    await live.progress({ kind: "assistant_note", text: "no_reply" });
+
+    const allLines = [...created, ...views].flatMap((v) => v.lines.map((l) => l.text));
+    expect(allLines.some((t) => /no_reply/i.test(t))).toBe(false);
+    vi.useRealTimers();
+  });
+
+  it("noReply() does not create a card if one was never shown (fast reply)", async () => {
+    vi.useFakeTimers();
+    const create = vi.fn(async () => "msg1");
+    const live = new LiveStatusController({
+      create,
+      edit: vi.fn(async () => {}),
+    }, { botName: "Claude", delayMs: 800 });
+
+    live.start("等待 OpenClaw 回复");
+    // NO_REPLY arrives before the 800ms create delay elapses.
+    await live.noReply();
+    await vi.advanceTimersByTimeAsync(1000);
+
+    expect(create).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
 });
