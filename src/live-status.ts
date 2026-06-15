@@ -2,14 +2,40 @@ import type { ProgressEvent } from "./openclaw-client";
 
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
 const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS || 120);
-// Feishu caps a single message at 20 edits (code=230072 once exhausted). Keep the
-// final edit for the completion marker; running-state updates may consume at most
-// maxEdits - 1, with the last running edit reserved for an explicit limit notice.
-const DEFAULT_MAX_EDITS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_EDITS || 20);
+// How many recent activity lines to keep in the card content area.
+const DEFAULT_HISTORY = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_HISTORY || 3);
+// How often to refresh the elapsed-time footer even when no new activity arrives,
+// so the "已用时间" keeps advancing. Card patch has no 20-edit cap (unlike text
+// edit), so a modest cadence is safe.
+const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS || 3000);
+
+/** One activity line shown in the card content area. */
+export type LiveStatusLine = {
+  kind: "tool_start" | "tool_end" | "text" | "lifecycle";
+  text: string;
+};
+
+/** Structured snapshot the renderer turns into a Feishu interactive card. */
+export type LiveStatusView = {
+  /** Card title, e.g. "Claude 正在执行" / "✅ Claude 已完成". */
+  title: string;
+  /** Up to `historySize` most-recent activity lines (oldest first). */
+  lines: LiveStatusLine[];
+  /** Footer: elapsed time like "0:42". */
+  elapsed: string;
+  /** Footer: model name, e.g. "phgeek-gw/claude-opus-4.8". */
+  model?: string;
+  /** Optional one-line hint (e.g. how to disable). */
+  hint?: string;
+  /** Terminal state: running / done / failed (lets renderer pick color). */
+  state: "running" | "done" | "failed";
+};
 
 export type LiveStatusCallbacks = {
-  create: (text: string) => Promise<string | undefined>;
-  edit: (messageId: string, text: string) => Promise<void>;
+  /** Create the status card; returns the new message id. */
+  create: (view: LiveStatusView) => Promise<string | undefined>;
+  /** Patch the existing status card. */
+  edit: (messageId: string, view: LiveStatusView) => Promise<void>;
   warn?: (message: string, err?: unknown) => void;
 };
 
@@ -18,22 +44,28 @@ export type LiveStatusOptions = {
   locale?: "zh" | "en";
   delayMs?: number;
   maxChars?: number;
-  maxEdits?: number;
+  /** Model name shown in the footer. */
+  model?: string;
+  /** Number of recent activity lines kept in the content area. */
+  historySize?: number;
+  /** Footer/auto-refresh cadence in ms. */
+  tickMs?: number;
+  /** Optional hint line (e.g. "调用 /livestatus off 关闭该状态提示"). */
   disableHint?: string;
 };
 
 export class LiveStatusController {
   private messageId?: string;
-  private lastSentText = "";
-  private detail = "";
-  /** Number of edits already issued against the live message (excludes create). */
-  private editCount = 0;
+  private lastSentSignature = "";
+  /** Recent activity lines (most-recent last), capped at historySize. */
+  private lines: LiveStatusLine[] = [];
+  private startedAt = Date.now();
   private createTimer?: NodeJS.Timeout;
+  private tickTimer?: NodeJS.Timeout;
   private createPromise?: Promise<void>;
   private finalized = false;
   private disabled = false;
-  /** True after the running-state budget is spent; future progress is ignored. */
-  private runningLimitReached = false;
+  private state: "running" | "done" | "failed" = "running";
 
   constructor(private readonly callbacks: LiveStatusCallbacks, private readonly opts: LiveStatusOptions) {}
 
@@ -41,7 +73,10 @@ export class LiveStatusController {
 
   start(initialDetail?: string): void {
     if (this.disabled || this.finalized || this.createTimer || this.messageId) return;
-    this.detail = initialDetail || "";
+    this.startedAt = Date.now();
+    if (initialDetail && initialDetail.trim()) {
+      this.pushLine("lifecycle", initialDetail.trim());
+    }
     this.createTimer = setTimeout(() => {
       this.createTimer = undefined;
       this.createPromise = this.ensureCreated();
@@ -49,55 +84,47 @@ export class LiveStatusController {
   }
 
   async progress(event: ProgressEvent | string): Promise<void> {
-    if (this.disabled || this.finalized || this.runningLimitReached) return;
-    // Only tool-call start is meaningful enough to spend one of Feishu's limited
-    // edit slots. Ignore verbose assistant notes, lifecycle ticks, tool end, and
-    // tool error; the final/error answer is delivered by the normal message path.
-    if (typeof event !== "string") {
-      if (event.kind !== "tool" || event.phase !== "start") return;
-      this.detail = this.formatToolStart(event);
+    if (this.disabled || this.finalized) return;
+    // Card patch has no 20-edit cap (verified against Feishu im.message.patch),
+    // so we can show a small rolling window of recent activity: tool start, tool
+    // end, and intermediate assistant text each count as one line. We ignore
+    // tool "error" (the error is delivered through the normal message path) and
+    // lifecycle ticks after the first.
+    if (typeof event === "string") {
+      const t = event.trim();
+      if (!t) return;
+      this.pushLine("text", t);
+    } else if (event.kind === "tool") {
+      if (event.phase === "start") this.pushLine("tool_start", this.formatTool(event));
+      else if (event.phase === "end") this.pushLine("tool_end", this.formatTool(event));
+      else return; // tool error -> normal error path
+    } else if (event.kind === "assistant_note") {
+      const t = (event.text || "").trim();
+      if (!t) return;
+      this.pushLine("text", t);
     } else {
-      // String progress is kept for tests/backwards compatibility, but in normal
-      // runtime OpenClaw progress is structured and only tool start passes above.
-      this.detail = event.trim();
+      return; // lifecycle ticks: ignore (footer timer already advances)
     }
-    if (!this.detail) return;
     await this.ensureCreatedNow();
-    await this.editRunningStatus();
+    await this.safeEdit(this.buildView());
   }
 
-  /**
-   * Finish the live status when the real (final) reply is delivered separately.
-   * The final answer is sent by the normal interactive-card path, so the status
-   * message must NOT be overwritten with the answer (text type does not render
-   * Markdown). Feishu renders message deletion as a visible "recalled a message"
-   * tombstone, so keep the status message and mark it done instead.
-   */
   async complete(): Promise<void> {
+    this.state = "done";
     this.finalized = true;
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
-    const doneText = this.opts.locale === "en"
-      ? `\u2705 ${this.opts.botName} done`
-      : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
-    await this.safeEdit(doneText, true);
+    await this.safeEdit(this.buildView(), true);
   }
 
-  /**
-   * Finish the live status when the run failed and the error is delivered by the
-   * normal path. Use a neutral/negative marker so it does not contradict the
-   * separately delivered error message.
-   */
   async fail(): Promise<void> {
+    this.state = "failed";
     this.finalized = true;
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
-    const failedText = this.opts.locale === "en"
-      ? `\u26A0\uFE0F ${this.opts.botName} stopped`
-      : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
-    await this.safeEdit(failedText, true);
+    await this.safeEdit(this.buildView(), true);
   }
 
   dispose(): void {
@@ -105,8 +132,22 @@ export class LiveStatusController {
     this.stopTimers();
   }
 
+  private pushLine(kind: LiveStatusLine["kind"], text: string): void {
+    const maxChars = this.opts.maxChars ?? DEFAULT_MAX_CHARS;
+    const clean = text.replace(/\s+/g, " ").trim();
+    if (!clean) return;
+    const clipped = clean.length > maxChars ? `${clean.slice(0, Math.max(0, maxChars - 1))}\u2026` : clean;
+    // Collapse consecutive lifecycle placeholders (e.g. repeated "等待 OpenClaw").
+    const last = this.lines[this.lines.length - 1];
+    if (last && last.kind === kind && last.text === clipped) return;
+    this.lines.push({ kind, text: clipped });
+    const limit = this.opts.historySize ?? DEFAULT_HISTORY;
+    if (this.lines.length > limit) this.lines = this.lines.slice(this.lines.length - limit);
+  }
+
   private stopTimers(): void {
     if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = undefined; }
+    if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = undefined; }
   }
 
   private async ensureCreatedNow(): Promise<void> {
@@ -120,41 +161,41 @@ export class LiveStatusController {
 
   private async ensureCreated(): Promise<void> {
     if (this.disabled || this.finalized || this.messageId) return;
-    const text = this.formatStatus(true);
+    const view = this.buildView();
     try {
-      const id = await this.callbacks.create(text);
+      const id = await this.callbacks.create(view);
       if (!id) {
         this.disabled = true;
         return;
       }
       this.messageId = id;
-      this.lastSentText = text;
+      this.lastSentSignature = this.signature(view);
+      this.startTicker();
     } catch (err) {
       this.disabled = true;
       this.callbacks.warn?.("live status create failed", err);
     }
   }
 
-  private async editRunningStatus(): Promise<void> {
-    if (!this.messageId || this.disabled || this.finalized || this.runningLimitReached) return;
-    const maxEdits = this.opts.maxEdits ?? DEFAULT_MAX_EDITS;
-    const runningBudget = Math.max(0, maxEdits - 1); // reserve final edit for complete()
-    if (this.editCount >= runningBudget) return;
-
-    const isLimitNotice = this.editCount === runningBudget - 1;
-    const text = isLimitNotice ? this.formatLimitNotice() : this.formatStatus();
-    const ok = await this.safeEdit(text);
-    if (ok && isLimitNotice) this.runningLimitReached = true;
+  /** Refresh the elapsed-time footer periodically even with no new activity. */
+  private startTicker(): void {
+    if (this.tickTimer || this.disabled || this.finalized) return;
+    const tickMs = this.opts.tickMs ?? DEFAULT_TICK_MS;
+    this.tickTimer = setInterval(() => {
+      if (this.finalized || this.disabled || !this.messageId) return;
+      void this.safeEdit(this.buildView());
+    }, tickMs);
+    this.tickTimer.unref?.();
   }
 
-  private async safeEdit(text: string, force = false): Promise<boolean> {
+  private async safeEdit(view: LiveStatusView, force = false): Promise<boolean> {
     if (!this.messageId || this.disabled) return false;
     if (!force && this.finalized) return false;
-    if (!force && text === this.lastSentText) return true;
+    const sig = this.signature(view);
+    if (!force && sig === this.lastSentSignature) return true;
     try {
-      await this.callbacks.edit(this.messageId, text);
-      this.lastSentText = text;
-      this.editCount++;
+      await this.callbacks.edit(this.messageId, view);
+      this.lastSentSignature = sig;
       return true;
     } catch (err) {
       this.disabled = true;
@@ -164,27 +205,40 @@ export class LiveStatusController {
     }
   }
 
-  private formatToolStart(event: Extract<ProgressEvent, { kind: "tool" }>): string {
+  /** Dedupe key: ignore elapsed (it always changes) so ticks without new
+   *  activity still refresh the footer, but identical content is skipped. */
+  private signature(view: LiveStatusView): string {
+    return `${view.state}|${view.title}|${view.lines.map((l) => `${l.kind}:${l.text}`).join("|")}`;
+  }
+
+  private formatTool(event: Extract<ProgressEvent, { kind: "tool" }>): string {
     const raw = event.text || event.name || "";
-    const prefix = `${event.name} start`;
+    const prefix = `${event.name} ${event.phase}`;
     let detail = raw.startsWith(prefix) ? raw.slice(prefix.length).trim() : raw.trim();
     if (detail.startsWith(":")) detail = detail.slice(1).trim();
     return detail ? `${event.name}: ${detail}` : event.name;
   }
 
-  private formatStatus(includeDisableHint = false): string {
-    const maxChars = this.opts.maxChars ?? DEFAULT_MAX_CHARS;
-    const clean = (this.detail || "").replace(/\s+/g, " ").trim();
-    const clipped = clean.length > maxChars ? `${clean.slice(0, Math.max(0, maxChars - 1))}\u2026` : clean;
-    const base = !clipped
-      ? (this.opts.locale === "en" ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`)
-      : (this.opts.locale === "en" ? `${this.opts.botName} is working: ${clipped}` : `${this.opts.botName} \u6b63\u5728\u6267\u884c\uff1a${clipped}`);
-    return includeDisableHint && this.opts.disableHint ? `${base}\n${this.opts.disableHint}` : base;
+  private formatElapsed(): string {
+    const totalSec = Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000));
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}:${String(s).padStart(2, "0")}`;
   }
 
-  private formatLimitNotice(): string {
-    return this.opts.locale === "en"
-      ? `${this.opts.botName} reached the update limit and is still running`
-      : `${this.opts.botName} \u5df2\u8fbe\u66f4\u65b0\u9650\u5236\uff0c\u6b63\u5728\u6301\u7eed\u6267\u884c\u4e2d`;
+  private buildView(): LiveStatusView {
+    const en = this.opts.locale === "en";
+    let title: string;
+    if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
+    else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
+    else title = en ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
+    return {
+      title,
+      lines: [...this.lines],
+      elapsed: this.formatElapsed(),
+      model: this.opts.model,
+      hint: this.opts.disableHint,
+      state: this.state,
+    };
   }
 }

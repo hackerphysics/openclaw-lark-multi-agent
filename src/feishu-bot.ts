@@ -3,7 +3,7 @@ import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
-import { LiveStatusController } from "./live-status.js";
+import { LiveStatusController, type LiveStatusView } from "./live-status.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve } from "path";
@@ -1237,11 +1237,12 @@ export class FeishuBot {
         };
         liveStatus = this.shouldUseLiveStatus(chatId, isNativeCommandTrigger)
           ? new LiveStatusController({
-              create: (text) => this.sendOrdered(chatId, () => this.replyTextMessage(lastHuman.messageId || "", text)),
-              edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
+              create: (view) => this.sendOrdered(chatId, () => this.replyLiveStatusCard(lastHuman.messageId || "", view, chatId)),
+              edit: (messageId, view) => this.sendOrdered(chatId, () => this.patchLiveStatusCard(messageId, view, chatId)),
               warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
             }, {
               botName: this.config.name,
+              model: this.config.model,
               locale: this.isEn(chatId) ? "en" : "zh",
               disableHint: this.isEn(chatId)
                 ? `Tip: send /livestatus off to hide this status message`
@@ -1926,11 +1927,12 @@ export class FeishuBot {
     const liveStatusEnabled = this.store.getBotLiveStatus(this.config.name, chatId) && !this.store.getBotVerbose(this.config.name, chatId);
     const liveStatus = liveStatusEnabled
       ? new LiveStatusController({
-          create: (text) => this.sendOrdered(chatId, () => this.sendTextMessage(chatId, text)),
-          edit: (messageId, text) => this.sendOrdered(chatId, () => this.editTextMessage(messageId, text)),
+          create: (view) => this.sendOrdered(chatId, () => this.sendLiveStatusCard(chatId, view)),
+          edit: (messageId, view) => this.sendOrdered(chatId, () => this.patchLiveStatusCard(messageId, view, chatId)),
           warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, err instanceof Error ? err.message : err),
         }, {
           botName: this.config.name,
+          model: this.config.model,
           locale: this.isEn(chatId) ? "en" : "zh",
           disableHint: this.isEn(chatId)
             ? `Tip: send /livestatus off to hide this status message`
@@ -1994,6 +1996,88 @@ export class FeishuBot {
     }
     await liveStatus?.complete().catch(() => {});
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
+  }
+
+  private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
+    const en = this.isEn(chatId);
+    const elements: any[] = [];
+    // Content area: recent activity lines (oldest first). Each line is one
+    // message: tool start / tool end / intermediate text.
+    if (view.lines.length > 0) {
+      const iconFor = (kind: string): string =>
+        kind === "tool_start" ? "▸"
+        : kind === "tool_end" ? "✓"
+        : kind === "lifecycle" ? "⋯"
+        : "•";
+      const content = view.lines
+        .map((l) => `${iconFor(l.kind)} ${this.escapeCardText(l.text)}`)
+        .join("\n");
+      elements.push({ tag: "markdown", content });
+    } else {
+      elements.push({ tag: "markdown", content: en ? "_working…_" : "_正在启动…_" });
+    }
+    elements.push({ tag: "hr" });
+    // Footer: elapsed time + model name (+ optional disable hint).
+    const footerBits: string[] = [];
+    footerBits.push(en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`);
+    if (view.model) footerBits.push(`🧠 ${this.escapeCardText(view.model)}`);
+    const footerParts = [`<font color='grey'>${footerBits.join("  ·  ")}</font>`];
+    if (view.hint) footerParts.push(`<font color='grey'>${this.escapeCardText(view.hint)}</font>`);
+    elements.push({ tag: "markdown", content: footerParts.join("\n") });
+    // Title color reflects state.
+    const template = view.state === "done" ? "green" : view.state === "failed" ? "orange" : "blue";
+    return {
+      schema: "2.0",
+      // update_multi is REQUIRED for im.message.patch to update the card; Feishu
+      // rejects patches on cards that did not declare it before and after.
+      config: { update_multi: true, width_mode: "fill" },
+      header: {
+        title: { tag: "plain_text", content: view.title },
+        template,
+      },
+      body: { elements },
+    };
+  }
+
+  /** Minimal escaping so activity text does not break card markdown. */
+  private escapeCardText(text: string): string {
+    return String(text || "").replace(/</g, "\uff1c").replace(/>/g, "\uff1e");
+  }
+
+  private async sendLiveStatusCard(chatId: string, view: LiveStatusView): Promise<string | undefined> {
+    try {
+      const res = await this.client.im.message.create({
+        params: { receive_id_type: "chat_id" },
+        data: {
+          receive_id: chatId,
+          content: JSON.stringify(this.buildLiveStatusCard(view, chatId)),
+          msg_type: "interactive",
+        },
+      });
+      this.store.clearBotUnavailableInChat(this.config.name, chatId);
+      return (res as any)?.data?.message_id || (res as any)?.message_id;
+    } catch (err) {
+      if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
+      throw err;
+    }
+  }
+
+  private async replyLiveStatusCard(messageId: string, view: LiveStatusView, chatId?: string): Promise<string | undefined> {
+    const res = await this.client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify(this.buildLiveStatusCard(view, chatId)),
+        msg_type: "interactive",
+      },
+    } as any);
+    return (res as any)?.data?.message_id || (res as any)?.message_id;
+  }
+
+  private async patchLiveStatusCard(messageId: string, view: LiveStatusView, chatId?: string): Promise<void> {
+    await this.client.im.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(this.buildLiveStatusCard(view, chatId)) },
+    } as any);
   }
 
   private async sendTextMessage(chatId: string, text: string): Promise<string | undefined> {

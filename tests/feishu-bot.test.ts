@@ -61,8 +61,9 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   (bot as any).removeReaction = vi.fn(async () => {});
   (bot as any).replyMessage = vi.fn(async () => {});
   (bot as any).sendMessage = vi.fn(async () => {});
-  (bot as any).sendTextMessage = vi.fn(async () => "live-status-msg");
-  (bot as any).editTextMessage = vi.fn(async () => {});
+  (bot as any).sendLiveStatusCard = vi.fn(async () => "live-status-msg");
+  (bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
+  (bot as any).patchLiveStatusCard = vi.fn(async () => {});
   return { bot, store, openclaw, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -645,8 +646,12 @@ describe("FeishuBot routing and queue behavior", () => {
 
       const result = await (h.bot as any).runDiscussionTurn("chat1", "prompt", { round: 1, maxRounds: 10 });
       expect(result.visible).toBe(true);
-      expect((h.bot as any).sendTextMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("Claude 正在执行：read: spec.md"));
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", "✅ Claude 已完成");
+      expect((h.bot as any).sendLiveStatusCard).toHaveBeenCalledWith("chat1", expect.objectContaining({
+        title: "Claude 正在执行",
+        lines: expect.arrayContaining([expect.objectContaining({ text: "read: spec.md" })]),
+      }));
+      const lastDiscussPatch = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1);
+      expect(lastDiscussPatch[1].title).toBe("✅ Claude 已完成");
       expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("讨论回复"));
     } finally {
       vi.useRealTimers();
@@ -1215,8 +1220,8 @@ describe("FeishuBot routing and queue behavior", () => {
     const h = makeHarness("Claude");
     try {
       h.store.setBotLiveStatus("Claude", "chat1", false);
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         await params.onSendAttempt?.();
@@ -1234,8 +1239,8 @@ describe("FeishuBot routing and queue behavior", () => {
         mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
       }));
 
-      expect((h.bot as any).replyTextMessage).not.toHaveBeenCalled();
-      expect((h.bot as any).editTextMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).replyLiveStatusCard).not.toHaveBeenCalled();
+      expect((h.bot as any).patchLiveStatusCard).not.toHaveBeenCalled();
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-off-trigger", "最终回复");
     } finally {
       FeishuBot.getAllBots().delete("app-Claude");
@@ -1684,8 +1689,8 @@ describe("FeishuBot routing and queue behavior", () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
     try {
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       (h.bot as any).deleteMessageById = vi.fn(async () => {});
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -1709,17 +1714,17 @@ describe("FeishuBot routing and queue behavior", () => {
 
       // Live status placeholder is created as a separate message and only shows
       // meaningful tool-start progress (no timer/progress bar/edit count noise).
-      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("live-trigger", expect.stringContaining("Claude"));
-      const placeholderText = (h.bot as any).replyTextMessage.mock.calls[0][1];
-      expect(placeholderText).toBe("Claude 正在执行：read: 读取 src/feishu-bot.ts\n提示：调用 /livestatus off 关闭该状态提示");
-      expect(placeholderText).not.toMatch(/\d+\/20/);
-      expect(placeholderText).not.toMatch(/\d+:\d{2}/);
+      expect((h.bot as any).replyLiveStatusCard).toHaveBeenCalledWith("live-trigger", expect.objectContaining({ title: "Claude 正在执行" }), "chat1");
+      const placeholderView = (h.bot as any).replyLiveStatusCard.mock.calls[0][1];
+      expect(placeholderView.lines.map((l: any) => l.text)).toContain("read: 读取 src/feishu-bot.ts");
+      expect(placeholderView.hint).toContain("/livestatus off");
+      expect(placeholderView.elapsed).toMatch(/\d+:\d{2}/);
       // ...the final reply goes through the normal interactive-card path (renders Markdown)...
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");
-      // ...and the live status message is marked done (not overwritten with the answer).
+      // ...and the live status card is patched to a done state (not overwritten with the answer).
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", expect.stringContaining("已完成"));
-      expect((h.bot as any).editTextMessage).not.toHaveBeenCalledWith("live-status-msg", "最终回复");
+      const lastPatchView = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1)[1];
+      expect(lastPatchView.title).toContain("已完成");
       expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -1732,8 +1737,8 @@ describe("FeishuBot routing and queue behavior", () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
     try {
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         await params.onSendAttempt?.();
@@ -1754,8 +1759,9 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(1000);
       await run;
 
-      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("runtime-live-trigger", expect.stringContaining("Claude 正在执行"));
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-status-msg", expect.stringContaining("执行中断"));
+      expect((h.bot as any).replyLiveStatusCard).toHaveBeenCalledWith("runtime-live-trigger", expect.objectContaining({ title: "Claude 正在执行" }), "chat1");
+      const runtimeFailPatch = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1)[1];
+      expect(runtimeFailPatch.title).toContain("执行中断");
     } finally {
       vi.useRealTimers();
       FeishuBot.getAllBots().delete("app-Claude");
@@ -1766,8 +1772,8 @@ describe("FeishuBot routing and queue behavior", () => {
   it("does not create live status for fast replies", async () => {
     const h = makeHarness("Claude");
     try {
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-status-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         await params.onSendAttempt?.();
@@ -1783,8 +1789,8 @@ describe("FeishuBot routing and queue behavior", () => {
         mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
       }));
 
-      expect((h.bot as any).replyTextMessage).not.toHaveBeenCalled();
-      expect((h.bot as any).editTextMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).replyLiveStatusCard).not.toHaveBeenCalled();
+      expect((h.bot as any).patchLiveStatusCard).not.toHaveBeenCalled();
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("fast-trigger", "快速回复");
     } finally {
       FeishuBot.getAllBots().delete("app-Claude");
@@ -1821,8 +1827,8 @@ describe("FeishuBot routing and queue behavior", () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
     try {
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-killed-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-killed-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       (h.bot as any).deleteMessageById = vi.fn(async () => {});
       const sessionStatuses = ["active", "killed", "killed"];
       h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { status: sessionStatuses.shift() || "killed" } }));
@@ -1843,7 +1849,7 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.advanceTimersByTimeAsync(0);
       expect(h.openclaw.chatCalls).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(800);
-      expect((h.bot as any).replyTextMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("等待 OpenClaw 回复"));
+      expect((h.bot as any).replyLiveStatusCard).toHaveBeenCalledWith("killed-mid-run", expect.objectContaining({ title: expect.stringContaining("Claude") }), "chat1");
       await vi.advanceTimersByTimeAsync(5_000);
       await vi.advanceTimersByTimeAsync(2_000);
       await run;
@@ -1855,7 +1861,8 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("killed-mid-run", expect.stringContaining("可以直接再发一条继续尝试"));
       // ...and the live status placeholder is marked interrupted (not overwritten with the error).
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
-      expect((h.bot as any).editTextMessage).toHaveBeenCalledWith("live-killed-msg", expect.stringContaining("执行中断"));
+      const killedPatchView = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1)[1];
+      expect(killedPatchView.title).toContain("执行中断");
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally {
       vi.useRealTimers();
@@ -1876,8 +1883,8 @@ describe("FeishuBot routing and queue behavior", () => {
         params.onSendAttempt?.();
         return await new Promise<string>((resolve) => { resolveReply = resolve; });
       });
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-transient-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-transient-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       FeishuBot.getAllBots().set("app-Claude", h.bot as any);
 
       const run = (h.bot as any).handleMessage(event({
@@ -1917,8 +1924,8 @@ describe("FeishuBot routing and queue behavior", () => {
         params.onSendAttempt?.();
         return await new Promise<string>((resolve) => { resolveReply = resolve; });
       });
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-runfail-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-runfail-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       FeishuBot.getAllBots().set("app-Claude", h.bot as any);
 
       const run = (h.bot as any).handleMessage(event({
@@ -1958,8 +1965,8 @@ describe("FeishuBot routing and queue behavior", () => {
         await new Promise(() => {}); // never resolves; monitor must stop it
         return "never";
       });
-      (h.bot as any).replyTextMessage = vi.fn(async () => "live-dead-msg");
-      (h.bot as any).editTextMessage = vi.fn(async () => {});
+      (h.bot as any).replyLiveStatusCard = vi.fn(async () => "live-dead-msg");
+      (h.bot as any).patchLiveStatusCard = vi.fn(async () => {});
       FeishuBot.getAllBots().set("app-Claude", h.bot as any);
 
       const run = (h.bot as any).handleMessage(event({
