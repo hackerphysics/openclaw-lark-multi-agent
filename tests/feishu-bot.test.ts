@@ -1722,7 +1722,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(doneText).toContain("✅");
       expect(doneText).toContain("累计7 次工具调用");
       expect(doneText).toContain("⏱ 耗时2:15");
-      expect(doneText).not.toMatch(/已用|\bfont\b/); // no footer styling
+      expect(doneText).toContain("<font color='grey'>"); // unobtrusive grey, footer-like
       // Failed uses a different status emoji
       const failCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "failed", title: "⚠️ Claude 执行中断" }, "chat1");
       expect(failCard.header).toBeUndefined();
