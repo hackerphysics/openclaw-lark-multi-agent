@@ -18,6 +18,7 @@ The goal is not blame. The goal is to make the same class of mistake harder to r
 | --- | --- | --- | --- |
 | 2026-05-11 | [Queued message marked DONE before processing](2026-05-11-queued-message-done-regression.md) | queue / sync / reactions | high |
 | 2026-05-11 | [Cron jobs must not share live LMA chat sessions](2026-05-11-cron-must-not-share-lma-session.md) | cron / sessions / concurrency | high |
+| 2026-06-16 | [Web UI `...(truncated)...` is display-only, not data loss](2026-06-16-web-ui-truncated-is-display-only.md) | context / display projection / false alarm | info |
 
 ## Template
 
