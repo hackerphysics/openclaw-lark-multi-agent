@@ -37,6 +37,7 @@ All of them connect to the same OpenClaw Gateway while keeping sessions, queues,
 - Feishu image download and OpenClaw multimodal attachment forwarding
 - Bridge attachment marker protocol for generated files/images/documents
 - Feishu CardKit v2 Markdown rendering, including native table elements for pipe tables
+- Live status card: in non-verbose mode each run shows a single self-updating Feishu interactive card (title + recent activity window with per-line timestamps + elapsed/model footer, refreshed once per second), which collapses to a compact one-line summary on a clean finish and retains the recent activity on failure for debugging
 - Bridge-level slash commands and escaped OpenClaw slash commands
 - `/discuss` mode for barrier-style multi-bot group discussion, including per-round markers and no-reply status notices
 - `/chairman` role: a single per-group chairman that answers plain messages when no bot is in Free mode, and acts as host, challenger, and summarizer inside `/discuss`
@@ -231,10 +232,13 @@ Bridge-level commands use a single slash and are handled by this project:
 - `/status` — show bot model, token usage, and session state
 - `/compact` — compact the OpenClaw session
 - `/reset` — reset the OpenClaw session
+- `/stop` — force-stop a stuck run for this bot in this chat and unlock the queue
 - `/verbose` — toggle tool-call messages for this bot in this chat
+- `/livestatus [on|off]` — toggle, or explicitly enable/disable, the self-updating run-status card shown in non-verbose mode (default on)
 - `/free [on|off]` — toggle, or explicitly enable/disable, this bot's Free mode in the current group chat
 - `/mute` — toggle this bot's mute mode in the current group chat
 - `/mode` — show this bot's current mode in the current chat
+- `/model [id]` — show or switch this bot's bound model (persisted)
 - `/discuss on|off|status|stop|rounds N` — control group-level multi-bot discussion mode (requires a chairman to enable; default 10 rounds)
 - `/chairman [@Bot|off]` — set, view, or clear the single chairman for this group
 - `/locale [zh|en]` — set or view this group's language
@@ -323,7 +327,7 @@ Persistent constraints (such as "do not call Feishu send tools directly" and the
 `/discuss` is an explicit group-level multi-agent discussion scheduler. It is separate from Free mode:
 
 - `/free` controls whether a single bot may answer plain human messages.
-- `/discuss on` requires a chairman to be set first (`/chairman @Bot`). It lets one coordinator take over plain human messages and run all Free-mode bots plus the chairman in barrier-style rounds.
+- `/discuss on` requires a chairman to be set first (`/chairman @Bot`). It lets one coordinator take over plain human messages and run all non-muted bots plus the chairman in barrier-style rounds. Free mode is ignored inside discussion: every bot that is not muted participates regardless of its Free setting.
 - Targeted mentions still fall through to normal routing, so `@GPT hello` works even while discuss mode is enabled.
 - Each participant receives the same round prompt and does not see other participants' replies from the current round until the next round.
 - The chairman speaks last each round: it gives its own view, challenges weak points, mediates disagreements, and decides whether to continue or conclude.
@@ -396,6 +400,23 @@ The bridge subscribes to Feishu `im.message.recalled_v1` events. When a user rec
 
 Version 1 behavior intentionally does **not** abort an OpenClaw run that has already started processing the recalled message, and it does not recall bot replies that were already sent. The first goal is to make recall reliable for queued/not-yet-processed messages.
 
+## Session health and error recovery
+
+The bridge distinguishes a failed *run* from a dead *session*:
+
+- During an active run, a health monitor polls the OpenClaw session. Only true
+  session-death states (`killed` / `dead` / `crashed`, matched on word
+  boundaries) are treated as unhealthy; run-level outcomes such as `aborted`,
+  `error`, or `timeout` are not, because the session usually remains usable for
+  the next message. A short re-check guards against transient blips.
+- When a session is genuinely unhealthy, the bridge warns the user but does not
+  force a `/reset`: the current message is still attempted, and only an in-run
+  confirmation of death stops the wait. Users decide whether to retry.
+- Recoverable agent errors are not surfaced as failures. When OpenClaw emits a
+  recoverable lifecycle error (for example `Context overflow: prompt too large`)
+  it auto-compacts and keeps the same run alive; the bridge defers instead of
+  rejecting, so a later real final reply wins. Only a genuine stall falls back to
+  the deferred error via the idle timeout. Non-recoverable errors still fail fast.
 
 ## Markdown, tables, and attachments
 
@@ -407,6 +428,50 @@ Assistant replies are sent as Feishu CardKit v2 cards. Markdown is preprocessed 
 - GitHub-style pipe tables are converted into native CardKit `table` elements.
 
 For generated files/images/documents, agents should use the bridge attachment marker protocol instead of calling Feishu messaging tools directly. The bridge strips the marker from the visible reply, validates the file path under the configured attachment directory, uploads/sends the attachment, and records it in local context. Markdown documents can be converted into Feishu cloud documents through this path.
+
+## Live status
+
+In non-verbose mode, each run shows a single self-updating Feishu interactive
+card so users can see progress without the noise of per-tool-call messages.
+Verbose mode and live status are mutually exclusive: when `/verbose` is on, the
+bridge emits the existing per-tool messages instead of a live status card.
+
+While running, the card shows:
+
+- a title (`<bot> is working`);
+- a rolling window of the most recent activity lines (tool start `▸`, tool end
+  `✓`, and intermediate assistant text `•`), each prefixed with the relative
+  time `mm:ss` since the run started;
+- a footer with elapsed time and the bound model name.
+
+The card is created lazily (a fast reply that finishes within the create delay
+never spawns a card, to avoid flicker) and is updated with `im.message.patch`,
+which has no 20-edit cap. A 1-second ticker advances the elapsed timer even when
+no new activity arrives.
+
+When the run ends:
+
+- a clean finish (normal reply or `NO_REPLY`) collapses the card to a single
+  compact grey line: status emoji + total tool calls + total elapsed;
+- a failure (provider error, killed/unhealthy session, delivery error, or idle
+  timeout) keeps the recent activity window plus the summary, with an orange
+  header, so the steps leading up to the failure stay visible for debugging.
+
+The final answer is always delivered separately through the normal interactive-card
+delivery path, so Markdown renders correctly; the live status card is a distinct
+message and never replaces or blocks the final reply.
+
+Live status is on by default and can be toggled per bot/chat with
+`/livestatus [on|off]`. It can be disabled globally by setting
+`OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS=0`. Tunable defaults:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS` | `1` | Master switch; `0` disables live status for all bots |
+| `OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS` | `800` | Delay before creating the card, so fast replies do not flicker one |
+| `OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS` | `1000` | How often the elapsed-time footer auto-refreshes |
+| `OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_HISTORY` | `6` | Number of recent activity lines kept in the card |
+| `OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS` | `120` | Per-line character cap before truncation |
 
 ## Data model
 
@@ -421,7 +486,7 @@ SQLite state lives in the configured data directory. Important tables:
 - `delivery_outbox` — durable user-visible delivery ledger with claim/dedupe state
 - `recalled_messages` — recalled user messages excluded from pending work and future context
 - `processed_events` — Feishu event de-duplication
-- `bot_chat_settings` — per-bot/per-chat settings such as verbose mode
+- `bot_chat_settings` — per-bot/per-chat settings such as verbose mode, mode, and live-status toggle
 
 ## Development
 
