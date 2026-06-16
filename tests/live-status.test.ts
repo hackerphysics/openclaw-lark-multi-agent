@@ -38,6 +38,54 @@ describe("LiveStatusController (interactive card)", () => {
     vi.useRealTimers();
   });
 
+  it("keeps recent activity lines plus a summary on failure (for debugging)", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0, historySize: 6 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await live.progress({ kind: "tool", phase: "end", name: "read", text: "read end: ok" });
+    await live.progress({ kind: "tool", phase: "start", name: "exec", text: "exec start: npm test" });
+    await live.fail();
+
+    const last = views[views.length - 1];
+    expect(last.state).toBe("failed");
+    // Recent activity is retained...
+    const texts = last.lines.map((l) => l.text);
+    expect(texts).toContain("read: a.ts");
+    expect(texts).toContain("read: ok");
+    expect(texts).toContain("exec: npm test");
+    // ...plus a trailing summary line.
+    expect(last.lines[last.lines.length - 1].kind).toBe("summary");
+    expect(last.lines[last.lines.length - 1].text).toContain("共调用工具 2 次");
+    vi.useRealTimers();
+  });
+
+  it("shows only a compact summary on a clean done (no activity lines)", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    await live.complete();
+
+    const last = views[views.length - 1];
+    expect(last.state).toBe("done");
+    expect(last.lines).toHaveLength(1);
+    expect(last.lines[0].kind).toBe("summary");
+    vi.useRealTimers();
+  });
+
   it("does not let a late progress edit run after complete()", async () => {
     vi.useFakeTimers();
     const views: LiveStatusView[] = [];

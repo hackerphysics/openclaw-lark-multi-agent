@@ -1710,11 +1710,11 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("renders a minimal finished card (no header/footer, one compact line)", () => {
+  it("renders a minimal done card but keeps activity on failure for debugging", () => {
     const h = makeHarness("Claude");
     try {
       const baseView = { title: "✅ Claude 已完成", lines: [], elapsed: "2:15", model: "phgeek-gw/claude-opus-4.8", toolCalls: 7, noReply: false };
-      // Done
+      // Done (clean): minimal single compact grey line, no header/footer.
       const doneCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done" }, "chat1");
       expect(doneCard.header).toBeUndefined();
       expect(doneCard.body.elements).toHaveLength(1);
@@ -1723,13 +1723,24 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(doneText).toContain("累计7 次工具调用");
       expect(doneText).toContain("⏱ 耗时2:15");
       expect(doneText).toContain("<font color='grey'>"); // unobtrusive grey, footer-like
-      // Failed uses a different status emoji
-      const failCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "failed", title: "⚠️ Claude 执行中断" }, "chat1");
-      expect(failCard.header).toBeUndefined();
-      expect(failCard.body.elements[0].content).toContain("⚠️");
-      // NO_REPLY marker
+      // NO_REPLY: still minimal (clean finish), 💤 marker.
       const noReplyCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done", noReply: true, toolCalls: 2, elapsed: "0:11" }, "chat1");
+      expect(noReplyCard.header).toBeUndefined();
       expect(noReplyCard.body.elements[0].content).toContain("累计2 次工具调用");
+      // Failed: keep the recent activity window + header + footer so the steps
+      // before the error/kill/timeout are visible for debugging.
+      const failView = { ...baseView, state: "failed", title: "⚠️ Claude 执行中断", lines: [
+        { kind: "tool_start", text: "read: a.ts", at: 2 },
+        { kind: "tool_end", text: "read: ok", at: 5 },
+        { kind: "summary", text: "累计2 次工具调用 · 耗时0:42", at: 42 },
+      ] };
+      const failCard = (h.bot as any).buildLiveStatusCard(failView, "chat1");
+      expect(failCard.header).toBeDefined();
+      expect(failCard.header.template).toBe("orange");
+      const failContent = failCard.body.elements.map((e: any) => e.content).join("\n");
+      expect(failContent).toContain("read: a.ts"); // recent activity retained
+      expect(failContent).toContain("read: ok");
+      expect(failContent).toContain("累计2 次工具调用"); // summary retained
       // Running card still has header + footer
       const runningCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "running", title: "Claude 正在执行", lines: [{ kind: "tool_start", text: "read: a.ts", at: 2 }] }, "chat1");
       expect(runningCard.header).toBeDefined();

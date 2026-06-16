@@ -283,11 +283,17 @@ export class LiveStatusController {
     if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
     else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
     else title = en ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
-    // When finished, replace the recent-activity window with a run summary
-    // (total tool calls + total time) instead of the last few messages.
-    const lines: LiveStatusLine[] = this.state === "running"
-      ? [...this.lines]
-      : [this.buildSummaryLine(en)];
+    // On a clean finish (done / NO_REPLY) show only the compact summary. On a
+    // failure (error / killed / timeout) keep the recent activity window too, so
+    // the last few steps before the failure are visible for debugging.
+    let lines: LiveStatusLine[];
+    if (this.state === "running") {
+      lines = [...this.lines];
+    } else if (this.state === "failed") {
+      lines = [...this.lines, this.buildSummaryLine(en)];
+    } else {
+      lines = [this.buildSummaryLine(en)];
+    }
     return {
       title,
       lines,

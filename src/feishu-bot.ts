@@ -2003,25 +2003,24 @@ export class FeishuBot {
 
   private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
     const en = this.isEn(chatId);
-    // Finished (done/failed): keep it minimal — no header, no footer, just one
-    // compact body line with three signals: status emoji + tool-call count +
-    // total elapsed. This avoids taking up much screen space after the run ends.
-    if (view.state !== "running") {
-      const statusEmoji = view.state === "failed" ? "⚠️" : view.noReply ? "💤" : "✅";
+    // Clean finish (done / NO_REPLY): keep it minimal — no header, no footer, just
+    // one compact grey line (status emoji + tool-call count + total elapsed) so
+    // the finished card does not take up much screen space.
+    if (view.state === "done") {
+      const statusEmoji = view.noReply ? "💤" : "✅";
       const summary = en
         ? `${statusEmoji} ${view.toolCalls} tool call${view.toolCalls === 1 ? "" : "s"} · ⏱ ${view.elapsed}`
         : `${statusEmoji} 累计${view.toolCalls} 次工具调用 · ⏱ 耗时${view.elapsed}`;
-      // Grey + small like the footer, so the finished card stays unobtrusive.
-      const compact = `<font color='grey'>${summary}</font>`;
       return {
         schema: "2.0",
         config: { update_multi: true, width_mode: "fill" },
-        body: { elements: [{ tag: "markdown", content: compact }] },
+        body: { elements: [{ tag: "markdown", content: `<font color='grey'>${summary}</font>` }] },
       };
     }
     const elements: any[] = [];
-    // Running: recent activity lines (each prefixed with the relative time mm:ss
-    // since the run started).
+    // Running OR failed: show the recent activity window (each line prefixed with
+    // the relative time mm:ss). On failure we deliberately KEEP the last lines so
+    // the steps leading up to the error/kill/timeout are visible for debugging.
     if (view.lines.length > 0) {
       const iconFor = (kind: string): string =>
         kind === "tool_start" ? "▸"
@@ -2046,6 +2045,7 @@ export class FeishuBot {
     footerBits.push(en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`);
     if (view.model) footerBits.push(`🧠 ${this.escapeCardText(view.model)}`);
     elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
+    const template = view.state === "failed" ? "orange" : "blue";
     return {
       schema: "2.0",
       // update_multi is REQUIRED for im.message.patch to update the card; Feishu
@@ -2053,7 +2053,7 @@ export class FeishuBot {
       config: { update_multi: true, width_mode: "fill" },
       header: {
         title: { tag: "plain_text", content: view.title },
-        template: "blue",
+        template,
       },
       body: { elements },
     };
