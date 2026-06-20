@@ -27,8 +27,10 @@ const SESSION_HEALTH_CONFIRM_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_S
 // Read at call time (not module load) so tests can toggle it per-case.
 function autoRetryEnabled(): boolean { return process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY !== "0"; }
 function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_MAX || 5); }
-// The exact phrase the agent must reply to confirm completion.
+// The exact phrase the agent must reply to confirm completion. The probe asks
+// for the locale-appropriate phrase; detection accepts BOTH so either works.
 const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
+const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE_EN || "DONE";
 
 class UnhealthySessionError extends Error {
   constructor(readonly status: string) {
@@ -1722,11 +1724,11 @@ export class FeishuBot {
     return !endOk;
   }
 
-  /** True when the agent's reply is exactly the completion phrase (tolerant of
-   *  trailing punctuation/whitespace). */
+  /** True when the agent's reply is exactly a completion phrase (zh or en,
+   *  tolerant of trailing punctuation/whitespace and case). */
   private isDonePhrase(text: string): boolean {
     const t = (text || "").trim().replace(/[。.!！~\s]+$/u, "");
-    return t === AUTO_RETRY_DONE_PHRASE;
+    return t === AUTO_RETRY_DONE_PHRASE || t.toUpperCase() === AUTO_RETRY_DONE_PHRASE_EN.toUpperCase();
   }
 
   /**
@@ -1770,9 +1772,10 @@ export class FeishuBot {
         : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`).catch(() => {});
 
       // One short line, in the user's own voice (we intentionally do not change
-      // senderName). Keep the exact done-phrase contract so we can detect it.
+      // senderName). Each locale uses its own done-phrase so the English probe
+      // stays fully English; detection accepts both phrases.
       const probe = en
-        ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE}", otherwise keep going.`
+        ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE_EN}", otherwise keep going.`
         : `刚才那个任务结束了吗？结束了就回我“${AUTO_RETRY_DONE_PHRASE}”，没结束就接着做。`;
 
       let probeReply: string;

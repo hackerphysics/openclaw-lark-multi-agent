@@ -2344,6 +2344,27 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
+    it("uses an English done-phrase in English locale and detects it", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.store.setChatLocale("chat1", "en");
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          if (h.openclaw.chatCalls.length === 1) return "let me check the code and"; // truncated
+          return "DONE"; // English confirmation
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "fix the code", messageId: "m1" }));
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        // English probe must be fully English (no Chinese mixed in).
+        expect(h.openclaw.chatCalls[1].currentMessage).toContain("DONE");
+        expect(h.openclaw.chatCalls[1].currentMessage).not.toMatch(/[\u4e00-\u9fff]/);
+        // Delivers the original truncated-looking reply; DONE is not shown.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "let me check the code and");
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "DONE");
+      } finally { h.cleanup(); }
+    });
+
     it("does not retry NO_REPLY", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
