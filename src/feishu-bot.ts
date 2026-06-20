@@ -21,6 +21,14 @@ const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
 const SESSION_HEALTH_POLL_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_POLL_MS || 5_000);
 const SESSION_HEALTH_CONFIRM_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_CONFIRM_MS || 2_000);
+// Auto-retry: when a reply looks truncated/incomplete, ask the same session
+// whether it finished. If it did not, let it continue; loop until it confirms
+// completion or the retry budget is spent. Off by setting AUTO_RETRY=0.
+// Read at call time (not module load) so tests can toggle it per-case.
+function autoRetryEnabled(): boolean { return process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY !== "0"; }
+function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_MAX || 5); }
+// The exact phrase the agent must reply to confirm completion.
+const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
 
 class UnhealthySessionError extends Error {
   constructor(readonly status: string) {
@@ -1284,6 +1292,20 @@ export class FeishuBot {
         }
         console.log(`[${this.config.name}] OpenClaw reply collected for ${chatId.slice(-8)} in ${Date.now() - queueStartedAt}ms`);
 
+        // Auto-retry: if the reply looks truncated/incomplete, confirm with the
+        // session and loop until it reports done (or the budget is spent). This
+        // replaces `reply` with the final, confirmed result before delivery.
+        reply = await this.autoRetryUntilComplete({
+          chatId,
+          sessionKey,
+          senderName: lastHuman.senderName,
+          triggerId,
+          lastHumanMessageId: lastHuman.messageId || "",
+          isNativeCommandTrigger,
+          initialReply: reply,
+          liveStatus,
+        });
+
         const parsedReply = this.extractBridgeAttachments(reply);
         const visibleReply = parsedReply.text;
         const trimmedReply = visibleReply.trim();
@@ -1673,6 +1695,113 @@ export class FeishuBot {
 
   private isRuntimeFailureText(text: string): boolean {
     return text.startsWith("⚠️ Agent 未正常完成") || /\n原因:\s*rpc\b/.test(text);
+  }
+
+  /**
+   * Heuristic: does this reply look truncated / mid-task? Bias toward false
+   * positives (“宁可错杀不放过”) — a false positive only costs one invisible
+   * confirmation round, and the session self-check is the real arbiter. We gate
+   * only on cheap text shape here, never on stopReason (the upstream rarely
+   * provides one for normal-looking-but-truncated finals).
+   */
+  private looksTruncated(text: string): boolean {
+    const t = (text || "").trim();
+    if (!t) return false; // empty/NO_REPLY handled elsewhere
+    // Unbalanced code fence => almost certainly cut off mid-block.
+    const fences = (t.match(/```/g) || []).length;
+    if (fences % 2 === 1) return true;
+    // Ends with an obvious continuation cue (dangling connector / lead-in).
+    if (/[，,：:、;；]\s*$/u.test(t)) return true;
+    if (/(接下来|然后|首先|现在我|让我|下一步|let me|now i|next,?|first,?)\s*$/iu.test(t)) return true;
+    // Core signal: ends without any sentence-ending punctuation / closer
+    // (“连句号都没有就感觉没成功”). Accept terminators across languages,
+    // closing brackets/quotes, code fences, and common emoji endings.
+    const endOk = /[。！？.!?…)\]」』】）"'`”’~—✨✅👍🙏]\s*$/u.test(t)
+      || /```\s*$/.test(t)
+      || /[}\]]\s*$/.test(t);
+    return !endOk;
+  }
+
+  /** True when the agent's reply is exactly the completion phrase (tolerant of
+   *  trailing punctuation/whitespace). */
+  private isDonePhrase(text: string): boolean {
+    const t = (text || "").trim().replace(/[。.!！~\s]+$/u, "");
+    return t === AUTO_RETRY_DONE_PHRASE;
+  }
+
+  /**
+   * Auto-retry loop: if `reply` looks truncated, ask the same session whether it
+   * finished. The session is the arbiter: if it replies exactly the done phrase,
+   * the ORIGINAL reply was the real result and we deliver that. Otherwise the
+   * session kept working and its new output becomes the latest reply, which we
+   * re-check. Loops until the session confirms completion, a reply no longer
+   * looks truncated, the budget is spent, or the session cannot answer.
+   */
+  private async autoRetryUntilComplete(params: {
+    chatId: string;
+    sessionKey: string;
+    senderName: string;
+    triggerId: number;
+    lastHumanMessageId: string;
+    isNativeCommandTrigger: boolean;
+    initialReply: string;
+    liveStatus?: LiveStatusController;
+  }): Promise<string> {
+    const { chatId, sessionKey, senderName, triggerId, lastHumanMessageId, isNativeCommandTrigger, liveStatus } = params;
+    let reply = params.initialReply;
+    if (!autoRetryEnabled() || isNativeCommandTrigger) return reply;
+
+    const maxRetry = autoRetryMax();
+    for (let attempt = 1; attempt <= maxRetry; attempt++) {
+      const trimmed = this.extractBridgeAttachments(reply).text.trim();
+      // Only engage for plausibly-successful-but-truncated text. Empty/NO_REPLY
+      // and runtime failures have their own handling upstream.
+      if (!trimmed || trimmed.toUpperCase() === "NO_REPLY" || this.isRuntimeFailureText(trimmed)) return reply;
+      if (!this.looksTruncated(trimmed)) return reply;
+
+      const en = this.isEn(chatId);
+      await liveStatus?.progress(en
+        ? `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`
+        : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`).catch(() => {});
+
+      const probe = en
+        ? `Has the previous task fully finished? If it is completely done, reply only "${AUTO_RETRY_DONE_PHRASE}". If not, please continue and finish the remaining work.`
+        : `刚才的任务结束了吗？如果已经完全结束，请只回复“${AUTO_RETRY_DONE_PHRASE}”；如果还没有，请继续完成剩下的工作。`;
+
+      let probeReply: string;
+      try {
+        probeReply = await this.withSessionHealthMonitor(chatId, lastHumanMessageId, triggerId, this.openclawClient.chatSendWithContext({
+          sessionKey,
+          unsyncedMessages: [],
+          currentMessage: probe,
+          currentSenderName: senderName,
+          deliver: false,
+          timeoutMs: 1_800_000,
+          includeContext: false,
+          includeBridgeAttachmentHint: false,
+          onProgress: (event) => liveStatus?.progress(event),
+        }));
+      } catch (err) {
+        // Confirmation round failed (timeout/unhealthy). Stop looping and deliver
+        // what we already have rather than spinning.
+        console.warn(`[${this.config.name}] auto-retry probe failed for ${chatId.slice(-8)}:`, this.errorSummary(err));
+        return reply;
+      }
+
+      const probeText = this.extractBridgeAttachments(probeReply).text.trim();
+      if (!probeText || probeText.toUpperCase() === "NO_REPLY") {
+        return reply; // session could not answer; deliver existing result
+      }
+      if (this.isDonePhrase(probeText)) {
+        console.log(`[${this.config.name}] auto-retry: session confirmed done after ${attempt} check(s) for ${chatId.slice(-8)}`);
+        return reply; // original reply was the real result
+      }
+      // Not done: the session kept working. Its output is the new latest reply.
+      console.log(`[${this.config.name}] auto-retry: session continued (attempt ${attempt}) for ${chatId.slice(-8)}`);
+      reply = probeReply;
+    }
+    console.warn(`[${this.config.name}] auto-retry budget (${maxRetry}) spent for ${chatId.slice(-8)}; delivering latest result`);
+    return reply;
   }
 
   private cancelDelayedFailure(chatId: string): void {

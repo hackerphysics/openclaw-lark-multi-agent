@@ -1,4 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+// Auto-retry is on by default in production; turn it off for the general suite so
+// the plain mock replies (no trailing punctuation) do not trigger probe rounds.
+// The dedicated auto-retry describe block enables it per-case.
+process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "0";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -2262,5 +2266,95 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("MEDIA:"))).toBe(false);
       expect(h.store.getRecent("chat1").some((m) => m.senderType === "bot" && m.content.includes("[Attachment: image"))).toBe(true);
     } finally { h.cleanup(); }
+  });
+
+  describe("auto-retry on truncated replies", () => {
+    const prev = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY;
+    afterEach(() => { process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = prev; });
+
+    it("detects truncation, confirms with the session, and delivers the original when done", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          // First (real) reply looks truncated (no ending punctuation).
+          if (h.openclaw.chatCalls.length === 1) return "我先看一下代码然后改";
+          // Probe round: session says it is done.
+          return "结束了";
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "帮我改代码", messageId: "m1" }));
+        // One real call + one confirmation probe.
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
+        // Delivers the ORIGINAL reply (the done phrase is never shown to the user).
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "我先看一下代码然后改");
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "结束了");
+      } finally { h.cleanup(); }
+    });
+
+    it("keeps looping while the session continues, then delivers the latest result", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          const n = h.openclaw.chatCalls.length;
+          if (n === 1) return "先处理第一步然后"; // truncated
+          if (n === 2) return "继续处理第二步接下来"; // still truncated -> keeps going
+          return "全部完成了。"; // complete sentence -> stop
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "多步任务", messageId: "m1" }));
+        // real + 2 probes (3rd reply ends cleanly so no further probe).
+        expect(h.openclaw.chatCalls).toHaveLength(3);
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "全部完成了。");
+      } finally { h.cleanup(); }
+    });
+
+    it("stops at the retry budget and delivers the latest result", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_MAX = "3";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          return "还在处理中然后"; // always truncated, never says done
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "停不下来的任务", messageId: "m1" }));
+        // real call + 3 probes = 4 total (budget = 3).
+        expect(h.openclaw.chatCalls).toHaveLength(4);
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "还在处理中然后");
+      } finally {
+        delete process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_MAX;
+        h.cleanup();
+      }
+    });
+
+    it("does not retry a reply that ends cleanly", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          return "任务已经完成。"; // ends with period -> no retry
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "正常任务", messageId: "m1" }));
+        expect(h.openclaw.chatCalls).toHaveLength(1);
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "任务已经完成。");
+      } finally { h.cleanup(); }
+    });
+
+    it("does not retry NO_REPLY", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          return "NO_REPLY";
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "不需要回复", messageId: "m1" }));
+        expect(h.openclaw.chatCalls).toHaveLength(1);
+      } finally { h.cleanup(); }
+    });
   });
 });
