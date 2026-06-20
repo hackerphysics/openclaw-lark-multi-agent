@@ -2356,5 +2356,27 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(1);
       } finally { h.cleanup(); }
     });
+
+    it("does not retry a reply that produced attachments (hard rule), even if the text looks truncated", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        const dir = mkdtempSync(join(tmpdir(), "lma-attach-"));
+        const attachmentPath = join(dir, "out.png");
+        writeFileSync(attachmentPath, "x");
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          // Short, no trailing punctuation (would look truncated) BUT carries an
+          // attachment marker -> hard rule must skip auto-retry.
+          return `已生成\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</LMA_BRIDGE_ATTACHMENTS>`;
+        });
+        (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "画个图", messageId: "m1" }));
+        // No probe round: exactly one call.
+        expect(h.openclaw.chatCalls).toHaveLength(1);
+        // Attachment still delivered.
+        expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath }));
+      } finally { h.cleanup(); }
+    });
   });
 });

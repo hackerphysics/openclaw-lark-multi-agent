@@ -1753,7 +1753,12 @@ export class FeishuBot {
 
     const maxRetry = autoRetryMax();
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
-      const trimmed = this.extractBridgeAttachments(reply).text.trim();
+      const parsed = this.extractBridgeAttachments(reply);
+      const trimmed = parsed.text.trim();
+      // Hard rule: a reply that produced attachments (image/file/doc) is a
+      // finished product — never auto-retry it (and never risk dropping the
+      // bridge attachment marker by replacing `reply` with a probe answer).
+      if (parsed.attachments.length > 0) return reply;
       // Only engage for plausibly-successful-but-truncated text. Empty/NO_REPLY
       // and runtime failures have their own handling upstream.
       if (!trimmed || trimmed.toUpperCase() === "NO_REPLY" || this.isRuntimeFailureText(trimmed)) return reply;
@@ -1764,9 +1769,11 @@ export class FeishuBot {
         ? `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`
         : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`).catch(() => {});
 
+      // One short line, in the user's own voice (we intentionally do not change
+      // senderName). Keep the exact done-phrase contract so we can detect it.
       const probe = en
-        ? `Has the previous task fully finished? If it is completely done, reply only "${AUTO_RETRY_DONE_PHRASE}". If not, please continue and finish the remaining work.`
-        : `刚才的任务结束了吗？如果已经完全结束，请只回复“${AUTO_RETRY_DONE_PHRASE}”；如果还没有，请继续完成剩下的工作。`;
+        ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE}", otherwise keep going.`
+        : `刚才那个任务结束了吗？结束了就回我“${AUTO_RETRY_DONE_PHRASE}”，没结束就接着做。`;
 
       let probeReply: string;
       try {
