@@ -31,6 +31,10 @@ function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_
 // for the locale-appropriate phrase; detection accepts BOTH so either works.
 const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
 const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE_EN || "DONE";
+// When an auto-retry probe errors AND context usage is at/above this percent,
+// auto-compact the session once and keep retrying (instead of giving up). This
+// rescues the “session too heavy → run times out / lock contention” failure mode.
+function autoRetryCompactPct(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_COMPACT_PCT || 50); }
 
 class UnhealthySessionError extends Error {
   constructor(readonly status: string) {
@@ -1724,6 +1728,20 @@ export class FeishuBot {
     return !endOk;
   }
 
+  /** Current context usage percent for a session (totalTokens / contextTokens),
+   *  or 0 if it cannot be determined. Same basis as /status. */
+  private async getContextUsagePercent(sessionKey: string): Promise<number> {
+    try {
+      const resp = await this.openclawClient.getSessionInfo(sessionKey);
+      const s = resp?.session;
+      const total = s?.totalTokens || 0;
+      const ctx = s?.contextTokens || 0;
+      return ctx > 0 ? Math.round((total / ctx) * 100) : 0;
+    } catch {
+      return 0;
+    }
+  }
+
   /** True when the agent's reply is exactly a completion phrase (zh or en,
    *  tolerant of trailing punctuation/whitespace and case). */
   private isDonePhrase(text: string): boolean {
@@ -1754,6 +1772,7 @@ export class FeishuBot {
     if (!autoRetryEnabled() || isNativeCommandTrigger) return reply;
 
     const maxRetry = autoRetryMax();
+    let compacted = false; // auto-compact at most once per auto-retry round
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
       const parsed = this.extractBridgeAttachments(reply);
       const trimmed = parsed.text.trim();
@@ -1792,9 +1811,28 @@ export class FeishuBot {
           onProgress: (event) => liveStatus?.progress(event),
         }));
       } catch (err) {
-        // Confirmation round failed (timeout/unhealthy). Stop looping and deliver
-        // what we already have rather than spinning.
+        // Confirmation round failed (timeout/unhealthy). If the session is heavy
+        // (≥ threshold) and we have not compacted yet this round, auto-compact and
+        // keep retrying — a bloated session is the usual cause of these timeouts.
+        // Otherwise stop looping and deliver what we already have.
         console.warn(`[${this.config.name}] auto-retry probe failed for ${chatId.slice(-8)}:`, this.errorSummary(err));
+        if (!compacted) {
+          const pct = await this.getContextUsagePercent(sessionKey);
+          if (pct >= autoRetryCompactPct()) {
+            const en = this.isEn(chatId);
+            await liveStatus?.progress(en
+              ? `🧹 Context is large (${pct}%) and the retry failed — auto-compacting…`
+              : `🧹 上下文过大（${pct}%）且重试出错，正在自动压缩…`).catch(() => {});
+            try {
+              await this.openclawClient.compactSession(sessionKey);
+              compacted = true;
+              console.log(`[${this.config.name}] auto-retry: compacted session at ${pct}% for ${chatId.slice(-8)}; continuing`);
+              continue; // retry the probe on the now-lighter session
+            } catch (compactErr) {
+              console.warn(`[${this.config.name}] auto-retry compact failed for ${chatId.slice(-8)}:`, this.errorSummary(compactErr));
+            }
+          }
+        }
         return reply;
       }
 

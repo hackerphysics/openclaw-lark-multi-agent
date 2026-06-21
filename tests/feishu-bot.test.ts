@@ -2378,6 +2378,48 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
+    it("auto-compacts and keeps retrying when a probe fails and context is large (>=50%)", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        // Heavy session: 60% usage.
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 600, contextTokens: 1000 } })) as any;
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          if (n === 1) return "处理中然后"; // truncated -> probe
+          if (n === 2) throw new Error("LLM request timed out"); // probe fails -> compact + continue
+          return "全部完成了。"; // after compact, clean reply
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "重任务", messageId: "m1" }));
+        // Compact was triggered exactly once.
+        expect(h.openclaw.compactSession).toHaveBeenCalledTimes(1);
+        // After compact it retried and delivered the clean result.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "全部完成了。");
+      } finally { h.cleanup(); }
+    });
+
+    it("does not auto-compact when context is small, even if a probe fails", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        // Light session: 10% usage.
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 100, contextTokens: 1000 } })) as any;
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          if (n === 1) return "处理中然后"; // truncated -> probe
+          throw new Error("LLM request timed out"); // probe fails -> no compact (small ctx), stop
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "轻任务", messageId: "m1" }));
+        expect(h.openclaw.compactSession).not.toHaveBeenCalled();
+        // Delivers the existing truncated-looking reply rather than spinning.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "处理中然后");
+      } finally { h.cleanup(); }
+    });
+
     it("does not retry a reply that produced attachments (hard rule), even if the text looks truncated", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
