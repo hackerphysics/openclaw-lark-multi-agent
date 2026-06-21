@@ -1722,7 +1722,7 @@ export class FeishuBot {
     // Core signal: ends without any sentence-ending punctuation / closer
     // (“连句号都没有就感觉没成功”). Accept terminators across languages,
     // closing brackets/quotes, code fences, and common emoji endings.
-    const endOk = /[。！？.!?…)\]」』】）"'`”’~—✨✅👍🙏]\s*$/u.test(t)
+    const endOk = /[。！？.!?…)\]」』】）"'`”’~～—✨✅👍🙏]\s*$/u.test(t)
       || /```\s*$/.test(t)
       || /[}\]]\s*$/.test(t);
     return !endOk;
@@ -1744,9 +1744,25 @@ export class FeishuBot {
 
   /** True when the agent's reply is exactly a completion phrase (zh or en,
    *  tolerant of trailing punctuation/whitespace and case). */
+  /**
+   * True when the agent's reply means “done”. We accept the exact phrase as well
+   * as common wrappers (“已经结束了” / “好的，结束了” / “yes, DONE”), but reject it
+   * when a negation/not-finished cue is present (“还没结束” / “not done”), so a
+   * “still working” answer never counts as completion.
+   */
   private isDonePhrase(text: string): boolean {
-    const t = (text || "").trim().replace(/[。.!！~\s]+$/u, "");
-    return t === AUTO_RETRY_DONE_PHRASE || t.toUpperCase() === AUTO_RETRY_DONE_PHRASE_EN.toUpperCase();
+    const raw = (text || "").trim();
+    if (!raw) return false;
+    // Short replies only — a long continuation is the model working, not confirming.
+    if (raw.length > 24) return false;
+    const stripped = raw.replace(/[。.!！~～\s“”"'，,]+/gu, "");
+    const zh = AUTO_RETRY_DONE_PHRASE; // e.g. 结束了
+    const en = AUTO_RETRY_DONE_PHRASE_EN.toUpperCase(); // e.g. DONE
+    const hasDone = stripped.includes(zh) || stripped.toUpperCase().includes(en);
+    if (!hasDone) return false;
+    // Reject if a not-finished / negation cue is present.
+    if (/(没|未|不|还在|继续|not|isn'?t|aren'?t|no[t\s])/iu.test(raw)) return false;
+    return true;
   }
 
   /**

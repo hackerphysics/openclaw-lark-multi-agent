@@ -2293,6 +2293,29 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
+    it("recognizes wrapped done phrases ('已经结束了') and rejects negations ('还没结束')", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          if (n === 1) return "先看代码然后改"; // truncated -> probe
+          if (n === 2) return "还没结束，我继续"; // negation -> NOT done, keep going
+          return "好的，已经结束了"; // wrapped done phrase -> confirmed
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "多轮", messageId: "m1" }));
+        // probe1 (negation, not done) -> reply becomes that, re-checked (truncated) ->
+        // probe2 returns wrapped done -> stop. 1 real + 2 probes = 3.
+        expect(h.openclaw.chatCalls).toHaveLength(3);
+        // The negation reply was the latest before the done confirmation, so it is
+        // delivered (the '已经结束了' confirmation itself is never shown).
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "还没结束，我继续");
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "好的，已经结束了");
+      } finally { h.cleanup(); }
+    });
+
     it("keeps looping while the session continues, then delivers the latest result", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
