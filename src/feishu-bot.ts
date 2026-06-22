@@ -1840,10 +1840,15 @@ export class FeishuBot {
               ? `🧹 Context is large (${pct}%) and the retry failed — auto-compacting…`
               : `🧹 上下文过大（${pct}%）且重试出错，正在自动压缩…`).catch(() => {});
             try {
-              await this.openclawClient.compactSession(sessionKey);
-              compacted = true;
-              console.log(`[${this.config.name}] auto-retry: compacted session at ${pct}% for ${chatId.slice(-8)}; continuing`);
-              continue; // retry the probe on the now-lighter session
+              const res = await this.openclawClient.compactSession(sessionKey);
+              compacted = true; // mark as attempted regardless, to avoid re-compacting in a loop
+              if (res?.compacted === true) {
+                console.log(`[${this.config.name}] auto-retry: compacted session at ${pct}% for ${chatId.slice(-8)}; continuing`);
+                continue; // retry the probe on the now-lighter session
+              }
+              // Compact was a no-op (e.g. summary did not reduce the session); do
+              // not spin — deliver what we have.
+              console.warn(`[${this.config.name}] auto-retry: compact was a no-op for ${chatId.slice(-8)} (${res?.reason || "no reason"}); delivering latest`);
             } catch (compactErr) {
               console.warn(`[${this.config.name}] auto-retry compact failed for ${chatId.slice(-8)}:`, this.errorSummary(compactErr));
             }
@@ -2874,11 +2879,26 @@ export class FeishuBot {
    */
   private async handleCompactCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
+    const en = this.isEn(chatId);
     try {
-      await this.openclawClient.compactSession(sessionKey);
-      await this.replyMessage(messageId, `✅ Session 已压缩`);
+      const res = await this.openclawClient.compactSession(sessionKey);
+      // sessions.compact resolves successfully even when nothing was compacted
+      // (e.g. the transcript is too small, or the LLM summary did not reduce the
+      // session). Only report success when the RPC actually compacted; otherwise
+      // tell the user it was a no-op so "压缩成功" never lies.
+      const compacted = res?.compacted === true;
+      if (compacted) {
+        await this.replyMessage(messageId, en ? `✅ Session compacted` : `✅ Session 已压缩`);
+      } else {
+        const reason = typeof res?.reason === "string" && res.reason ? res.reason : (en ? "nothing to compact" : "无需压缩");
+        await this.replyMessage(messageId, en
+          ? `ℹ️ Session not compacted (${reason})`
+          : `ℹ️ Session 未压缩（${reason}）`);
+      }
     } catch (err) {
-      await this.replyMessage(messageId, `❌ 压缩失败: ${(err as Error).message}`);
+      await this.replyMessage(messageId, en
+        ? `❌ Compact failed: ${(err as Error).message}`
+        : `❌ 压缩失败: ${(err as Error).message}`);
     }
   }
 

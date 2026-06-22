@@ -29,7 +29,7 @@ class MockOpenClaw {
     if (this.replies.length > 0) return this.replies.shift()!;
     return "mock reply";
   }
-  compactSession = vi.fn(async () => "ok");
+  compactSession = vi.fn(async () => ({ ok: true, compacted: true }));
   async resetSession() { return "ok"; }
   abortChat = vi.fn(async () => {});
 }
@@ -2462,6 +2462,40 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(1);
         // Attachment still delivered.
         expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath }));
+      } finally { h.cleanup(); }
+    });
+  });
+
+  describe("/compact command honors the actual compaction result", () => {
+    it("reports success only when the session was actually compacted", async () => {
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: true })) as any;
+        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
+      } finally { h.cleanup(); }
+    });
+
+    it("reports a no-op (not success) when the RPC returns compacted=false", async () => {
+      const h = makeHarness("GPT");
+      try {
+        // This is the real bug: RPC resolves fine but did NOT compact.
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
+        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        // Must NOT claim success.
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
+        // Should say not compacted, and surface the reason.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("未压缩"));
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("transcript too small"));
+      } finally { h.cleanup(); }
+    });
+
+    it("reports failure when the RPC throws", async () => {
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.compactSession = vi.fn(async () => { throw new Error("rpc timeout"); }) as any;
+        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("压缩失败"));
       } finally { h.cleanup(); }
     });
   });
