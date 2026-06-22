@@ -13,6 +13,7 @@ export type ToolTrimResult = {
   removedToolResults?: number;
   strippedToolCalls?: number;
   removedEmptyAssistants?: number;
+  keptRecentToolCalls?: number;
   backupPath?: string;
 };
 
@@ -52,16 +53,36 @@ export function resolveSessionFilePath(sessionKey: string, sessionId: string, op
  *
  * Typical reduction is ~70-90% for tool-heavy sessions.
  */
-export function toolTrimCompactFile(filePath: string): ToolTrimResult {
+export function toolTrimCompactFile(filePath: string, keepRecentToolCalls: number = 3): ToolTrimResult {
   if (!existsSync(filePath)) return { ok: false, reason: "transcript file not found" };
   const original = readFileSync(filePath, "utf8");
   const lines = original.split("\n");
   const bytesBefore = Buffer.byteLength(original, "utf8");
 
+  // First pass: collect every toolCall id in order, so we can keep the most
+  // recent N of them (and their matching toolResults) intact. Recent tool calls
+  // are often still relevant to what the agent is doing next.
+  const toolCallIds: string[] = [];
+  for (const line of lines) {
+    if (line.trim() === "") continue;
+    let d: any;
+    try { d = JSON.parse(line); } catch { continue; }
+    if (d?.type !== "message") continue;
+    const msg = d.message;
+    if (msg?.role === "assistant" && Array.isArray(msg.content)) {
+      for (const p of msg.content) {
+        if (p && typeof p === "object" && p.type === "toolCall" && p.id) toolCallIds.push(String(p.id));
+      }
+    }
+  }
+  const keepN = Math.max(0, Math.floor(keepRecentToolCalls));
+  const keepIds = new Set(keepN > 0 ? toolCallIds.slice(-keepN) : []);
+
   const out: string[] = [];
   let removedToolResults = 0;
   let strippedToolCalls = 0;
   let removedEmptyAssistants = 0;
+  let keptRecentToolCalls = 0;
   let linesBefore = 0;
 
   for (const line of lines) {
@@ -73,15 +94,33 @@ export function toolTrimCompactFile(filePath: string): ToolTrimResult {
     const msg = d.message;
     const role = msg?.role;
 
-    if (role === "toolResult") { removedToolResults++; continue; }
+    if (role === "toolResult") {
+      // Keep the toolResult only if its toolCall is in the recent keep-set.
+      if (msg?.toolCallId && keepIds.has(String(msg.toolCallId))) { out.push(line); continue; }
+      removedToolResults++; continue;
+    }
 
     if (role === "assistant" && Array.isArray(msg?.content)) {
       const content = msg.content as any[];
       const hasToolCall = content.some((p) => p && typeof p === "object" && p.type === "toolCall");
       if (hasToolCall) {
-        const kept = content.filter((p) => p && typeof p === "object" && p.type !== "toolCall");
+        // Keep toolCalls that are in the recent keep-set; strip the rest.
+        const kept = content.filter((p) => {
+          if (!p || typeof p !== "object") return false;
+          if (p.type !== "toolCall") return true;
+          return p.id && keepIds.has(String(p.id));
+        });
+        const keptToolCall = kept.some((p) => p.type === "toolCall");
         const hasText = kept.some((p) => p.type === "text" && typeof p.text === "string" && p.text.trim() !== "");
-        if (!hasText) { removedEmptyAssistants++; continue; }
+        if (!keptToolCall && !hasText) { removedEmptyAssistants++; continue; }
+        if (keptToolCall) {
+          keptRecentToolCalls++;
+          // stopReason stays toolUse since a toolCall remains.
+          if (kept.length !== content.length) msg.content = kept;
+          out.push(JSON.stringify(d));
+          continue;
+        }
+        // All toolCalls stripped: keep text only, fix stopReason.
         msg.content = kept;
         if (msg.stopReason === "toolUse") msg.stopReason = "stop";
         strippedToolCalls++;
@@ -98,7 +137,7 @@ export function toolTrimCompactFile(filePath: string): ToolTrimResult {
   }
 
   if (removedToolResults === 0 && strippedToolCalls === 0 && removedEmptyAssistants === 0) {
-    return { ok: true, reason: "no tool content to trim", bytesBefore, bytesAfter: bytesBefore, linesBefore, linesAfter: out.length };
+    return { ok: true, reason: "no tool content to trim", bytesBefore, bytesAfter: bytesBefore, linesBefore, linesAfter: out.length, keptRecentToolCalls };
   }
 
   // Always back up first.
@@ -121,6 +160,7 @@ export function toolTrimCompactFile(filePath: string): ToolTrimResult {
     removedToolResults,
     strippedToolCalls,
     removedEmptyAssistants,
+    keptRecentToolCalls,
     backupPath,
   };
 }

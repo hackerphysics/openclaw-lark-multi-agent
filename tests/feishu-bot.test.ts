@@ -2529,4 +2529,61 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
   });
+
+  describe("high-context alert", () => {
+    const prev = process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT;
+    afterEach(() => { process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT = prev; });
+
+    it("alerts once when context crosses the threshold, then stays quiet until it drops", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT = "80";
+      const h = makeHarness("GPT");
+      try {
+        (h.bot as any).sendMessage = vi.fn(async () => {});
+        // 85% usage.
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 850, contextTokens: 1000 } })) as any;
+        await (h.bot as any).maybeAlertHighContext("chat1");
+        await (h.bot as any).maybeAlertHighContext("chat1"); // still high -> no second alert
+        expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+        expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("85%"));
+      } finally { h.cleanup(); }
+    });
+
+    it("re-arms after usage drops, alerting again on the next crossing", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT = "80";
+      const h = makeHarness("GPT");
+      try {
+        (h.bot as any).sendMessage = vi.fn(async () => {});
+        let pctTokens = 850;
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: pctTokens, contextTokens: 1000 } })) as any;
+        await (h.bot as any).maybeAlertHighContext("chat1"); // 85% -> alert
+        pctTokens = 600; // dropped (e.g. after compact) to 60%
+        await (h.bot as any).maybeAlertHighContext("chat1"); // re-arms, no alert
+        pctTokens = 900; // climbs back to 90%
+        await (h.bot as any).maybeAlertHighContext("chat1"); // alert again
+        expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(2);
+      } finally { h.cleanup(); }
+    });
+
+    it("does not alert below the threshold", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT = "80";
+      const h = makeHarness("GPT");
+      try {
+        (h.bot as any).sendMessage = vi.fn(async () => {});
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 500, contextTokens: 1000 } })) as any;
+        await (h.bot as any).maybeAlertHighContext("chat1");
+        expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+      } finally { h.cleanup(); }
+    });
+
+    it("is disabled when threshold is 0", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT = "0";
+      const h = makeHarness("GPT");
+      try {
+        (h.bot as any).sendMessage = vi.fn(async () => {});
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 990, contextTokens: 1000 } })) as any;
+        await (h.bot as any).maybeAlertHighContext("chat1");
+        expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+      } finally { h.cleanup(); }
+    });
+  });
 });

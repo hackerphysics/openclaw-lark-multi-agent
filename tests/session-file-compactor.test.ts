@@ -33,7 +33,7 @@ describe("toolTrimCompactFile", () => {
     ].join("\n") + "\n";
     writeFileSync(f, content);
 
-    const r = toolTrimCompactFile(f);
+    const r = toolTrimCompactFile(f, 0); // keep no recent tool calls -> trim all
     expect(r.ok).toBe(true);
     expect(r.removedToolResults).toBe(2);
     expect(r.strippedToolCalls).toBe(1);
@@ -72,6 +72,37 @@ describe("toolTrimCompactFile", () => {
     expect(r.ok).toBe(true);
     const after = readFileSync(f, "utf8").length;
     expect(after).toBeLessThan(before * 0.3); // >70% reduction (toolResults are the bulk)
+  });
+
+  it("keeps the most recent N tool calls (and their results) intact", () => {
+    const d = tmp();
+    const f = join(d, "s.jsonl");
+    const rows: string[] = [line({ type: "message", message: { role: "user", content: [{ type: "text", text: "go" }] } })];
+    for (let i = 0; i < 5; i++) {
+      rows.push(line({ type: "message", message: { role: "assistant", stopReason: "toolUse", content: [
+        { type: "text", text: `step ${i}` },
+        { type: "toolCall", id: `t${i}`, name: "read", arguments: { path: `f${i}` } },
+      ] } }));
+      rows.push(line({ type: "message", message: { role: "toolResult", toolCallId: `t${i}`, content: [{ type: "text", text: "R".repeat(1000) }] } }));
+    }
+    writeFileSync(f, rows.join("\n") + "\n");
+
+    const r = toolTrimCompactFile(f, 2); // keep last 2 tool calls (t3, t4)
+    expect(r.ok).toBe(true);
+    const out = readFileSync(f, "utf8").trim().split("\n").map((l) => JSON.parse(l));
+    // The two most-recent toolResults (t3, t4) survive; earlier ones (t0-t2) gone.
+    const toolResultIds = out.filter((d) => d.message.role === "toolResult").map((d) => d.message.toolCallId);
+    expect(toolResultIds.sort()).toEqual(["t3", "t4"]);
+    // The recent assistant toolCalls (t3, t4) are kept on their assistant lines.
+    const keptToolCallIds = out.flatMap((d) => Array.isArray(d.message.content)
+      ? d.message.content.filter((p: any) => p.type === "toolCall").map((p: any) => p.id) : []);
+    expect(keptToolCallIds.sort()).toEqual(["t3", "t4"]);
+    expect(r.keptRecentToolCalls).toBe(2);
+    // Earlier assistant lines kept their TEXT (step 0-2) even though toolCall stripped.
+    const texts = out.flatMap((d) => Array.isArray(d.message.content)
+      ? d.message.content.filter((p: any) => p.type === "text").map((p: any) => p.text) : []);
+    expect(texts).toContain("step 0");
+    expect(texts).toContain("step 4");
   });
 
   it("is a no-op (still ok) when there is no tool content", () => {

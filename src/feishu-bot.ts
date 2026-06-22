@@ -36,6 +36,12 @@ const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RET
 // auto-compact the session once and keep retrying (instead of giving up). This
 // rescues the “session too heavy → run times out / lock contention” failure mode.
 function autoRetryCompactPct(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_COMPACT_PCT || 50); }
+// How many of the most-recent tool calls (and their results) tool-trim keeps
+// intact — recent tool calls may still be relevant to the agent's next step.
+function toolTrimKeepRecent(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_TOOLTRIM_KEEP_RECENT || 3); }
+// After a reply is delivered, if context usage reaches this percent, send the
+// user a one-time alert to compact. 0 disables the alert.
+function contextAlertPct(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT || 80); }
 
 class UnhealthySessionError extends Error {
   constructor(readonly status: string) {
@@ -103,6 +109,8 @@ export class FeishuBot {
   private delayedFailureTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
   private lastRealDeliveryAt: Map<string, number> = new Map();
+  /** Per-chat: whether we've already sent the high-context alert this cycle. */
+  private contextAlerted: Map<string, boolean> = new Map();
   /** Active chatSend trigger target so final replies and proactive session.message share one delivery key. */
   private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout>; liveStatus?: LiveStatusController }> = new Map();
   private adminOpenId: string | null;
@@ -1418,6 +1426,8 @@ export class FeishuBot {
               // Mark every merged trigger as delivered so retries/restarts do
               // not re-process any of them.
               for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
+              // After a successful reply, warn the user once if context is high.
+              void this.maybeAlertHighContext(chatId);
             } catch (err) {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
@@ -1740,6 +1750,38 @@ export class FeishuBot {
       return ctx > 0 ? Math.round((total / ctx) * 100) : 0;
     } catch {
       return 0;
+    }
+  }
+
+  /**
+   * After a reply is delivered, alert the user once if context usage crossed the
+   * threshold (default 80%), so they can compact before a session bloats into the
+   * timeout/lock/overflow failure modes. We only alert on a fresh crossing: once
+   * alerted we stay quiet until usage drops back below the threshold (e.g. after
+   * a compact), then re-arm.
+   */
+  private async maybeAlertHighContext(chatId: string): Promise<void> {
+    const threshold = contextAlertPct();
+    if (threshold <= 0) return;
+    try {
+      const sessionKey = this.getSessionKey(chatId);
+      const pct = await this.getContextUsagePercent(sessionKey);
+      if (pct <= 0) return;
+      const alerted = this.contextAlerted.get(chatId) || false;
+      if (pct >= threshold) {
+        if (alerted) return; // already warned this cycle
+        this.contextAlerted.set(chatId, true);
+        const en = this.isEn(chatId);
+        const text = en
+          ? `\u26a0\ufe0f Context is at ${pct}% (\u2265${threshold}%). Consider /compact soon to avoid timeouts/overflow.`
+          : `\u26a0\ufe0f \u4e0a\u4e0b\u6587\u5df2\u8fbe ${pct}%\uff08\u2265${threshold}%\uff09\uff0c\u5efa\u8bae\u5c3d\u5feb /compact \u538b\u7f29\uff0c\u907f\u514d\u8d85\u65f6/\u7206\u4e0a\u4e0b\u6587\u3002`;
+        await this.sendMessage(chatId, text).catch(() => {});
+      } else if (pct < threshold - 5) {
+        // Re-arm once usage clearly dropped (hysteresis to avoid flapping).
+        this.contextAlerted.set(chatId, false);
+      }
+    } catch {
+      // best-effort; never block delivery
     }
   }
 
@@ -2918,7 +2960,7 @@ export class FeishuBot {
     if (!filePath) {
       return { compacted: false, method: "none", reason: nativeReason || "transcript file not found" };
     }
-    const trim = toolTrimCompactFile(filePath);
+    const trim = toolTrimCompactFile(filePath, toolTrimKeepRecent());
     if (!trim.ok) {
       return { compacted: false, method: "none", reason: trim.reason || "tool-trim failed" };
     }
