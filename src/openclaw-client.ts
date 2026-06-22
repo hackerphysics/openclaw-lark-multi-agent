@@ -197,6 +197,16 @@ export class OpenClawClient {
                 stream: "chatFinal",
                 data: { text: textParts.join("\n") },
               });
+            } else if (state === "error") {
+              // A chat-level error (e.g. "Request timed out before a response")
+              // must NOT be silently dropped — otherwise mid-run delta text gets
+              // surfaced as if it were a normal reply and the run neither errors
+              // nor retries. Record it so the collect loop can surface/handle it.
+              this.agentEvents.get(sk)!.push({
+                ...frame.payload,
+                stream: "chatError",
+                data: { error: frame.payload?.errorMessage || frame.payload?.error || "chat error" },
+              });
             }
           } else {
             this.agentEvents.get(sk)!.push(frame.payload);
@@ -824,6 +834,27 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 resetIdleTimer();
                 console.warn(`[OpenClaw] recoverable lifecycle error for runId=${evRunId || runId}; deferring (agent may auto-recover): ${errText.slice(0, 120)}`);
                 return;
+              }
+              clearTimeout(idleTimer);
+              clearInterval(poller);
+              if (chatFinalTimer) clearTimeout(chatFinalTimer);
+              if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+              reject(new Error(`Agent error: ${errText}`));
+              return;
+            }
+            if (ev.stream === "chatError") {
+              // Chat-level error (most commonly a request timeout). Treat it like
+              // a lifecycle error: recoverable ones defer (agent may auto-recover
+              // and still produce a real final); otherwise reject so the bridge
+              // surfaces the failure / lets auto-retry kick in — instead of
+              // surfacing whatever mid-run delta text happened to be collected.
+              const errText = String(ev.data?.error || "chat error");
+              if (this.isRecoverableAgentError(errText)) {
+                pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
+                resetIdleTimer();
+                console.warn(`[OpenClaw] recoverable chat error for runId=${evRunId || runId}; deferring: ${errText.slice(0, 120)}`);
+                bucket.splice(i, 1);
+                continue;
               }
               clearTimeout(idleTimer);
               clearInterval(poller);

@@ -107,6 +107,40 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).rejects.toThrow(/permission denied/);
   });
 
+  it("rejects on a chat-level error (request timeout) instead of surfacing mid-run delta text", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
+    // Agent produced some mid-run delta text (e.g. between tool calls)...
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatDelta", data: { deltaText: "让我查一下这个文件。", delta: "让我查一下这个文件。" } });
+    // ...then the run timed out at the chat level.
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "Request timed out before a response was received" } });
+
+    // Must reject (timeout), NOT resolve with the mid-run delta text.
+    await expect(replyPromise).rejects.toThrow(/timed out/i);
+  });
+
+  it("defers on a recoverable chat-level error and lets a later final win", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+
+    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "Context overflow: prompt too long" } });
+    setTimeout(() => {
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatFinal", data: { text: "recovered after overflow" } });
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
+    }, 50);
+
+    await expect(replyPromise).resolves.toBe("recovered after overflow");
+  });
+
   it("treats empty final as NO_REPLY when requested", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();
