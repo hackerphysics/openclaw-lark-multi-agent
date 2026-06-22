@@ -860,6 +860,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               clearInterval(poller);
               if (chatFinalTimer) clearTimeout(chatFinalTimer);
               if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+              // Abort the (possibly still-running) backgrounded run before we
+              // reject, so an auto-retry probe does not race a zombie run on the
+              // same session. Idempotent/best-effort.
+              this.abortChat(targetSessionKey || sessionKey, evRunId || runId).catch((abortErr) => {
+                console.warn(`[OpenClaw] abort after chat error failed:`, (abortErr as Error).message);
+              });
               reject(new Error(`Agent error: ${errText}`));
               return;
             }

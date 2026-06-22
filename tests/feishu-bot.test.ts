@@ -2316,6 +2316,43 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
+    it("auto-retries a main-run timeout by resuming the session via probe", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          const n = h.openclaw.chatCalls.length;
+          // 1st (main run) times out -> reject.
+          if (n === 1) throw new Error("Agent error: Request timed out before a response was received");
+          // 2nd (probe) the session resumes and finishes.
+          return "接着把剩下的做完了。";
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干个活", messageId: "m1" }));
+        // main run (reject) + 1 probe.
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        // The probe was sent (resume prompt), and its result delivered.
+        expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "接着把剩下的做完了。");
+      } finally { h.cleanup(); }
+    });
+
+    it("does not auto-retry a terminal (non-retryable) main-run error", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          throw new Error("Agent error: The requested model is not supported");
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干个活", messageId: "m1" }));
+        // Only the main run; no probe (terminal error).
+        expect(h.openclaw.chatCalls).toHaveLength(1);
+        // Surfaced as an error, not retried.
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("做完"));
+      } finally { h.cleanup(); }
+    });
+
     it("keeps looping while the session continues, then delivers the latest result", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
