@@ -105,6 +105,9 @@ export class FeishuBot {
   private initializedSessions: Set<string> = new Set();
   /** Per-chat busy lock: timestamp when became busy (0 = not busy) */
   private busyChats: Map<string, number> = new Map();
+  /** Per-chat "stop" generation counter. Bumped by /stop so any in-flight
+   *  auto-retry loop can detect it was cancelled and stop retrying immediately. */
+  private stopEpoch: Map<string, number> = new Map();
   /** Per-chat pending reply message IDs (to ack with DONE when their trigger is processed) */
   private pendingAckMessages: Map<string, { messageId: string; emoji: string; rowId: number }[]> = new Map();
   /** Per-chat pending tool message sends (to await before final reply) */
@@ -1767,22 +1770,34 @@ export class FeishuBot {
    * only on cheap text shape here, never on stopReason (the upstream rarely
    * provides one for normal-looking-but-truncated finals).
    */
+  /**
+   * Heuristic: does this reply look genuinely truncated / cut off mid-task?
+   *
+   * IMPORTANT (per Stephen): only retry when there is CLEAR evidence the agent
+   * did not finish — do NOT retry just because a reply lacks a trailing period.
+   * Many complete replies legitimately end without sentence punctuation (a terse
+   * “好的”, a bullet list, a path, a number, a closing word). Treating those as
+   * truncated caused needless extra probe rounds, which hurts UX. So we gate on
+   * strong structural signals only:
+   *   1. Unbalanced code fence — almost certainly cut off mid code block.
+   *   2. Ends with a dangling connector / lead-in (“然后”, “接下来”, “let me”…)
+   *      or a trailing clause-joining punctuation (comma/colon/semicolon),
+   *      which means a sentence was left hanging.
+   *   3. Ends mid-word inside a Latin word right after a connector-less clause
+   *      (very rare; only when the last “word” is unusually long), kept minimal.
+   * A plain “no sentence-ending punctuation” is deliberately NOT sufficient.
+   */
   private looksTruncated(text: string): boolean {
     const t = (text || "").trim();
     if (!t) return false; // empty/NO_REPLY handled elsewhere
-    // Unbalanced code fence => almost certainly cut off mid-block.
+    // (1) Unbalanced code fence => almost certainly cut off mid-block.
     const fences = (t.match(/```/g) || []).length;
     if (fences % 2 === 1) return true;
-    // Ends with an obvious continuation cue (dangling connector / lead-in).
+    // (2a) Trailing clause-joining punctuation: a sentence was left hanging.
     if (/[，,：:、;；]\s*$/u.test(t)) return true;
-    if (/(接下来|然后|首先|现在我|让我|下一步|let me|now i|next,?|first,?)\s*$/iu.test(t)) return true;
-    // Core signal: ends without any sentence-ending punctuation / closer
-    // (“连句号都没有就感觉没成功”). Accept terminators across languages,
-    // closing brackets/quotes, code fences, and common emoji endings.
-    const endOk = /[。！？.!?…)\]」』】）"'`”’~～—✨✅👍🙏]\s*$/u.test(t)
-      || /```\s*$/.test(t)
-      || /[}\]]\s*$/.test(t);
-    return !endOk;
+    // (2b) Ends on an explicit continuation cue / lead-in.
+    if (/(接下来|然后|首先|现在我|让我|下一步|我先|我来|我接着|接着|稍等|let me|now i|next|first|\b(?:and|then|so|to|the|a)\b)\s*$/iu.test(t)) return true;
+    return false;
   }
 
   /**
@@ -1796,10 +1811,59 @@ export class FeishuBot {
    * sends an explicit "invoke 格式错了，请重试" probe so the agent re-issues the
    * tool call correctly rather than the generic done-check.
    */
+  /**
+   * Did the model serialize a tool call as plain text instead of emitting a real
+   * function call? When that happens, the structured tool-call XML leaks into the
+   * visible text channel and the tool never runs. We must distinguish this from a
+   * reply that merely *mentions* a tag (teaching, quoting, showing an example),
+   * which must NOT trigger a retry. So we require strong STRUCTURAL evidence of a
+   * leaked call, not just any tag at the end:
+   *
+   *   1. The reply must END with a closing `</invoke>` (optionally `antml:`).
+   *      A dangling OPEN tag or a bare `</parameter>`/`<function_calls>` alone is
+   *      not enough — too easy to hit in normal prose.
+   *   2. Somewhere before it there must be a matching `<invoke name="...">` OPEN
+   *      tag — i.e. a whole call block (`<invoke…>…</invoke>`) materialized as
+   *      text. A lone `</invoke>` (e.g. “闭合标签是 </invoke>”) is a mention,
+   *      not a leaked call.
+   *   3. The trailing `</invoke>` must NOT be wrapped in inline code/backticks or
+   *      a fenced code block — those are deliberate examples, not a leak.
+   *
+   * Anchored at the very end because a genuinely leaked call is the LAST thing in
+   * the message (the model stopped right after “emitting” it). This keeps the
+   * trigger tight so we do not retry on normal replies that talk about tags.
+   */
   private looksLikeBrokenToolCall(text: string): boolean {
     const t = (text || "").trim();
     if (!t) return false;
-    return /<\/?\s*(?:antml:)?(?:invoke|parameter|function_calls)\b[^>]*>\s*$/i.test(t);
+    // (1) Must end with a closing invoke tag (the serialized call's terminator).
+    const closeMatch = /<\/\s*(?:antml:)?invoke\s*>\s*$/i.exec(t);
+    if (!closeMatch) return false;
+    // (3) Reject when that closing tag is fenced or inline-code wrapped (example).
+    if (this.isTrailingTagInCode(t, closeMatch.index)) return false;
+    // (2) Require a matching opening `<invoke ...>` before the closer — proof that
+    //     a whole call block leaked, not just a mention of the closing tag.
+    const head = t.slice(0, closeMatch.index);
+    if (!/<\s*(?:antml:)?invoke\b[^>]*>/i.test(head)) return false;
+    return true;
+  }
+
+  /**
+   * Is the tag at `tagIndex` inside an inline-code span (`` `…` ``) or a fenced
+   * code block (```` ``` ````)? Such tags are deliberate examples, not a leaked
+   * tool call, so the broken-tool-call detector must ignore them.
+   */
+  private isTrailingTagInCode(text: string, tagIndex: number): boolean {
+    const before = text.slice(0, tagIndex);
+    // Fenced block: an odd number of ``` before the tag means we are inside one.
+    const fences = (before.match(/```/g) || []).length;
+    if (fences % 2 === 1) return true;
+    // Inline code: an odd number of unescaped backticks on the tag's own line.
+    const lineStart = before.lastIndexOf("\n") + 1;
+    const lineBefore = before.slice(lineStart);
+    const ticks = (lineBefore.match(/`/g) || []).length;
+    if (ticks % 2 === 1) return true;
+    return false;
   }
 
   /** Current context usage percent for a session (totalTokens / contextTokens),
@@ -1906,11 +1970,22 @@ export class FeishuBot {
     const maxRetry = autoRetryMax();
     let compacted = false; // auto-compact at most once per auto-retry round
     let probedAtLeastOnce = false;
+    // Snapshot the stop generation at entry. If the user runs /stop while this
+    // loop is in flight, handleStopCommand bumps the epoch; we detect the change
+    // and stop retrying immediately instead of issuing more probes.
+    const startStopEpoch = this.stopEpoch.get(chatId) || 0;
+    const wasStopped = () => (this.stopEpoch.get(chatId) || 0) !== startStopEpoch;
     // Set per-iteration when the reply under inspection ended with a dangling
     // tool-call tag (model typed an invoke as plain text); selects the explicit
     // "invoke format was broken, retry" probe instead of the generic done-check.
     let brokenToolCall = false;
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
+      // /stop while we were looping: abandon retries and deliver what we have.
+      if (wasStopped()) {
+        console.log(`[${this.config.name}] auto-retry: aborted by /stop for ${chatId.slice(-8)}`);
+        if (!reply) throw new Error(`Agent error: ${params.initialError || "stopped by user"}`);
+        return reply;
+      }
       brokenToolCall = false;
       if (!forceProbe) {
         const parsed = this.extractBridgeAttachments(reply);
@@ -1999,6 +2074,14 @@ export class FeishuBot {
       }
 
       const probeText = this.extractBridgeAttachments(probeReply).text.trim();
+      // /stop landed while the probe was in flight: stop here rather than loop
+      // again. Deliver the latest meaningful output we have.
+      if (wasStopped()) {
+        console.log(`[${this.config.name}] auto-retry: aborted by /stop mid-probe for ${chatId.slice(-8)}`);
+        const latest = probeText && probeText.toUpperCase() !== "NO_REPLY" ? probeReply : reply;
+        if (!latest) throw new Error(`Agent error: ${params.initialError || "stopped by user"}`);
+        return latest;
+      }
       if (!probeText || probeText.toUpperCase() === "NO_REPLY") {
         if (!reply) throw new Error(`Agent error: ${params.initialError || "no reply after retry"}`);
         return reply; // session could not answer; deliver existing result
@@ -3351,6 +3434,9 @@ export class FeishuBot {
   private async handleStopCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     try {
+      // Bump the stop generation FIRST so any in-flight auto-retry loop sees the
+      // cancellation on its next iteration and stops retrying immediately.
+      this.stopEpoch.set(chatId, (this.stopEpoch.get(chatId) || 0) + 1);
       // Abort all active runs for this session (chat.abort with no runId).
       await this.openclawClient.abortChat(sessionKey).catch(() => {});
       // Force-unlock the busy gate so queued messages can be processed.

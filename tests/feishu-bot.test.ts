@@ -2319,8 +2319,8 @@ describe("FeishuBot routing and queue behavior", () => {
       try {
         h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
           h.openclaw.chatCalls.push(params);
-          // First (real) reply looks truncated (no ending punctuation).
-          if (h.openclaw.chatCalls.length === 1) return "我先看一下代码然后改";
+          // First (real) reply looks truncated (ends on a dangling connector).
+          if (h.openclaw.chatCalls.length === 1) return "我先看一下代码，然后";
           // Probe round: session says it is done.
           return "结束了";
         });
@@ -2329,7 +2329,7 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(2);
         expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
         // Delivers the ORIGINAL reply (the done phrase is never shown to the user).
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "我先看一下代码然后改");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "我先看一下代码，然后");
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "结束了");
       } finally { h.cleanup(); }
     });
@@ -2342,8 +2342,8 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
           h.openclaw.chatCalls.push(params);
           n++;
-          if (n === 1) return "先看代码然后改"; // truncated -> probe
-          if (n === 2) return "还没结束，我继续"; // negation -> NOT done, keep going
+          if (n === 1) return "先看代码，然后"; // truncated (dangling connector) -> probe
+          if (n === 2) return "还没结束，我接着"; // negation + truncated -> NOT done, keep going
           return "好的，已经结束了"; // wrapped done phrase -> confirmed
         });
         await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "多轮", messageId: "m1" }));
@@ -2352,7 +2352,7 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(3);
         // The negation reply was the latest before the done confirmation, so it is
         // delivered (the '已经结束了' confirmation itself is never shown).
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "还没结束，我继续");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "还没结束，我接着");
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "好的，已经结束了");
       } finally { h.cleanup(); }
     });
@@ -2543,7 +2543,7 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("sends an explicit 'invoke format was broken, retry' probe when a reply ends with a dangling tool-call tag", async () => {
+    it("sends an explicit 'invoke format was broken, retry' probe when a whole tool-call block leaked as text", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
       try {
@@ -2551,9 +2551,9 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
           h.openclaw.chatCalls.push(params);
           n++;
-          // Real reply: the model typed a tool call as plain text, so it ends
-          // with a dangling invoke tag (the tool never actually ran).
-          if (n === 1) return "我来读一下文件\n<\/antml:invoke>";
+          // Real failure: a complete tool-call block serialized as plain text
+          // (open <invoke…> + parameter + closing </invoke>) — the tool never ran.
+          if (n === 1) return "我来读一下文件\n<invoke name=\"read\">\n<parameter name=\"path\">/a.ts</parameter>\n<\/antml:invoke>";
           // After being told the format was broken, it retries and finishes.
           return "重试后读到了文件，处理完成。";
         });
@@ -2561,8 +2561,30 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(2);
         // The probe must explicitly call out the invoke format being wrong.
         expect(h.openclaw.chatCalls[1].currentMessage).toContain("invoke 格式错了");
-        // The dangling-tag reply is never shown to the user; the retried result is.
+        // The leaked-block reply is never shown to the user; the retried result is.
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "重试后读到了文件，处理完成。");
+      } finally { h.cleanup(); }
+    });
+
+    it("does NOT trigger an invoke-retry on a reply that merely mentions a tag (tightened detector)", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          // A normal, COMPLETE sentence that happens to end by mentioning a
+          // closing tag. There is no matching opening <invoke>, so this is a
+          // mention — not a leaked call — and must not provoke an invoke-retry.
+          if (n === 1) return "关闭标签是 </invoke>。";
+          return "不应该走到这里";
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "讲解标签", messageId: "m1" }));
+        // Reply ends with a sentence period -> not truncated, not a leaked call.
+        // No probe at all: exactly one call, delivered as-is.
+        expect(h.openclaw.chatCalls).toHaveLength(1);
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "关闭标签是 </invoke>。");
       } finally { h.cleanup(); }
     });
 
@@ -2574,14 +2596,15 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
           h.openclaw.chatCalls.push(params);
           n++;
-          if (n === 1) return "已经处理完了\n<invoke name=\"read\">"; // dangling open tag
+          // Complete leaked block (open + close) -> triggers invoke-retry probe.
+          if (n === 1) return "已经处理完了\n<invoke name=\"read\"><\/antml:invoke>";
           return "结束了"; // it was actually done
         });
         await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干活", messageId: "m1" }));
         expect(h.openclaw.chatCalls).toHaveLength(2);
         expect(h.openclaw.chatCalls[1].currentMessage).toContain("invoke 格式错了");
         // Done phrase confirmed -> deliver the ORIGINAL reply, not the done phrase.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "已经处理完了\n<invoke name=\"read\">");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "已经处理完了\n<invoke name=\"read\"><\/antml:invoke>");
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "结束了");
       } finally { h.cleanup(); }
     });
@@ -2605,7 +2628,7 @@ describe("FeishuBot routing and queue behavior", () => {
             // Main run takes long enough for the live card to materialize, then
             // returns a reply ending in a dangling invoke tag.
             await new Promise((r) => setTimeout(r, 1000));
-            return "我来跑个命令\n<\/antml:invoke>";
+            return "我来跑个命令\n<invoke name=\"exec\"><\/antml:invoke>";
           }
           return "重试后完成了。";
         });
@@ -2622,6 +2645,31 @@ describe("FeishuBot routing and queue behavior", () => {
         const allLines = cardViews.flatMap((v) => (v.lines || []).map((l: any) => l.text));
         expect(allLines.some((t: string) => /工具调用格式|重试/.test(t))).toBe(true);
       } finally { h.cleanup(); vi.useRealTimers(); }
+    });
+
+    it("stops auto-retrying immediately when the user runs /stop mid-loop", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          if (n === 1) return "先看代码，然后"; // truncated -> enters auto-retry
+          if (n === 2) {
+            // The probe comes back "still working" (would normally loop again)...
+            // ...but the user hits /stop right now, mid-loop.
+            await (h.bot as any).handleStopCommand("chat1", "stop-msg");
+            return "还在处理中然后"; // not a done phrase -> loop would continue if not stopped
+          }
+          return "不应该走到这里"; // a 3rd probe would mean stop was ignored
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "改代码", messageId: "m1" }));
+        // 1 real run + exactly 1 probe (the one during which /stop fired). No 3rd call.
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        // /stop confirmation was sent.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("stop-msg", expect.stringContaining("已停止"));
+      } finally { h.cleanup(); }
     });
   });
 
