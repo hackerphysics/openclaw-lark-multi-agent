@@ -2467,7 +2467,7 @@ describe("FeishuBot routing and queue behavior", () => {
   });
 
   describe("/compact command honors the actual compaction result", () => {
-    it("reports success only when the session was actually compacted", async () => {
+    it("reports success when native compaction actually compacted", async () => {
       const h = makeHarness("GPT");
       try {
         h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: true })) as any;
@@ -2476,26 +2476,56 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("reports a no-op (not success) when the RPC returns compacted=false", async () => {
+    it("reports a no-op when native did not compact AND tool-trim has no file to trim", async () => {
       const h = makeHarness("GPT");
       try {
-        // This is the real bug: RPC resolves fine but did NOT compact.
+        // Native resolves fine but did NOT compact (the original bug).
         h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
+        // No sessionId -> tool-trim fallback cannot find a file -> overall no-op.
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 0 } })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1");
-        // Must NOT claim success.
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
-        // Should say not compacted, and surface the reason.
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("未压缩"));
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("transcript too small"));
       } finally { h.cleanup(); }
     });
 
-    it("reports failure when the RPC throws", async () => {
+    it("falls back to tool-trim when native compaction does not compact", async () => {
       const h = makeHarness("GPT");
       try {
-        h.openclaw.compactSession = vi.fn(async () => { throw new Error("rpc timeout"); }) as any;
+        // Native fails to compact (e.g. session too big to summarize).
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
+        // getSessionInfo provides a sessionId so tool-trim can locate the file.
+        const sid = "trimtest-" + Date.now();
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { sessionId: sid, totalTokens: 900000 } })) as any;
+        // Lay down a tool-heavy transcript at the path resolveSessionFilePath builds:
+        // <OPENCLAW_HOME>/agents/main/sessions/<sid>.jsonl
+        const home = mkdtempSync(join(tmpdir(), "lma-oc-home-"));
+        process.env.OPENCLAW_HOME = home;
+        const sdir = join(home, "agents", "main", "sessions");
+        mkdirSync(sdir, { recursive: true });
+        const rows: string[] = [JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "go" }] } })];
+        for (let i = 0; i < 30; i++) {
+          rows.push(JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "s" }, { type: "toolCall", id: "t" + i, name: "read", arguments: {} }] } }));
+          rows.push(JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: "t" + i, content: [{ type: "text", text: "Z".repeat(2000) }] } }));
+        }
+        writeFileSync(join(sdir, sid + ".jsonl"), rows.join("\n") + "\n");
+
         await (h.bot as any).handleCompactCommand("chat1", "m1");
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("压缩失败"));
+        // Reported success via tool-trim.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("删工具调用"));
+        rmSync(home, { recursive: true, force: true });
+        delete process.env.OPENCLAW_HOME;
+      } finally { h.cleanup(); }
+    });
+
+    it("reports failure when native compaction throws and there is no fallback file", async () => {
+      const h = makeHarness("GPT");
+      try {
+        // Native throws; tool-trim cannot find a file -> overall no-op (not success).
+        h.openclaw.compactSession = vi.fn(async () => { throw new Error("rpc timeout"); }) as any;
+        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 0 } })) as any;
+        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
       } finally { h.cleanup(); }
     });
   });

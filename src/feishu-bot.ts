@@ -10,6 +10,7 @@ import { basename, extname, join, resolve } from "path";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
+import { resolveSessionFilePath, toolTrimCompactFile } from "./session-file-compactor.js";
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -1840,15 +1841,14 @@ export class FeishuBot {
               ? `🧹 Context is large (${pct}%) and the retry failed — auto-compacting…`
               : `🧹 上下文过大（${pct}%）且重试出错，正在自动压缩…`).catch(() => {});
             try {
-              const res = await this.openclawClient.compactSession(sessionKey);
+              const r = await this.compactWithFallback(sessionKey);
               compacted = true; // mark as attempted regardless, to avoid re-compacting in a loop
-              if (res?.compacted === true) {
-                console.log(`[${this.config.name}] auto-retry: compacted session at ${pct}% for ${chatId.slice(-8)}; continuing`);
+              if (r.compacted) {
+                console.log(`[${this.config.name}] auto-retry: compacted session (${r.method}${r.detail ? " " + r.detail : ""}) at ${pct}% for ${chatId.slice(-8)}; continuing`);
                 continue; // retry the probe on the now-lighter session
               }
-              // Compact was a no-op (e.g. summary did not reduce the session); do
-              // not spin — deliver what we have.
-              console.warn(`[${this.config.name}] auto-retry: compact was a no-op for ${chatId.slice(-8)} (${res?.reason || "no reason"}); delivering latest`);
+              // Compact was a no-op; do not spin — deliver what we have.
+              console.warn(`[${this.config.name}] auto-retry: compact was a no-op for ${chatId.slice(-8)} (${r.reason || "no reason"}); delivering latest`);
             } catch (compactErr) {
               console.warn(`[${this.config.name}] auto-retry compact failed for ${chatId.slice(-8)}:`, this.errorSummary(compactErr));
             }
@@ -2877,20 +2877,81 @@ export class FeishuBot {
   /**
    * Handle /compact command: compress session context.
    */
+  /**
+   * Compact a session with a fallback chain:
+   *   1. OpenClaw's native (LLM-summary) compaction — best semantics.
+   *   2. If that did not compact (or threw), fall back to "tool-trim": rewrite
+   *      the transcript file to drop tool calls/results while keeping the
+   *      conversation. This needs no model, so it works no matter how large the
+   *      session is (the native path itself fails to fit an oversized session
+   *      into the model). A backup is always written before any file change.
+   * Returns a structured result describing what happened.
+   */
+  private async compactWithFallback(sessionKey: string): Promise<{
+    compacted: boolean;
+    method: "native" | "tool-trim" | "none";
+    reason?: string;
+    detail?: string;
+  }> {
+    // 1. Native compaction first.
+    let nativeReason: string | undefined;
+    try {
+      const res = await this.openclawClient.compactSession(sessionKey);
+      if (res?.compacted === true) return { compacted: true, method: "native" };
+      nativeReason = typeof res?.reason === "string" ? res.reason : undefined;
+    } catch (err) {
+      nativeReason = (err as Error).message;
+    }
+
+    // 2. Fall back to tool-trim on the transcript file.
+    let sessionId: string | undefined;
+    try {
+      const info = await this.openclawClient.getSessionInfo(sessionKey);
+      sessionId = info?.session?.sessionId;
+    } catch {
+      // ignore; handled below
+    }
+    if (!sessionId) {
+      return { compacted: false, method: "none", reason: nativeReason || "could not resolve session file" };
+    }
+    const filePath = resolveSessionFilePath(sessionKey, sessionId);
+    if (!filePath) {
+      return { compacted: false, method: "none", reason: nativeReason || "transcript file not found" };
+    }
+    const trim = toolTrimCompactFile(filePath);
+    if (!trim.ok) {
+      return { compacted: false, method: "none", reason: trim.reason || "tool-trim failed" };
+    }
+    const before = trim.bytesBefore || 0;
+    const after = trim.bytesAfter || 0;
+    if (before > 0 && after >= before) {
+      // Nothing meaningful trimmed.
+      return { compacted: false, method: "none", reason: trim.reason || "no tool content to trim" };
+    }
+    const pct = before > 0 ? Math.round((1 - after / before) * 100) : 0;
+    const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)}M`;
+    return {
+      compacted: true,
+      method: "tool-trim",
+      detail: `${mb(before)}→${mb(after)} (-${pct}%)`,
+    };
+  }
+
   private async handleCompactCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     const en = this.isEn(chatId);
     try {
-      const res = await this.openclawClient.compactSession(sessionKey);
-      // sessions.compact resolves successfully even when nothing was compacted
-      // (e.g. the transcript is too small, or the LLM summary did not reduce the
-      // session). Only report success when the RPC actually compacted; otherwise
-      // tell the user it was a no-op so "压缩成功" never lies.
-      const compacted = res?.compacted === true;
-      if (compacted) {
-        await this.replyMessage(messageId, en ? `✅ Session compacted` : `✅ Session 已压缩`);
+      const r = await this.compactWithFallback(sessionKey);
+      if (r.compacted) {
+        if (r.method === "tool-trim") {
+          await this.replyMessage(messageId, en
+            ? `✅ Session compacted (tool-trim${r.detail ? " " + r.detail : ""})`
+            : `✅ Session 已压缩（删工具调用${r.detail ? " " + r.detail : ""}）`);
+        } else {
+          await this.replyMessage(messageId, en ? `✅ Session compacted` : `✅ Session 已压缩`);
+        }
       } else {
-        const reason = typeof res?.reason === "string" && res.reason ? res.reason : (en ? "nothing to compact" : "无需压缩");
+        const reason = r.reason || (en ? "nothing to compact" : "无需压缩");
         await this.replyMessage(messageId, en
           ? `ℹ️ Session not compacted (${reason})`
           : `ℹ️ Session 未压缩（${reason}）`);
