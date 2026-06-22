@@ -4,6 +4,7 @@ import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
 import { LiveStatusController, type LiveStatusView } from "./live-status.js";
+import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve } from "path";
@@ -2402,6 +2403,74 @@ export class FeishuBot {
     } as any);
   }
 
+  /**
+   * Render the /compact progress card. While running it shows a phase line plus a
+   * ticking elapsed footer so the user can see compaction is in progress; when
+   * terminal it collapses to a single compact line (success/skip/fail).
+   */
+  private buildCompactProgressCard(view: CompactProgressView, chatId?: string): any {
+    const en = this.isEn(chatId);
+    if (view.state !== "running") {
+      let line: string;
+      if (view.state === "done") {
+        line = en
+          ? `✅ Session compacted${view.detail ? ` (${view.detail})` : ""} · ⏱ ${view.elapsed}`
+          : `✅ Session 已压缩${view.detail ? `（${view.detail}）` : ""} · ⏱ 耗时 ${view.elapsed}`;
+      } else if (view.state === "noop") {
+        line = en
+          ? `ℹ️ Session not compacted${view.detail ? ` (${view.detail})` : ""}`
+          : `ℹ️ Session 未压缩${view.detail ? `（${view.detail}）` : ""}`;
+      } else {
+        line = en
+          ? `❌ Compact failed${view.detail ? `: ${view.detail}` : ""}`
+          : `❌ 压缩失败${view.detail ? `：${view.detail}` : ""}`;
+      }
+      return {
+        schema: "2.0",
+        config: { update_multi: true, width_mode: "fill" },
+        body: { elements: [{ tag: "markdown", content: `<font color='grey'>${this.escapeCardText(line)}</font>` }] },
+      };
+    }
+    // Running: phase line + ticking elapsed footer.
+    const phaseLine = view.phase === "tool-trim"
+      ? (en ? "🧹 Native compaction is slow — switching to fast trim…" : "🧹 原生压缩较慢，已切换快速压缩…")
+      : (en ? "🧹 Compacting session…" : "🧹 正在压缩 session…");
+    const footer = en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`;
+    return {
+      schema: "2.0",
+      config: { update_multi: true, width_mode: "fill" },
+      header: {
+        title: { tag: "plain_text", content: en ? "Compacting" : "正在压缩" },
+        template: "blue",
+      },
+      body: {
+        elements: [
+          { tag: "markdown", content: this.escapeCardText(phaseLine) },
+          { tag: "hr" },
+          { tag: "markdown", content: `<font color='grey'>${footer}</font>` },
+        ],
+      },
+    };
+  }
+
+  private async replyCompactCard(messageId: string, view: CompactProgressView, chatId?: string): Promise<string | undefined> {
+    const res = await this.client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify(this.buildCompactProgressCard(view, chatId)),
+        msg_type: "interactive",
+      },
+    } as any);
+    return (res as any)?.data?.message_id || (res as any)?.message_id;
+  }
+
+  private async patchCompactCard(messageId: string, view: CompactProgressView, chatId?: string): Promise<void> {
+    await this.client.im.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(this.buildCompactProgressCard(view, chatId)) },
+    } as any);
+  }
+
   private async sendTextMessage(chatId: string, text: string): Promise<string | undefined> {
     try {
       const res = await this.client.im.message.create({
@@ -2991,7 +3060,10 @@ export class FeishuBot {
    *      into the model). A backup is always written before any file change.
    * Returns a structured result describing what happened.
    */
-  private async compactWithFallback(sessionKey: string): Promise<{
+  private async compactWithFallback(
+    sessionKey: string,
+    onPhase?: (phase: "native" | "tool-trim") => void,
+  ): Promise<{
     compacted: boolean;
     method: "native" | "tool-trim" | "none";
     reason?: string;
@@ -3007,7 +3079,10 @@ export class FeishuBot {
       nativeReason = (err as Error).message;
     }
 
-    // 2. Fall back to tool-trim on the transcript file.
+    // 2. Fall back to tool-trim on the transcript file. Tell the caller so a
+    //    progress card can flip from "compacting" to "fast-trim" (this is the
+    //    slow→still-working transition the user most needs to see).
+    onPhase?.("tool-trim");
     let sessionId: string | undefined;
     try {
       const info = await this.openclawClient.getSessionInfo(sessionKey);
@@ -3044,26 +3119,50 @@ export class FeishuBot {
   private async handleCompactCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     const en = this.isEn(chatId);
+    // Large sessions can take tens of seconds to compact (native compaction may
+    // even time out before the tool-trim fallback kicks in). Show a ticking
+    // "compacting…" card so the user can SEE it is working instead of staring at
+    // nothing and assuming nothing is happening. The card is created lazily, so
+    // a fast compaction that finishes quickly never flashes a card at all.
+    const progress = new CompactProgressController({
+      create: (view) => this.sendOrdered(chatId, () => this.replyCompactCard(messageId, view, chatId)),
+      edit: (id, view) => this.sendOrdered(chatId, () => this.patchCompactCard(id, view, chatId)),
+      warn: (msg, err) => console.warn(`[${this.config.name}] ${msg}`, err instanceof Error ? err.message : err),
+    }, { locale: en ? "en" : "zh" });
+    progress.start();
     try {
-      const r = await this.compactWithFallback(sessionKey);
+      const r = await this.compactWithFallback(sessionKey, (phase) => {
+        if (phase === "tool-trim") void progress.toToolTrim().catch(() => {});
+      });
       if (r.compacted) {
-        if (r.method === "tool-trim") {
-          await this.replyMessage(messageId, en
-            ? `✅ Session compacted (tool-trim${r.detail ? " " + r.detail : ""})`
-            : `✅ Session 已压缩（删工具调用${r.detail ? " " + r.detail : ""}）`);
-        } else {
-          await this.replyMessage(messageId, en ? `✅ Session compacted` : `✅ Session 已压缩`);
+        // If a card was shown, patch it in place; otherwise (fast finish, no card)
+        // fall back to a normal reply so the user still gets confirmation.
+        const detail = r.method === "tool-trim" && r.detail
+          ? (en ? `tool-trim ${r.detail}` : `删工具调用 ${r.detail}`)
+          : (en ? "native" : "原生压缩");
+        await progress.done(detail);
+        if (!progress.id) {
+          await this.replyMessage(messageId, r.method === "tool-trim"
+            ? (en ? `✅ Session compacted (tool-trim${r.detail ? " " + r.detail : ""})` : `✅ Session 已压缩（删工具调用${r.detail ? " " + r.detail : ""}）`)
+            : (en ? `✅ Session compacted` : `✅ Session 已压缩`));
         }
       } else {
         const reason = r.reason || (en ? "nothing to compact" : "无需压缩");
-        await this.replyMessage(messageId, en
-          ? `ℹ️ Session not compacted (${reason})`
-          : `ℹ️ Session 未压缩（${reason}）`);
+        await progress.noop(reason);
+        if (!progress.id) {
+          await this.replyMessage(messageId, en
+            ? `ℹ️ Session not compacted (${reason})`
+            : `ℹ️ Session 未压缩（${reason}）`);
+        }
       }
     } catch (err) {
-      await this.replyMessage(messageId, en
-        ? `❌ Compact failed: ${(err as Error).message}`
-        : `❌ 压缩失败: ${(err as Error).message}`);
+      const reason = (err as Error).message;
+      await progress.fail(reason);
+      if (!progress.id) {
+        await this.replyMessage(messageId, en
+          ? `❌ Compact failed: ${reason}`
+          : `❌ 压缩失败: ${reason}`);
+      }
     }
   }
 
