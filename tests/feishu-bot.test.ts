@@ -2246,6 +2246,47 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("recovers attachments when the opening marker is severely truncated (RIDGE_ATTACHMENTS>) and leaks no remnant", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const attachmentPath = resolve(tmpdir(), "olma-test-attachments", "severe-trunc.png");
+      mkdirSync(dirname(attachmentPath), { recursive: true });
+      writeFileSync(attachmentPath, "fake-image");
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        // The model dropped the entire `<LMA_B` prefix, leaving `RIDGE_ATTACHMENTS>`.
+        // The JSON payload itself is intact — parse it regardless of the mangled tag.
+        return `正文\nRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"活度图叠CT/前位平片/后位平片,共享强度标尺"}]}</LMA_BRIDGE_ATTACHMENTS>`;
+      });
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "发图", messageId: "severe-trunc" }));
+      // Attachment recovered with the right path + caption.
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath, caption: "活度图叠CT/前位平片/后位平片,共享强度标尺" }));
+      // The visible text keeps ONLY the real body — no marker remnant leaks.
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("severe-trunc", "正文");
+      const delivered = (h.bot as any).replyMessage.mock.calls.map((c: any[]) => c[1]).join("\n");
+      expect(delivered).not.toMatch(/ATTACHMENTS|RIDGE|<\/parameter>/i);
+    } finally { h.cleanup(); }
+  });
+
+  it("recovers attachments when the opening marker is gone entirely (JSON only before closer)", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const attachmentPath = resolve(tmpdir(), "olma-test-attachments", "no-open.png");
+      mkdirSync(dirname(attachmentPath), { recursive: true });
+      writeFileSync(attachmentPath, "fake-image");
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        return `正文\n{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</LMA_BRIDGE_ATTACHMENTS>`;
+      });
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "发图", messageId: "no-open" }));
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("no-open", "正文");
+      expect((h.bot as any).replyMessage.mock.calls.map((c: any[]) => c[1]).join("\n")).not.toMatch(/ATTACHMENTS|<\/parameter>/i);
+    } finally { h.cleanup(); }
+  });
+
   it("converts MEDIA directives into bridge attachments instead of leaving path text", async () => {
     const h = makeHarness();
     try {
@@ -2500,6 +2541,87 @@ describe("FeishuBot routing and queue behavior", () => {
         // Attachment still delivered.
         expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath }));
       } finally { h.cleanup(); }
+    });
+
+    it("sends an explicit 'invoke format was broken, retry' probe when a reply ends with a dangling tool-call tag", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          // Real reply: the model typed a tool call as plain text, so it ends
+          // with a dangling invoke tag (the tool never actually ran).
+          if (n === 1) return "我来读一下文件\n<\/antml:invoke>";
+          // After being told the format was broken, it retries and finishes.
+          return "重试后读到了文件，处理完成。";
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "读文件", messageId: "m1" }));
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        // The probe must explicitly call out the invoke format being wrong.
+        expect(h.openclaw.chatCalls[1].currentMessage).toContain("invoke 格式错了");
+        // The dangling-tag reply is never shown to the user; the retried result is.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "重试后读到了文件，处理完成。");
+      } finally { h.cleanup(); }
+    });
+
+    it("accepts the done phrase in response to a broken-tool-call probe (task was actually finished)", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          if (n === 1) return "已经处理完了\n<invoke name=\"read\">"; // dangling open tag
+          return "结束了"; // it was actually done
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干活", messageId: "m1" }));
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        expect(h.openclaw.chatCalls[1].currentMessage).toContain("invoke 格式错了");
+        // Done phrase confirmed -> deliver the ORIGINAL reply, not the done phrase.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "已经处理完了\n<invoke name=\"read\">");
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "结束了");
+      } finally { h.cleanup(); }
+    });
+
+    it("shows the auto-retry status on the live-status card (broken tool-call round)", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      vi.useFakeTimers();
+      const h = makeHarness("Claude");
+      try {
+        // Live status is on by default; capture every view the card is rendered with.
+        const cardViews: any[] = [];
+        (h.bot as any).replyLiveStatusCard = vi.fn(async (_id: string, view: any) => { cardViews.push(view); return "live-status-msg"; });
+        (h.bot as any).patchLiveStatusCard = vi.fn(async (_id: string, view: any) => { cardViews.push(view); });
+        FeishuBot.getAllBots().set("app-Claude", h.bot as any);
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          await params.onSubmitted?.(`run-${n}`);
+          if (n === 1) {
+            // Main run takes long enough for the live card to materialize, then
+            // returns a reply ending in a dangling invoke tag.
+            await new Promise((r) => setTimeout(r, 1000));
+            return "我来跑个命令\n<\/antml:invoke>";
+          }
+          return "重试后完成了。";
+        });
+        const run = (h.bot as any).handleMessage(event({
+          chatType: "group",
+          text: "跑个命令",
+          messageId: "live-trigger",
+          mentions: [{ name: "万万（Claude）", id: { app_id: "app-Claude", open_id: "claude-open-id" } }],
+        }));
+        await vi.advanceTimersByTimeAsync(800);  // lazy-create the card
+        await vi.advanceTimersByTimeAsync(1000); // main run resolves -> auto-retry fires
+        await run;
+        // The live-status card must have shown a retry line for the broken tool call.
+        const allLines = cardViews.flatMap((v) => (v.lines || []).map((l: any) => l.text));
+        expect(allLines.some((t: string) => /工具调用格式|重试/.test(t))).toBe(true);
+      } finally { h.cleanup(); vi.useRealTimers(); }
     });
   });
 

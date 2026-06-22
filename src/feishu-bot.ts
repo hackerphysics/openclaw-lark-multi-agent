@@ -33,6 +33,14 @@ function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_
 // for the locale-appropriate phrase; detection accepts BOTH so either works.
 const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
 const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE_EN || "DONE";
+// When the previous reply ended with a dangling tool-call tag (the model typed
+// an invoke/tool call as plain text and it never ran), the auto-retry probe
+// explicitly tells the agent its invoke format was broken and to retry, instead
+// of the generic done-check. It still accepts the done phrase if actually done.
+const AUTO_RETRY_BROKEN_TOOL_PROBE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_BROKEN_TOOL_PROBE
+  || `刚才的任务是不是没结束，invoke 格式错了，invoke 格式错了，请重试。如果结束了，回复“${AUTO_RETRY_DONE_PHRASE}”。`;
+const AUTO_RETRY_BROKEN_TOOL_PROBE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_BROKEN_TOOL_PROBE_EN
+  || `Your last task did not finish — the invoke format was broken, the invoke format was broken, please retry. If it is actually done, reply "${AUTO_RETRY_DONE_PHRASE_EN}".`;
 // When an auto-retry probe errors AND context usage is at/above this percent,
 // auto-compact the session once and keep retrying (instead of giving up). This
 // rescues the “session too heavy → run times out / lock contention” failure mode.
@@ -1777,6 +1785,23 @@ export class FeishuBot {
     return !endOk;
   }
 
+  /**
+   * Did the model type a tool call as plain text instead of emitting a real
+   * function call? When that happens the visible reply ends with a dangling
+   * invoke / parameter / function_calls tag (with or without the `antml:`
+   * prefix), because the tool-call markup leaked into the text channel and the
+   * tool never actually ran. We detect such a tag anchored at the END of the
+   * message — that dangling tag is the tell-tale Stephen flagged ("如果监测到
+   * 这个结尾，说明 tool call 格式出了问题"). On detection the auto-retry loop
+   * sends an explicit "invoke 格式错了，请重试" probe so the agent re-issues the
+   * tool call correctly rather than the generic done-check.
+   */
+  private looksLikeBrokenToolCall(text: string): boolean {
+    const t = (text || "").trim();
+    if (!t) return false;
+    return /<\/?\s*(?:antml:)?(?:invoke|parameter|function_calls)\b[^>]*>\s*$/i.test(t);
+  }
+
   /** Current context usage percent for a session (totalTokens / contextTokens),
    *  or 0 if it cannot be determined. Same basis as /status. */
   private async getContextUsagePercent(sessionKey: string): Promise<number> {
@@ -1881,7 +1906,12 @@ export class FeishuBot {
     const maxRetry = autoRetryMax();
     let compacted = false; // auto-compact at most once per auto-retry round
     let probedAtLeastOnce = false;
+    // Set per-iteration when the reply under inspection ended with a dangling
+    // tool-call tag (model typed an invoke as plain text); selects the explicit
+    // "invoke format was broken, retry" probe instead of the generic done-check.
+    let brokenToolCall = false;
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
+      brokenToolCall = false;
       if (!forceProbe) {
         const parsed = this.extractBridgeAttachments(reply);
         const trimmed = parsed.text.trim();
@@ -1892,21 +1922,33 @@ export class FeishuBot {
         // Only engage for plausibly-successful-but-truncated text. Empty/NO_REPLY
         // and runtime failures have their own handling upstream.
         if (!trimmed || trimmed.toUpperCase() === "NO_REPLY" || this.isRuntimeFailureText(trimmed)) return reply;
-        if (!this.looksTruncated(trimmed)) return reply;
+        // A dangling invoke/tool-call tag is a strong "tool call leaked as text"
+        // signal — engage even if the generic truncation heuristic would miss it.
+        brokenToolCall = this.looksLikeBrokenToolCall(trimmed);
+        if (!this.looksTruncated(trimmed) && !brokenToolCall) return reply;
       }
       forceProbe = false; // consumed; subsequent rounds inspect the probe reply
 
       const en = this.isEn(chatId);
       await liveStatus?.progress(en
-        ? `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`
-        : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`).catch(() => {});
+        ? (brokenToolCall
+            ? `⚠️ Tool-call format looked broken — asking it to retry (${attempt}/${maxRetry})…`
+            : `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`)
+        : (brokenToolCall
+            ? `⚠️ 工具调用格式疑似出错，正在让它重试（${attempt}/${maxRetry}）…`
+            : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`)).catch(() => {});
 
       // One short line, in the user's own voice (we intentionally do not change
       // senderName). Each locale uses its own done-phrase so the English probe
-      // stays fully English; detection accepts both phrases.
-      const probe = en
-        ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE_EN}", otherwise keep going.`
-        : `刚才那个任务结束了吗？结束了就回我“${AUTO_RETRY_DONE_PHRASE}”，没结束就接着做。`;
+      // stays fully English; detection accepts both phrases. When the previous
+      // reply ended with a dangling tool-call tag, send the explicit "invoke
+      // format was broken, retry" probe instead of the generic done-check so the
+      // agent re-issues the tool call correctly.
+      const probe = brokenToolCall
+        ? (en ? AUTO_RETRY_BROKEN_TOOL_PROBE_EN : AUTO_RETRY_BROKEN_TOOL_PROBE)
+        : (en
+            ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE_EN}", otherwise keep going.`
+            : `刚才那个任务结束了吗？结束了就回我“${AUTO_RETRY_DONE_PHRASE}”，没结束就接着做。`);
 
       let probeReply: string;
       try {
@@ -2541,22 +2583,42 @@ export class FeishuBot {
 
   private extractBridgeAttachments(reply: string): { text: string; attachments: BridgeAttachment[] } {
     const attachments: BridgeAttachment[] = [];
-    // Some models occasionally corrupt the attachment marker while preserving
-    // the exact JSON payload: the closing tag can become </parameter>, or the
-    // opening "<LMA" prefix can be truncated leaving "_BRIDGE_ATTACHMENTS>".
-    // Treat these as recoverable shapes; otherwise the marker leaks as
-    // user-visible text and attachments are not sent.
-    const markerPattern = /(?:<LMA_BRIDGE_ATTACHMENTS>|_BRIDGE_ATTACHMENTS>)([\s\S]*?)(?:<\/LMA_BRIDGE_ATTACHMENTS>|<\/parameter>)/g;
-    let text = reply.replace(markerPattern, (_match, jsonText) => {
+    // Models occasionally corrupt the attachment marker. The opening tag is the
+    // least reliable part: we have seen it lose the "<LMA" prefix ("_BRIDGE_…"),
+    // lose even more ("RIDGE_ATTACHMENTS>"), or drop entirely. The closing tag is
+    // far more reliably emitted. So instead of enumerating opening-tag shapes,
+    // anchor on the closer and recover the JSON payload by brace-balancing
+    // backwards from it — robust no matter how many leading chars are dropped.
+    let text = reply;
+    let guard = 0;
+    for (;;) {
+      if (guard++ > 50) break; // safety: never loop unbounded on pathological input
+      const found = this.findBridgeAttachmentMarker(text);
+      if (!found) break;
+      const { start, end, json } = found;
+      let consumed = false;
       try {
-        const parsed = JSON.parse(String(jsonText).trim());
-        const rawAttachments = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.attachments) ? parsed.attachments : [parsed];
+        const parsed = JSON.parse(json);
+        const rawAttachments = Array.isArray(parsed)
+          ? parsed
+          : Array.isArray(parsed?.attachments) ? parsed.attachments : [parsed];
+        const before = attachments.length;
         for (const item of rawAttachments) this.pushBridgeAttachment(attachments, item);
+        // Only strip the span if it actually yielded at least one attachment;
+        // otherwise leave the text alone rather than eat unrelated content.
+        consumed = attachments.length > before;
       } catch (err) {
         console.warn(`[${this.config.name}] Failed to parse bridge attachment marker:`, (err as Error).message);
       }
-      return "";
-    });
+      if (consumed) {
+        text = (text.slice(0, start) + text.slice(end)).replace(/[^\S\n]+\n/g, "\n");
+      } else {
+        // Could not use this span; blank it out so we do not re-find it forever,
+        // but keep scanning in case another valid marker exists earlier.
+        text = text.slice(0, start) + text.slice(end);
+      }
+    }
+    text = text.trim();
 
     // Compatibility fallback for agents that use OpenClaw's channel directive
     // syntax instead of the LMA marker. In Feishu/LMA, leaving MEDIA:<path> in
@@ -2570,6 +2632,100 @@ export class FeishuBot {
       return "";
     }).trim();
     return { text, attachments };
+  }
+
+  /**
+   * Locate one bridge-attachment marker in `text` and recover its JSON payload,
+   * tolerating arbitrary corruption of the OPENING tag (lost prefix, or no
+   * opening tag at all). Strategy:
+   *   1. Find a closing tag — the full `</LMA_BRIDGE_ATTACHMENTS>`, or a partial
+   *      suffix of it (e.g. `_BRIDGE_ATTACHMENTS>`, `RIDGE_ATTACHMENTS>`), or the
+   *      `</parameter>` the marker sometimes degrades into.
+   *   2. From just before that closer, brace-match BACKWARDS to the start of the
+   *      JSON value (`{...}` or `[...]`), so the opening marker is irrelevant.
+   *   3. Return the span to strip [start,end) plus the extracted JSON string.
+   * `start` extends left to swallow any leftover opening-marker remnant (so no
+   * `RIDGE_ATTACHMENTS>` text leaks into the visible reply).
+   */
+  private findBridgeAttachmentMarker(text: string): { start: number; end: number; json: string } | null {
+    // Closing-tag candidates, longest/most-specific first. We accept partial
+    // suffixes of the real closing tag because the opening corruption pattern
+    // (dropped leading chars) also happens to the closer.
+    const closeRe = /<\/LMA_BRIDGE_ATTACHMENTS>|[A-Z_]*BRIDGE_ATTACHMENTS>\s*<\/LMA_BRIDGE_ATTACHMENTS>|<\/parameter>/g;
+    // The JSON sits between an (often corrupted) opener and the closer. Find the
+    // closer first, then walk back to the JSON. Prefer the canonical closer.
+    const closers: Array<{ idx: number; len: number }> = [];
+    const canonical = /<\/LMA_BRIDGE_ATTACHMENTS>/g;
+    let m: RegExpExecArray | null;
+    while ((m = canonical.exec(text))) closers.push({ idx: m.index, len: m[0].length });
+    if (closers.length === 0) {
+      // Degraded closer: `</parameter>` immediately after the JSON payload.
+      const param = /<\/parameter>/g;
+      while ((m = param.exec(text))) closers.push({ idx: m.index, len: m[0].length });
+    }
+    void closeRe; // (kept for documentation of accepted shapes)
+    for (const c of closers) {
+      const json = this.extractJsonBeforeIndex(text, c.idx);
+      if (!json) continue;
+      // Extend `start` left over any opening-marker remnant + surrounding space,
+      // so the visible text does not keep a dangling `RIDGE_ATTACHMENTS>` etc.
+      // The remnant is always some trailing SUFFIX of `<LMA_BRIDGE_ATTACHMENTS>`
+      // (corruption drops leading chars), so match any such suffix.
+      let start = json.start;
+      const lead = text.slice(Math.max(0, start - 48), start);
+      const leadMarker = this.openMarkerRemnant().exec(lead);
+      if (leadMarker) start = Math.max(0, start - (lead.length - leadMarker.index));
+      return { start, end: c.idx + c.len, json: json.text };
+    }
+    return null;
+  }
+
+  /**
+   * Regex matching a trailing remnant of the opening marker `<LMA_BRIDGE_ATTACHMENTS>`
+   * at the END of a string. Built from every suffix of the full marker so that
+   * however many leading characters the model dropped (`_BRIDGE_ATTACHMENTS>`,
+   * `RIDGE_ATTACHMENTS>`, `>` …), the leftover is fully stripped from the visible
+   * text. Trailing `>` and surrounding whitespace are also consumed.
+   */
+  private openMarkerRemnant(): RegExp {
+    const full = "<LMA_BRIDGE_ATTACHMENTS>";
+    const suffixes: string[] = [];
+    for (let i = 0; i < full.length; i++) suffixes.push(full.slice(i).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    // Longest suffixes first so the regex prefers the most complete remnant.
+    return new RegExp(`(?:${suffixes.join("|")})\\s*$`);
+  }
+
+  /**
+   * Given the index of a closing tag, walk backwards to extract the balanced
+   * JSON value (`{...}` or `[...]`) that ends just before it. Returns the JSON
+   * string and its start offset, or null if no balanced value is found.
+   */
+  private extractJsonBeforeIndex(text: string, closeIdx: number): { text: string; start: number } | null {
+    // Skip whitespace immediately before the closer.
+    let end = closeIdx;
+    while (end > 0 && /\s/.test(text[end - 1])) end--;
+    if (end === 0) return null;
+    const lastChar = text[end - 1];
+    const open = lastChar === "}" ? "{" : lastChar === "]" ? "[" : null;
+    if (!open) return null;
+    const close = lastChar;
+    // Brace-balance backwards, ignoring braces inside strings.
+    let depth = 0;
+    let inStr = false;
+    for (let i = end - 1; i >= 0; i--) {
+      const ch = text[i];
+      if (inStr) {
+        if (ch === '"' && text[i - 1] !== "\\") inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === close) depth++;
+      else if (ch === open) {
+        depth--;
+        if (depth === 0) return { text: text.slice(i, end), start: i };
+      }
+    }
+    return null;
   }
 
   private pushBridgeAttachment(attachments: BridgeAttachment[], item: any): void {
