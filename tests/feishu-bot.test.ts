@@ -2408,6 +2408,27 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
+    it("treats a reply with no trailing punctuation at all as truncated and probes", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          // No terminal punctuation / closer at the end -> likely cut off mid-sentence.
+          if (n === 1) return "我先看一下代码再改这里";
+          return "结束了"; // session confirms it actually finished
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "改代码", messageId: "m1" }));
+        // real + 1 confirmation probe.
+        expect(h.openclaw.chatCalls).toHaveLength(2);
+        expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
+        // Done confirmed -> deliver the original reply, not the done phrase.
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "我先看一下代码再改这里");
+      } finally { h.cleanup(); }
+    });
+
     it("uses an English done-phrase in English locale and detects it", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");

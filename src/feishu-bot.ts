@@ -1719,28 +1719,19 @@ export class FeishuBot {
   }
 
   /**
-   * Heuristic: does this reply look truncated / mid-task? Bias toward false
-   * positives (“宁可错杀不放过”) — a false positive only costs one invisible
-   * confirmation round, and the session self-check is the real arbiter. We gate
-   * only on cheap text shape here, never on stopReason (the upstream rarely
-   * provides one for normal-looking-but-truncated finals).
-   */
-  /**
-   * Heuristic: does this reply look genuinely truncated / cut off mid-task?
+   * Heuristic: does this reply look truncated / cut off mid-task? Used as the
+   * SOLE auto-retry trigger — if true, we ask the session a one-line “done?” probe.
    *
-   * IMPORTANT (per Stephen): only retry when there is CLEAR evidence the agent
-   * did not finish — do NOT retry just because a reply lacks a trailing period.
-   * Many complete replies legitimately end without sentence punctuation (a terse
-   * “好的”, a bullet list, a path, a number, a closing word). Treating those as
-   * truncated caused needless extra probe rounds, which hurts UX. So we gate on
-   * strong structural signals only:
+   * Signals (any one is enough):
    *   1. Unbalanced code fence — almost certainly cut off mid code block.
-   *   2. Ends with a dangling connector / lead-in (“然后”, “接下来”, “let me”…)
-   *      or a trailing clause-joining punctuation (comma/colon/semicolon),
-   *      which means a sentence was left hanging.
-   *   3. Ends mid-word inside a Latin word right after a connector-less clause
-   *      (very rare; only when the last “word” is unusually long), kept minimal.
-   * A plain “no sentence-ending punctuation” is deliberately NOT sufficient.
+   *   2. Trailing clause-joining punctuation (comma/colon/semicolon/、) — a
+   *      sentence was left hanging.
+   *   3. A dangling connector / lead-in (“然后”, “接下来”, “let me”, “and”…).
+   *   4. Ends without ANY sentence-ending punctuation / closer (no terminal
+   *      punctuation, closing bracket/quote, code fence, or wrap-up emoji).
+   *      Per Stephen: a reply that ends with no punctuation at all is also
+   *      treated as likely unfinished. A false positive only costs one cheap,
+   *      invisible confirmation probe; the session itself is the real arbiter.
    */
   private looksTruncated(text: string): boolean {
     const t = (text || "").trim();
@@ -1752,6 +1743,15 @@ export class FeishuBot {
     if (/[，,：:、;；]\s*$/u.test(t)) return true;
     // (2b) Ends on an explicit continuation cue / lead-in.
     if (/(接下来|然后|首先|现在我|让我|下一步|我先|我来|我接着|接着|稍等|let me|now i|next|first|\b(?:and|then|so|to|the|a)\b)\s*$/iu.test(t)) return true;
+    // (2c) Ends without ANY sentence-ending punctuation / closer. A finished
+    //      reply normally ends with terminal punctuation, a closing bracket/
+    //      quote, a code fence, or a wrap-up emoji; if none of those are present
+    //      the reply was most likely cut off mid-sentence. (Stephen: “结尾没有
+    //      任何标点符号也算疑似未结束”.)
+    const endOk = /[。！？.!?…)\]」』】）"'`”’~～—✨✅👍🙏🎉🙌]\s*$/u.test(t)
+      || /```\s*$/.test(t)
+      || /[}\]]\s*$/.test(t);
+    if (!endOk) return true;
     return false;
   }
 
