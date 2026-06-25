@@ -2357,43 +2357,6 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("auto-retries a main-run timeout by resuming the session via probe", async () => {
-      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
-      const h = makeHarness("GPT");
-      try {
-        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
-          h.openclaw.chatCalls.push(params);
-          const n = h.openclaw.chatCalls.length;
-          // 1st (main run) times out -> reject.
-          if (n === 1) throw new Error("Agent error: Request timed out before a response was received");
-          // 2nd (probe) the session resumes and finishes.
-          return "接着把剩下的做完了。";
-        });
-        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干个活", messageId: "m1" }));
-        // main run (reject) + 1 probe.
-        expect(h.openclaw.chatCalls).toHaveLength(2);
-        // The probe was sent (resume prompt), and its result delivered.
-        expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "接着把剩下的做完了。");
-      } finally { h.cleanup(); }
-    });
-
-    it("does not auto-retry a terminal (non-retryable) main-run error", async () => {
-      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
-      const h = makeHarness("GPT");
-      try {
-        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
-          h.openclaw.chatCalls.push(params);
-          throw new Error("Agent error: The requested model is not supported");
-        });
-        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干个活", messageId: "m1" }));
-        // Only the main run; no probe (terminal error).
-        expect(h.openclaw.chatCalls).toHaveLength(1);
-        // Surfaced as an error, not retried.
-        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("做完"));
-      } finally { h.cleanup(); }
-    });
-
     it("keeps looping while the session continues, then delivers the latest result", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
@@ -2479,45 +2442,22 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("auto-compacts and keeps retrying when a probe fails and context is large (>=50%)", async () => {
+    it("delivers the existing reply when the confirmation probe fails (no compact, no spin)", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
       const h = makeHarness("GPT");
       try {
-        // Heavy session: 60% usage.
-        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 600, contextTokens: 1000 } })) as any;
         let n = 0;
         h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
           h.openclaw.chatCalls.push(params);
           n++;
-          if (n === 1) return "处理中然后"; // truncated -> probe
-          if (n === 2) throw new Error("LLM request timed out"); // probe fails -> compact + continue
-          return "全部完成了。"; // after compact, clean reply
+          if (n === 1) return "处理中，然后"; // truncated -> probe
+          throw new Error("LLM request timed out"); // probe fails -> stop, no compact
         });
-        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "重任务", messageId: "m1" }));
-        // Compact was triggered exactly once.
-        expect(h.openclaw.compactSession).toHaveBeenCalledTimes(1);
-        // After compact it retried and delivered the clean result.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "全部完成了。");
-      } finally { h.cleanup(); }
-    });
-
-    it("does not auto-compact when context is small, even if a probe fails", async () => {
-      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
-      const h = makeHarness("GPT");
-      try {
-        // Light session: 10% usage.
-        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 100, contextTokens: 1000 } })) as any;
-        let n = 0;
-        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
-          h.openclaw.chatCalls.push(params);
-          n++;
-          if (n === 1) return "处理中然后"; // truncated -> probe
-          throw new Error("LLM request timed out"); // probe fails -> no compact (small ctx), stop
-        });
-        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "轻任务", messageId: "m1" }));
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "m1" }));
+        // Never auto-compacts on a failed probe anymore.
         expect(h.openclaw.compactSession).not.toHaveBeenCalled();
         // Delivers the existing truncated-looking reply rather than spinning.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "处理中然后");
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "处理中，然后");
       } finally { h.cleanup(); }
     });
 

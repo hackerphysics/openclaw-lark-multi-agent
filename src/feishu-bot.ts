@@ -33,10 +33,6 @@ function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_
 // for the locale-appropriate phrase; detection accepts BOTH so either works.
 const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
 const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE_EN || "DONE";
-// When an auto-retry probe errors AND context usage is at/above this percent,
-// auto-compact the session once and keep retrying (instead of giving up). This
-// rescues the “session too heavy → run times out / lock contention” failure mode.
-function autoRetryCompactPct(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_COMPACT_PCT || 50); }
 // How many of the most-recent tool calls (and their results) tool-trim keeps
 // intact — recent tool calls may still be relevant to the agent's next step.
 function toolTrimKeepRecent(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_TOOLTRIM_KEEP_RECENT || 3); }
@@ -1304,27 +1300,9 @@ export class FeishuBot {
             onProgress: (event) => liveStatus?.progress(event),
           }));
         } catch (mainErr) {
-          // The main run failed before returning a reply. If it is a retryable
-          // error (e.g. a request timeout) and not a session-health failure,
-          // reuse the SAME auto-retry mechanism to let the session resume from
-          // where it was interrupted, instead of giving up immediately.
-          if (mainErr instanceof UnhealthySessionError) throw mainErr;
-          const errText = (mainErr as Error)?.message || String(mainErr);
-          if (autoRetryEnabled() && !isNativeCommandTrigger && this.isRetryableAgentError(errText)) {
-            console.warn(`[${this.config.name}] main run failed (${errText.slice(0, 80)}) for ${chatId.slice(-8)}; entering auto-retry`);
-            reply = await this.autoRetryUntilComplete({
-              chatId,
-              sessionKey,
-              senderName: lastHuman.senderName,
-              triggerId,
-              lastHumanMessageId: lastHuman.messageId || "",
-              isNativeCommandTrigger,
-              initialError: errText,
-              liveStatus,
-            });
-          } else {
-            throw mainErr;
-          }
+          // The main run failed before returning a reply. Surface the error; we
+          // only auto-retry replies that look truncated, not transient run errors.
+          throw mainErr;
         } finally {
           // OpenClaw may emit the final assistant session.message just after
           // collectReply returns. Keep the trigger mapping briefly so proactive
@@ -1741,21 +1719,6 @@ export class FeishuBot {
   }
 
   /**
-   * Is this main-run error worth auto-retrying (by resuming the session via the
-   * probe loop)? Mainly transient failures — request/response timeouts and
-   * aborted/incomplete runs. We do NOT auto-retry clearly terminal errors
-   * (auth/permission/quota/billing/model-not-supported), which would just fail
-   * again. The error text comes from collectReply's `Agent error: <msg>`.
-   */
-  private isRetryableAgentError(errText: string): boolean {
-    const t = (errText || "").toLowerCase();
-    // Terminal errors: never auto-retry.
-    if (/(unauthorized|permission|forbidden|invalid api key|quota|billing|insufficient|model_not_supported|not supported|invalid_request)/.test(t)) return false;
-    // Retryable: timeouts and transient interruptions.
-    return /(timed out|timeout|aborted|operation was aborted|no response|request failed|temporarily|connection|econnreset|socket hang|stream)/.test(t);
-  }
-
-  /**
    * Heuristic: does this reply look truncated / mid-task? Bias toward false
    * positives (“宁可错杀不放过”) — a false positive only costs one invisible
    * confirmation round, and the session self-check is the real arbiter. We gate
@@ -1868,6 +1831,9 @@ export class FeishuBot {
    * session kept working and its new output becomes the latest reply, which we
    * re-check. Loops until the session confirms completion, a reply no longer
    * looks truncated, the budget is spent, or the session cannot answer.
+   *
+   * This is the ONLY auto-retry trigger: a reply that LOOKS UNFINISHED. We do not
+   * retry on transient run errors, and we do not auto-compact-and-retry.
    */
   private async autoRetryUntilComplete(params: {
     chatId: string;
@@ -1877,25 +1843,13 @@ export class FeishuBot {
     lastHumanMessageId: string;
     isNativeCommandTrigger: boolean;
     initialReply?: string;
-    /** When set, the main run failed with this (recoverable) error instead of
-     *  returning a reply; start the probe loop immediately to let the session
-     *  resume from where it was interrupted (e.g. a request timeout). */
-    initialError?: string;
     liveStatus?: LiveStatusController;
   }): Promise<string> {
     const { chatId, sessionKey, senderName, triggerId, lastHumanMessageId, isNativeCommandTrigger, liveStatus } = params;
     let reply = params.initialReply ?? "";
-    // Whether we still owe at least one probe regardless of how `reply` looks.
-    // The timeout path starts in this state (no reply to inspect yet).
-    let forceProbe = params.initialError !== undefined && !params.initialReply;
-    if (!autoRetryEnabled() || isNativeCommandTrigger) {
-      if (forceProbe) throw new Error(`Agent error: ${params.initialError}`);
-      return reply;
-    }
+    if (!autoRetryEnabled() || isNativeCommandTrigger) return reply;
 
     const maxRetry = autoRetryMax();
-    let compacted = false; // auto-compact at most once per auto-retry round
-    let probedAtLeastOnce = false;
     // Snapshot the stop generation at entry. If the user runs /stop while this
     // loop is in flight, handleStopCommand bumps the epoch; we detect the change
     // and stop retrying immediately instead of issuing more probes.
@@ -1905,22 +1859,18 @@ export class FeishuBot {
       // /stop while we were looping: abandon retries and deliver what we have.
       if (wasStopped()) {
         console.log(`[${this.config.name}] auto-retry: aborted by /stop for ${chatId.slice(-8)}`);
-        if (!reply) throw new Error(`Agent error: ${params.initialError || "stopped by user"}`);
         return reply;
       }
-      if (!forceProbe) {
-        const parsed = this.extractBridgeAttachments(reply);
-        const trimmed = parsed.text.trim();
-        // Hard rule: a reply that produced attachments (image/file/doc) is a
-        // finished product — never auto-retry it (and never risk dropping the
-        // bridge attachment marker by replacing `reply` with a probe answer).
-        if (parsed.attachments.length > 0) return reply;
-        // Only engage for plausibly-successful-but-truncated text. Empty/NO_REPLY
-        // and runtime failures have their own handling upstream.
-        if (!trimmed || trimmed.toUpperCase() === "NO_REPLY" || this.isRuntimeFailureText(trimmed)) return reply;
-        if (!this.looksTruncated(trimmed)) return reply;
-      }
-      forceProbe = false; // consumed; subsequent rounds inspect the probe reply
+      const parsed = this.extractBridgeAttachments(reply);
+      const trimmed = parsed.text.trim();
+      // Hard rule: a reply that produced attachments (image/file/doc) is a
+      // finished product — never auto-retry it (and never risk dropping the
+      // bridge attachment marker by replacing `reply` with a probe answer).
+      if (parsed.attachments.length > 0) return reply;
+      // Only engage for plausibly-successful-but-truncated text. Empty/NO_REPLY
+      // and runtime failures have their own handling upstream.
+      if (!trimmed || trimmed.toUpperCase() === "NO_REPLY" || this.isRuntimeFailureText(trimmed)) return reply;
+      if (!this.looksTruncated(trimmed)) return reply;
 
       const en = this.isEn(chatId);
       await liveStatus?.progress(en
@@ -1947,38 +1897,10 @@ export class FeishuBot {
           includeBridgeAttachmentHint: false,
           onProgress: (event) => liveStatus?.progress(event),
         }));
-        probedAtLeastOnce = true;
       } catch (err) {
-        // Confirmation round failed (timeout/unhealthy). If the session is heavy
-        // (≥ threshold) and we have not compacted yet this round, auto-compact and
-        // keep retrying — a bloated session is the usual cause of these timeouts.
-        // Otherwise stop looping.
+        // The confirmation round itself failed (timeout/unhealthy). Do not spin:
+        // deliver the existing (truncated-looking) reply as-is.
         console.warn(`[${this.config.name}] auto-retry probe failed for ${chatId.slice(-8)}:`, this.errorSummary(err));
-        if (!compacted) {
-          const pct = await this.getContextUsagePercent(sessionKey);
-          if (pct >= autoRetryCompactPct()) {
-            const en = this.isEn(chatId);
-            await liveStatus?.progress(en
-              ? `🧹 Context is large (${pct}%) and the retry failed — auto-compacting…`
-              : `🧹 上下文过大（${pct}%）且重试出错，正在自动压缩…`).catch(() => {});
-            try {
-              const r = await this.compactWithFallback(sessionKey);
-              compacted = true; // mark as attempted regardless, to avoid re-compacting in a loop
-              if (r.compacted) {
-                console.log(`[${this.config.name}] auto-retry: compacted session (${r.method}${r.detail ? " " + r.detail : ""}) at ${pct}% for ${chatId.slice(-8)}; continuing`);
-                forceProbe = !reply; // if we still have no reply (timeout path), keep probing
-                continue; // retry the probe on the now-lighter session
-              }
-              // Compact was a no-op; do not spin.
-              console.warn(`[${this.config.name}] auto-retry: compact was a no-op for ${chatId.slice(-8)} (${r.reason || "no reason"})`);
-            } catch (compactErr) {
-              console.warn(`[${this.config.name}] auto-retry compact failed for ${chatId.slice(-8)}:`, this.errorSummary(compactErr));
-            }
-          }
-        }
-        // No reply to fall back to (timeout path) and retries exhausted/failed:
-        // re-throw so the caller surfaces the original failure.
-        if (!reply) throw (err instanceof Error ? err : new Error(`Agent error: ${params.initialError || "retry failed"}`));
         return reply;
       }
 
@@ -1987,28 +1909,20 @@ export class FeishuBot {
       // again. Deliver the latest meaningful output we have.
       if (wasStopped()) {
         console.log(`[${this.config.name}] auto-retry: aborted by /stop mid-probe for ${chatId.slice(-8)}`);
-        const latest = probeText && probeText.toUpperCase() !== "NO_REPLY" ? probeReply : reply;
-        if (!latest) throw new Error(`Agent error: ${params.initialError || "stopped by user"}`);
-        return latest;
+        return probeText && probeText.toUpperCase() !== "NO_REPLY" ? probeReply : reply;
       }
       if (!probeText || probeText.toUpperCase() === "NO_REPLY") {
-        if (!reply) throw new Error(`Agent error: ${params.initialError || "no reply after retry"}`);
         return reply; // session could not answer; deliver existing result
       }
       if (this.isDonePhrase(probeText)) {
         console.log(`[${this.config.name}] auto-retry: session confirmed done after ${attempt} check(s) for ${chatId.slice(-8)}`);
-        // On the timeout path we have no original reply; the done confirmation
-        // means the interrupted work actually finished — but we have nothing
-        // user-visible to deliver, so treat it as NO_REPLY rather than fabricate.
-        return reply || "NO_REPLY";
+        return reply;
       }
       // Not done: the session kept working. Its output is the new latest reply.
       console.log(`[${this.config.name}] auto-retry: session continued (attempt ${attempt}) for ${chatId.slice(-8)}`);
       reply = probeReply;
     }
     console.warn(`[${this.config.name}] auto-retry budget (${maxRetry}) spent for ${chatId.slice(-8)}; delivering latest result`);
-    void probedAtLeastOnce;
-    if (!reply) throw new Error(`Agent error: ${params.initialError || "retry budget exhausted"}`);
     return reply;
   }
 
