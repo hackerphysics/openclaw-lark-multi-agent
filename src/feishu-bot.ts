@@ -33,14 +33,6 @@ function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_
 // for the locale-appropriate phrase; detection accepts BOTH so either works.
 const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
 const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE_EN || "DONE";
-// When the previous reply ended with a dangling tool-call tag (the model typed
-// an invoke/tool call as plain text and it never ran), the auto-retry probe
-// explicitly tells the agent its invoke format was broken and to retry, instead
-// of the generic done-check. It still accepts the done phrase if actually done.
-const AUTO_RETRY_BROKEN_TOOL_PROBE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_BROKEN_TOOL_PROBE
-  || `刚才的任务是不是没结束，invoke 格式错了，invoke 格式错了，请重试。如果结束了，回复“${AUTO_RETRY_DONE_PHRASE}”。`;
-const AUTO_RETRY_BROKEN_TOOL_PROBE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_BROKEN_TOOL_PROBE_EN
-  || `Your last task did not finish — the invoke format was broken, the invoke format was broken, please retry. If it is actually done, reply "${AUTO_RETRY_DONE_PHRASE_EN}".`;
 // When an auto-retry probe errors AND context usage is at/above this percent,
 // auto-compact the session once and keep retrying (instead of giving up). This
 // rescues the “session too heavy → run times out / lock contention” failure mode.
@@ -1800,72 +1792,6 @@ export class FeishuBot {
     return false;
   }
 
-  /**
-   * Did the model type a tool call as plain text instead of emitting a real
-   * function call? When that happens the visible reply ends with a dangling
-   * invoke / parameter / function_calls tag (with or without the `antml:`
-   * prefix), because the tool-call markup leaked into the text channel and the
-   * tool never actually ran. We detect such a tag anchored at the END of the
-   * message — that dangling tag is the tell-tale Stephen flagged ("如果监测到
-   * 这个结尾，说明 tool call 格式出了问题"). On detection the auto-retry loop
-   * sends an explicit "invoke 格式错了，请重试" probe so the agent re-issues the
-   * tool call correctly rather than the generic done-check.
-   */
-  /**
-   * Did the model serialize a tool call as plain text instead of emitting a real
-   * function call? When that happens, the structured tool-call XML leaks into the
-   * visible text channel and the tool never runs. We must distinguish this from a
-   * reply that merely *mentions* a tag (teaching, quoting, showing an example),
-   * which must NOT trigger a retry. So we require strong STRUCTURAL evidence of a
-   * leaked call, not just any tag at the end:
-   *
-   *   1. The reply must END with a closing `</invoke>` (optionally `antml:`).
-   *      A dangling OPEN tag or a bare `</parameter>`/`<function_calls>` alone is
-   *      not enough — too easy to hit in normal prose.
-   *   2. Somewhere before it there must be a matching `<invoke name="...">` OPEN
-   *      tag — i.e. a whole call block (`<invoke…>…</invoke>`) materialized as
-   *      text. A lone `</invoke>` (e.g. “闭合标签是 </invoke>”) is a mention,
-   *      not a leaked call.
-   *   3. The trailing `</invoke>` must NOT be wrapped in inline code/backticks or
-   *      a fenced code block — those are deliberate examples, not a leak.
-   *
-   * Anchored at the very end because a genuinely leaked call is the LAST thing in
-   * the message (the model stopped right after “emitting” it). This keeps the
-   * trigger tight so we do not retry on normal replies that talk about tags.
-   */
-  private looksLikeBrokenToolCall(text: string): boolean {
-    const t = (text || "").trim();
-    if (!t) return false;
-    // (1) Must end with a closing invoke tag (the serialized call's terminator).
-    const closeMatch = /<\/\s*(?:antml:)?invoke\s*>\s*$/i.exec(t);
-    if (!closeMatch) return false;
-    // (3) Reject when that closing tag is fenced or inline-code wrapped (example).
-    if (this.isTrailingTagInCode(t, closeMatch.index)) return false;
-    // (2) Require a matching opening `<invoke ...>` before the closer — proof that
-    //     a whole call block leaked, not just a mention of the closing tag.
-    const head = t.slice(0, closeMatch.index);
-    if (!/<\s*(?:antml:)?invoke\b[^>]*>/i.test(head)) return false;
-    return true;
-  }
-
-  /**
-   * Is the tag at `tagIndex` inside an inline-code span (`` `…` ``) or a fenced
-   * code block (```` ``` ````)? Such tags are deliberate examples, not a leaked
-   * tool call, so the broken-tool-call detector must ignore them.
-   */
-  private isTrailingTagInCode(text: string, tagIndex: number): boolean {
-    const before = text.slice(0, tagIndex);
-    // Fenced block: an odd number of ``` before the tag means we are inside one.
-    const fences = (before.match(/```/g) || []).length;
-    if (fences % 2 === 1) return true;
-    // Inline code: an odd number of unescaped backticks on the tag's own line.
-    const lineStart = before.lastIndexOf("\n") + 1;
-    const lineBefore = before.slice(lineStart);
-    const ticks = (lineBefore.match(/`/g) || []).length;
-    if (ticks % 2 === 1) return true;
-    return false;
-  }
-
   /** Current context usage percent for a session (totalTokens / contextTokens),
    *  or 0 if it cannot be determined. Same basis as /status. */
   private async getContextUsagePercent(sessionKey: string): Promise<number> {
@@ -1975,10 +1901,6 @@ export class FeishuBot {
     // and stop retrying immediately instead of issuing more probes.
     const startStopEpoch = this.stopEpoch.get(chatId) || 0;
     const wasStopped = () => (this.stopEpoch.get(chatId) || 0) !== startStopEpoch;
-    // Set per-iteration when the reply under inspection ended with a dangling
-    // tool-call tag (model typed an invoke as plain text); selects the explicit
-    // "invoke format was broken, retry" probe instead of the generic done-check.
-    let brokenToolCall = false;
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
       // /stop while we were looping: abandon retries and deliver what we have.
       if (wasStopped()) {
@@ -1986,7 +1908,6 @@ export class FeishuBot {
         if (!reply) throw new Error(`Agent error: ${params.initialError || "stopped by user"}`);
         return reply;
       }
-      brokenToolCall = false;
       if (!forceProbe) {
         const parsed = this.extractBridgeAttachments(reply);
         const trimmed = parsed.text.trim();
@@ -1997,33 +1918,21 @@ export class FeishuBot {
         // Only engage for plausibly-successful-but-truncated text. Empty/NO_REPLY
         // and runtime failures have their own handling upstream.
         if (!trimmed || trimmed.toUpperCase() === "NO_REPLY" || this.isRuntimeFailureText(trimmed)) return reply;
-        // A dangling invoke/tool-call tag is a strong "tool call leaked as text"
-        // signal — engage even if the generic truncation heuristic would miss it.
-        brokenToolCall = this.looksLikeBrokenToolCall(trimmed);
-        if (!this.looksTruncated(trimmed) && !brokenToolCall) return reply;
+        if (!this.looksTruncated(trimmed)) return reply;
       }
       forceProbe = false; // consumed; subsequent rounds inspect the probe reply
 
       const en = this.isEn(chatId);
       await liveStatus?.progress(en
-        ? (brokenToolCall
-            ? `⚠️ Tool-call format looked broken — asking it to retry (${attempt}/${maxRetry})…`
-            : `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`)
-        : (brokenToolCall
-            ? `⚠️ 工具调用格式疑似出错，正在让它重试（${attempt}/${maxRetry}）…`
-            : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`)).catch(() => {});
+        ? `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`
+        : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`).catch(() => {});
 
       // One short line, in the user's own voice (we intentionally do not change
       // senderName). Each locale uses its own done-phrase so the English probe
-      // stays fully English; detection accepts both phrases. When the previous
-      // reply ended with a dangling tool-call tag, send the explicit "invoke
-      // format was broken, retry" probe instead of the generic done-check so the
-      // agent re-issues the tool call correctly.
-      const probe = brokenToolCall
-        ? (en ? AUTO_RETRY_BROKEN_TOOL_PROBE_EN : AUTO_RETRY_BROKEN_TOOL_PROBE)
-        : (en
-            ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE_EN}", otherwise keep going.`
-            : `刚才那个任务结束了吗？结束了就回我“${AUTO_RETRY_DONE_PHRASE}”，没结束就接着做。`);
+      // stays fully English; detection accepts both phrases.
+      const probe = en
+        ? `Is that done? If so just reply "${AUTO_RETRY_DONE_PHRASE_EN}", otherwise keep going.`
+        : `刚才那个任务结束了吗？结束了就回我“${AUTO_RETRY_DONE_PHRASE}”，没结束就接着做。`;
 
       let probeReply: string;
       try {
