@@ -8,6 +8,12 @@ const DEFAULT_HISTORY = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS
 // so the "已用时间" ticks like a live timer. Interactive-card patch has no 20-edit
 // cap (unlike text edit), so a 1s cadence is fine.
 const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_TICK_MS || 1000);
+// How many CONSECUTIVE card-edit failures to tolerate before giving up on the
+// card. Feishu's im.message.patch can intermittently return code=2200
+// "Internal Error" (a transient server-side error); a single failure must not
+// freeze the live-status card for the rest of a long run. We skip the failed
+// tick, keep the ticker alive, and only disable after this many in a row.
+const MAX_CONSECUTIVE_EDIT_FAILURES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_EDIT_FAILURES || 5);
 
 /** One activity line shown in the card content area. */
 export type LiveStatusLine = {
@@ -67,6 +73,12 @@ export class LiveStatusController {
   private createPromise?: Promise<void>;
   private finalized = false;
   private disabled = false;
+  /** Consecutive safeEdit failures. A single transient Feishu error (e.g. card
+   *  patch code=2200 "Internal Error") must NOT permanently disable the card:
+   *  we skip that one tick and keep the ticker running, so the next second's
+   *  patch recovers it. Only after this many CONSECUTIVE failures do we give up.
+   *  A success resets the counter. */
+  private consecutiveEditFailures = 0;
   private state: "running" | "done" | "failed" = "running";
   /** Total tool calls (tool_start events) seen during the run, for the summary. */
   private toolCallCount = 0;
@@ -121,7 +133,7 @@ export class LiveStatusController {
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
-    await this.safeEdit(this.buildView(), true);
+    await this.safeEditFinal(this.buildView());
   }
 
   async fail(): Promise<void> {
@@ -130,7 +142,7 @@ export class LiveStatusController {
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
-    await this.safeEdit(this.buildView(), true);
+    await this.safeEditFinal(this.buildView());
   }
 
   /**
@@ -145,7 +157,7 @@ export class LiveStatusController {
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
-    await this.safeEdit(this.buildView(), true);
+    await this.safeEditFinal(this.buildView());
   }
 
   dispose(): void {
@@ -243,12 +255,51 @@ export class LiveStatusController {
     try {
       await this.callbacks.edit(this.messageId, view);
       this.lastSentSignature = sig;
+      this.consecutiveEditFailures = 0; // recovered
       return true;
     } catch (err) {
-      this.disabled = true;
-      this.stopTimers();
-      this.callbacks.warn?.("live status edit failed", err);
+      // A single transient Feishu error (e.g. card patch code=2200 "Internal
+      // Error", rate limit, network blip) must NOT permanently freeze the card.
+      // Skip this tick and keep the ticker running so the next patch recovers it.
+      // Only give up after several CONSECUTIVE failures (a persistent problem,
+      // e.g. the message was deleted or we truly lost access).
+      this.consecutiveEditFailures++;
+      const giveUp = this.consecutiveEditFailures >= MAX_CONSECUTIVE_EDIT_FAILURES;
+      this.callbacks.warn?.(
+        `live status edit failed (${this.consecutiveEditFailures}/${MAX_CONSECUTIVE_EDIT_FAILURES}${giveUp ? ", disabling" : ", will retry next tick"})`,
+        err,
+      );
+      if (giveUp) {
+        this.disabled = true;
+        this.stopTimers();
+      }
       return false;
+    }
+  }
+
+  /**
+   * Terminal edits (complete/fail/noReply) are one-shot — there is no next tick to
+   * recover them — so a transient Feishu error (code=2200 etc.) would leave the
+   * card stuck on "running". Retry the final patch a few times with small backoff
+   * so the card reliably reaches its terminal state.
+   */
+  private async safeEditFinal(view: LiveStatusView): Promise<void> {
+    if (!this.messageId || this.disabled) return;
+    const attempts = Math.max(1, MAX_CONSECUTIVE_EDIT_FAILURES);
+    for (let i = 0; i < attempts; i++) {
+      try {
+        await this.callbacks.edit(this.messageId, view);
+        this.lastSentSignature = this.signature(view);
+        return;
+      } catch (err) {
+        const last = i === attempts - 1;
+        this.callbacks.warn?.(
+          `live status final edit failed (${i + 1}/${attempts}${last ? ", giving up" : ", retrying"})`,
+          err,
+        );
+        if (last) return;
+        await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+      }
     }
   }
 

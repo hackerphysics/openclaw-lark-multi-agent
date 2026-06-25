@@ -429,4 +429,82 @@ describe("LiveStatusController (interactive card)", () => {
     expect(new Set(elapsedValues).size).toBeGreaterThan(1); // elapsed actually changed
     vi.useRealTimers();
   });
+
+  it("survives a single transient edit failure (code=2200) and keeps ticking", async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    const editOk: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => {
+        calls++;
+        // Fail exactly once (simulating a transient Feishu code=2200), then recover.
+        if (calls === 2) throw new Error("code=2200 Internal Error");
+        editOk.push(view);
+      }),
+    }, { botName: "Claude", delayMs: 0, tickMs: 1000 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // Drive several ticks; one of them throws but the ticker must keep running.
+    await vi.advanceTimersByTimeAsync(5000);
+    // The card was NOT permanently disabled: edits keep landing after the failure.
+    const okAfterFailure = editOk.length;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(editOk.length).toBeGreaterThan(okAfterFailure);
+    // And a terminal edit still goes through.
+    await live.complete();
+    expect(editOk[editOk.length - 1].state).toBe("done");
+    vi.useRealTimers();
+  });
+
+  it("disables the card only after MAX consecutive edit failures", async () => {
+    vi.useFakeTimers();
+    const warn = vi.fn();
+    let editCalls = 0;
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async () => { editCalls++; throw new Error("code=2200 Internal Error"); }),
+      warn,
+    }, { botName: "Claude", delayMs: 0, tickMs: 1000 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    // Let many ticks fire; after 5 consecutive failures the ticker disables itself.
+    await vi.advanceTimersByTimeAsync(20000);
+    const callsAtDisable = editCalls;
+    // Once disabled, no further edits are attempted no matter how much time passes.
+    await vi.advanceTimersByTimeAsync(10000);
+    expect(editCalls).toBe(callsAtDisable);
+    // It gave up at the configured threshold (default 5), not on the first failure.
+    expect(callsAtDisable).toBeGreaterThanOrEqual(5);
+    expect(warn).toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("retries the terminal edit when it transiently fails, so the card reaches done", async () => {
+    vi.useFakeTimers();
+    let completeAttempts = 0;
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg1"),
+      edit: vi.fn(async (_id, view) => {
+        if (view.state === "done") {
+          completeAttempts++;
+          if (completeAttempts === 1) throw new Error("code=2200 Internal Error"); // first terminal patch fails
+        }
+        views.push(view);
+      }),
+    }, { botName: "Claude", delayMs: 0, tickMs: 1000 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const done = live.complete();
+    await vi.advanceTimersByTimeAsync(1000); // allow the backoff retry to fire
+    await done;
+    // The terminal patch was retried and ultimately landed a done view.
+    expect(completeAttempts).toBeGreaterThanOrEqual(2);
+    expect(views.some((v) => v.state === "done")).toBe(true);
+    vi.useRealTimers();
+  });
 });
