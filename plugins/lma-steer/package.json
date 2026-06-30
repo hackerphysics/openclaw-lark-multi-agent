@@ -5,8 +5,10 @@
   "private": true,
   "description": "OpenClaw plugin: steer a queued message into the active run at the next tool-call boundary (used by the LMA bridge).",
   "openclaw": {
-    "extensions": ["./src/index.ts"],
-    "runtimeExtensions": ["./dist/index.js"]
+    "extensions": ["./dist/index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.0"
+    }
   },
   "scripts": {
     "build": "tsc -p tsconfig.json"
