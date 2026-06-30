@@ -1,0 +1,11 @@
+{
+  "id": "lma-steer",
+  "name": "LMA Steer",
+  "description": "Inject (steer) a queued user message into the active OpenClaw run at the next tool-call boundary, with an observable outcome the LMA bridge can render as a Feishu reaction.",
+  "version": "0.1.0",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
