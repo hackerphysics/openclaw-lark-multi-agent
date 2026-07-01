@@ -1,6 +1,6 @@
 {
   "name": "openclaw-lark-multi-agent",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Multi-bot Lark/Feishu bridge for OpenClaw, with per-bot model routing and isolated sessions",
   "type": "module",
   "scripts": {
@@ -23,6 +23,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "@vitest/coverage-v8": "^4.1.5",
+    "openclaw": "^2026.6.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.5"
