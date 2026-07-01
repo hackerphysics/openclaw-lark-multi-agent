@@ -35,6 +35,11 @@ class MockOpenClaw {
   // Steer stub: default to "steered" so busy-branch tests exercise the steer path.
   // Override per-test (e.g. return { status: "unavailable" }) to test fallback.
   steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const, sessionId: "sid-1" }));
+  // Consumed callbacks registered by the bridge; tests call fireSteerConsumed to
+  // simulate the model actually consuming a steered message.
+  steerConsumedCbs: Array<(text: string) => void> = [];
+  onSteerConsumed = vi.fn((_sessionKey: string, cb: (text: string) => void) => { this.steerConsumedCbs.push(cb); });
+  fireSteerConsumed(text: string) { for (const cb of this.steerConsumedCbs) cb(text); }
 }
 
 function event(opts: { chatId?: string; chatType?: "p2p" | "group"; text: string; messageId?: string; mentions?: any[]; senderType?: "user" | "app"; openId?: string }) {
@@ -2131,12 +2136,16 @@ describe("FeishuBot routing and queue behavior", () => {
 
       // It was steered into the active run: steer() called with the user text.
       expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), "中途插入的话");
-      // Reaction is "Get" (inserted), NOT "Typing" (queued-and-wait).
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
-      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("busy-2", "Typing");
+      // Before consumption: reaction is "Typing" (awaiting insertion), NOT "Get".
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("busy-2", "Get");
       // Its pending trigger was cleared, so it will NOT run as a separate batch.
       const secondRow = h.store.getMessageId("busy-2")!;
       expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
+
+      // Model consumes the steered message -> reaction flips Typing -> Get.
+      h.openclaw.fireSteerConsumed("中途插入的话");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
 
       releaseFirst("first reply");
       await first;

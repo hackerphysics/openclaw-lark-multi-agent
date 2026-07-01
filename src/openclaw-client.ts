@@ -9,6 +9,7 @@ import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 export type ProgressEvent =
   | { kind: "tool"; phase: "start" | "end" | "error"; name: string; text: string }
   | { kind: "assistant_note"; text: string }
+  | { kind: "steer"; text: string }
   | { kind: "lifecycle"; text: string };
 
 export type ChatAttachment = {
@@ -53,6 +54,11 @@ export class OpenClawClient {
   private lastToolNamesByItemId: Map<string, string> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: { sourceType?: string }) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
+  /** Per-session texts that were steered into the active run and are awaiting
+   *  confirmation that the model actually consumed them (a matching sessionUser
+   *  event). Used to fire a `steer` progress line in correct time order and to
+   *  let the bridge flip the reaction to Get only after real consumption. */
+  private pendingSteerTexts: Map<string, Set<string>> = new Map();
   /** Sessions where verbose mode should deliver visible transcript text even when mixed with tool blocks. */
   private verboseTranscriptSessions: Set<string> = new Set();
   private verboseAssistantTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -233,6 +239,11 @@ export class OpenClawClient {
               stream: "sessionUser",
               data: { text: visibleUserText },
             });
+            // If this user message is one we steered into the run, the model has
+            // now actually consumed it (session.message is emitted as the message
+            // is committed to the transcript). Render it on the live-status card
+            // in correct time order and flip the reaction to Get.
+            this.handleSteerConsumption(rawKey, visibleUserText);
           }
           const visibleAssistantText = this.extractVisibleAssistantText(msg);
           if (visibleAssistantText) {
@@ -972,6 +983,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       const res = await this.rpc("lma.steer", { sessionKey, text }, 10000);
       const status = res?.status;
       if (status === "steered" || status === "no_active_run" || status === "rejected") {
+        // On a successful steer, remember the text so that when the model
+        // actually consumes it (a matching sessionUser event on THIS run) we can
+        // render it on the live-status card in correct time order and let the
+        // bridge flip the reaction to Get only after real consumption.
+        if (status === "steered") this.registerPendingSteer(sessionKey, text);
         return { status, sessionId: typeof res?.sessionId === "string" ? res.sessionId : undefined };
       }
       return { status: "unavailable" };
@@ -984,6 +1000,60 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       }
       return { status: "unavailable" };
     }
+  }
+
+  /** Callback fired when a steered message is confirmed consumed by the model
+   *  (matching sessionUser event). Keyed by bare/short session key. */
+  private steerConsumedCallbacks: Map<string, (text: string) => void> = new Map();
+
+  /** Register a callback (per bare session key) invoked when a steered message
+   *  is actually consumed by the active run. The bridge uses this to flip the
+   *  Feishu reaction from "Typing" (awaiting insertion) to "Get" (inserted). */
+  onSteerConsumed(sessionKey: string, cb: (text: string) => void): void {
+    this.steerConsumedCallbacks.set(this.shortKey(sessionKey), cb);
+  }
+
+  private shortKey(sessionKey: string): string {
+    return sessionKey.replace(/^agent:[^:]+:/, "");
+  }
+
+  private registerPendingSteer(sessionKey: string, text: string): void {
+    const key = this.shortKey(sessionKey);
+    const norm = text.replace(/\s+/g, " ").trim();
+    if (!norm) return;
+    let set = this.pendingSteerTexts.get(key);
+    if (!set) { set = new Set(); this.pendingSteerTexts.set(key, set); }
+    set.add(norm);
+  }
+
+  /**
+   * Called when a sessionUser event is seen for a session. If its text matches a
+   * pending steered message, fire the live-status `steer` line (correct time
+   * order) and the steer-consumed callback, then clear that pending entry.
+   * Returns true if it matched a steered message.
+   */
+  private handleSteerConsumption(sessionKey: string, text: string): boolean {
+    const key = this.shortKey(sessionKey);
+    const set = this.pendingSteerTexts.get(key);
+    if (!set || set.size === 0) return false;
+    const norm = (text || "").replace(/\s+/g, " ").trim();
+    if (!norm) return false;
+    // Match exact, or the sessionUser text containing the steered text (the run
+    // may wrap it). Prefer the longest matching pending entry.
+    let matched: string | undefined;
+    for (const pending of set) {
+      if (norm === pending || norm.includes(pending)) {
+        if (!matched || pending.length > matched.length) matched = pending;
+      }
+    }
+    if (!matched) return false;
+    set.delete(matched);
+    if (set.size === 0) this.pendingSteerTexts.delete(key);
+    const progressCb = this.progressCallbacks.get(key) || this.progressCallbacks.get(`agent:main:${key}`);
+    if (progressCb) void progressCb({ kind: "steer", text: matched });
+    const consumedCb = this.steerConsumedCallbacks.get(key);
+    if (consumedCb) { try { consumedCb(matched); } catch { /* ignore */ } }
+    return true;
   }
 
   /**

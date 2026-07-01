@@ -949,14 +949,27 @@ export class FeishuBot {
         const sessionKeyForSteer = this.getSessionKey(chatId);
         const steer = await this.openclawClient.steer(sessionKeyForSteer, cleanText).catch(() => ({ status: "unavailable" as const }));
         if (steer.status === "steered") {
-          // Inserted into the active run. Reuse the existing reaction lifecycle:
-          // mark "Get" (received/inserted); the current run's completion will
-          // advance it to DONE together with the rest of the batch.
-          await this.addReaction(messageId, "Get").catch(() => {});
-          pending.push({ messageId, emoji: "Get", rowId: insertedId });
+          // Accepted into the active run's steer queue, but NOT yet consumed by
+          // the model. Show "Typing" (awaiting insertion) now; flip to "Get" only
+          // when the model actually consumes it at a tool-call boundary (a
+          // matching sessionUser event), which also renders it on the live-status
+          // card in correct time order.
+          await this.addReaction(messageId, "Typing").catch(() => {});
+          pending.push({ messageId, emoji: "Typing", rowId: insertedId });
           this.pendingAckMessages.set(chatId, pending);
+          const norm = cleanText.replace(/\s+/g, " ").trim();
+          this.openclawClient.onSteerConsumed(sessionKeyForSteer, (consumedText) => {
+            const cn = (consumedText || "").replace(/\s+/g, " ").trim();
+            if (cn !== norm && !cn.includes(norm)) return;
+            // Flip Typing -> Get now that the model has actually read it.
+            void this.removeReaction(messageId, "Typing").catch(() => {});
+            void this.addReaction(messageId, "Get").catch(() => {});
+            const acks = this.pendingAckMessages.get(chatId) || [];
+            for (const a of acks) if (a.messageId === messageId) a.emoji = "Get";
+            this.pendingAckMessages.set(chatId, acks);
+          });
           console.log(
-            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, STEERED into active run: "${cleanText.substring(0, 50)}..."`
+            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, STEERED (awaiting consumption): "${cleanText.substring(0, 50)}..."`
           );
           // The message is already in DB with a pending trigger. Clear that
           // trigger so it is NOT re-run as a separate follow-up batch after the
@@ -2315,6 +2328,7 @@ export class FeishuBot {
         : kind === "tool_end" ? "✓"
         : kind === "lifecycle" ? "⋯"
         : kind === "summary" ? "📊"
+        : kind === "steer" ? "💬"
         : "•";
       const fmtAt = (sec: number): string => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
       const content = view.lines

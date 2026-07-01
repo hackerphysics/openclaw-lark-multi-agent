@@ -17,7 +17,7 @@ const MAX_CONSECUTIVE_EDIT_FAILURES = Number(process.env.OPENCLAW_LARK_MULTI_AGE
 
 /** One activity line shown in the card content area. */
 export type LiveStatusLine = {
-  kind: "tool_start" | "tool_end" | "text" | "lifecycle" | "summary";
+  kind: "tool_start" | "tool_end" | "text" | "lifecycle" | "summary" | "steer";
   text: string;
   /** Relative time (seconds since run start) when this line was produced. */
   at: number;
@@ -120,6 +120,14 @@ export class LiveStatusController {
       const t = (event.text || "").trim();
       if (!t || this.isNoReplyText(t)) return;
       this.appendText(t);
+    } else if (event.kind === "steer") {
+      // A user message that was steered into THIS run and has now actually been
+      // consumed by the model at a tool-call boundary. It is appended as its own
+      // line so it lands in the correct time-order position (right after the
+      // tool that just finished), not merged with assistant text.
+      const t = (event.text || "").trim();
+      if (!t) return;
+      this.pushLine("steer", t);
     } else {
       return; // lifecycle ticks: ignore (footer timer already advances)
     }

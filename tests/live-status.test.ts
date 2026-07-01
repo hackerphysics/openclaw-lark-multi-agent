@@ -128,6 +128,29 @@ describe("LiveStatusController (interactive card)", () => {
     vi.useRealTimers();
   });
 
+  it("renders a steered message as its own line in correct time order", async () => {
+    vi.useFakeTimers();
+    const views: LiveStatusView[] = [];
+    const live = new LiveStatusController({
+      create: vi.fn(async (view) => { views.push(view); return "m1"; }),
+      edit: vi.fn(async (_id, view) => { views.push(view); }),
+    }, { botName: "Claude", delayMs: 0 });
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+
+    // A tool runs, then the user's steered message is consumed at the boundary,
+    // then another tool runs. The steer line must sit BETWEEN the two tools.
+    await live.progress({ kind: "tool", phase: "start", name: "exec", text: "exec start: step1" });
+    await live.progress({ kind: "tool", phase: "end", name: "exec", text: "exec end: ok" });
+    await live.progress({ kind: "steer", text: "顺便也查承德天气" });
+    await live.progress({ kind: "tool", phase: "start", name: "web_fetch", text: "web_fetch start" });
+
+    const last = views[views.length - 1];
+    expect(last.lines.map((l) => l.kind)).toEqual(["tool_start", "tool_end", "steer", "tool_start"]);
+    expect(last.lines[2].text).toBe("顺便也查承德天气");
+    vi.useRealTimers();
+  });
+
   it("merges consecutive assistant text fragments into one line (no tool between)", async () => {
     // Repro: a long assistant message (e.g. a Markdown table) is flushed as
     // multiple incremental fragments. Without a tool event between them they all
