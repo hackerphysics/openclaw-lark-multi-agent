@@ -33,6 +33,17 @@ function autoRetryMax(): number { return Number(process.env.OPENCLAW_LARK_MULTI_
 // for the locale-appropriate phrase; detection accepts BOTH so either works.
 const AUTO_RETRY_DONE_PHRASE = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE || "\u7ed3\u675f\u4e86";
 const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_DONE_PHRASE_EN || "DONE";
+// Prefix wrapped around a steered (mid-run inserted) message so the agent knows
+// it is a NEW user message that arrived while it was still working, and should
+// be handled together with the current task. The live-status card and reactions
+// still key off the ORIGINAL text; only what OpenClaw receives is wrapped.
+function steerInjectionPrefix(en: boolean): string {
+  const zh = process.env.OPENCLAW_LARK_MULTI_AGENT_STEER_PREFIX
+    || "【用户中途插入的新消息，请与当前任务一起处理】";
+  const enText = process.env.OPENCLAW_LARK_MULTI_AGENT_STEER_PREFIX_EN
+    || "[New message inserted by the user mid-task; please handle it together with the current task]";
+  return en ? enText : zh;
+}
 // How many of the most-recent tool calls (and their results) tool-trim keeps
 // intact — recent tool calls may still be relevant to the agent's next step.
 function toolTrimKeepRecent(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_TOOLTRIM_KEEP_RECENT || 3); }
@@ -947,7 +958,10 @@ export class FeishuBot {
         // seen at the next tool-call boundary (lets the user nudge/correct a long
         // run in real time). The lma-steer plugin reports whether it landed.
         const sessionKeyForSteer = this.getSessionKey(chatId);
-        const steer = await this.openclawClient.steer(sessionKeyForSteer, cleanText).catch(() => ({ status: "unavailable" as const }));
+        // Wrap the message so the agent knows it is a NEW user message inserted
+        // mid-task. The live-status line and reactions still key off the original.
+        const steerWrapped = `${steerInjectionPrefix(this.isEn(chatId))}\n${cleanText}`;
+        const steer = await this.openclawClient.steer(sessionKeyForSteer, steerWrapped, cleanText).catch(() => ({ status: "unavailable" as const }));
         if (steer.status === "steered") {
           // Accepted into the active run's steer queue, but NOT yet consumed by
           // the model. Show "Typing" (awaiting insertion) now; flip to "Get" only
@@ -960,13 +974,14 @@ export class FeishuBot {
           const norm = cleanText.replace(/\s+/g, " ").trim();
           this.openclawClient.onSteerConsumed(sessionKeyForSteer, (consumedText) => {
             const cn = (consumedText || "").replace(/\s+/g, " ").trim();
-            if (cn !== norm && !cn.includes(norm)) return;
+            if (cn !== norm && !cn.includes(norm)) return false; // not ours; keep waiting
             // Flip Typing -> Get now that the model has actually read it.
             void this.removeReaction(messageId, "Typing").catch(() => {});
             void this.addReaction(messageId, "Get").catch(() => {});
             const acks = this.pendingAckMessages.get(chatId) || [];
             for (const a of acks) if (a.messageId === messageId) a.emoji = "Get";
             this.pendingAckMessages.set(chatId, acks);
+            return true; // one-shot: matched, remove this callback
           });
           console.log(
             `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, STEERED (awaiting consumption): "${cleanText.substring(0, 50)}..."`

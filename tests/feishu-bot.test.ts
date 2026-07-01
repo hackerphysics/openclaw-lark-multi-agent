@@ -37,8 +37,8 @@ class MockOpenClaw {
   steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const, sessionId: "sid-1" }));
   // Consumed callbacks registered by the bridge; tests call fireSteerConsumed to
   // simulate the model actually consuming a steered message.
-  steerConsumedCbs: Array<(text: string) => void> = [];
-  onSteerConsumed = vi.fn((_sessionKey: string, cb: (text: string) => void) => { this.steerConsumedCbs.push(cb); });
+  steerConsumedCbs: Array<(text: string) => boolean | void> = [];
+  onSteerConsumed = vi.fn((_sessionKey: string, cb: (text: string) => boolean | void) => { this.steerConsumedCbs.push(cb); });
   fireSteerConsumed(text: string) { for (const cb of this.steerConsumedCbs) cb(text); }
 }
 
@@ -2134,8 +2134,13 @@ describe("FeishuBot routing and queue behavior", () => {
       await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入的话", messageId: "busy-2" }));
 
-      // It was steered into the active run: steer() called with the user text.
-      expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), "中途插入的话");
+      // It was steered into the active run: steer() called with the wrapped text
+      // (insertion prefix + original) plus the original as the display text.
+      expect(h.openclaw.steer).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.stringContaining("中途插入的话"),
+        "中途插入的话",
+      );
       // Before consumption: reaction is "Typing" (awaiting insertion), NOT "Get".
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
       expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("busy-2", "Get");
