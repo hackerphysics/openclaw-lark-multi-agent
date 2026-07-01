@@ -311,6 +311,17 @@ export class OpenClawClient {
         this.connected = false;
         this.connectPromise = null;
         console.log("[OpenClaw] WS disconnected");
+        // Reject all in-flight RPCs so callers fail fast instead of hanging until
+        // their timeout. Combined with the collectReply disconnect check, this
+        // lets the bridge release busy locks promptly on a gateway restart.
+        if (this.pending.size > 0) {
+          const err = new Error("Gateway disconnected");
+          for (const [id, entry] of this.pending) {
+            if (entry.timer) clearTimeout(entry.timer);
+            try { entry.reject(err); } catch { /* ignore */ }
+            this.pending.delete(id);
+          }
+        }
         if (this.shouldReconnect) {
           this.scheduleReconnect();
         }
@@ -502,6 +513,11 @@ export class OpenClawClient {
    */
 private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string }): Promise<string> {
     return new Promise((resolve, reject) => {
+      // Whether we were connected when the run started. We only treat a later
+      // disconnect as a mid-run gateway drop (fail fast) if we began connected;
+      // this keeps unit tests that drive collectReply without a live socket from
+      // tripping the disconnect path.
+      const startedConnected = this.connected;
       let text = "";
       let chatDeltaText = "";
       let chatFinalText = "";
@@ -610,6 +626,21 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       };
 
       const poller = setInterval(() => {
+        // Gateway connection dropped mid-run (e.g. gateway restart): the run will
+        // never deliver a reply on this connection, so stop waiting instead of
+        // hanging until the 30-min idle timeout. Failing fast lets the bridge
+        // release its busy lock so new messages are not stuck "waiting".
+        if (startedConnected && !this.connected) {
+          clearInterval(poller);
+          if (chatFinalTimer) clearTimeout(chatFinalTimer);
+          if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+          if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
+          if (idleTimer) clearTimeout(idleTimer);
+          const salvaged = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
+          if (salvaged) { resolve(salvaged); return; }
+          reject(new Error("Gateway disconnected during run"));
+          return;
+        }
         // /stop force-abort: finish immediately instead of waiting for the
         // cancelled lifecycle to be treated as a transient state (idle timeout).
         if (sessionKey && (this.forceAbortedSessions.has(sessionKey) || this.forceAbortedSessions.has(shortSessionKey))) {
