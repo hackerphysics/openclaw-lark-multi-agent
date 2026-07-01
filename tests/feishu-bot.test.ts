@@ -32,6 +32,9 @@ class MockOpenClaw {
   compactSession = vi.fn(async () => ({ ok: true, compacted: true }));
   async resetSession() { return "ok"; }
   abortChat = vi.fn(async () => {});
+  // Steer stub: default to "steered" so busy-branch tests exercise the steer path.
+  // Override per-test (e.g. return { status: "unavailable" }) to test fallback.
+  steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const, sessionId: "sid-1" }));
 }
 
 function event(opts: { chatId?: string; chatType?: "p2p" | "group"; text: string; messageId?: string; mentions?: any[]; senderType?: "user" | "app"; openId?: string }) {
@@ -2081,6 +2084,9 @@ describe("FeishuBot routing and queue behavior", () => {
     const h = makeHarness("GLM");
     try {
       h.store.setBotMode("GLM", "chat1", "free");
+      // Force the queue-and-wait fallback (steer unavailable) so this test keeps
+      // validating the original mid-run queuing behavior.
+      h.openclaw.steer = vi.fn(async () => ({ status: "unavailable" as const }));
       let releaseFirst!: (value: string) => void;
       (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -2102,6 +2108,40 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.openclaw.chatCalls[1].currentMessage).toBe("第二条");
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "DONE");
+    } finally { h.cleanup(); }
+  });
+
+  it("steers a mid-run message into the active run instead of queuing a second run", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setBotMode("GLM", "chat1", "free");
+      // Default mock steer returns "steered".
+      let releaseFirst!: (value: string) => void;
+      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
+        h.openclaw.chatCalls.push(params);
+        if (h.openclaw.chatCalls.length === 1) {
+          return new Promise<string>((resolve) => { releaseFirst = resolve; });
+        }
+        return Promise.resolve("should-not-happen");
+      });
+
+      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "第一条", messageId: "busy-1" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入的话", messageId: "busy-2" }));
+
+      // It was steered into the active run: steer() called with the user text.
+      expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), "中途插入的话");
+      // Reaction is "Get" (inserted), NOT "Typing" (queued-and-wait).
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("busy-2", "Typing");
+      // Its pending trigger was cleared, so it will NOT run as a separate batch.
+      const secondRow = h.store.getMessageId("busy-2")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
+
+      releaseFirst("first reply");
+      await first;
+      // No second chatSendWithContext run for the steered message.
+      expect(h.openclaw.chatCalls).toHaveLength(1);
     } finally { h.cleanup(); }
   });
 

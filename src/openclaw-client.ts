@@ -924,6 +924,38 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   }
 
   /**
+   * Steer a message into the ACTIVE run for a session via the lma-steer plugin's
+   * `lma.steer` gateway method. Unlike a plain new message, this injects the text
+   * at the next tool-call boundary of the run that is currently executing, so the
+   * user can nudge/correct a long run instead of waiting for it to finish.
+   *
+   * Returns a structured status so the bridge can render the right reaction:
+   *  - "steered"       -> queued into the active run (will be seen next boundary)
+   *  - "no_active_run" -> no active run; caller should fall back to normal queueing
+   *  - "rejected"      -> active run refused the injection (compacting/not streaming)
+   *  - "unavailable"   -> the lma-steer plugin/method is not available (e.g. not
+   *                       installed or gateway not restarted); caller falls back.
+   */
+  async steer(sessionKey: string, text: string): Promise<{ status: "steered" | "no_active_run" | "rejected" | "unavailable"; sessionId?: string }> {
+    try {
+      const res = await this.rpc("lma.steer", { sessionKey, text }, 10000);
+      const status = res?.status;
+      if (status === "steered" || status === "no_active_run" || status === "rejected") {
+        return { status, sessionId: typeof res?.sessionId === "string" ? res.sessionId : undefined };
+      }
+      return { status: "unavailable" };
+    } catch (err) {
+      // Unknown method / plugin missing / transient RPC error -> caller falls back
+      // to normal queueing. Never throw into the message path.
+      const msg = (err as Error)?.message || String(err);
+      if (!/unknown method/i.test(msg)) {
+        console.warn(`[OpenClaw] lma.steer failed for ${sessionKey.slice(-8)}: ${msg}`);
+      }
+      return { status: "unavailable" };
+    }
+  }
+
+  /**
    * Get session info (model, tokens, etc.) for status display.
    */
   async getSessionInfo(sessionKey: string): Promise<any> {

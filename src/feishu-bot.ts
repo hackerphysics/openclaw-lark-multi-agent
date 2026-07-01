@@ -942,12 +942,35 @@ export class FeishuBot {
       const isBusy = busySince > 0 && (Date.now() - busySince) < BUSY_TIMEOUT_MS;
 
       if (isBusy) {
-        // Queued: show waiting reaction
+        // The agent is mid-run. Instead of only queuing to wait for the current
+        // run to finish, try to STEER this message into the active run so it is
+        // seen at the next tool-call boundary (lets the user nudge/correct a long
+        // run in real time). The lma-steer plugin reports whether it landed.
+        const sessionKeyForSteer = this.getSessionKey(chatId);
+        const steer = await this.openclawClient.steer(sessionKeyForSteer, cleanText).catch(() => ({ status: "unavailable" as const }));
+        if (steer.status === "steered") {
+          // Inserted into the active run. Reuse the existing reaction lifecycle:
+          // mark "Get" (received/inserted); the current run's completion will
+          // advance it to DONE together with the rest of the batch.
+          await this.addReaction(messageId, "Get").catch(() => {});
+          pending.push({ messageId, emoji: "Get", rowId: insertedId });
+          this.pendingAckMessages.set(chatId, pending);
+          console.log(
+            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, STEERED into active run: "${cleanText.substring(0, 50)}..."`
+          );
+          // The message is already in DB with a pending trigger. Clear that
+          // trigger so it is NOT re-run as a separate follow-up batch after the
+          // current run ends — it has already been injected into this run.
+          if (insertedId > 0) this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
+          return;
+        }
+        // Could not steer (no active run raced to idle, rejected, or plugin
+        // unavailable): fall back to the original behavior — queue and wait.
         await this.addReaction(messageId, "Typing").catch(() => {});
         pending.push({ messageId, emoji: "Typing", rowId: insertedId });
         this.pendingAckMessages.set(chatId, pending);
         console.log(
-          `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, queuing: "${cleanText.substring(0, 50)}..."`
+          `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}), queuing: "${cleanText.substring(0, 50)}..."`
         );
         return; // Message is in DB, will be picked up when agent finishes
       }
