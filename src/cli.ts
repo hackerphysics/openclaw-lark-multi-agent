@@ -127,7 +127,12 @@ WantedBy=${params.mode === "system" ? "multi-user.target" : "default.target"}
 }
 
 function run(cmd: string, args: string[]) {
-  execFileSync(cmd, args, { stdio: "inherit" });
+  // On Windows, npm-installed CLIs (like `openclaw`) are .cmd shims. Node's
+  // execFileSync does NOT resolve/execute .cmd files without shell:true (it
+  // fails with ENOENT before the subprocess ever starts — no output from the
+  // target command at all). Native .exe tools (nssm, systemctl on Linux) are
+  // unaffected by this flag either way, so enabling it only on win32 is safe.
+  execFileSync(cmd, args, { stdio: "inherit", shell: process.platform === "win32" });
 }
 
 function runSudo(args: string[]) {
@@ -184,12 +189,22 @@ function cmdInstallWindowsService(args: string[]) {
   console.log(`Installed Windows service: ${APP_NAME}`);
 }
 
-function runCapture(cmd: string, args: string[]): { code: number } {
+function runCapture(cmd: string, args: string[]): { code: number; spawnError?: string } {
   try {
-    execFileSync(cmd, args, { stdio: "inherit" });
+    // See run()'s comment: Windows needs shell:true to execute a .cmd shim
+    // (e.g. openclaw installed via `npm install -g`), otherwise the subprocess
+    // never starts (ENOENT) and no output from it is ever produced.
+    execFileSync(cmd, args, { stdio: "inherit", shell: process.platform === "win32" });
     return { code: 0 };
   } catch (err: any) {
-    return { code: typeof err?.status === "number" ? err.status : 1 };
+    const code = typeof err?.status === "number" ? err.status : 1;
+    // A spawn failure (command never started) has no numeric exit status/signal
+    // from the target process — surface that distinctly from "the command ran
+    // and returned non-zero", since the fix differs (PATH vs. the tool's own error).
+    const spawnError = typeof err?.status !== "number" && !err?.signal
+      ? (err?.message || String(err))
+      : undefined;
+    return { code, spawnError };
   }
 }
 
@@ -217,8 +232,17 @@ function cmdInstallSteerPlugin(args: string[]) {
   console.log(`Installing lma-steer plugin from: ${pluginDir}`);
   const res = runCapture(openclawBin, installArgs);
   if (res.code !== 0) {
-    console.error(`\n"${openclawBin} plugins install" failed (exit ${res.code}).`);
-    console.error(`Make sure the OpenClaw CLI is installed and on PATH (or set OPENCLAW_BIN),`);
+    if (res.spawnError) {
+      // The subprocess never started (e.g. Windows failing to exec a .cmd shim
+      // without a shell, or the binary truly missing from PATH). This is
+      // distinct from "openclaw ran and returned an error" — no output above
+      // this line came from openclaw itself.
+      console.error(`\nCould not start "${openclawBin}": ${res.spawnError}`);
+      console.error(`Make sure the OpenClaw CLI is installed and on PATH (or set OPENCLAW_BIN to its full path),`);
+    } else {
+      console.error(`\n"${openclawBin} plugins install" failed (exit ${res.code}).`);
+      console.error(`Make sure the OpenClaw CLI is installed and on PATH (or set OPENCLAW_BIN),`);
+    }
     console.error(`then rerun: ${CLI_NAME} install-steer-plugin`);
     process.exit(res.code);
   }

@@ -48,4 +48,20 @@ describe("CLI", () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it("install-steer-plugin reports a distinct 'could not start' error when the openclaw binary cannot be spawned", () => {
+    // Regression guard for the Windows bug: execFileSync could not exec a .cmd
+    // shim without shell:true, so the subprocess never started and no output
+    // from openclaw itself was ever produced (silent "exit 1"). Pointing
+    // OPENCLAW_BIN at a nonexistent binary reproduces a real spawn failure on
+    // any platform; the CLI must surface it distinctly, not a generic failure.
+    try {
+      run(["install-steer-plugin"], { OPENCLAW_BIN: "olma-definitely-not-a-real-binary-xyz" });
+      expect.fail("expected install-steer-plugin to exit non-zero");
+    } catch (err: any) {
+      const output = `${err.stdout || ""}${err.stderr || ""}`;
+      expect(output).toContain("Could not start");
+      expect(output).toContain("olma-definitely-not-a-real-binary-xyz");
+    }
+  });
 });
