@@ -1170,6 +1170,13 @@ export class FeishuBot {
       const isNativeCommandTrigger = firstIsNative;
       const lastHuman = mergedTriggers[mergedTriggers.length - 1];
       const triggerId = lastHuman.id || 0;
+      // Snapshot the stop generation BEFORE the main run starts. If the user runs
+      // /stop at any point during the main run, handleStopCommand bumps the epoch;
+      // auto-retry compares against this baseline and skips retrying entirely. If
+      // we snapshotted inside auto-retry instead, a /stop that landed during the
+      // main run would already be baked into the baseline and go undetected —
+      // that was the "stop then auto-retry anyway" bug.
+      const runStartStopEpoch = this.stopEpoch.get(chatId) || 0;
       const mergedContent = mergedTriggers.map((m) => m.content).join("\n");
       const mergedTriggerIds = mergedTriggers.map((m) => m.id || 0).filter(Boolean);
       const droppedTriggerIds = droppedMergedTriggers.map((m) => m.id || 0).filter(Boolean);
@@ -1323,6 +1330,7 @@ export class FeishuBot {
           isNativeCommandTrigger,
           initialReply: reply,
           liveStatus,
+          runStartStopEpoch,
         });
 
         const parsedReply = this.extractBridgeAttachments(reply);
@@ -1844,16 +1852,22 @@ export class FeishuBot {
     isNativeCommandTrigger: boolean;
     initialReply?: string;
     liveStatus?: LiveStatusController;
+    /** Stop generation captured BEFORE the main run started. A /stop anywhere
+     *  from the main run onward bumps the epoch past this baseline, so we can
+     *  detect it even though it happened before this function was called. */
+    runStartStopEpoch?: number;
   }): Promise<string> {
     const { chatId, sessionKey, senderName, triggerId, lastHumanMessageId, isNativeCommandTrigger, liveStatus } = params;
     let reply = params.initialReply ?? "";
     if (!autoRetryEnabled() || isNativeCommandTrigger) return reply;
 
     const maxRetry = autoRetryMax();
-    // Snapshot the stop generation at entry. If the user runs /stop while this
-    // loop is in flight, handleStopCommand bumps the epoch; we detect the change
-    // and stop retrying immediately instead of issuing more probes.
-    const startStopEpoch = this.stopEpoch.get(chatId) || 0;
+    // Baseline stop generation. Prefer the epoch captured before the main run
+    // (runStartStopEpoch) so a /stop that landed DURING the main run is still
+    // seen here; fall back to the current epoch only if the caller did not pass
+    // one. If the user hit /stop at any point from the main run onward, the
+    // epoch is now past the baseline and we must not auto-retry at all.
+    const startStopEpoch = params.runStartStopEpoch ?? (this.stopEpoch.get(chatId) || 0);
     const wasStopped = () => (this.stopEpoch.get(chatId) || 0) !== startStopEpoch;
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
       // /stop while we were looping: abandon retries and deliver what we have.

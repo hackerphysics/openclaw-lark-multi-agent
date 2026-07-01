@@ -2528,6 +2528,33 @@ describe("FeishuBot routing and queue behavior", () => {
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("stop-msg", expect.stringContaining("已停止"));
       } finally { h.cleanup(); }
     });
+
+    it("does NOT auto-retry when /stop fired DURING the main run (before auto-retry)", async () => {
+      // Reproduces the reported bug: user hits /stop while the main run is going;
+      // the main run returns a truncated-looking partial reply; auto-retry must
+      // NOT kick in and re-trigger work.
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const h = makeHarness("GPT");
+      try {
+        let n = 0;
+        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+          h.openclaw.chatCalls.push(params);
+          n++;
+          if (n === 1) {
+            // Main run: user stops it mid-flight, then it returns a partial
+            // (truncated-looking) reply because it was interrupted.
+            await (h.bot as any).handleStopCommand("chat1", "stop-msg");
+            return "我正在处理，然后"; // dangling connector -> looksTruncated true
+          }
+          return "不应该重试"; // any 2nd call = auto-retry wrongly fired
+        });
+        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "干个活", messageId: "m1" }));
+        // Exactly ONE call (the main run). No probe, because /stop during the main
+        // run bumped the epoch past the pre-run baseline.
+        expect(h.openclaw.chatCalls).toHaveLength(1);
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("stop-msg", expect.stringContaining("已停止"));
+      } finally { h.cleanup(); }
+    });
   });
 
   describe("/compact command honors the actual compaction result", () => {
