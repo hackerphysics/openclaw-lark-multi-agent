@@ -16,8 +16,9 @@ function run(args: string[], env: NodeJS.ProcessEnv = {}) {
 describe("CLI", () => {
   it("prints help", () => {
     const out = run(["--help"]);
-    expect(out).toContain("openclaw-lark-multi-agent init");
+    expect(out).toContain("lma init");
     expect(out).toContain("install-systemd");
+    expect(out).toContain("install-steer-plugin");
   });
 
   it("initializes state dir with sample config", () => {

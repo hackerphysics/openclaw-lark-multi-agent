@@ -70,8 +70,11 @@ After the package is published to npm:
 
 ```bash
 npm install -g openclaw-lark-multi-agent
-openclaw-lark-multi-agent init
+lma init
 ```
+
+> The command is `lma` (short). It is also available under its full name
+> `openclaw-lark-multi-agent` for back-compat.
 
 This creates:
 
@@ -81,19 +84,19 @@ This creates:
 Edit the generated config and fill in your OpenClaw Gateway token and Lark app credentials. Then run:
 
 ```bash
-openclaw-lark-multi-agent start
+lma start
 ```
 
 Install as a systemd user service:
 
 ```bash
-openclaw-lark-multi-agent install-systemd --user
+lma install-systemd --user
 ```
 
 On Windows, install [NSSM](https://nssm.cc/download), make sure `nssm.exe` is in `PATH`, then run PowerShell or Command Prompt as Administrator:
 
 ```powershell
-openclaw-lark-multi-agent install-windows-service
+lma install-windows-service
 ```
 
 ### Optional: real-time steering plugin
@@ -102,7 +105,7 @@ To let users nudge/correct a long-running agent turn in real time (instead of
 waiting for it to finish), install the bundled `lma-steer` OpenClaw plugin:
 
 ```bash
-openclaw-lark-multi-agent install-steer-plugin
+lma install-steer-plugin
 # then restart the OpenClaw gateway so it loads the plugin:
 systemctl --user restart openclaw-gateway.service
 ```
@@ -116,12 +119,12 @@ finishes — everything still works, just without real-time steering. See
 Useful CLI commands:
 
 ```bash
-openclaw-lark-multi-agent --help
-openclaw-lark-multi-agent doctor
-openclaw-lark-multi-agent start [config]
-openclaw-lark-multi-agent init [--state-dir DIR] [--force]
-openclaw-lark-multi-agent install-systemd [--user|--system] [--state-dir DIR]
-openclaw-lark-multi-agent install-steer-plugin [--no-force]
+lma --help
+lma doctor
+lma start [config]
+lma init [--state-dir DIR] [--force]
+lma install-systemd [--user|--system] [--state-dir DIR]
+lma install-steer-plugin [--no-force]
 ```
 
 ## Quick start from source
@@ -212,15 +215,15 @@ The npm CLI works on Windows as well. It uses `%USERPROFILE%\.openclaw\openclaw-
 
 ```powershell
 npm install -g openclaw-lark-multi-agent
-openclaw-lark-multi-agent init
+lma init
 notepad $env:USERPROFILE\.openclaw\openclaw-lark-multi-agent\config.json
-openclaw-lark-multi-agent start
+lma start
 ```
 
 To run as a Windows service, install [NSSM](https://nssm.cc/download), put `nssm.exe` in `PATH`, open an elevated terminal, then run:
 
 ```powershell
-openclaw-lark-multi-agent install-windows-service
+lma install-windows-service
 ```
 
 A legacy helper script is also available at `scripts/install-windows-service.bat`.

@@ -7,6 +7,11 @@ import { homedir } from "node:os";
 import { startApp } from "./index.js";
 
 const APP_NAME = "openclaw-lark-multi-agent";
+// Short command name shown in help/usage. The published binary is available as
+// both `lma` (preferred) and `openclaw-lark-multi-agent` (back-compat). APP_NAME
+// stays as the long identifier for the state dir and systemd unit so existing
+// installs keep working; only the user-facing command label is shortened.
+const CLI_NAME = "lma";
 const HOME_DIR = homedir() || process.env.HOME || process.cwd();
 const DEFAULT_STATE_DIR = resolve(HOME_DIR, ".openclaw", APP_NAME);
 const DEFAULT_CONFIG_PATH = resolve(DEFAULT_STATE_DIR, "config.json");
@@ -15,20 +20,22 @@ function usage(exitCode = 0): never {
   console.log(`OpenClaw Lark Multi-Agent
 
 Usage:
-  ${APP_NAME} start [config]
-  ${APP_NAME} init [--state-dir DIR] [--force]
-  ${APP_NAME} install-systemd [--user|--system] [--state-dir DIR] [--no-restart]
-  ${APP_NAME} install-windows-service [--state-dir DIR] [--no-start]
-  ${APP_NAME} install-steer-plugin [--no-force]
-  ${APP_NAME} doctor [--state-dir DIR]
-  ${APP_NAME} --help
+  ${CLI_NAME} start [config]
+  ${CLI_NAME} init [--state-dir DIR] [--force]
+  ${CLI_NAME} install-systemd [--user|--system] [--state-dir DIR] [--no-restart]
+  ${CLI_NAME} install-windows-service [--state-dir DIR] [--no-start]
+  ${CLI_NAME} install-steer-plugin [--no-force]
+  ${CLI_NAME} doctor [--state-dir DIR]
+  ${CLI_NAME} --help
 
 Examples:
-  ${APP_NAME} init
-  ${APP_NAME} start ~/.openclaw/${APP_NAME}/config.json
-  ${APP_NAME} install-systemd --user
-  ${APP_NAME} install-windows-service
-  ${APP_NAME} install-steer-plugin
+  ${CLI_NAME} init
+  ${CLI_NAME} start ~/.openclaw/${APP_NAME}/config.json
+  ${CLI_NAME} install-systemd --user
+  ${CLI_NAME} install-windows-service
+  ${CLI_NAME} install-steer-plugin
+
+(The command is also available as \`${APP_NAME}\` for back-compat.)
 `);
   process.exit(exitCode);
 }
@@ -212,7 +219,7 @@ function cmdInstallSteerPlugin(args: string[]) {
   if (res.code !== 0) {
     console.error(`\n"${openclawBin} plugins install" failed (exit ${res.code}).`);
     console.error(`Make sure the OpenClaw CLI is installed and on PATH (or set OPENCLAW_BIN),`);
-    console.error(`then rerun: ${APP_NAME} install-steer-plugin`);
+    console.error(`then rerun: ${CLI_NAME} install-steer-plugin`);
     process.exit(res.code);
   }
   console.log(`\nlma-steer plugin installed. Restart the OpenClaw gateway to load it, e.g.:`);
