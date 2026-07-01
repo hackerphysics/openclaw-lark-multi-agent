@@ -96,6 +96,23 @@ On Windows, install [NSSM](https://nssm.cc/download), make sure `nssm.exe` is in
 openclaw-lark-multi-agent install-windows-service
 ```
 
+### Optional: real-time steering plugin
+
+To let users nudge/correct a long-running agent turn in real time (instead of
+waiting for it to finish), install the bundled `lma-steer` OpenClaw plugin:
+
+```bash
+openclaw-lark-multi-agent install-steer-plugin
+# then restart the OpenClaw gateway so it loads the plugin:
+systemctl --user restart openclaw-gateway.service
+```
+
+When the agent is mid-run and a new message arrives, the bridge injects it into
+the active run at the next tool-call boundary (Feishu shows the "Get" reaction).
+Without the plugin, the bridge falls back to queuing the message until the run
+finishes — everything still works, just without real-time steering. See
+`plugins/lma-steer/README.md` for details.
+
 Useful CLI commands:
 
 ```bash
@@ -104,6 +121,7 @@ openclaw-lark-multi-agent doctor
 openclaw-lark-multi-agent start [config]
 openclaw-lark-multi-agent init [--state-dir DIR] [--force]
 openclaw-lark-multi-agent install-systemd [--user|--system] [--state-dir DIR]
+openclaw-lark-multi-agent install-steer-plugin [--no-force]
 ```
 
 ## Quick start from source

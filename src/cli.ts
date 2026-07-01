@@ -19,6 +19,7 @@ Usage:
   ${APP_NAME} init [--state-dir DIR] [--force]
   ${APP_NAME} install-systemd [--user|--system] [--state-dir DIR] [--no-restart]
   ${APP_NAME} install-windows-service [--state-dir DIR] [--no-start]
+  ${APP_NAME} install-steer-plugin [--no-force]
   ${APP_NAME} doctor [--state-dir DIR]
   ${APP_NAME} --help
 
@@ -27,6 +28,7 @@ Examples:
   ${APP_NAME} start ~/.openclaw/${APP_NAME}/config.json
   ${APP_NAME} install-systemd --user
   ${APP_NAME} install-windows-service
+  ${APP_NAME} install-steer-plugin
 `);
   process.exit(exitCode);
 }
@@ -175,6 +177,51 @@ function cmdInstallWindowsService(args: string[]) {
   console.log(`Installed Windows service: ${APP_NAME}`);
 }
 
+function runCapture(cmd: string, args: string[]): { code: number } {
+  try {
+    execFileSync(cmd, args, { stdio: "inherit" });
+    return { code: 0 };
+  } catch (err: any) {
+    return { code: typeof err?.status === "number" ? err.status : 1 };
+  }
+}
+
+/**
+ * Install the bundled lma-steer OpenClaw plugin into the local OpenClaw gateway.
+ * The plugin registers the `lma.steer` gateway method that the bridge uses to
+ * inject a message into an active run at the next tool-call boundary. The plugin
+ * ships inside this package under plugins/lma-steer (built to dist).
+ */
+function cmdInstallSteerPlugin(args: string[]) {
+  // Default to --force so reinstalling an updated bundled plugin overwrites the
+  // previously installed copy. Pass --no-force to keep an existing install.
+  const noForce = hasFlag(args, "--no-force");
+  hasFlag(args, "--force");
+  if (args.length > 0) throw new Error(`Unknown install-steer-plugin arguments: ${args.join(" ")}`);
+  // Resolve the bundled plugin dir relative to this CLI file: dist/cli.js -> ../plugins/lma-steer.
+  const cliDir = dirname(fileURLToPath(import.meta.url));
+  const pluginDir = resolve(cliDir, "..", "plugins", "lma-steer");
+  if (!existsSync(resolve(pluginDir, "openclaw.plugin.json")) || !existsSync(resolve(pluginDir, "dist", "index.js"))) {
+    throw new Error(`bundled lma-steer plugin not found or not built at: ${pluginDir}`);
+  }
+  const openclawBin = process.env.OPENCLAW_BIN || "openclaw";
+  const installArgs = ["plugins", "install", pluginDir];
+  if (!noForce) installArgs.push("--force");
+  console.log(`Installing lma-steer plugin from: ${pluginDir}`);
+  const res = runCapture(openclawBin, installArgs);
+  if (res.code !== 0) {
+    console.error(`\n"${openclawBin} plugins install" failed (exit ${res.code}).`);
+    console.error(`Make sure the OpenClaw CLI is installed and on PATH (or set OPENCLAW_BIN),`);
+    console.error(`then rerun: ${APP_NAME} install-steer-plugin`);
+    process.exit(res.code);
+  }
+  console.log(`\nlma-steer plugin installed. Restart the OpenClaw gateway to load it, e.g.:`);
+  console.log(`  systemctl --user restart openclaw-gateway.service`);
+  console.log(`Then verify:`);
+  console.log(`  openclaw gateway call lma.steer --params '{"sessionKey":"test","text":"ping"}'`);
+  console.log(`  (expect {"status":"no_active_run"} for an idle session)`);
+}
+
 function cmdDoctor(args: string[]) {
   const stateDir = resolve(takeOption(args, "--state-dir") || DEFAULT_STATE_DIR);
   if (args.length > 0) throw new Error(`Unknown doctor arguments: ${args.join(" ")}`);
@@ -193,6 +240,7 @@ async function main() {
   if (cmd === "init") return cmdInit(args);
   if (cmd === "install-systemd") return cmdInstallSystemd(args);
   if (cmd === "install-windows-service") return cmdInstallWindowsService(args);
+  if (cmd === "install-steer-plugin") return cmdInstallSteerPlugin(args);
   if (cmd === "doctor") return cmdDoctor(args);
   if (cmd === "start") {
     const configPath = args[0] ? resolve(args[0]) : DEFAULT_CONFIG_PATH;

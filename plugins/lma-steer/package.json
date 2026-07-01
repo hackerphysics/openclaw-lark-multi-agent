@@ -1,19 +1,18 @@
 {
-  "name": "openclaw-lma-steer",
+  "name": "lma-steer",
   "version": "0.1.0",
   "type": "module",
   "private": true,
   "description": "OpenClaw plugin: steer a queued message into the active run at the next tool-call boundary (used by the LMA bridge).",
+  "files": [
+    "dist",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
   "openclaw": {
     "extensions": ["./dist/index.js"],
     "compat": {
       "pluginApi": ">=2026.3.0"
     }
-  },
-  "scripts": {
-    "build": "tsc -p tsconfig.json"
-  },
-  "devDependencies": {
-    "typescript": "^5.5.0"
   }
 }
