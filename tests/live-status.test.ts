@@ -86,6 +86,62 @@ describe("LiveStatusController (interactive card)", () => {
     vi.useRealTimers();
   });
 
+  it("freezes without emitting a done patch and returns durable final metadata", async () => {
+    vi.useFakeTimers();
+    const edit = vi.fn(async () => {});
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "msg-final"),
+      edit,
+    }, { botName: "Claude", model: "phgeek-gw/claude-opus-4.8", locale: "zh", delayMs: 0 });
+
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await live.progress({ kind: "tool", phase: "start", name: "read", text: "read start: a.ts" });
+    const editsBeforePrepare = edit.mock.calls.length;
+    const meta = await live.prepareFinalDelivery();
+
+    expect(meta).toMatchObject({
+      messageId: "msg-final",
+      toolCalls: 1,
+      model: "phgeek-gw/claude-opus-4.8",
+      locale: "zh",
+    });
+    expect(meta?.elapsed).toMatch(/^\d+:\d{2}$/);
+    expect(edit).toHaveBeenCalledTimes(editsBeforePrepare); // no compact done patch
+    await live.progress({ kind: "tool", phase: "start", name: "exec", text: "exec start: npm test" });
+    expect(edit).toHaveBeenCalledTimes(editsBeforePrepare); // frozen against late edits
+    vi.useRealTimers();
+  });
+
+  it("still returns an existing card for final delivery after ticking was disabled", async () => {
+    vi.useFakeTimers();
+    const live = new LiveStatusController({
+      create: vi.fn(async () => "recoverable-card"),
+      edit: vi.fn(async () => {}),
+    }, { botName: "Claude", model: "model-Claude", delayMs: 0 });
+    live.start();
+    await vi.advanceTimersByTimeAsync(0);
+    (live as any).disabled = true; // repeated transient edit failures gave up ticking
+    const meta = await live.prepareFinalDelivery();
+    expect(meta).toMatchObject({ messageId: "recoverable-card", model: "model-Claude" });
+    vi.useRealTimers();
+  });
+
+  it("returns no final target when a fast reply finishes before card creation", async () => {
+    vi.useFakeTimers();
+    const create = vi.fn(async () => "too-late");
+    const live = new LiveStatusController({ create, edit: vi.fn(async () => {}) }, {
+      botName: "Claude",
+      delayMs: 800,
+    });
+    live.start();
+    const meta = await live.prepareFinalDelivery();
+    expect(meta).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(create).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
   it("does not let a late progress edit run after complete()", async () => {
     vi.useFakeTimers();
     const views: LiveStatusView[] = [];

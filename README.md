@@ -10,7 +10,7 @@ This project is a bridge layer for OpenClaw. It does **not** implement an agent 
 
 Lark/Feishu gives each bot its own app identity, but OpenClaw normally exposes one assistant identity per channel account. This bridge lets you create several Lark bots such as:
 
-- `GPT Bot` → `github-copilot/gpt-5.5`
+- `GPT Bot` → `phgeek-gw/gpt-5.6-sol`
 - `Gemini Bot` → `github-copilot/gemini-3.1-pro-preview`
 - `Claude Bot` → `github-copilot/claude-opus-4.7`
 
@@ -149,7 +149,7 @@ Edit `config.json`:
       "name": "GPT",
       "appId": "cli_xxx",
       "appSecret": "YOUR_LARK_APP_SECRET",
-      "model": "github-copilot/gpt-5.5"
+      "model": "phgeek-gw/gpt-5.6-sol"
     },
     {
       "name": "Gemini",

@@ -10,7 +10,7 @@
 
 Lark/飞书里每个机器人都有自己的 App 身份，但 OpenClaw 通常在一个 channel account 下暴露一个助手身份。这个桥接层可以让你创建多个飞书机器人，例如：
 
-- `GPT Bot` → `github-copilot/gpt-5.5`
+- `GPT Bot` → `phgeek-gw/gpt-5.6-sol`
 - `Gemini Bot` → `github-copilot/gemini-3.1-pro-preview`
 - `Claude Bot` → `github-copilot/claude-opus-4.7`
 
@@ -127,7 +127,7 @@ cp config.example.json config.json
       "name": "GPT",
       "appId": "cli_xxx",
       "appSecret": "YOUR_LARK_APP_SECRET",
-      "model": "github-copilot/gpt-5.5"
+      "model": "phgeek-gw/gpt-5.6-sol"
     },
     {
       "name": "Gemini",

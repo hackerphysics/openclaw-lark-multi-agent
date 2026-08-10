@@ -3,7 +3,7 @@ import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient } from "./openclaw-client.js";
-import { LiveStatusController, type LiveStatusView } from "./live-status.js";
+import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { MessageStore } from "./message-store.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -23,6 +23,8 @@ const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
 const SESSION_HEALTH_POLL_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_POLL_MS || 5_000);
 const SESSION_HEALTH_CONFIRM_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_CONFIRM_MS || 2_000);
+const DELIVERY_MAX_ATTEMPTS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_DELIVERY_MAX_ATTEMPTS || 5);
+const DELIVERY_RETRY_BASE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_DELIVERY_RETRY_BASE_MS || 1_000);
 // Auto-retry: when a reply looks truncated/incomplete, ask the same session
 // whether it finished. If it did not, let it continue; loop until it confirms
 // completion or the retry budget is spent. Off by setting AUTO_RETRY=0.
@@ -118,6 +120,8 @@ export class FeishuBot {
   private sendQueue: Map<string, Promise<void>> = new Map();
   /** Per-chat delayed runtime failure notifications, canceled if a real reply arrives. */
   private delayedFailureTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /** Per-chat durable outbox retry timer. */
+  private deliveryRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
   private lastRealDeliveryAt: Map<string, number> = new Map();
   /** Per-chat: whether we've already sent the high-context alert this cycle. */
@@ -279,7 +283,11 @@ export class FeishuBot {
         const parsed = this.extractBridgeAttachments(text);
         if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) this.cancelDelayedFailure(chatId);
         const activeTarget = this.activeDeliveryTargets.get(chatId);
+        let finalStatusMeta: LiveStatusFinalMeta | undefined;
         try {
+          if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
+            finalStatusMeta = await activeTarget?.liveStatus?.prepareTerminalDelivery(false);
+          }
           await this.enqueueAndDispatchDelivery(
             chatId,
             sourceType,
@@ -287,13 +295,14 @@ export class FeishuBot {
             parsed.text.trim(),
             parsed.attachments,
             activeTarget?.messageId,
-            undefined
+            activeTarget ? `trigger:${activeTarget.triggerId}` : undefined,
+            finalStatusMeta,
           );
-          if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
+          if (!finalStatusMeta && sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
             await activeTarget?.liveStatus?.complete().catch(() => {});
           }
         } catch (err) {
-          if (sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
+          if (!finalStatusMeta && sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
           throw err;
         }
       } catch (err) {
@@ -375,9 +384,9 @@ export class FeishuBot {
    */
   private async drainOnStartup(): Promise<void> {
     try {
-      const restoredDeliveries = this.store.resetStaleDeliveries(this.config.name, 5 * 60_000, 5);
-      if (restoredDeliveries.restored > 0 || restoredDeliveries.failed > 0) {
-        console.warn(`[${this.config.name}] Startup delivery recovery: restored=${restoredDeliveries.restored}, failed=${restoredDeliveries.failed}`);
+      const restoredDeliveries = this.store.resetDeliveringOnStartup(this.config.name);
+      if (restoredDeliveries > 0) {
+        console.warn(`[${this.config.name}] Startup delivery recovery: restored=${restoredDeliveries}`);
       }
       const chats = this.store.getAllChatInfo();
       const drainTasks: Promise<void>[] = [];
@@ -1397,7 +1406,17 @@ export class FeishuBot {
           // submitted far enough that auto-replaying risks duplicate delivery.
           // The user can resend a new message if they want to retry.
           markSubmittedBatch("empty-returned");
-          await liveStatus?.noReply().catch(() => {});
+          // The proactive session.message path can already have delivered the
+          // real answer on this trigger's shared live-status card while the
+          // chat-final collector returns an empty string. In that race, a late
+          // noReply() patch would overwrite the answer with the idle summary.
+          const existingAnswer = this.store.getDeliveryByKey(this.config.name, chatId, `trigger:${triggerId}`);
+          const answerAlreadyOwned = this.deliveryOwnsVisiblePayload(existingAnswer);
+          if (answerAlreadyOwned) {
+            console.log(`[${this.config.name}] Empty-final cleanup skipped; trigger ${triggerId} already has an answer delivery`);
+          } else {
+            await liveStatus?.noReply().catch(() => {});
+          }
           console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; not replaying submitted message(s)`);
           const pendingAcks = this.pendingAckMessages.get(chatId) || [];
           const remainingAcks: typeof pendingAcks = [];
@@ -1471,21 +1490,29 @@ export class FeishuBot {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
             await liveStatus?.complete().catch(() => {});
           } else {
+            let finalStatusMeta: LiveStatusFinalMeta | undefined;
             try {
-              // Final answer always goes through the normal interactive-card
-              // delivery path so Markdown renders correctly. The live status is a
-              // SEPARATE message: once the final reply is enqueued, mark the
-              // status message done.
+              // If a live-status card exists, freeze it and persist enough
+              // metadata in the outbox to turn THIS SAME card into the final
+              // answer. Fast replies / disabled status / create failures have no
+              // card and transparently use the existing new-message path.
+              // Text answers become the card body. Attachment-only results still
+              // freeze the card so the outbox can durably collapse it to a done
+              // summary (including disabled-but-existing cards).
+              if ((shouldReply && visibleReply.trim()) || hasAttachments) {
+                finalStatusMeta = await liveStatus?.prepareTerminalDelivery(false);
+              }
               await this.enqueueAndDispatchDelivery(
                 chatId,
                 "assistant_visible",
-                this.deliverySourceId("visible", `${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`),
+                this.deliverySourceId("visible", `${triggerId}|${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`),
                 shouldReply ? visibleReply : "",
                 parsedReply.attachments,
                 lastHuman.messageId,
-                `trigger:${triggerId}`
+                `trigger:${triggerId}`,
+                finalStatusMeta,
               );
-              await liveStatus?.complete();
+              if (!finalStatusMeta) await liveStatus?.complete();
               // Mark every merged trigger as delivered so retries/restarts do
               // not re-process any of them.
               for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
@@ -1495,7 +1522,10 @@ export class FeishuBot {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
               // that creates a second misleading "bot did not complete" message.
-              await liveStatus?.fail().catch(() => {});
+              // If the card was not frozen for merged final delivery, retain the
+              // normal interrupted status. A prepared card has already been
+              // patched/fallen back by the durable dispatcher.
+              if (!finalStatusMeta) await liveStatus?.fail().catch(() => {});
               console.warn(`[${this.config.name}] assistant delivery failed after notification:`, this.errorSummary(err));
             }
           }
@@ -1504,10 +1534,41 @@ export class FeishuBot {
           await liveStatus?.fail().catch(() => {});
           this.scheduleDelayedFailure(chatId, lastHuman.messageId, visibleReply, triggerId);
         } else if (!shouldReply && !hasAttachments) {
-          // Explicit NO_REPLY (or empty visible text): the model finished without
-          // producing a user-visible reply. Mark the status card done with a
-          // "no content" summary instead of leaving it stuck on "正在执行".
-          await liveStatus?.noReply().catch(() => {});
+          // A proactive session.message may already own this trigger and carry
+          // the real answer while collectReply returns empty/NO_REPLY. Never
+          // overwrite that same card with a 💤 summary.
+          const existingAnswer = this.store.getDeliveryByKey(this.config.name, chatId, `trigger:${triggerId}`);
+          const answerAlreadyOwned = this.deliveryOwnsVisiblePayload(existingAnswer);
+          if (answerAlreadyOwned) {
+            console.log(`[${this.config.name}] NO_REPLY cleanup skipped; trigger ${triggerId} already has an answer delivery`);
+          } else {
+            // Explicit NO_REPLY/empty final also uses the durable cleanup outbox
+            // when a card exists, so a previously-disabled card gets one terminal
+            // patch attempt instead of remaining stuck on "正在执行".
+            const noReplyMeta = await liveStatus?.prepareTerminalDelivery(true);
+            if (noReplyMeta) {
+              const cleanupId = this.store.enqueueDelivery({
+                sessionKey: this.deliverySessionKey(chatId),
+                chatId,
+                botName: this.config.name,
+                sourceType: "no_reply_status_cleanup",
+                sourceId: `no-reply:${triggerId}:${noReplyMeta.messageId}`,
+                deliveryKey: `trigger:${triggerId}:no-reply-status`,
+                contentHash: "",
+                content: "",
+                attachmentsJson: "[]",
+                replyToMessageId: lastHuman.messageId || "",
+                deliveryMode: "patch_live_status",
+                targetMessageId: noReplyMeta.messageId,
+                deliveryMetaJson: JSON.stringify(noReplyMeta),
+                textDelivered: true,
+                cleanupPending: true,
+              });
+              if (cleanupId) await this.dispatchPendingDeliveries(chatId, lastHuman.messageId);
+            } else {
+              await liveStatus?.noReply().catch(() => {});
+            }
+          }
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 
@@ -1729,6 +1790,62 @@ export class FeishuBot {
     };
   }
 
+  private deliveryOwnsVisiblePayload(item?: { content: string; attachmentsJson: string; status: string } | null): boolean {
+    if (!item || item.status === "failed") return false;
+    if (item.content.trim()) return true;
+    try {
+      const attachments = JSON.parse(item.attachmentsJson || "[]");
+      return Array.isArray(attachments) && attachments.length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "model" | "locale">, emoji = "✅"): string {
+    const en = meta.locale === "en";
+    const core = en
+      ? `${emoji} ${meta.toolCalls} tool call${meta.toolCalls === 1 ? "" : "s"} · ⏱ ${meta.elapsed}`
+      : `${emoji} 累计${meta.toolCalls} 次工具调用 · ⏱ 耗时${meta.elapsed}`;
+    return meta.model ? `${core} · 🧠 ${this.escapeCardText(meta.model)}` : core;
+  }
+
+  /** Final answer card used to replace the running live-status card in place. */
+  private buildFinalAnswerCard(text: string, meta: LiveStatusFinalMeta): any {
+    const elements: any[] = buildFeishuCardElements(text);
+    elements.push({ tag: "hr" });
+    elements.push({
+      tag: "markdown",
+      content: `<font color='grey'>${this.completionSummary(meta)}</font>`,
+    });
+    return {
+      schema: "2.0",
+      config: { update_multi: true, width_mode: "fill" },
+      body: { elements },
+    };
+  }
+
+  private async patchFinalAnswerCard(messageId: string, text: string, meta: LiveStatusFinalMeta, _chatId?: string): Promise<void> {
+    await this.client.im.message.patch({
+      path: { message_id: messageId },
+      data: { content: JSON.stringify(this.buildFinalAnswerCard(text, meta)) },
+    } as any);
+  }
+
+  /** Best-effort cleanup when a final-card patch was too large/failed and the
+   * answer had to be delivered as a separate message. */
+  private async patchLiveStatusDoneSummary(messageId: string, meta: LiveStatusFinalMeta, chatId?: string): Promise<void> {
+    const view: LiveStatusView = {
+      title: meta.locale === "en" ? `✅ ${this.config.name} done` : `✅ ${this.config.name} 已完成`,
+      lines: [],
+      elapsed: meta.elapsed,
+      model: meta.model,
+      toolCalls: meta.toolCalls,
+      noReply: Boolean(meta.noReply),
+      state: "done",
+    };
+    await this.patchLiveStatusCard(messageId, view, chatId);
+  }
+
   private formatUserVisibleError(err: unknown): string {
     const raw = err instanceof Error ? err.message : String(err);
     let reason = raw.replace(/\s+/g, " ").trim();
@@ -1781,16 +1898,14 @@ export class FeishuBot {
    * Heuristic: does this reply look truncated / cut off mid-task? Used as the
    * SOLE auto-retry trigger — if true, we ask the session a one-line “done?” probe.
    *
-   * Signals (any one is enough):
-   *   1. Unbalanced code fence — almost certainly cut off mid code block.
-   *   2. Trailing clause-joining punctuation (comma/colon/semicolon/、) — a
-   *      sentence was left hanging.
-   *   3. A dangling connector / lead-in (“然后”, “接下来”, “let me”, “and”…).
-   *   4. Ends without ANY sentence-ending punctuation / closer (no terminal
-   *      punctuation, closing bracket/quote, code fence, or wrap-up emoji).
-   *      Per Stephen: a reply that ends with no punctuation at all is also
-   *      treated as likely unfinished. A false positive only costs one cheap,
-   *      invisible confirmation probe; the session itself is the real arbiter.
+   * Signals are intentionally HIGH PRECISION. A reply is suspicious only when:
+   *   1. Its Markdown/code structure is visibly unclosed; or
+   *   2. It ends on punctuation/words that grammatically demand continuation.
+   *
+   * Merely lacking a final punctuation mark is NOT enough. Short answers,
+   * headings, model lists, paths, hashes, commands, English labels, and normal
+   * chat prose routinely end without punctuation; treating all of them as
+   * truncated caused obvious false-positive confirmation probes.
    */
   private looksTruncated(text: string): boolean {
     const t = (text || "").trim();
@@ -1798,19 +1913,17 @@ export class FeishuBot {
     // (1) Unbalanced code fence => almost certainly cut off mid-block.
     const fences = (t.match(/```/g) || []).length;
     if (fences % 2 === 1) return true;
-    // (2a) Trailing clause-joining punctuation: a sentence was left hanging.
-    if (/[，,：:、;；]\s*$/u.test(t)) return true;
-    // (2b) Ends on an explicit continuation cue / lead-in.
-    if (/(接下来|然后|首先|现在我|让我|下一步|我先|我来|我接着|接着|稍等|let me|now i|next|first|\b(?:and|then|so|to|the|a)\b)\s*$/iu.test(t)) return true;
-    // (2c) Ends without ANY sentence-ending punctuation / closer. A finished
-    //      reply normally ends with terminal punctuation, a closing bracket/
-    //      quote, a code fence, or a wrap-up emoji; if none of those are present
-    //      the reply was most likely cut off mid-sentence. (Stephen: “结尾没有
-    //      任何标点符号也算疑似未结束”.)
-    const endOk = /[。！？.!?…)\]」』】）"'`”’~～—✨✅👍🙏🎉🙌]\s*$/u.test(t)
-      || /```\s*$/.test(t)
-      || /[}\]]\s*$/.test(t);
-    if (!endOk) return true;
+    // (2a) A terminal comma/semicolon/、 strongly suggests an unfinished clause.
+    // A colon is only suspicious when it is a real prose lead-in near the end;
+    // URLs, times, drive letters, key:value and headings commonly end in colons.
+    if (/[，,、;；]\s*$/u.test(t)) return true;
+    if (!/\b(?:https?|ftp):\/\/\S*$/iu.test(t)
+        && /[：:]\s*$/u.test(t)
+        && /(?:如下|包括|例如|原因|步骤|结论|结果|注意|namely|including|such as|because|steps?|results?|notes?)\s*[：:]\s*$/iu.test(t)) return true;
+    // (2b) Explicit continuation cues only. Keep this narrow: generic sentence
+    // starters like “我先/我来/first/the/a” are valid standalone captions and
+    // were the largest source of false positives.
+    if (/(接下来|然后|下一步|我接着|接着|稍等|let me|next)\s*$/iu.test(t)) return true;
     return false;
   }
 
@@ -2054,18 +2167,63 @@ export class FeishuBot {
     await this.enqueueAndDispatchDelivery(chatId, "discussion_system", sourceId, text);
   }
 
-  private async enqueueAndDispatchDelivery(chatId: string, sourceType: string, sourceId: string, text: string, attachments: BridgeAttachment[] = [], replyToMessageId?: string, deliveryKey?: string): Promise<void> {
+  private async enqueueAndDispatchDelivery(
+    chatId: string,
+    sourceType: string,
+    sourceId: string,
+    text: string,
+    attachments: BridgeAttachment[] = [],
+    replyToMessageId?: string,
+    deliveryKey?: string,
+    liveStatusFinal?: LiveStatusFinalMeta,
+  ): Promise<void> {
     if (!text.trim() && attachments.length === 0) return;
     const attachmentsJson = JSON.stringify(attachments);
     const normalizedPayload = `${text.trim()}|${attachmentsJson}`;
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
+    const enqueueDurableStatusCleanup = async (meta: LiveStatusFinalMeta, suffix: string): Promise<void> => {
+      const cleanupId = this.store.enqueueDelivery({
+        sessionKey: this.deliverySessionKey(chatId),
+        chatId,
+        botName: this.config.name,
+        sourceType: `${sourceType}_status_cleanup`,
+        sourceId: `${sourceId}:status-cleanup:${suffix}:${meta.messageId}`,
+        deliveryKey: `${finalDeliveryKey}:status-cleanup:${suffix}:${meta.messageId}`,
+        contentHash: "",
+        content: "",
+        attachmentsJson: "[]",
+        replyToMessageId: replyToMessageId || "",
+        deliveryMode: "patch_live_status",
+        targetMessageId: meta.messageId,
+        deliveryMetaJson: JSON.stringify(meta),
+        textDelivered: true,
+        cleanupPending: true,
+      });
+      if (cleanupId) await this.dispatchPendingDeliveries(chatId, replyToMessageId);
+    };
+    const finishDedupedStatus = async () => {
+      if (!liveStatusFinal) return;
+      await enqueueDurableStatusCleanup(liveStatusFinal, "content-dedupe");
+    };
     if (sourceType === "verbose_transcript") {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) {
+        await finishDedupedStatus();
+        return;
+      }
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) {
+        await finishDedupedStatus();
+        return;
+      }
     } else if (!deliveryKey) {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) return;
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) return;
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) {
+        await finishDedupedStatus();
+        return;
+      }
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) {
+        await finishDedupedStatus();
+        return;
+      }
     }
     const deliveryId = this.store.enqueueDelivery({
       sessionKey: this.deliverySessionKey(chatId),
@@ -2078,51 +2236,265 @@ export class FeishuBot {
       content: text,
       attachmentsJson,
       replyToMessageId: replyToMessageId || "",
+      deliveryMode: liveStatusFinal ? "patch_live_status" : "send",
+      targetMessageId: liveStatusFinal?.messageId || "",
+      deliveryMetaJson: liveStatusFinal ? JSON.stringify(liveStatusFinal) : "{}",
     });
-    if (deliveryId === null) return;
+    if (deliveryId === null) {
+      // Another path already owns this stable logical delivery (commonly the
+      // proactive callback racing the chat-final path). Never show the full
+      // answer again on a second card. The original outbox row remains the sole
+      // owner of text delivery; a different newly-frozen card is only collapsed.
+      const existing = this.store.getDeliveryByKey(this.config.name, chatId, finalDeliveryKey);
+
+      // A failed owner must not permanently poison a logical trigger. Re-enqueue
+      // the payload under a deterministic recovery key so a later authoritative
+      // delivery gets a fresh retry budget.
+      if (existing?.status === "failed" && !existing.textDelivered && text.trim()) {
+        if (existing.content.trim() === text.trim()) {
+          this.store.requeueFailedDelivery(existing.id!);
+        } else {
+          const recoveryKey = `${finalDeliveryKey}:recovery:${contentHash}`;
+          this.store.enqueueDelivery({
+            sessionKey: this.deliverySessionKey(chatId), chatId, botName: this.config.name,
+            sourceType: `${sourceType}_recovery`, sourceId: `${sourceId}:recovery`,
+            deliveryKey: recoveryKey, contentHash, content: text, attachmentsJson: "[]",
+            replyToMessageId: replyToMessageId || "",
+            deliveryMode: liveStatusFinal ? "patch_live_status" : "send",
+            targetMessageId: liveStatusFinal?.messageId || "",
+            deliveryMetaJson: liveStatusFinal ? JSON.stringify(liveStatusFinal) : "{}",
+          });
+        }
+      }
+
+      // The chat-final result is authoritative over an earlier proactive event.
+      // If proactive claimed the trigger key with different text, persist a
+      // deterministic correction row that patches the same card after it.
+      if (sourceId.startsWith("visible:") && existing?.sourceId.startsWith("proactive:")
+          && text.trim() && existing.content.trim() !== text.trim()) {
+        const correctionKey = `${finalDeliveryKey}:authoritative:${contentHash}`;
+        this.store.enqueueDelivery({
+          sessionKey: this.deliverySessionKey(chatId), chatId, botName: this.config.name,
+          sourceType: "assistant_visible_authoritative", sourceId: `${sourceId}:authoritative`,
+          deliveryKey: correctionKey, contentHash, content: text, attachmentsJson: "[]",
+          replyToMessageId: replyToMessageId || "",
+          deliveryMode: liveStatusFinal || existing.targetMessageId ? "patch_live_status" : "send",
+          targetMessageId: liveStatusFinal?.messageId || existing.targetMessageId,
+          deliveryMetaJson: liveStatusFinal?.messageId
+            ? JSON.stringify(liveStatusFinal)
+            : existing.deliveryMetaJson,
+        });
+      }
+
+      // A competing final may add attachments that the first owner did not see.
+      // Persist only the missing attachments in their own stable attachment row
+      // instead of silently dropping them or duplicating the final text.
+      const existingAttachments = (() => {
+        try { return JSON.parse(existing?.attachmentsJson || "[]") as BridgeAttachment[]; }
+        catch { return [] as BridgeAttachment[]; }
+      })();
+      const supplementalRows = this.store.listDeliveriesByKeyPrefix(this.config.name, chatId, `${finalDeliveryKey}:attachments:`);
+      const deliveredSupplementalKeys = new Set<string>();
+      const incomingAttachmentKeys = new Set(attachments.map((a) => JSON.stringify(a)));
+      for (const row of supplementalRows) {
+        try {
+          const rowAttachments = JSON.parse(row.attachmentsJson || "[]") as BridgeAttachment[];
+          const rowKeys = rowAttachments.map((a) => JSON.stringify(a));
+          if (row.status === "failed") {
+            // Revive a failed supplemental row when the same attachment is
+            // explicitly presented again; its deterministic key would otherwise
+            // make INSERT OR IGNORE suppress every future retry.
+            if (rowKeys.some((key) => incomingAttachmentKeys.has(key))) {
+              this.store.requeueFailedDelivery(row.id!);
+              for (const key of rowKeys) deliveredSupplementalKeys.add(key);
+            }
+            continue;
+          }
+          for (const key of rowKeys) deliveredSupplementalKeys.add(key);
+        } catch { /* malformed legacy row: ignore and keep processing */ }
+      }
+      const existingKeys = new Set([
+        ...existingAttachments.map((a) => JSON.stringify(a)),
+        ...deliveredSupplementalKeys,
+      ]);
+      const missingAttachments = attachments.filter((a) => !existingKeys.has(JSON.stringify(a)));
+      if (missingAttachments.length > 0) {
+        const missingJson = JSON.stringify(missingAttachments);
+        this.store.enqueueDelivery({
+          sessionKey: this.deliverySessionKey(chatId),
+          chatId,
+          botName: this.config.name,
+          sourceType: `${sourceType}_attachments`,
+          sourceId: `${sourceId}:attachments:${this.stableHash(missingJson)}`,
+          deliveryKey: `${finalDeliveryKey}:attachments:${this.stableHash(missingJson)}`,
+          contentHash: this.stableHash(`|${missingJson}`),
+          content: "",
+          attachmentsJson: missingJson,
+          replyToMessageId: replyToMessageId || "",
+          deliveryMode: "send",
+          targetMessageId: "",
+          deliveryMetaJson: "{}",
+        });
+      }
+
+      // Dispatch recovery/correction/supplement rows together in creation order.
+      await this.dispatchPendingDeliveries(chatId, replyToMessageId);
+
+      // A correction/recovery row can intentionally patch the newly-frozen card.
+      // Never enqueue a compact cleanup for that same card afterwards: it would
+      // overwrite the authoritative answer that was just patched into place.
+      const competingRows = this.store.listDeliveriesByKeyPrefix(this.config.name, chatId, `${finalDeliveryKey}:`);
+      const finalCardOwnsVisiblePayload = Boolean(liveStatusFinal) && [existing, ...competingRows]
+        .some((row) => row?.targetMessageId === liveStatusFinal!.messageId && this.deliveryOwnsVisiblePayload(row));
+
+      if (liveStatusFinal && existing?.targetMessageId !== liveStatusFinal.messageId && !finalCardOwnsVisiblePayload) {
+        const cleanupJson = JSON.stringify(liveStatusFinal);
+        const cleanupId = this.store.enqueueDelivery({
+          sessionKey: this.deliverySessionKey(chatId),
+          chatId,
+          botName: this.config.name,
+          sourceType: `${sourceType}_status_cleanup`,
+          sourceId: `${sourceId}:status-cleanup:${liveStatusFinal.messageId}`,
+          deliveryKey: `${finalDeliveryKey}:status-cleanup:${liveStatusFinal.messageId}`,
+          contentHash: "",
+          content: "",
+          attachmentsJson: "[]",
+          replyToMessageId: replyToMessageId || "",
+          deliveryMode: "patch_live_status",
+          targetMessageId: liveStatusFinal.messageId,
+          deliveryMetaJson: cleanupJson,
+          textDelivered: true,
+          cleanupPending: true,
+        });
+        if (cleanupId) await this.dispatchPendingDeliveries(chatId, replyToMessageId);
+      }
+      return;
+    }
     await this.dispatchPendingDeliveries(chatId, replyToMessageId);
     if (sourceType === "assistant_visible" && (text.trim() || attachments.length > 0) && text.trim().toUpperCase() !== "NO_REPLY" && !this.isRuntimeFailureText(text.trim())) {
       this.lastRealDeliveryAt.set(chatId, Date.now());
     }
   }
 
+  private scheduleDeliveryRetry(chatId: string, attempt: number): void {
+    if (this.deliveryRetryTimers.has(chatId)) return;
+    const delay = Math.min(30_000, DELIVERY_RETRY_BASE_MS * Math.max(1, 2 ** Math.max(0, attempt - 1)));
+    const timer = setTimeout(() => {
+      this.deliveryRetryTimers.delete(chatId);
+      void this.dispatchPendingDeliveries(chatId).catch((err) => {
+        console.warn(`[${this.config.name}] scheduled delivery retry failed for ${chatId.slice(-8)}:`, this.errorSummary(err));
+      });
+    }, delay);
+    timer.unref?.();
+    this.deliveryRetryTimers.set(chatId, timer);
+  }
+
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
-    const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
-    for (const item of pending) {
-      await this.sendOrdered(chatId, async () => {
+    let retryScheduled = false;
+    while (true) {
+      const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
+      if (pending.length === 0) break;
+      for (const item of pending) {
+        await this.sendOrdered(chatId, async () => {
+        if (!item.id || !this.store.claimDelivery(item.id)) return;
+        let failureStage: "text" | "attachment" | "cleanup" = "text";
         try {
-          if (!item.id || !this.store.claimDelivery(item.id)) return;
           const attachments = JSON.parse(item.attachmentsJson || "[]") as BridgeAttachment[];
-          if (item.content.trim()) {
+
+          // Text first. A patch error is ambiguous: Feishu may have applied the
+          // patch but timed out returning the response. Do NOT immediately create
+          // a second visible answer. Retry the same idempotent patch; only after
+          // the retry budget is exhausted do we fall back to a new message.
+          if (item.content.trim() && !item.textDelivered) {
             const replyTarget = item.replyToMessageId || replyToMessageId;
             const shouldReplyToSource = replyTarget && (item.sourceType === "assistant_visible" || item.sourceType === "verbose_transcript" || item.sourceType === "provider_error" || item.sourceType === "delayed_error");
-            if (shouldReplyToSource) {
+            if (item.deliveryMode === "patch_live_status" && item.targetMessageId) {
               try {
-                await this.replyMessage(replyTarget, item.content);
-              } catch (err) {
-                console.warn(`[${this.config.name}] replyMessage failed, fallback to sendMessage:`, (err as Error).message);
-                await this.sendMessage(chatId, item.content);
+                const meta = JSON.parse(item.deliveryMetaJson || "{}") as LiveStatusFinalMeta;
+                await this.patchFinalAnswerCard(item.targetMessageId, item.content, meta, chatId);
+                this.store.markDeliveryTextDelivered(item.id);
+              } catch (patchErr) {
+                if (item.attempts + 1 < DELIVERY_MAX_ATTEMPTS) throw patchErr;
+                console.warn(`[${this.config.name}] final-card patch exhausted; falling back to new message:`, this.errorSummary(patchErr));
+                if (shouldReplyToSource) {
+                  try { await this.replyMessage(replyTarget, item.content); }
+                  catch { await this.sendMessage(chatId, item.content); }
+                } else {
+                  await this.sendMessage(chatId, item.content);
+                }
+                this.store.markDeliveryTextDeliveredWithCleanup(item.id);
               }
             } else {
-              await this.sendMessage(chatId, item.content);
+              if (shouldReplyToSource) {
+                try { await this.replyMessage(replyTarget, item.content); }
+                catch { await this.sendMessage(chatId, item.content); }
+              } else {
+                await this.sendMessage(chatId, item.content);
+              }
+              this.store.markDeliveryTextDelivered(item.id);
             }
           }
-          for (const attachment of attachments) await this.sendBridgeAttachment(chatId, attachment);
-          if (item.id) this.store.markDeliveryDelivered(item.id);
+
+          // Attachments are independent from status-card cleanup. An unpatchable
+          // or deleted status card must never block otherwise-sendable files.
+          failureStage = "attachment";
+          const cursor = Math.max(0, item.attachmentCursor || 0);
+          for (let i = cursor; i < attachments.length; i++) {
+            await this.sendBridgeAttachment(chatId, attachments[i]);
+            this.store.markDeliveryAttachmentCursor(item.id, i + 1);
+          }
+
+          // Cleanup last, after all payload is visible. Cleanup-only rows and
+          // attachment-only finals enter here as a separately retryable stage.
+          const refreshedBeforeCleanup = this.store.getDeliveryByKey(item.botName, item.chatId, item.deliveryKey);
+          const needsCleanup = Boolean(refreshedBeforeCleanup?.cleanupPending)
+            || (!item.content.trim() && item.deliveryMode === "patch_live_status" && Boolean(item.targetMessageId));
+          if (needsCleanup && item.targetMessageId) {
+            failureStage = "cleanup";
+            const meta = JSON.parse(item.deliveryMetaJson || "{}") as LiveStatusFinalMeta;
+            await this.patchLiveStatusDoneSummary(item.targetMessageId, meta, chatId);
+            this.store.markDeliveryCleanupPending(item.id, false);
+          }
+
+          this.store.markDeliveryDelivered(item.id);
         } catch (err) {
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
-          if (item.id) this.store.markDeliveryFailed(item.id);
-          const errorText = `⚠️ 附件发送失败：${this.errorSummary(err)}`;
+          const willRetry = this.store.retryDelivery(item.id, DELIVERY_MAX_ATTEMPTS);
+          if (willRetry) {
+            retryScheduled = true;
+            console.warn(
+              `[${this.config.name}] delivery ${item.id} ${failureStage} failed (attempt ${item.attempts + 1}/${DELIVERY_MAX_ATTEMPTS}); retry scheduled:`,
+              this.errorSummary(err),
+            );
+            this.scheduleDeliveryRetry(chatId, item.attempts + 1);
+            return;
+          }
+
+          // Cleanup is cosmetic once text/attachments are visible. Exhausting
+          // cleanup retries must not turn a successful answer into a scary
+          // user-facing failure.
+          if (failureStage === "cleanup") {
+            this.store.markDeliveryDelivered(item.id);
+            console.warn(`[${this.config.name}] status-card cleanup abandoned after ${DELIVERY_MAX_ATTEMPTS} attempts:`, this.errorSummary(err));
+            return;
+          }
+
+          this.store.markDeliveryFailed(item.id);
+          const label = failureStage === "attachment" ? "附件发送失败" : "最终回复发送失败";
+          const errorText = `⚠️ ${label}（已重试 ${DELIVERY_MAX_ATTEMPTS} 次）：${this.errorSummary(err)}`;
           const replyTarget = item.replyToMessageId || replyToMessageId;
           try {
             if (replyTarget) await this.replyMessage(replyTarget, errorText);
             else await this.sendMessage(chatId, errorText);
           } catch (notifyErr) {
-            console.warn(`[${this.config.name}] Failed to notify attachment delivery error:`, this.errorSummary(notifyErr));
+            console.warn(`[${this.config.name}] Failed to notify terminal delivery error:`, this.errorSummary(notifyErr));
           }
-          throw err;
         }
-      });
+        });
+      }
+      // Drain subsequent pages immediately after successful batches. If any row
+      // was returned to pending, honor its backoff timer instead of hot-looping.
+      if (pending.length < 50 || retryScheduled) break;
     }
   }
 
@@ -2288,6 +2660,7 @@ export class FeishuBot {
       const roundMarker = `—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
       displayReply = `${displayReply}\n\n${roundMarker}`;
     }
+    let finalStatusMeta: LiveStatusFinalMeta | undefined;
     if (isVisible || parsedReply.attachments.length > 0) {
       const storedContent = [displayReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
         .filter(Boolean)
@@ -2301,9 +2674,21 @@ export class FeishuBot {
         timestamp: Date.now(),
       });
       try {
-        await this.enqueueAndDispatchDelivery(chatId, "discussion", `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`, isVisible ? displayReply : "", parsedReply.attachments);
+        if (isVisible || parsedReply.attachments.length > 0) {
+          finalStatusMeta = await liveStatus?.prepareTerminalDelivery(false);
+        }
+        await this.enqueueAndDispatchDelivery(
+          chatId,
+          "discussion",
+          `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+          isVisible ? displayReply : "",
+          parsedReply.attachments,
+          undefined,
+          undefined,
+          finalStatusMeta,
+        );
       } catch (err) {
-        await liveStatus?.fail().catch(() => {});
+        if (!finalStatusMeta) await liveStatus?.fail().catch(() => {});
         throw err;
       }
     }
@@ -2311,7 +2696,7 @@ export class FeishuBot {
     // status card with a "no content" summary, not a plain done summary.
     if (!isVisible && parsedReply.attachments.length === 0) {
       await liveStatus?.noReply().catch(() => {});
-    } else {
+    } else if (!finalStatusMeta) {
       await liveStatus?.complete().catch(() => {});
     }
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
@@ -2324,9 +2709,12 @@ export class FeishuBot {
     // the finished card does not take up much screen space.
     if (view.state === "done") {
       const statusEmoji = view.noReply ? "💤" : "✅";
-      const summary = en
-        ? `${statusEmoji} ${view.toolCalls} tool call${view.toolCalls === 1 ? "" : "s"} · ⏱ ${view.elapsed}`
-        : `${statusEmoji} 累计${view.toolCalls} 次工具调用 · ⏱ 耗时${view.elapsed}`;
+      const summary = this.completionSummary({
+        toolCalls: view.toolCalls,
+        elapsed: view.elapsed,
+        model: view.model,
+        locale: en ? "en" : "zh",
+      }, statusEmoji);
       return {
         schema: "2.0",
         config: { update_multi: true, width_mode: "fill" },
@@ -2804,13 +3192,13 @@ export class FeishuBot {
       } catch (err) {
         console.warn(`[${this.config.name}] Feishu doc conversion failed, falling back to file attachment:`, this.errorSummary(err));
         const caption = attachment.caption?.trim();
-        await this.sendMessage(chatId, `${caption ? `${caption}\n` : ""}飞书文档创建失败，已改为 Markdown 文件附件发送。`);
         await this.sendBridgeFileAttachment(chatId, filePath);
+        await this.sendMessage(chatId, `${caption ? `${caption}\n` : ""}飞书文档创建失败，已改为 Markdown 文件附件发送。`);
         return;
       }
     }
 
-    if (attachment.caption?.trim()) await this.sendMessage(chatId, attachment.caption.trim());
+    const caption = attachment.caption?.trim();
 
     if (type === "image") {
       if (statSync(filePath).size > 10 * 1024 * 1024) throw new Error(`Image too large (>10MB): ${filePath}`);
@@ -2827,10 +3215,12 @@ export class FeishuBot {
           msg_type: "image",
         },
       });
+      if (caption) await this.sendMessage(chatId, caption);
       return;
     }
 
     await this.sendBridgeFileAttachment(chatId, filePath);
+    if (caption) await this.sendMessage(chatId, caption);
   }
 
   private async sendBridgeFileAttachment(chatId: string, filePath: string): Promise<void> {

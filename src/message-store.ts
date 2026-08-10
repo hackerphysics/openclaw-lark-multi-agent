@@ -48,6 +48,19 @@ export interface DeliveryOutboxItem {
   content: string;
   attachmentsJson: string;
   replyToMessageId: string;
+  /** Delivery mode. `patch_live_status` turns the existing live-status card
+   * into the final answer instead of creating a second Feishu message. */
+  deliveryMode?: "send" | "patch_live_status";
+  /** Existing interactive-card message id to patch for patch_live_status. */
+  targetMessageId?: string;
+  /** Persisted JSON footer metadata (tool calls / elapsed / model / locale). */
+  deliveryMetaJson?: string;
+  /** Durable stage checkpoint: final text/card is already visible. */
+  textDelivered?: boolean;
+  /** Durable stage checkpoint: number of attachments already delivered. */
+  attachmentCursor?: number;
+  /** Final status-card cleanup (done summary after fallback/dedupe) is pending. */
+  cleanupPending?: boolean;
   status: "pending" | "delivering" | "delivered" | "failed";
   attempts: number;
   createdAt: number;
@@ -204,6 +217,12 @@ export class MessageStore {
         content TEXT NOT NULL DEFAULT '',
         attachments_json TEXT NOT NULL DEFAULT '[]',
         reply_to_message_id TEXT NOT NULL DEFAULT '',
+        delivery_mode TEXT NOT NULL DEFAULT 'send',
+        target_message_id TEXT NOT NULL DEFAULT '',
+        delivery_meta_json TEXT NOT NULL DEFAULT '{}',
+        text_delivered INTEGER NOT NULL DEFAULT 0,
+        attachment_cursor INTEGER NOT NULL DEFAULT 0,
+        cleanup_pending INTEGER NOT NULL DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'pending',
         attempts INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
@@ -237,6 +256,36 @@ export class MessageStore {
     } catch {
       // Column already exists
     }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'send'`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN target_message_id TEXT NOT NULL DEFAULT ''`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN delivery_meta_json TEXT NOT NULL DEFAULT '{}'`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN text_delivered INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN attachment_cursor INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
+    try {
+      this.db.exec(`ALTER TABLE delivery_outbox ADD COLUMN cleanup_pending INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // Column already exists
+    }
     // Backfill stable keys for rows created by earlier outbox experiments before
     // creating indexes that reference the new columns.
     this.db.exec(`
@@ -247,9 +296,47 @@ export class MessageStore {
     try {
       this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_key ON delivery_outbox(bot_name, chat_id, delivery_key)`);
     } catch {
-      // Existing duplicate experimental rows can prevent index creation in dev DB.
-      // Fresh DBs still get the table-level UNIQUE constraint; dirty DBs still use
-      // source unique + short-window content hash until cleaned.
+      // Legacy experimental databases may contain duplicate logical deliveries.
+      // Keep the earliest owner (and its stage checkpoints) deterministically,
+      // remove later duplicates, then REQUIRE the unique index. Continuing
+      // without it would allow duplicate visible finals on explicit trigger keys.
+      // Merge durable progress into the earliest owner before deleting later
+      // duplicates. Prefer the most-complete state so upgrading a dirty legacy DB
+      // cannot replay already-visible text/attachments or lose delivered state.
+      this.db.exec(`
+        UPDATE delivery_outbox AS owner
+        SET
+          text_delivered = (
+            SELECT MAX(d.text_delivered) FROM delivery_outbox d
+            WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key
+          ),
+          attachment_cursor = (
+            SELECT MAX(d.attachment_cursor) FROM delivery_outbox d
+            WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key
+          ),
+          cleanup_pending = (
+            SELECT MAX(d.cleanup_pending) FROM delivery_outbox d
+            WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key
+          ),
+          attempts = (
+            SELECT MAX(d.attempts) FROM delivery_outbox d
+            WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key
+          ),
+          status = CASE
+            WHEN EXISTS(SELECT 1 FROM delivery_outbox d WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key AND d.status='delivered') THEN 'delivered'
+            WHEN EXISTS(SELECT 1 FROM delivery_outbox d WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key AND d.status='pending') THEN 'pending'
+            WHEN EXISTS(SELECT 1 FROM delivery_outbox d WHERE d.bot_name=owner.bot_name AND d.chat_id=owner.chat_id AND d.delivery_key=owner.delivery_key AND d.status='delivering') THEN 'pending'
+            ELSE 'failed'
+          END
+        WHERE owner.id IN (
+          SELECT MIN(id) FROM delivery_outbox GROUP BY bot_name, chat_id, delivery_key HAVING COUNT(*) > 1
+        );
+        DELETE FROM delivery_outbox
+        WHERE id NOT IN (
+          SELECT MIN(id) FROM delivery_outbox GROUP BY bot_name, chat_id, delivery_key
+        );
+      `);
+      this.db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_delivery_outbox_key ON delivery_outbox(bot_name, chat_id, delivery_key)`);
     }
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_delivery_outbox_content ON delivery_outbox(bot_name, chat_id, content_hash, created_at)`);
 
@@ -468,9 +555,28 @@ export class MessageStore {
     const now = Date.now();
     const result = this.db.prepare(`
       INSERT OR IGNORE INTO delivery_outbox
-        (session_key, chat_id, bot_name, source_type, source_id, delivery_key, content_hash, content, attachments_json, reply_to_message_id, status, attempts, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-    `).run(item.sessionKey, item.chatId, item.botName, item.sourceType, item.sourceId, item.deliveryKey, item.contentHash, item.content, item.attachmentsJson, item.replyToMessageId || '', now, now);
+        (session_key, chat_id, bot_name, source_type, source_id, delivery_key, content_hash, content, attachments_json, reply_to_message_id, delivery_mode, target_message_id, delivery_meta_json, text_delivered, attachment_cursor, cleanup_pending, status, attempts, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+    `).run(
+      item.sessionKey,
+      item.chatId,
+      item.botName,
+      item.sourceType,
+      item.sourceId,
+      item.deliveryKey,
+      item.contentHash,
+      item.content,
+      item.attachmentsJson,
+      item.replyToMessageId || '',
+      item.deliveryMode || 'send',
+      item.targetMessageId || '',
+      item.deliveryMetaJson || '{}',
+      item.textDelivered ? 1 : 0,
+      item.attachmentCursor || 0,
+      item.cleanupPending ? 1 : 0,
+      now,
+      now,
+    );
     return result.changes ? Number(result.lastInsertRowid) : null;
   }
 
@@ -480,6 +586,23 @@ export class MessageStore {
       WHERE session_key = ? AND source_type = ? AND source_id = ?
     `).get(sessionKey, sourceType, sourceId) as any;
     return row ? this.mapDelivery(row) : null;
+  }
+
+  getDeliveryByKey(botName: string, chatId: string, deliveryKey: string): DeliveryOutboxItem | null {
+    const row = this.db.prepare(`
+      SELECT * FROM delivery_outbox
+      WHERE bot_name = ? AND chat_id = ? AND delivery_key = ?
+    `).get(botName, chatId, deliveryKey) as any;
+    return row ? this.mapDelivery(row) : null;
+  }
+
+  listDeliveriesByKeyPrefix(botName: string, chatId: string, prefix: string): DeliveryOutboxItem[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM delivery_outbox
+      WHERE bot_name = ? AND chat_id = ? AND delivery_key LIKE ?
+      ORDER BY id ASC
+    `).all(botName, chatId, `${prefix}%`) as any[];
+    return rows.map((row) => this.mapDelivery(row));
   }
 
   getPendingDeliveries(chatId?: string, botName?: string, maxCount: number = 20): DeliveryOutboxItem[] {
@@ -571,17 +694,30 @@ export class MessageStore {
     return false;
   }
 
+  /** Recover in-flight rows after process restart. A new process cannot own a
+   * legitimate delivering row, so every matching row returns to pending—even if
+   * the previous process crashed on its nominal final attempt. The restarted
+   * process gets another chance to finish rather than silently losing payload. */
+  resetDeliveringOnStartup(botName: string): number {
+    const result = this.db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'pending', updated_at = ?
+      WHERE bot_name = ? AND status = 'delivering'
+    `).run(Date.now(), botName);
+    return result.changes;
+  }
+
   resetStaleDeliveries(botName: string, staleMs: number, maxAttempts: number): { restored: number; failed: number } {
     const cutoff = Date.now() - staleMs;
     const fail = this.db.prepare(`
       UPDATE delivery_outbox
       SET status = 'failed', updated_at = ?
-      WHERE bot_name = ? AND status = 'delivering' AND updated_at < ? AND attempts >= ?
+      WHERE bot_name = ? AND status = 'delivering' AND updated_at <= ? AND attempts >= ?
     `).run(Date.now(), botName, cutoff, maxAttempts);
     const restore = this.db.prepare(`
       UPDATE delivery_outbox
       SET status = 'pending', updated_at = ?
-      WHERE bot_name = ? AND status = 'delivering' AND updated_at < ? AND attempts < ?
+      WHERE bot_name = ? AND status = 'delivering' AND updated_at <= ? AND attempts < ?
     `).run(Date.now(), botName, cutoff, maxAttempts);
     return { restored: restore.changes, failed: fail.changes };
   }
@@ -591,6 +727,43 @@ export class MessageStore {
       UPDATE delivery_outbox SET status = 'delivering', attempts = attempts + 1, updated_at = ? WHERE id = ? AND status = 'pending'
     `).run(Date.now(), id);
     return result.changes === 1;
+  }
+
+  markDeliveryTextDelivered(id: number): void {
+    this.db.prepare(`
+      UPDATE delivery_outbox SET text_delivered = 1, updated_at = ? WHERE id = ?
+    `).run(Date.now(), id);
+  }
+
+  /** Atomically checkpoint fallback text and the remaining card cleanup. */
+  markDeliveryTextDeliveredWithCleanup(id: number): void {
+    this.db.prepare(`
+      UPDATE delivery_outbox
+      SET text_delivered = 1, cleanup_pending = 1, updated_at = ?
+      WHERE id = ?
+    `).run(Date.now(), id);
+  }
+
+  markDeliveryAttachmentCursor(id: number, cursor: number): void {
+    this.db.prepare(`
+      UPDATE delivery_outbox SET attachment_cursor = ?, updated_at = ? WHERE id = ?
+    `).run(cursor, Date.now(), id);
+  }
+
+  /** Return a failed in-flight delivery to pending until its retry budget is spent. */
+  retryDelivery(id: number, maxAttempts: number): boolean {
+    const result = this.db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'pending', updated_at = ?
+      WHERE id = ? AND status = 'delivering' AND attempts < ?
+    `).run(Date.now(), id, maxAttempts);
+    return result.changes === 1;
+  }
+
+  markDeliveryCleanupPending(id: number, pending: boolean): void {
+    this.db.prepare(`
+      UPDATE delivery_outbox SET cleanup_pending = ?, updated_at = ? WHERE id = ?
+    `).run(pending ? 1 : 0, Date.now(), id);
   }
 
   markDeliveryDelivered(id: number): void {
@@ -603,6 +776,16 @@ export class MessageStore {
     this.db.prepare(`
       UPDATE delivery_outbox SET status = 'failed', updated_at = ? WHERE id = ?
     `).run(Date.now(), id);
+  }
+
+  /** Give a later explicit duplicate another chance after terminal failure. */
+  requeueFailedDelivery(id: number): boolean {
+    const result = this.db.prepare(`
+      UPDATE delivery_outbox
+      SET status = 'pending', attempts = 0, updated_at = ?
+      WHERE id = ? AND status = 'failed'
+    `).run(Date.now(), id);
+    return result.changes === 1;
   }
 
   private mapDelivery(row: any): DeliveryOutboxItem {
@@ -618,6 +801,12 @@ export class MessageStore {
       content: row.content || '',
       attachmentsJson: row.attachments_json || '[]',
       replyToMessageId: row.reply_to_message_id || '',
+      deliveryMode: row.delivery_mode === 'patch_live_status' ? 'patch_live_status' : 'send',
+      targetMessageId: row.target_message_id || '',
+      deliveryMetaJson: row.delivery_meta_json || '{}',
+      textDelivered: Boolean(row.text_delivered),
+      attachmentCursor: Number(row.attachment_cursor || 0),
+      cleanupPending: Boolean(row.cleanup_pending),
       status: row.status,
       attempts: row.attempts || 0,
       createdAt: row.created_at,

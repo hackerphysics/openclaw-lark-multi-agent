@@ -67,7 +67,7 @@ function sampleConfig(): string {
         name: "GPT",
         appId: "cli_xxx",
         appSecret: "YOUR_LARK_APP_SECRET",
-        model: "github-copilot/gpt-5.5",
+        model: "phgeek-gw/gpt-5.6-sol",
       },
       {
         name: "Gemini",

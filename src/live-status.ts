@@ -41,6 +41,16 @@ export type LiveStatusView = {
   state: "running" | "done" | "failed";
 };
 
+/** Persisted metadata needed to turn the live-status card into the final answer. */
+export type LiveStatusFinalMeta = {
+  messageId: string;
+  toolCalls: number;
+  elapsed: string;
+  model?: string;
+  locale: "zh" | "en";
+  noReply?: boolean;
+};
+
 export type LiveStatusCallbacks = {
   /** Create the status card; returns the new message id. */
   create: (view: LiveStatusView) => Promise<string | undefined>;
@@ -142,6 +152,33 @@ export class LiveStatusController {
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
     await this.safeEditFinal(this.buildView());
+  }
+
+  /**
+   * Freeze any successful terminal state (text, attachment-only, or NO_REPLY)
+   * without first emitting the compact done patch. The caller persists this
+   * metadata in the outbox, which owns the final patch/cleanup. If no card was
+   * created, the caller falls back to normal new-message delivery.
+   */
+  async prepareTerminalDelivery(noReply = false): Promise<LiveStatusFinalMeta | undefined> {
+    this.state = "done";
+    this.noReplyResult = noReply;
+    this.finalized = true;
+    this.stopTimers();
+    if (this.createPromise) await this.createPromise.catch(() => {});
+    if (!this.messageId) return undefined;
+    return {
+      messageId: this.messageId,
+      toolCalls: this.toolCallCount,
+      elapsed: this.formatElapsed(),
+      model: this.opts.model,
+      locale: this.opts.locale === "en" ? "en" : "zh",
+      noReply,
+    };
+  }
+
+  async prepareFinalDelivery(): Promise<LiveStatusFinalMeta | undefined> {
+    return this.prepareTerminalDelivery(false);
   }
 
   async fail(): Promise<void> {

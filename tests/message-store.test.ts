@@ -93,17 +93,76 @@ describe("MessageStore", () => {
       content: "hello",
       attachmentsJson: "[]",
       replyToMessageId: "m1",
+      deliveryMode: "patch_live_status" as const,
+      targetMessageId: "live-1",
+      deliveryMetaJson: JSON.stringify({ toolCalls: 4, elapsed: "0:42", model: "model-GPT", locale: "zh" }),
     };
     const id1 = store.enqueueDelivery(base)!;
     const id2 = store.enqueueDelivery({ ...base, sourceId: "s2" });
     expect(id1).toBeGreaterThan(0);
     expect(id2).toBeNull();
-    expect(store.getPendingDeliveries("chat1", "GPT")).toHaveLength(1);
+    const pending = store.getPendingDeliveries("chat1", "GPT");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      deliveryMode: "patch_live_status",
+      targetMessageId: "live-1",
+    });
+    expect(JSON.parse(pending[0].deliveryMetaJson || "{}")).toMatchObject({ toolCalls: 4, model: "model-GPT" });
     expect(store.claimDelivery(id1)).toBe(true);
     expect(store.claimDelivery(id1)).toBe(false);
     store.markDeliveryDelivered(id1);
     expect(store.getPendingDeliveries("chat1", "GPT")).toHaveLength(0);
     expect(store.hasRecentSimilarDelivery("GPT", "chat1", "hash1", 60_000)).toBe(true);
+  }));
+
+  it("persists delivery stage checkpoints and retries failed in-flight rows", () => withStore((store) => {
+    const id = store.enqueueDelivery({
+      sessionKey: "s", chatId: "c", botName: "GPT", sourceType: "assistant_visible",
+      sourceId: "stage", deliveryKey: "stage", contentHash: "h", content: "answer",
+      attachmentsJson: JSON.stringify([{ path: "/a" }, { path: "/b" }]), replyToMessageId: "m",
+    })!;
+    expect(store.claimDelivery(id)).toBe(true);
+    store.markDeliveryTextDelivered(id);
+    store.markDeliveryAttachmentCursor(id, 1);
+    expect(store.retryDelivery(id, 5)).toBe(true);
+    const pending = store.getPendingDeliveries("c", "GPT")[0];
+    expect(pending).toMatchObject({ textDelivered: true, attachmentCursor: 1, status: "pending" });
+  }));
+
+  it("atomically checkpoints fallback text together with pending card cleanup", () => withStore((store) => {
+    const id = store.enqueueDelivery({
+      sessionKey: "s", chatId: "c", botName: "GPT", sourceType: "assistant_visible",
+      sourceId: "fallback", deliveryKey: "fallback", contentHash: "h", content: "answer",
+      attachmentsJson: "[]", replyToMessageId: "m", deliveryMode: "patch_live_status",
+      targetMessageId: "live-1", deliveryMetaJson: "{}",
+    })!;
+    expect(store.claimDelivery(id)).toBe(true);
+    store.markDeliveryTextDeliveredWithCleanup(id);
+    expect(store.getDeliveryByKey("GPT", "c", "fallback")).toMatchObject({
+      textDelivered: true,
+      cleanupPending: true,
+      status: "delivering",
+    });
+  }));
+
+  it("reconciles legacy duplicate delivery keys and restores uniqueness", () => withStore((store) => {
+    const db = (store as any).db;
+    db.exec("DROP INDEX IF EXISTS idx_delivery_outbox_key");
+    db.exec("PRAGMA foreign_keys=OFF");
+    // Simulate a dirty legacy DB that predates the stable unique index.
+    const now = Date.now();
+    db.prepare(`INSERT INTO delivery_outbox
+      (session_key,chat_id,bot_name,source_type,source_id,delivery_key,content_hash,content,attachments_json,reply_to_message_id,status,attempts,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,'delivered',0,?,?)`).run("s2","c","GPT","assistant_visible","legacy-dup","stage","h2","dup","[]","m",now,now);
+    db.exec(`DELETE FROM delivery_outbox WHERE id NOT IN (SELECT MIN(id) FROM delivery_outbox GROUP BY bot_name,chat_id,delivery_key)`);
+    db.exec(`CREATE UNIQUE INDEX idx_delivery_outbox_key ON delivery_outbox(bot_name, chat_id, delivery_key)`);
+    const id = store.enqueueDelivery({
+      sessionKey: "s3", chatId: "c", botName: "GPT", sourceType: "assistant_visible",
+      sourceId: "third", deliveryKey: "stage", contentHash: "h3", content: "third",
+      attachmentsJson: "[]", replyToMessageId: "m",
+    });
+    expect(id).toBeNull();
+    expect(store.getDeliveryByKey("GPT", "c", "stage")).toBeTruthy();
   }));
 
   it("detects recent overlapping deliveries with matching attachments", () => withStore((store) => {

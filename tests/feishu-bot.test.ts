@@ -76,7 +76,14 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   (bot as any).sendLiveStatusCard = vi.fn(async () => "live-status-msg");
   (bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
   (bot as any).patchLiveStatusCard = vi.fn(async () => {});
-  return { bot, store, openclaw, cleanup: () => { store.close(); rmSync(dir, { recursive: true, force: true }); } };
+  (bot as any).patchFinalAnswerCard = vi.fn(async () => {});
+  (bot as any).patchLiveStatusDoneSummary = vi.fn(async () => {});
+  return { bot, store, openclaw, cleanup: () => {
+    for (const timer of (bot as any).deliveryRetryTimers.values()) clearTimeout(timer);
+    (bot as any).deliveryRetryTimers.clear();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  } };
 }
 
 function markBotSeen(botName: string, chatId = "chat1") {
@@ -130,15 +137,20 @@ describe("FeishuBot routing and queue behavior", () => {
   it("delivers identical assistant_visible content for different trigger keys", async () => {
     const h = makeHarness("GPT");
     try {
-      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-1", "同样的回复内容", [], "m1", "trigger:1");
-      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-2", "同样的回复内容", [], "m2", "trigger:2");
+      h.openclaw.replies.push("同样的回复内容。", "同样的回复内容。");
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "问题一", messageId: "real-trigger-1" }));
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "问题二", messageId: "real-trigger-2" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(2);
-      expect((h.bot as any).replyMessage).toHaveBeenNthCalledWith(1, "m1", "同样的回复内容");
-      expect((h.bot as any).replyMessage).toHaveBeenNthCalledWith(2, "m2", "同样的回复内容");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("real-trigger-1", "同样的回复内容。");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("real-trigger-2", "同样的回复内容。");
+      const rows = (h.store as any).db.prepare(`SELECT source_id, delivery_key FROM delivery_outbox WHERE source_type='assistant_visible' ORDER BY id`).all();
+      expect(rows).toHaveLength(2);
+      expect(rows[0].source_id).not.toBe(rows[1].source_id);
+      expect(rows.map((r: any) => r.delivery_key)).toEqual(["trigger:1", "trigger:3"]);
     } finally { h.cleanup(); }
   });
 
-  it("recovers stale delivering outbox rows on startup", async () => {
+  it("recovers even freshly-delivering outbox rows on startup", async () => {
     const h = makeHarness("GPT");
     try {
       const id = h.store.enqueueDelivery({
@@ -154,8 +166,9 @@ describe("FeishuBot routing and queue behavior", () => {
         replyToMessageId: "m-stale",
       })!;
       expect(h.store.claimDelivery(id)).toBe(true);
-      (h.store as any).db.prepare("UPDATE delivery_outbox SET updated_at = ? WHERE id = ?").run(Date.now() - 600_000, id);
-      expect(h.store.resetStaleDeliveries("GPT", 5 * 60_000, 5)).toEqual({ restored: 1, failed: 0 });
+      // A new process owns no legitimate in-flight work, so even a row claimed
+      // milliseconds before the crash must be restored immediately.
+      expect(h.store.resetDeliveringOnStartup("GPT")).toBe(1);
       await (h.bot as any).dispatchPendingDeliveries("chat1");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m-stale", "stale reply");
     } finally { h.cleanup(); }
@@ -662,9 +675,13 @@ describe("FeishuBot routing and queue behavior", () => {
         title: "Claude 正在执行",
         lines: expect.arrayContaining([expect.objectContaining({ text: "read: spec.md" })]),
       }));
-      const lastDiscussPatch = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1);
-      expect(lastDiscussPatch[1].title).toBe("✅ Claude 已完成");
-      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("讨论回复"));
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith(
+        "live-status-msg",
+        expect.stringContaining("讨论回复"),
+        expect.objectContaining({ toolCalls: 1, model: "model-Claude", locale: "zh" }),
+        "chat1",
+      );
+      expect((h.bot as any).sendMessage).not.toHaveBeenCalledWith("chat1", expect.stringContaining("讨论回复"));
     } finally {
       vi.useRealTimers();
       h.cleanup();
@@ -1588,6 +1605,66 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("does not let a NO_REPLY chat-final overwrite a proactive answer on the shared card", async () => {
+    const h = makeHarness("GPT");
+    try {
+      delete (h.bot as any).ensureSession;
+      await (h.bot as any).ensureSession("chat1");
+      const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await new Promise((resolve) => setTimeout(resolve, 1_250));
+        await cb("proactive final answer");
+        return "NO_REPLY";
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "noreply-race" }));
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "proactive final answer", expect.any(Object), "chat1");
+      expect((h.bot as any).patchLiveStatusDoneSummary).not.toHaveBeenCalledWith("live-status-msg", expect.anything(), "chat1");
+    } finally { h.cleanup(); }
+  });
+
+  it("does not let an empty chat-final overwrite a proactive answer on the shared card", async () => {
+    const h = makeHarness("GPT");
+    try {
+      delete (h.bot as any).ensureSession;
+      await (h.bot as any).ensureSession("chat1");
+      const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await new Promise((resolve) => setTimeout(resolve, 1_250));
+        await cb("proactive final answer");
+        return "";
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "empty-race" }));
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "proactive final answer", expect.any(Object), "chat1");
+      expect((h.bot as any).patchLiveStatusDoneSummary).not.toHaveBeenCalledWith("live-status-msg", expect.anything(), "chat1");
+    } finally { h.cleanup(); }
+  });
+
+  it("does not let a NO_REPLY chat-final collapse an attachment-only proactive answer", async () => {
+    const h = makeHarness("GPT");
+    try {
+      delete (h.bot as any).ensureSession;
+      await (h.bot as any).ensureSession("chat1");
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await new Promise((resolve) => setTimeout(resolve, 1_250));
+        await cb('<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"file","path":"/tmp/proactive.pdf"}]}</LMA_BRIDGE_ATTACHMENTS>');
+        return "NO_REPLY";
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "attachment-race" }));
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).patchLiveStatusDoneSummary).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).patchLiveStatusDoneSummary).toHaveBeenCalledWith(
+        "live-status-msg",
+        expect.objectContaining({ noReply: false }),
+        "chat1",
+      );
+    } finally { h.cleanup(); }
+  });
+
   it("delays runtime failure notices and cancels them when a real proactive reply arrives", async () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
@@ -1624,19 +1701,27 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("marks live status complete when a proactive visible reply is delivered for the active trigger", async () => {
+  it("merges a proactive visible reply into the active live-status card", async () => {
     const h = makeHarness("GPT");
     try {
       delete (h.bot as any).ensureSession;
       await (h.bot as any).ensureSession("chat1");
       const release = (h.bot as any).setActiveDeliveryTarget("chat1", 42, "reply-42");
       const activeTarget = (h.bot as any).activeDeliveryTargets.get("chat1");
-      activeTarget.liveStatus = { complete: vi.fn(async () => {}), fail: vi.fn(async () => {}) };
+      const meta = { messageId: "live-proactive", toolCalls: 3, elapsed: "0:21", model: "model-GPT", locale: "zh" as const };
+      activeTarget.liveStatus = {
+        prepareTerminalDelivery: vi.fn(async () => meta),
+        prepareFinalDelivery: vi.fn(async () => meta),
+        complete: vi.fn(async () => {}),
+        fail: vi.fn(async () => {}),
+      };
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
       await cb("proactive answer");
       release();
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-42", "proactive answer");
-      expect(activeTarget.liveStatus.complete).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-proactive", "proactive answer", meta, "chat1");
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("reply-42", "proactive answer");
+      expect(h.store.getDeliveryByKey("GPT", "chat1", "trigger:42")).toMatchObject({ status: "delivered" });
+      expect(activeTarget.liveStatus.complete).not.toHaveBeenCalled();
       expect(activeTarget.liveStatus.fail).not.toHaveBeenCalled();
     } finally { h.cleanup(); }
   });
@@ -1651,6 +1736,124 @@ describe("FeishuBot routing and queue behavior", () => {
       release();
       expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(1);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-42", "same answer");
+    } finally { h.cleanup(); }
+  });
+
+  it("lets the authoritative chat-final correct an earlier proactive payload", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const meta = { messageId: "shared-card", toolCalls: 2, elapsed: "0:12", model: "model-GPT", locale: "zh" as const };
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "proactive:abc", "中间消息", [], "reply-42", "trigger:42", meta);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "visible:def", "真正的最终答案", [], "reply-42", "trigger:42", meta);
+      const patches = (h.bot as any).patchFinalAnswerCard.mock.calls.map((c: any[]) => c[1]);
+      expect(patches).toEqual(["中间消息", "真正的最终答案"]);
+    } finally { h.cleanup(); }
+  });
+
+  it("does not overwrite a cross-card authoritative correction with a done-summary cleanup", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const firstMeta = { messageId: "old-card", toolCalls: 1, elapsed: "0:05", model: "model-GPT", locale: "zh" as const };
+      const finalMeta = { messageId: "new-card", toolCalls: 2, elapsed: "0:12", model: "model-GPT", locale: "zh" as const };
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "proactive:abc", "中间消息", [], "reply-42", "trigger:cross-card", firstMeta);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "visible:def", "真正的最终答案", [], "reply-42", "trigger:cross-card", finalMeta);
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("new-card", "真正的最终答案", finalMeta, "chat1");
+      expect((h.bot as any).patchLiveStatusDoneSummary).not.toHaveBeenCalledWith("new-card", finalMeta, "chat1");
+    } finally { h.cleanup(); }
+  });
+
+  it("collapses a second frozen live card when its delivery key was already claimed", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "first", "same answer", [], "reply-1", "trigger:dup");
+      const meta = { messageId: "late-live-card", toolCalls: 5, elapsed: "0:55", model: "model-GPT", locale: "zh" as const };
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "second", "same answer", [], "reply-1", "trigger:dup", meta);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).patchFinalAnswerCard).not.toHaveBeenCalledWith("late-live-card", "same answer", meta, "chat1");
+      expect((h.bot as any).patchLiveStatusDoneSummary).toHaveBeenCalledWith("late-live-card", meta, "chat1");
+    } finally { h.cleanup(); }
+  });
+
+  it("durably delivers attachments added by a competing duplicate final", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "first", "same answer", [], "reply-1", "trigger:extra-file");
+      const meta = { messageId: "second-live", toolCalls: 1, elapsed: "0:10", model: "model-GPT", locale: "zh" as const };
+      const attachment = { type: "file", path: "/tmp/new.pdf" };
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "second", "same answer", [attachment], "reply-1", "trigger:extra-file", meta);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", attachment);
+      expect((h.bot as any).patchLiveStatusDoneSummary).toHaveBeenCalledWith("second-live", meta, "chat1");
+    } finally { h.cleanup(); }
+  });
+
+  it("does not redeliver a supplemental attachment across repeated collisions", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "base", "answer", [], "m", "trigger:supplemental");
+      const a = { type: "file", path: "/tmp/a.pdf" };
+      const b = { type: "file", path: "/tmp/b.pdf" };
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "collision-1", "answer", [a], "m", "trigger:supplemental");
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "collision-2", "answer", [a, b], "m", "trigger:supplemental");
+      const sent = (h.bot as any).sendBridgeAttachment.mock.calls.map((c: any[]) => c[1].path);
+      expect(sent).toEqual(["/tmp/a.pdf", "/tmp/b.pdf"]);
+    } finally { h.cleanup(); }
+  });
+
+  it("revives a failed supplemental attachment when it is explicitly retried", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "base", "answer", [], "m", "trigger:failed-file");
+      const a = { type: "file", path: "/tmp/retry.pdf" };
+      const json = JSON.stringify([a]);
+      const id = h.store.enqueueDelivery({
+        sessionKey: "lma-gpt-chat1", chatId: "chat1", botName: "GPT",
+        sourceType: "assistant_visible_attachments", sourceId: "failed-supplement",
+        deliveryKey: `trigger:failed-file:attachments:${(h.bot as any).stableHash(json)}`,
+        contentHash: "x", content: "", attachmentsJson: json, replyToMessageId: "m",
+        deliveryMode: "send", targetMessageId: "", deliveryMetaJson: "{}",
+      })!;
+      h.store.markDeliveryFailed(id);
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "retry", "answer", [a], "m", "trigger:failed-file");
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledTimes(1);
+      expect(h.store.getDeliveryByKey("GPT", "chat1", `trigger:failed-file:attachments:${(h.bot as any).stableHash(json)}`)?.status).toBe("delivered");
+    } finally { h.cleanup(); }
+  });
+
+  it("drains more than one 50-row outbox page without waiting for another event", async () => {
+    const h = makeHarness("GPT");
+    try {
+      for (let i = 0; i < 60; i++) {
+        h.store.enqueueDelivery({
+          sessionKey: "lma-gpt-chat1", chatId: "chat1", botName: "GPT",
+          sourceType: "discussion_system", sourceId: `bulk-${i}`, deliveryKey: `bulk-${i}`,
+          contentHash: `h-${i}`, content: `row-${i}`, attachmentsJson: "[]",
+          replyToMessageId: "", deliveryMode: "send", targetMessageId: "", deliveryMetaJson: "{}",
+        });
+      }
+      await (h.bot as any).dispatchPendingDeliveries("chat1");
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(60);
+      expect(h.store.getPendingDeliveries("chat1", "GPT", 100)).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("revives a failed delivery-key owner when the same final is presented again", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const id = h.store.enqueueDelivery({
+        sessionKey: "lma-gpt-chat1", chatId: "chat1", botName: "GPT",
+        sourceType: "assistant_visible", sourceId: "failed-owner", deliveryKey: "trigger:failed-owner",
+        contentHash: "h", content: "最终答案", attachmentsJson: "[]", replyToMessageId: "reply-1",
+      })!;
+      h.store.markDeliveryFailed(id);
+      await (h.bot as any).enqueueAndDispatchDelivery(
+        "chat1", "assistant_visible", "visible:retry", "最终答案", [], "reply-1", "trigger:failed-owner",
+      );
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-1", "最终答案");
+      expect(h.store.getDeliveryByKey("GPT", "chat1", "trigger:failed-owner")).toMatchObject({ status: "delivered" });
     } finally { h.cleanup(); }
   });
 
@@ -1673,6 +1876,18 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("collapses a frozen status card when recent-content dedupe skips delivery", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "discussion", "discussion-a", "same discussion answer", []);
+      const meta = { messageId: "deduped-live", toolCalls: 2, elapsed: "0:20", model: "model-GPT", locale: "zh" as const };
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "discussion", "discussion-b", "same discussion answer", [], undefined, undefined, meta);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).patchLiveStatusDoneSummary).toHaveBeenCalledWith("deduped-live", meta, "chat1");
+      expect((h.bot as any).patchFinalAnswerCard).not.toHaveBeenCalledWith("deduped-live", expect.anything(), expect.anything(), "chat1");
+    } finally { h.cleanup(); }
+  });
+
   it("uses short-window containment dedupe for chat-final plus proactive overlap", async () => {
     const h = makeHarness("GPT");
     try {
@@ -1690,6 +1905,75 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-1", "我已经完成了主要分析，结论是可以合并。");
     } finally { h.cleanup(); }
+  });
+
+  it("reports an accurate terminal final-text error after the retry budget", async () => {
+    const h = makeHarness("Claude");
+    try {
+      const id = h.store.enqueueDelivery({
+        sessionKey: "lma-claude-chat1", chatId: "chat1", botName: "Claude",
+        sourceType: "assistant_visible", sourceId: "terminal-text", deliveryKey: "trigger:terminal-text",
+        contentHash: "h", content: "final answer", attachmentsJson: "[]", replyToMessageId: "reply-to",
+      })!;
+      (h.store as any).db.prepare("UPDATE delivery_outbox SET attempts = ? WHERE id = ?").run(4, id);
+      let replyCalls = 0;
+      (h.bot as any).replyMessage = vi.fn(async () => {
+        replyCalls++;
+        if (replyCalls === 1) throw new Error("reply transport down");
+      });
+      (h.bot as any).sendMessage = vi.fn(async () => { throw new Error("send transport down"); });
+      await (h.bot as any).dispatchPendingDeliveries("chat1", "reply-to");
+      const notices = (h.bot as any).replyMessage.mock.calls.map((c: any[]) => String(c[1]));
+      expect(notices.some((x: string) => x.includes("最终回复发送失败"))).toBe(true);
+      expect(notices.some((x: string) => x.includes("附件发送失败"))).toBe(false);
+    } finally { h.cleanup(); }
+  });
+
+  it("patches final text into live status and still delivers attachments", async () => {
+    const h = makeHarness("Claude");
+    try {
+      const meta = { messageId: "live-with-file", toolCalls: 2, elapsed: "0:18", model: "model-Claude", locale: "zh" as const };
+      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      const attachment = { type: "file", path: "/tmp/result.pdf", caption: "结果" };
+      await (h.bot as any).enqueueAndDispatchDelivery(
+        "chat1",
+        "assistant_visible",
+        "merged-with-file",
+        "结果如下",
+        [attachment],
+        "trigger-file",
+        "trigger:with-file",
+        meta,
+      );
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-with-file", "结果如下", meta, "chat1");
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("trigger-file", "结果如下");
+      expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", attachment);
+    } finally { h.cleanup(); }
+  });
+
+  it("retries an ambiguous final-card patch before falling back, then collapses the status card", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      const meta = { messageId: "live-fallback", toolCalls: 9, elapsed: "1:03", model: "model-Claude", locale: "zh" as const };
+      (h.bot as any).patchFinalAnswerCard = vi.fn(async () => { throw new Error("card payload too large"); });
+      await (h.bot as any).enqueueAndDispatchDelivery(
+        "chat1",
+        "assistant_visible",
+        "fallback-source",
+        "很长的最终答案",
+        [],
+        "trigger-msg",
+        "trigger:fallback",
+        meta,
+      );
+      // First ambiguous patch failure is retried; no duplicate fallback yet.
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("trigger-msg", "很长的最终答案");
+      for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(31_000);
+      await vi.waitUntil(() => h.store.getPendingDeliveries("chat1", "Claude").length === 0, { timeout: 1000 });
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("trigger-msg", "很长的最终答案");
+      expect((h.bot as any).patchLiveStatusDoneSummary).toHaveBeenCalledWith("live-fallback", meta, "chat1");
+    } finally { vi.useRealTimers(); h.cleanup(); }
   });
 
   it("notifies the group when provider errors happen", async () => {
@@ -1734,7 +2018,22 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(doneText).toContain("✅");
       expect(doneText).toContain("累计7 次工具调用");
       expect(doneText).toContain("⏱ 耗时2:15");
+      expect(doneText).toContain("🧠 phgeek-gw/claude-opus-4.8");
       expect(doneText).toContain("<font color='grey'>"); // unobtrusive grey, footer-like
+
+      // The merged final card keeps full Markdown elements, then appends the
+      // same compact completion footer including the configured model.
+      const finalCard = (h.bot as any).buildFinalAnswerCard("## 最终结论\n\n内容", {
+        messageId: "live-1",
+        toolCalls: 7,
+        elapsed: "2:15",
+        model: "phgeek-gw/claude-opus-4.8",
+        locale: "zh",
+      });
+      const finalText = finalCard.body.elements.map((e: any) => e.content || "").join("\n");
+      expect(finalText).toContain("最终结论");
+      expect(finalText).toContain("✅ 累计7 次工具调用 · ⏱ 耗时2:15 · 🧠 phgeek-gw/claude-opus-4.8");
+      expect(finalCard.config.update_multi).toBe(true);
       // NO_REPLY: still minimal (clean finish), 💤 marker.
       const noReplyCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done", noReply: true, toolCalls: 2, elapsed: "0:11" }, "chat1");
       expect(noReplyCard.header).toBeUndefined();
@@ -1760,7 +2059,7 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("uses a live status message in non-verbose mode and finishes it after the final reply", async () => {
+  it("merges the final reply into the live status message in non-verbose mode", async () => {
     vi.useFakeTimers();
     const h = makeHarness("Claude");
     try {
@@ -1794,12 +2093,15 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(placeholderView.lines.map((l: any) => l.text)).toContain("read: 读取 src/feishu-bot.ts");
       expect(placeholderView.hint).toBeUndefined();
       expect(placeholderView.elapsed).toMatch(/\d+:\d{2}/);
-      // ...the final reply goes through the normal interactive-card path (renders Markdown)...
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("live-trigger", "最终回复");
-      // ...and the live status card is patched to a done state (not overwritten with the answer).
+      // The final reply replaces the SAME live-status card; no second reply is sent.
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("live-trigger", "最终回复");
+      expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith(
+        "live-status-msg",
+        "最终回复",
+        expect.objectContaining({ toolCalls: 1, model: "model-Claude", locale: "zh" }),
+        "chat1",
+      );
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
-      const lastPatchView = (h.bot as any).patchLiveStatusCard.mock.calls.at(-1)[1];
-      expect(lastPatchView.title).toContain("已完成");
       expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
     } finally {
       vi.useRealTimers();
@@ -2209,15 +2511,70 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("飞书文档创建失败"));
       expect((h.bot as any).client.im.file.create).toHaveBeenCalled();
       expect((h.bot as any).client.im.message.create).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ msg_type: "file" }) }));
+      expect((h.bot as any).client.im.message.create.mock.invocationCallOrder[0])
+        .toBeLessThan((h.bot as any).sendMessage.mock.invocationCallOrder[0]);
     } finally { h.cleanup(); rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it("surfaces attachment delivery failures to the triggering message", async () => {
+  it("abandons exhausted status cleanup without reporting a successful answer as failed", async () => {
     const h = makeHarness("Claude");
     try {
+      const meta = { messageId: "deleted-live-card", toolCalls: 3, elapsed: "0:30", model: "model-Claude", locale: "zh" as const };
+      const id = h.store.enqueueDelivery({
+        sessionKey: "lma-claude-chat1", chatId: "chat1", botName: "Claude",
+        sourceType: "assistant_visible_status_cleanup", sourceId: "cleanup", deliveryKey: "trigger:cleanup",
+        contentHash: "", content: "", attachmentsJson: "[]", replyToMessageId: "reply-1",
+        deliveryMode: "patch_live_status", targetMessageId: meta.messageId,
+        deliveryMetaJson: JSON.stringify(meta), textDelivered: true, cleanupPending: true,
+      })!;
+      (h.store as any).db.prepare("UPDATE delivery_outbox SET attempts = ? WHERE id = ?").run(4, id);
+      (h.bot as any).patchLiveStatusDoneSummary = vi.fn(async () => { throw new Error("card deleted"); });
+      await (h.bot as any).dispatchPendingDeliveries("chat1", "reply-1");
+      expect(h.store.getDeliveryByKey("Claude", "chat1", "trigger:cleanup")).toMatchObject({ status: "delivered" });
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("reply-1", expect.stringContaining("失败"));
+    } finally { h.cleanup(); }
+  });
+
+  it("retries a transient attachment failure and resumes from its durable cursor", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("Claude");
+    try {
+      let secondAttempts = 0;
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (_chatId: string, attachment: any) => {
+        if (attachment.path === "/tmp/second") {
+          secondAttempts++;
+          if (secondAttempts === 1) throw new Error("upload exploded");
+        }
+      });
+      await (h.bot as any).enqueueAndDispatchDelivery(
+        "chat1", "assistant_visible", "source-attachment", "",
+        [{ type: "file", path: "/tmp/first" }, { type: "file", path: "/tmp/second" }],
+        "reply-to", "trigger:attachment",
+      );
+      expect(h.store.getPendingDeliveries("chat1", "Claude")).toHaveLength(1);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("reply-to", expect.stringContaining("附件发送失败"));
+      await vi.advanceTimersByTimeAsync(1_100);
+      await vi.waitUntil(() => h.store.getPendingDeliveries("chat1", "Claude").length === 0, { timeout: 1000 });
+      expect((h.bot as any).sendBridgeAttachment.mock.calls.map((c: any[]) => c[1].path)).toEqual([
+        "/tmp/first", "/tmp/second", "/tmp/second",
+      ]);
+    } finally { vi.useRealTimers(); h.cleanup(); }
+  });
+
+  it("reports an accurate terminal attachment error after the retry budget", async () => {
+    const h = makeHarness("Claude");
+    try {
+      const id = h.store.enqueueDelivery({
+        sessionKey: "lma-claude-chat1", chatId: "chat1", botName: "Claude",
+        sourceType: "assistant_visible", sourceId: "terminal-attachment", deliveryKey: "trigger:terminal-attachment",
+        contentHash: "h", content: "", attachmentsJson: JSON.stringify([{ type: "file", path: "/tmp/missing" }]),
+        replyToMessageId: "reply-to",
+      })!;
+      (h.store as any).db.prepare("UPDATE delivery_outbox SET attempts = ? WHERE id = ?").run(4, id);
       (h.bot as any).sendBridgeAttachment = vi.fn(async () => { throw new Error("upload exploded"); });
-      await expect((h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-attachment", "", [{ type: "file", path: "/tmp/missing" }], "reply-to", "trigger:attachment")).rejects.toThrow("upload exploded");
+      await (h.bot as any).dispatchPendingDeliveries("chat1", "reply-to");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-to", expect.stringContaining("附件发送失败"));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-to", expect.not.stringContaining("最终回复发送失败"));
     } finally { h.cleanup(); }
   });
 
@@ -2250,8 +2607,11 @@ describe("FeishuBot routing and queue behavior", () => {
       });
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "review 下", messageId: "m1" }));
       const allReplies = (h.bot as any).replyMessage.mock.calls.map((call: any[]) => call[1]);
-      expect(allReplies.filter((text: string) => text.includes("附件发送失败"))).toHaveLength(1);
+      // First failure is retained in the durable outbox and retried; do not
+      // prematurely tell the user it is terminal or emit a fake provider error.
+      expect(allReplies.filter((text: string) => text.includes("附件发送失败"))).toHaveLength(0);
       expect(allReplies.some((text: string) => text.includes("这次没有完成回复"))).toBe(false);
+      expect(h.store.getPendingDeliveries("chat1", "GPT")).toHaveLength(1);
       expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
     } finally { h.cleanup(); }
   });
@@ -2383,7 +2743,7 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(2);
         expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
         // Delivers the ORIGINAL reply (the done phrase is never shown to the user).
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "我先看一下代码，然后");
+        expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "我先看一下代码，然后", expect.any(Object), "chat1");
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "结束了");
       } finally { h.cleanup(); }
     });
@@ -2406,7 +2766,7 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls).toHaveLength(3);
         // The negation reply was the latest before the done confirmation, so it is
         // delivered (the '已经结束了' confirmation itself is never shown).
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "还没结束，我接着");
+        expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "还没结束，我接着", expect.any(Object), "chat1");
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "好的，已经结束了");
       } finally { h.cleanup(); }
     });
@@ -2425,7 +2785,7 @@ describe("FeishuBot routing and queue behavior", () => {
         await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "多步任务", messageId: "m1" }));
         // real + 2 probes (3rd reply ends cleanly so no further probe).
         expect(h.openclaw.chatCalls).toHaveLength(3);
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "全部完成了。");
+        expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "全部完成了。", expect.any(Object), "chat1");
       } finally { h.cleanup(); }
     });
 
@@ -2441,7 +2801,7 @@ describe("FeishuBot routing and queue behavior", () => {
         await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "停不下来的任务", messageId: "m1" }));
         // real call + 3 probes = 4 total (budget = 3).
         expect(h.openclaw.chatCalls).toHaveLength(4);
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "还在处理中然后");
+        expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "还在处理中然后", expect.any(Object), "chat1");
       } finally {
         delete process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY_MAX;
         h.cleanup();
@@ -2462,25 +2822,47 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("treats a reply with no trailing punctuation at all as truncated and probes", async () => {
+    it("does not retry completed-looking replies merely because they lack punctuation", async () => {
       process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
-      const h = makeHarness("GPT");
+      const examples = [
+        "我先看一下代码再改这里",
+        "ARK_OPENCLAW_OK",
+        "openclaw-lark-multi-agent",
+        "Providers: deepseek github-copilot phgeek-gw",
+        "模型配置已经更新完成",
+        "C:\\Users\\51694\\.openclaw\\extensions\\lma-steer",
+        "sha256:abcdef123456",
+      ];
+      for (const [i, reply] of examples.entries()) {
+        const h = makeHarness("GPT");
+        try {
+          h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+            h.openclaw.chatCalls.push(params);
+            return reply;
+          });
+          await (h.bot as any).handleMessage(event({ chatType: "p2p", text: `case-${i}`, messageId: `no-punct-${i}` }));
+          expect(h.openclaw.chatCalls, reply).toHaveLength(1);
+        } finally { h.cleanup(); }
+      }
+    });
+
+    it("retries only explicit prose lead-in colons, not structural colons", async () => {
+      process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "1";
+      const suspicious = makeHarness("GPT");
       try {
-        let n = 0;
-        h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
-          h.openclaw.chatCalls.push(params);
-          n++;
-          // No terminal punctuation / closer at the end -> likely cut off mid-sentence.
-          if (n === 1) return "我先看一下代码再改这里";
-          return "结束了"; // session confirms it actually finished
-        });
-        await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "改代码", messageId: "m1" }));
-        // real + 1 confirmation probe.
-        expect(h.openclaw.chatCalls).toHaveLength(2);
-        expect(h.openclaw.chatCalls[1].currentMessage).toContain("结束了吗");
-        // Done confirmed -> deliver the original reply, not the done phrase.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "我先看一下代码再改这里");
-      } finally { h.cleanup(); }
+        suspicious.openclaw.replies.push("原因如下：", "结束了");
+        await (suspicious.bot as any).handleMessage(event({ chatType: "p2p", text: "原因", messageId: "colon-leadin" }));
+        expect(suspicious.openclaw.chatCalls).toHaveLength(2);
+      } finally { suspicious.cleanup(); }
+
+      for (const reply of ["https://example.com/path:", "12:30", "key:value", "C:\\work:"]) {
+        const h = makeHarness("GPT");
+        try {
+          h.openclaw.replies.push(reply);
+          await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "结构文本", messageId: `struct-${reply}` }));
+          expect(h.openclaw.chatCalls, reply).toHaveLength(1);
+        } finally { h.cleanup(); }
+      }
     });
 
     it("uses an English done-phrase in English locale and detects it", async () => {
@@ -2490,7 +2872,7 @@ describe("FeishuBot routing and queue behavior", () => {
         h.store.setChatLocale("chat1", "en");
         h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
           h.openclaw.chatCalls.push(params);
-          if (h.openclaw.chatCalls.length === 1) return "let me check the code and"; // truncated
+          if (h.openclaw.chatCalls.length === 1) return "I need to inspect it, let me"; // explicit continuation cue
           return "DONE"; // English confirmation
         });
         await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "fix the code", messageId: "m1" }));
@@ -2499,7 +2881,7 @@ describe("FeishuBot routing and queue behavior", () => {
         expect(h.openclaw.chatCalls[1].currentMessage).toContain("DONE");
         expect(h.openclaw.chatCalls[1].currentMessage).not.toMatch(/[\u4e00-\u9fff]/);
         // Delivers the original truncated-looking reply; DONE is not shown.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "let me check the code and");
+        expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "I need to inspect it, let me", expect.objectContaining({ locale: "en" }), "chat1");
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", "DONE");
       } finally { h.cleanup(); }
     });
@@ -2532,7 +2914,7 @@ describe("FeishuBot routing and queue behavior", () => {
         // Never auto-compacts on a failed probe anymore.
         expect(h.openclaw.compactSession).not.toHaveBeenCalled();
         // Delivers the existing truncated-looking reply rather than spinning.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "处理中，然后");
+        expect((h.bot as any).patchFinalAnswerCard).toHaveBeenCalledWith("live-status-msg", "处理中，然后", expect.any(Object), "chat1");
       } finally { h.cleanup(); }
     });
 
