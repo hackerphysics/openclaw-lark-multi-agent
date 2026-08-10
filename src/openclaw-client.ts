@@ -537,6 +537,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
       let replayInvalidTimer: ReturnType<typeof setTimeout> | null = null;
+      let genericChatErrorTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingRuntimeFailureText = "";
       let lastActivitySummary = "";
       let lastActivityAt = 0;
@@ -562,6 +563,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           if (chatFinalTimer) clearTimeout(chatFinalTimer);
           if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
           if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
+          if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
           console.warn(`[OpenClaw] collectReply idle timeout for runId=${runId} sessionKey=${sessionKey}`);
           this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
             console.warn(`[OpenClaw] abort after collectReply idle timeout failed:`, (err as Error).message);
@@ -632,6 +634,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
+        if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
         resolve(finalText);
       };
 
@@ -645,6 +648,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           if (chatFinalTimer) clearTimeout(chatFinalTimer);
           if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
           if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
+          if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
           if (idleTimer) clearTimeout(idleTimer);
           const salvaged = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
           if (salvaged) { resolve(salvaged); return; }
@@ -890,6 +894,26 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               // surfaces the failure / lets auto-retry kick in — instead of
               // surfacing whatever mid-run delta text happened to be collected.
               const errText = String(ev.data?.error || "chat error");
+              if (this.isGenericChatError(errText)) {
+                // Gateway can emit a terminal chat error without errorMessage,
+                // then persist a richer terminal snapshot a moment later. Do
+                // not expose the placeholder "chat error" to users. Reconcile
+                // through agent.wait, whose snapshot includes timeout phase,
+                // stop reason, and the real upstream error when available.
+                if (!genericChatErrorTimer) {
+                  genericChatErrorTimer = setTimeout(() => {
+                    genericChatErrorTimer = null;
+                    void this.resolveTerminalChatError(evRunId || runId).then((detail) => {
+                      clearTimeout(idleTimer);
+                      clearInterval(poller);
+                      if (chatFinalTimer) clearTimeout(chatFinalTimer);
+                      if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+                      reject(new Error(`Agent error: ${detail}`));
+                    });
+                  }, 350);
+                }
+                continue;
+              }
               if (this.isRecoverableAgentError(errText)) {
                 pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
                 resetIdleTimer();
@@ -901,6 +925,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
               clearInterval(poller);
               if (chatFinalTimer) clearTimeout(chatFinalTimer);
               if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+              if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
               // Abort the (possibly still-running) backgrounded run before we
               // reject, so an auto-retry probe does not race a zombie run on the
               // same session. Idempotent/best-effort.
@@ -924,6 +949,49 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    * context-overflow / prompt-too-large, which OpenClaw recovers from via its
    * context-overflow-recovery + auto-compaction path.
    */
+  private isGenericChatError(errText: string): boolean {
+    const t = (errText || "").trim().toLowerCase();
+    return t === "chat error" || t === "agent error: chat error";
+  }
+
+  private async resolveTerminalChatError(runId: string): Promise<string> {
+    try {
+      const snapshot = await this.rpc("agent.wait", { runId, timeoutMs: 1500 }, 2500);
+      return this.formatTerminalRunError(snapshot);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      return `OpenClaw 运行失败，但未返回具体原因${detail ? `（${detail}）` : ""}`;
+    }
+  }
+
+  private formatTerminalRunError(snapshot: any): string {
+    const rawError = typeof snapshot?.error === "string" ? snapshot.error.trim() : "";
+    const timeoutPhase = typeof snapshot?.timeoutPhase === "string" ? snapshot.timeoutPhase.trim() : "";
+    const stopReason = typeof snapshot?.stopReason === "string" ? snapshot.stopReason.trim() : "";
+    const status = typeof snapshot?.status === "string" ? snapshot.status.trim() : "";
+    const timedOut = status === "timeout" || Boolean(timeoutPhase) || /timed?\s*out|timeout/i.test(rawError);
+    if (timedOut) {
+      const startedAt = Number(snapshot?.startedAt);
+      const endedAt = Number(snapshot?.endedAt);
+      const elapsedSeconds = Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt
+        ? Math.round((endedAt - startedAt) / 1000)
+        : 0;
+      const elapsed = elapsedSeconds > 0 ? `（运行约 ${this.formatDurationSeconds(elapsedSeconds)}）` : "";
+      const phase = timeoutPhase ? `，阶段：${timeoutPhase}` : "";
+      return `Agent 运行超时${elapsed}${phase}，已被 OpenClaw 终止`;
+    }
+    if (rawError) return rawError;
+    if (stopReason === "stop" || stopReason === "rpc") return `Agent 被停止（${stopReason}）`;
+    const meta = [status && `状态=${status}`, stopReason && `原因=${stopReason}`, timeoutPhase && `阶段=${timeoutPhase}`].filter(Boolean).join("，");
+    return meta ? `OpenClaw 运行失败：${meta}` : "OpenClaw 运行失败，但未返回具体原因";
+  }
+
+  private formatDurationSeconds(seconds: number): string {
+    if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
+    if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
+    return `${seconds} 秒`;
+  }
+
   private isRecoverableAgentError(errText: string): boolean {
     const t = (errText || "").toLowerCase();
     return t.includes("context overflow")

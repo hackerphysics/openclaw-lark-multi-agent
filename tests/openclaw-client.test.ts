@@ -124,6 +124,56 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).rejects.toThrow(/timed out/i);
   });
 
+  it("reconciles a generic chat error through agent.wait and reports the real timeout", async () => {
+    vi.useFakeTimers();
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+    (client as any).rpc = vi.fn(async (method: string, params: any) => {
+      expect(method).toBe("agent.wait");
+      expect(params.runId).toBe("chat-run");
+      return {
+        runId: "chat-run",
+        status: "timeout",
+        timeoutPhase: "provider",
+        startedAt: 1_000,
+        endedAt: 601_000,
+      };
+    });
+
+    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
+    const rejection = expect(replyPromise).rejects.toThrow(/运行超时.*10 分钟.*provider/);
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "chat error" } });
+    await vi.advanceTimersByTimeAsync(400);
+
+    await rejection;
+    vi.useRealTimers();
+  });
+
+  it("waits briefly for a detailed chat error after a generic placeholder", async () => {
+    vi.useFakeTimers();
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const events = new Map<string, any[]>();
+    (client as any).agentEvents = events;
+    const key = "agent:main:s1";
+    events.set(key, []);
+    (client as any).rpc = vi.fn(async () => ({ status: "error", error: "tool validation failed: bad input" }));
+
+    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
+    const rejection = expect(replyPromise).rejects.toThrow(/tool validation failed: bad input/);
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "chat error" } });
+    setTimeout(() => {
+      events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "tool validation failed: bad input" } });
+    }, 100);
+    await vi.advanceTimersByTimeAsync(200);
+
+    await rejection;
+    expect((client as any).rpc.mock.calls.some((call: any[]) => call[0] === "agent.wait")).toBe(false);
+    vi.useRealTimers();
+  });
+
   it("defers on a recoverable chat-level error and lets a later final win", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();
