@@ -37,7 +37,7 @@ All of them connect to the same OpenClaw Gateway while keeping sessions, queues,
 - Feishu image download and OpenClaw multimodal attachment forwarding
 - Bridge attachment marker protocol for generated files/images/documents
 - Feishu CardKit v2 Markdown rendering, including native table elements for pipe tables
-- Live status card: in non-verbose mode each run shows a single self-updating Feishu interactive card (title + recent activity window with per-line timestamps + elapsed/model footer, refreshed once per second), which collapses to a compact one-line summary on a clean finish and retains the recent activity on failure for debugging
+- Live status card: in non-verbose mode each run shows a self-updating Feishu interactive card (title + recent activity window with per-line timestamps + elapsed footer, refreshed once per second), which collapses to tool-call count + elapsed on a clean finish; the final answer is sent separately at the bottom with a model footer
 - Bridge-level slash commands and escaped OpenClaw slash commands
 - `/discuss` mode for barrier-style multi-bot group discussion, including per-round markers and no-reply status notices
 - `/chairman` role: a single per-group chairman that answers plain messages when no bot is in Free mode, and acts as host, challenger, and summarizer inside `/discuss`
@@ -463,7 +463,7 @@ While running, the card shows:
 - a rolling window of the most recent activity lines (tool start `▸`, tool end
   `✓`, and intermediate assistant text `•`), each prefixed with the relative
   time `mm:ss` since the run started;
-- a footer with elapsed time and the bound model name.
+- a footer with elapsed time.
 
 The card is created lazily (a fast reply that finishes within the create delay
 never spawns a card, to avoid flicker) and is updated with `im.message.patch`,
@@ -479,8 +479,9 @@ When the run ends:
   header, so the steps leading up to the failure stay visible for debugging.
 
 The final answer is always delivered separately through the normal interactive-card
-delivery path, so Markdown renders correctly; the live status card is a distinct
-message and never replaces or blocks the final reply.
+delivery path, so it is created at completion time and remains below any user messages
+inserted during the run. Its footer shows only the bound model name. The live-status
+card remains a distinct earlier message and owns tool-call count + elapsed time.
 
 Live status is on by default and can be toggled per bot/chat with
 `/livestatus [on|off]`. It can be disabled globally by setting

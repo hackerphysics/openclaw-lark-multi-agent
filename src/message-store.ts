@@ -48,12 +48,13 @@ export interface DeliveryOutboxItem {
   content: string;
   attachmentsJson: string;
   replyToMessageId: string;
-  /** Delivery mode. `patch_live_status` turns the existing live-status card
-   * into the final answer instead of creating a second Feishu message. */
+  /** Delivery mode. New final replies use `send`; `patch_live_status` is kept
+   * for status-only cleanup and restart compatibility with legacy outbox rows. */
   deliveryMode?: "send" | "patch_live_status";
   /** Existing interactive-card message id to patch for patch_live_status. */
   targetMessageId?: string;
-  /** Persisted JSON footer metadata (tool calls / elapsed / model / locale). */
+  /** Persisted JSON delivery metadata (for example final-reply model footer,
+   * or legacy live-status cleanup metadata). */
   deliveryMetaJson?: string;
   /** Durable stage checkpoint: final text/card is already visible. */
   textDelivered?: boolean;

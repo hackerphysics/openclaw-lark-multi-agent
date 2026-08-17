@@ -120,6 +120,11 @@ export class FeishuBot {
   private sendQueue: Map<string, Promise<void>> = new Map();
   /** Per-chat delayed runtime failure notifications, canceled if a real reply arrives. */
   private delayedFailureTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /** Ephemeral model footer overrides used by final-message wrappers. Keeping
+   * replyMessage/sendMessage two-argument APIs avoids contaminating ordinary
+   * command/error/card sends with model attribution. */
+  private replyModelFooters: Map<string, string> = new Map();
+  private sendModelFooters: Map<string, string> = new Map();
   /** Per-chat durable outbox retry timer. */
   private deliveryRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
@@ -283,11 +288,7 @@ export class FeishuBot {
         const parsed = this.extractBridgeAttachments(text);
         if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) this.cancelDelayedFailure(chatId);
         const activeTarget = this.activeDeliveryTargets.get(chatId);
-        let finalStatusMeta: LiveStatusFinalMeta | undefined;
         try {
-          if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
-            finalStatusMeta = await activeTarget?.liveStatus?.prepareTerminalDelivery(false);
-          }
           await this.enqueueAndDispatchDelivery(
             chatId,
             sourceType,
@@ -296,13 +297,13 @@ export class FeishuBot {
             parsed.attachments,
             activeTarget?.messageId,
             activeTarget ? `trigger:${activeTarget.triggerId}` : undefined,
-            finalStatusMeta,
+            sourceType === "verbose_transcript" ? undefined : this.config.model,
           );
-          if (!finalStatusMeta && sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
+          if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
             await activeTarget?.liveStatus?.complete().catch(() => {});
           }
         } catch (err) {
-          if (!finalStatusMeta && sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
+          if (sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
           throw err;
         }
       } catch (err) {
@@ -1490,18 +1491,10 @@ export class FeishuBot {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
             await liveStatus?.complete().catch(() => {});
           } else {
-            let finalStatusMeta: LiveStatusFinalMeta | undefined;
             try {
-              // If a live-status card exists, freeze it and persist enough
-              // metadata in the outbox to turn THIS SAME card into the final
-              // answer. Fast replies / disabled status / create failures have no
-              // card and transparently use the existing new-message path.
-              // Text answers become the card body. Attachment-only results still
-              // freeze the card so the outbox can durably collapse it to a done
-              // summary (including disabled-but-existing cards).
-              if ((shouldReply && visibleReply.trim()) || hasAttachments) {
-                finalStatusMeta = await liveStatus?.prepareTerminalDelivery(false);
-              }
+              // Keep live status and final answer as separate messages. The final
+              // answer is created at completion time so it remains at the bottom
+              // even when the user inserted more messages during the run.
               await this.enqueueAndDispatchDelivery(
                 chatId,
                 "assistant_visible",
@@ -1510,9 +1503,9 @@ export class FeishuBot {
                 parsedReply.attachments,
                 lastHuman.messageId,
                 `trigger:${triggerId}`,
-                finalStatusMeta,
+                this.config.model,
               );
-              if (!finalStatusMeta) await liveStatus?.complete();
+              await liveStatus?.complete();
               // Mark every merged trigger as delivered so retries/restarts do
               // not re-process any of them.
               for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
@@ -1522,10 +1515,7 @@ export class FeishuBot {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
               // that creates a second misleading "bot did not complete" message.
-              // If the card was not frozen for merged final delivery, retain the
-              // normal interrupted status. A prepared card has already been
-              // patched/fallen back by the durable dispatcher.
-              if (!finalStatusMeta) await liveStatus?.fail().catch(() => {});
+              await liveStatus?.fail().catch(() => {});
               console.warn(`[${this.config.name}] assistant delivery failed after notification:`, this.errorSummary(err));
             }
           }
@@ -1780,13 +1770,19 @@ export class FeishuBot {
     return s;
   }
 
-  private buildMarkdownCard(text: string) {
+  private buildMarkdownCard(text: string, model?: string) {
+    const elements: any[] = buildFeishuCardElements(text);
+    if (model?.trim()) {
+      elements.push({ tag: "hr" });
+      elements.push({
+        tag: "markdown",
+        content: `<font color='grey'>🧠 ${this.escapeCardText(model.trim())}</font>`,
+      });
+    }
     return {
       schema: "2.0",
       config: { wide_screen_mode: true },
-      body: {
-        elements: buildFeishuCardElements(text),
-      },
+      body: { elements },
     };
   }
 
@@ -1801,38 +1797,15 @@ export class FeishuBot {
     }
   }
 
-  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "model" | "locale">, emoji = "✅"): string {
+  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "locale">, emoji = "✅"): string {
     const en = meta.locale === "en";
-    const core = en
+    return en
       ? `${emoji} ${meta.toolCalls} tool call${meta.toolCalls === 1 ? "" : "s"} · ⏱ ${meta.elapsed}`
       : `${emoji} 累计${meta.toolCalls} 次工具调用 · ⏱ 耗时${meta.elapsed}`;
-    return meta.model ? `${core} · 🧠 ${this.escapeCardText(meta.model)}` : core;
   }
 
-  /** Final answer card used to replace the running live-status card in place. */
-  private buildFinalAnswerCard(text: string, meta: LiveStatusFinalMeta): any {
-    const elements: any[] = buildFeishuCardElements(text);
-    elements.push({ tag: "hr" });
-    elements.push({
-      tag: "markdown",
-      content: `<font color='grey'>${this.completionSummary(meta)}</font>`,
-    });
-    return {
-      schema: "2.0",
-      config: { update_multi: true, width_mode: "fill" },
-      body: { elements },
-    };
-  }
-
-  private async patchFinalAnswerCard(messageId: string, text: string, meta: LiveStatusFinalMeta, _chatId?: string): Promise<void> {
-    await this.client.im.message.patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(this.buildFinalAnswerCard(text, meta)) },
-    } as any);
-  }
-
-  /** Best-effort cleanup when a final-card patch was too large/failed and the
-   * answer had to be delivered as a separate message. */
+  /** Best-effort terminal cleanup for status-only rows and legacy v1.4.3
+   * outbox entries that once targeted the live-status card. */
   private async patchLiveStatusDoneSummary(messageId: string, meta: LiveStatusFinalMeta, chatId?: string): Promise<void> {
     const view: LiveStatusView = {
       title: meta.locale === "en" ? `✅ ${this.config.name} done` : `✅ ${this.config.name} 已完成`,
@@ -2175,55 +2148,22 @@ export class FeishuBot {
     attachments: BridgeAttachment[] = [],
     replyToMessageId?: string,
     deliveryKey?: string,
-    liveStatusFinal?: LiveStatusFinalMeta,
+    finalReplyModel?: string,
   ): Promise<void> {
     if (!text.trim() && attachments.length === 0) return;
     const attachmentsJson = JSON.stringify(attachments);
     const normalizedPayload = `${text.trim()}|${attachmentsJson}`;
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
-    const enqueueDurableStatusCleanup = async (meta: LiveStatusFinalMeta, suffix: string): Promise<void> => {
-      const cleanupId = this.store.enqueueDelivery({
-        sessionKey: this.deliverySessionKey(chatId),
-        chatId,
-        botName: this.config.name,
-        sourceType: `${sourceType}_status_cleanup`,
-        sourceId: `${sourceId}:status-cleanup:${suffix}:${meta.messageId}`,
-        deliveryKey: `${finalDeliveryKey}:status-cleanup:${suffix}:${meta.messageId}`,
-        contentHash: "",
-        content: "",
-        attachmentsJson: "[]",
-        replyToMessageId: replyToMessageId || "",
-        deliveryMode: "patch_live_status",
-        targetMessageId: meta.messageId,
-        deliveryMetaJson: JSON.stringify(meta),
-        textDelivered: true,
-        cleanupPending: true,
-      });
-      if (cleanupId) await this.dispatchPendingDeliveries(chatId, replyToMessageId);
-    };
-    const finishDedupedStatus = async () => {
-      if (!liveStatusFinal) return;
-      await enqueueDurableStatusCleanup(liveStatusFinal, "content-dedupe");
-    };
+    const deliveryMetaJson = finalReplyModel?.trim()
+      ? JSON.stringify({ model: finalReplyModel.trim() })
+      : "{}";
     if (sourceType === "verbose_transcript") {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) {
-        await finishDedupedStatus();
-        return;
-      }
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) {
-        await finishDedupedStatus();
-        return;
-      }
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
     } else if (!deliveryKey) {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) {
-        await finishDedupedStatus();
-        return;
-      }
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) {
-        await finishDedupedStatus();
-        return;
-      }
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) return;
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) return;
     }
     const deliveryId = this.store.enqueueDelivery({
       sessionKey: this.deliverySessionKey(chatId),
@@ -2236,9 +2176,9 @@ export class FeishuBot {
       content: text,
       attachmentsJson,
       replyToMessageId: replyToMessageId || "",
-      deliveryMode: liveStatusFinal ? "patch_live_status" : "send",
-      targetMessageId: liveStatusFinal?.messageId || "",
-      deliveryMetaJson: liveStatusFinal ? JSON.stringify(liveStatusFinal) : "{}",
+      deliveryMode: "send",
+      targetMessageId: "",
+      deliveryMetaJson,
     });
     if (deliveryId === null) {
       // Another path already owns this stable logical delivery (commonly the
@@ -2260,9 +2200,9 @@ export class FeishuBot {
             sourceType: `${sourceType}_recovery`, sourceId: `${sourceId}:recovery`,
             deliveryKey: recoveryKey, contentHash, content: text, attachmentsJson: "[]",
             replyToMessageId: replyToMessageId || "",
-            deliveryMode: liveStatusFinal ? "patch_live_status" : "send",
-            targetMessageId: liveStatusFinal?.messageId || "",
-            deliveryMetaJson: liveStatusFinal ? JSON.stringify(liveStatusFinal) : "{}",
+            deliveryMode: "send",
+            targetMessageId: "",
+            deliveryMetaJson,
           });
         }
       }
@@ -2278,11 +2218,9 @@ export class FeishuBot {
           sourceType: "assistant_visible_authoritative", sourceId: `${sourceId}:authoritative`,
           deliveryKey: correctionKey, contentHash, content: text, attachmentsJson: "[]",
           replyToMessageId: replyToMessageId || "",
-          deliveryMode: liveStatusFinal || existing.targetMessageId ? "patch_live_status" : "send",
-          targetMessageId: liveStatusFinal?.messageId || existing.targetMessageId,
-          deliveryMetaJson: liveStatusFinal?.messageId
-            ? JSON.stringify(liveStatusFinal)
-            : existing.deliveryMetaJson,
+          deliveryMode: "send",
+          targetMessageId: "",
+          deliveryMetaJson,
         });
       }
 
@@ -2339,35 +2277,6 @@ export class FeishuBot {
 
       // Dispatch recovery/correction/supplement rows together in creation order.
       await this.dispatchPendingDeliveries(chatId, replyToMessageId);
-
-      // A correction/recovery row can intentionally patch the newly-frozen card.
-      // Never enqueue a compact cleanup for that same card afterwards: it would
-      // overwrite the authoritative answer that was just patched into place.
-      const competingRows = this.store.listDeliveriesByKeyPrefix(this.config.name, chatId, `${finalDeliveryKey}:`);
-      const finalCardOwnsVisiblePayload = Boolean(liveStatusFinal) && [existing, ...competingRows]
-        .some((row) => row?.targetMessageId === liveStatusFinal!.messageId && this.deliveryOwnsVisiblePayload(row));
-
-      if (liveStatusFinal && existing?.targetMessageId !== liveStatusFinal.messageId && !finalCardOwnsVisiblePayload) {
-        const cleanupJson = JSON.stringify(liveStatusFinal);
-        const cleanupId = this.store.enqueueDelivery({
-          sessionKey: this.deliverySessionKey(chatId),
-          chatId,
-          botName: this.config.name,
-          sourceType: `${sourceType}_status_cleanup`,
-          sourceId: `${sourceId}:status-cleanup:${liveStatusFinal.messageId}`,
-          deliveryKey: `${finalDeliveryKey}:status-cleanup:${liveStatusFinal.messageId}`,
-          contentHash: "",
-          content: "",
-          attachmentsJson: "[]",
-          replyToMessageId: replyToMessageId || "",
-          deliveryMode: "patch_live_status",
-          targetMessageId: liveStatusFinal.messageId,
-          deliveryMetaJson: cleanupJson,
-          textDelivered: true,
-          cleanupPending: true,
-        });
-        if (cleanupId) await this.dispatchPendingDeliveries(chatId, replyToMessageId);
-      }
       return;
     }
     await this.dispatchPendingDeliveries(chatId, replyToMessageId);
@@ -2401,36 +2310,36 @@ export class FeishuBot {
         try {
           const attachments = JSON.parse(item.attachmentsJson || "[]") as BridgeAttachment[];
 
-          // Text first. A patch error is ambiguous: Feishu may have applied the
-          // patch but timed out returning the response. Do NOT immediately create
-          // a second visible answer. Retry the same idempotent patch; only after
-          // the retry budget is exhausted do we fall back to a new message.
+          // Final text is always sent as a NEW message. Never patch it into the
+          // older live-status card: user messages inserted during the run must
+          // stay above the eventual final answer, not below it.
           if (item.content.trim() && !item.textDelivered) {
             const replyTarget = item.replyToMessageId || replyToMessageId;
-            const shouldReplyToSource = replyTarget && (item.sourceType === "assistant_visible" || item.sourceType === "verbose_transcript" || item.sourceType === "provider_error" || item.sourceType === "delayed_error");
-            if (item.deliveryMode === "patch_live_status" && item.targetMessageId) {
-              try {
-                const meta = JSON.parse(item.deliveryMetaJson || "{}") as LiveStatusFinalMeta;
-                await this.patchFinalAnswerCard(item.targetMessageId, item.content, meta, chatId);
-                this.store.markDeliveryTextDelivered(item.id);
-              } catch (patchErr) {
-                if (item.attempts + 1 < DELIVERY_MAX_ATTEMPTS) throw patchErr;
-                console.warn(`[${this.config.name}] final-card patch exhausted; falling back to new message:`, this.errorSummary(patchErr));
-                if (shouldReplyToSource) {
-                  try { await this.replyMessage(replyTarget, item.content); }
-                  catch { await this.sendMessage(chatId, item.content); }
-                } else {
-                  await this.sendMessage(chatId, item.content);
-                }
-                this.store.markDeliveryTextDeliveredWithCleanup(item.id);
-              }
+            const shouldReplyToSource = Boolean(replyTarget) && (
+              item.sourceType.startsWith("assistant_visible")
+              || item.sourceType === "verbose_transcript"
+              || item.sourceType === "provider_error"
+              || item.sourceType === "delayed_error"
+            );
+            let finalModel: string | undefined;
+            try {
+              const meta = JSON.parse(item.deliveryMetaJson || "{}") as { model?: string };
+              finalModel = typeof meta.model === "string" && meta.model.trim() ? meta.model.trim() : undefined;
+            } catch { /* legacy/malformed metadata: send without model footer */ }
+
+            if (shouldReplyToSource) {
+              try { await this.replyFinalMessage(replyTarget!, item.content, finalModel); }
+              catch { await this.sendFinalMessage(chatId, item.content, finalModel); }
             } else {
-              if (shouldReplyToSource) {
-                try { await this.replyMessage(replyTarget, item.content); }
-                catch { await this.sendMessage(chatId, item.content); }
-              } else {
-                await this.sendMessage(chatId, item.content);
-              }
+              await this.sendFinalMessage(chatId, item.content, finalModel);
+            }
+
+            // Rows created by v1.4.3 may still target a live-status card. Preserve
+            // restart compatibility: send their text as a new message, then
+            // collapse the old status card in the cleanup stage below.
+            if (item.deliveryMode === "patch_live_status" && item.targetMessageId) {
+              this.store.markDeliveryTextDeliveredWithCleanup(item.id);
+            } else {
               this.store.markDeliveryTextDelivered(item.id);
             }
           }
@@ -2660,7 +2569,6 @@ export class FeishuBot {
       const roundMarker = `—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
       displayReply = `${displayReply}\n\n${roundMarker}`;
     }
-    let finalStatusMeta: LiveStatusFinalMeta | undefined;
     if (isVisible || parsedReply.attachments.length > 0) {
       const storedContent = [displayReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
         .filter(Boolean)
@@ -2674,9 +2582,6 @@ export class FeishuBot {
         timestamp: Date.now(),
       });
       try {
-        if (isVisible || parsedReply.attachments.length > 0) {
-          finalStatusMeta = await liveStatus?.prepareTerminalDelivery(false);
-        }
         await this.enqueueAndDispatchDelivery(
           chatId,
           "discussion",
@@ -2685,10 +2590,10 @@ export class FeishuBot {
           parsedReply.attachments,
           undefined,
           undefined,
-          finalStatusMeta,
+          this.config.model,
         );
       } catch (err) {
-        if (!finalStatusMeta) await liveStatus?.fail().catch(() => {});
+        await liveStatus?.fail().catch(() => {});
         throw err;
       }
     }
@@ -2696,7 +2601,7 @@ export class FeishuBot {
     // status card with a "no content" summary, not a plain done summary.
     if (!isVisible && parsedReply.attachments.length === 0) {
       await liveStatus?.noReply().catch(() => {});
-    } else if (!finalStatusMeta) {
+    } else {
       await liveStatus?.complete().catch(() => {});
     }
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
@@ -2712,7 +2617,6 @@ export class FeishuBot {
       const summary = this.completionSummary({
         toolCalls: view.toolCalls,
         elapsed: view.elapsed,
-        model: view.model,
         locale: en ? "en" : "zh",
       }, statusEmoji);
       return {
@@ -2745,11 +2649,10 @@ export class FeishuBot {
       elements.push({ tag: "markdown", content: en ? "_working…_" : "_正在启动…_" });
     }
     elements.push({ tag: "hr" });
-    // Footer: elapsed time + model name.
-    const footerBits: string[] = [];
-    footerBits.push(en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`);
-    if (view.model) footerBits.push(`🧠 ${this.escapeCardText(view.model)}`);
-    elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
+    // Running/failed status owns timing; model attribution belongs to the final
+    // reply card so the two messages have clear, non-duplicated responsibilities.
+    const footer = en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`;
+    elements.push({ tag: "markdown", content: `<font color='grey'>${footer}</font>` });
     const template = view.state === "failed" ? "orange" : "blue";
     return {
       schema: "2.0",
@@ -2916,9 +2819,20 @@ export class FeishuBot {
     await this.client.im.v1.message.delete({ path: { message_id: messageId } });
   }
 
+  private async replyFinalMessage(messageId: string, text: string, model?: string): Promise<string | undefined> {
+    if (!model?.trim()) return this.replyMessage(messageId, text);
+    this.replyModelFooters.set(messageId, model.trim());
+    try {
+      return await this.replyMessage(messageId, text);
+    } finally {
+      this.replyModelFooters.delete(messageId);
+    }
+  }
+
   private async replyMessage(messageId: string, text: string): Promise<string | undefined> {
     // Use Feishu CardKit v2 markdown component for full Markdown rendering.
-    const card = this.buildMarkdownCard(text);
+    const model = this.replyModelFooters.get(messageId);
+    const card = this.buildMarkdownCard(text, model);
     try {
       const res = await this.client.im.message.reply({
         path: { message_id: messageId },
@@ -2929,11 +2843,12 @@ export class FeishuBot {
       });
       return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch {
-      // Fallback to plain text if card fails
+      // Fallback to plain text if card fails; retain model attribution.
+      const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}` : text;
       const res = await this.client.im.message.reply({
         path: { message_id: messageId },
         data: {
-          content: JSON.stringify({ text }),
+          content: JSON.stringify({ text: fallbackText }),
           msg_type: "text",
         },
       });
@@ -3246,8 +3161,19 @@ export class FeishuBot {
   /**
    * Send a proactive message to a chat (not a reply).
    */
+  private async sendFinalMessage(chatId: string, text: string, model?: string): Promise<string | undefined> {
+    if (!model?.trim()) return this.sendMessage(chatId, text);
+    this.sendModelFooters.set(chatId, model.trim());
+    try {
+      return await this.sendMessage(chatId, text);
+    } finally {
+      this.sendModelFooters.delete(chatId);
+    }
+  }
+
   private async sendMessage(chatId: string, text: string): Promise<string | undefined> {
-    const card = this.buildMarkdownCard(text);
+    const model = this.sendModelFooters.get(chatId);
+    const card = this.buildMarkdownCard(text, model);
     try {
       const res = await this.client.im.message.create({
         params: { receive_id_type: "chat_id" },
@@ -3262,13 +3188,14 @@ export class FeishuBot {
     } catch (err) {
       console.warn(`[${this.config.name}] sendMessage interactive failed:`, JSON.stringify((err as any)?.response?.data || (err as any)?.data || { message: (err as Error).message }));
       if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
-      // Fallback to plain text
+      // Fallback to plain text; retain model attribution.
       try {
+        const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}` : text;
         const res = await this.client.im.message.create({
           params: { receive_id_type: "chat_id" },
           data: {
             receive_id: chatId,
-            content: JSON.stringify({ text }),
+            content: JSON.stringify({ text: fallbackText }),
             msg_type: "text",
           },
         });
