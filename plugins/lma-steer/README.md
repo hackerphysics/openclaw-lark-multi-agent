@@ -1,45 +1,38 @@
-# lma-steer
+# lma-steer (legacy compatibility plugin)
 
-An OpenClaw plugin bundled with **openclaw-lark-multi-agent**. It registers a
-Gateway method `lma.steer` that the bridge uses to inject a message into an
-**active** OpenClaw run at the next tool-call boundary — so a user can nudge or
-correct a long-running task in real time instead of waiting for it to finish.
+This plugin is retained for older `openclaw-lark-multi-agent` deployments that
+called the private `lma.steer` Gateway method.
 
-## Why a plugin
+Current LMA releases on OpenClaw 2026.8+ do **not** use this plugin. They submit
+mid-run input through the public protocol API:
 
-Native `chat.send` with `queue.mode=steer` only acks `{status:"started"}` — it
-cannot tell the bridge whether the message actually steered into the active run,
-was queued as a followup, or was rejected. This plugin uses the runtime
-primitives `resolveActiveEmbeddedRunSessionId` + `queueAgentHarnessMessage`,
-which expose that distinction, so the bridge can render an accurate Feishu
-reaction.
-
-## Install
-
-From an installed `openclaw-lark-multi-agent`:
-
-```bash
-openclaw-lark-multi-agent install-steer-plugin
+```text
+chat.send { queueMode: "steer" }
 ```
 
-Then restart the OpenClaw gateway so it loads the plugin:
+The public path owns admission, while LMA retains its durable fallback trigger
+until a matching `session.message` confirms transcript consumption. Only then
+is the Feishu acknowledgement changed from Typing to Get, so provisional
+acceptance and actual model consumption remain distinct.
+
+## Legacy installation
+
+Only install this plugin when maintaining an older LMA release that explicitly
+requires `lma.steer`:
 
 ```bash
-systemctl --user restart openclaw-gateway.service
+lma install-steer-plugin
 ```
 
-Verify (an idle session returns `no_active_run`):
+Restart the OpenClaw Gateway after installation. For new deployments, skip this
+step.
 
-```bash
-openclaw gateway call lma.steer --params '{"sessionKey":"test","text":"ping"}'
-```
+## Legacy method
 
-## Gateway method
-
-`lma.steer`
-
+- method: `lma.steer`
 - params: `{ sessionKey: string, text: string }`
 - result: `{ status: "steered" | "no_active_run" | "rejected", sessionId?: string }`
-  - `steered` — queued into the active run; seen at the next tool-call boundary
-  - `no_active_run` — no active run; caller should send as a normal new message
-  - `rejected` — active run refused the injection (e.g. compacting / not streaming)
+
+Its synchronous `steered` result reflects immediate queue eligibility only; it
+cannot prove later runtime consumption. This limitation is why current LMA uses
+the public native steering path instead.

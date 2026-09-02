@@ -408,6 +408,14 @@ v1 行为边界：如果消息已经进入 OpenClaw 正在处理，暂不 abort�
 
 如果 Agent 需要发送生成的文件、图片或文档，应使用 bridge attachment marker 协议，而不是直接调用飞书消息工具。桥接层会从可见回复中剥离 marker，校验文件路径位于配置的附件目录下，然后上传/发送附件，并写入本地上下文。Markdown 文档也可以通过这个路径转换成飞书云文档。
 
+## OpenClaw 2026.8 兼容性
+
+LMA 以 Gateway protocol 4 为基线，并使用 `openclaw@2026.8.2` 构建和测试。OpenClaw 2026.8 把活动 session row 与 transcript 迁入每个 Agent 的 SQLite 数据库。LMA 不再直接查找或改写 JSONL：`/compact` 先调用语义化 `sessions.compact`，如果语义压缩无法执行，再通过同一个 Gateway RPC 的 `maxLines` 安全保留最近一段转录。可用 `OPENCLAW_LARK_MULTI_AGENT_COMPACT_FALLBACK_MAX_LINES` 调整默认保留数量（默认 `200`，最小 `20`）。
+
+新版把模型元数据与模型覆盖允许列表分开。如果 `agents.defaults.modelPolicy.allow` 非空，LMA 配置中的每个模型都必须被该列表的精确模型引用或 `provider/*` 通配符允许。遇到拒绝时，LMA 会直接报告 model policy 错误，不再错误记录“模型已确保”。
+
+执行中插入的消息改用公开的 `chat.send { queueMode: "steer" }`。RPC 成功返回只是暂时接受；LMA 会继续保留本地 pending trigger，只有匹配的 `session.message` 确认消息已写入转录并被消费后才清除，同时把飞书标记从 Typing 切换为 Get。异步 `error`/`aborted` 按 runId 投递，未消费的输入仍由普通队列兜底。这样不再依赖无法表达后续异步拒绝的旧同步插件原语。
+
 ## Live Status 与最终回复
 
 非 verbose 模式下，执行过程显示一张可更新的 live status 卡片。运行中显示最近活动和耗时；完成后收缩为“累计工具调用次数 + 总耗时”。

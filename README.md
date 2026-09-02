@@ -99,22 +99,20 @@ On Windows, install [NSSM](https://nssm.cc/download), make sure `nssm.exe` is in
 lma install-windows-service
 ```
 
-### Optional: real-time steering plugin
+### Real-time steering
 
-To let users nudge/correct a long-running agent turn in real time (instead of
-waiting for it to finish), install the bundled `lma-steer` OpenClaw plugin:
+When the agent is mid-run and a new message arrives, the bridge submits it via
+OpenClaw's public `chat.send` API with `queueMode: "steer"`. The RPC
+acknowledgment is provisional: LMA retains its durable pending trigger until a
+matching `session.message` proves transcript commitment/consumption, and only
+then switches Feishu from Typing to Get. Async `error`/`aborted` terminals are
+routed by run id, while unconsumed input remains available for normal queue
+fallback. This replaces the deprecated synchronous plugin primitive whose
+boolean could not represent later runtime rejection.
 
-```bash
-lma install-steer-plugin
-# then restart the OpenClaw gateway so it loads the plugin:
-systemctl --user restart openclaw-gateway.service
-```
-
-When the agent is mid-run and a new message arrives, the bridge injects it into
-the active run at the next tool-call boundary (Feishu shows the "Get" reaction).
-Without the plugin, the bridge falls back to queuing the message until the run
-finishes — everything still works, just without real-time steering. See
-`plugins/lma-steer/README.md` for details.
+OpenClaw 2026.8+ no longer requires the bundled `lma-steer` plugin. The
+`install-steer-plugin` command remains temporarily for older installations but
+current LMA releases do not call its private Gateway method.
 
 Useful CLI commands:
 
@@ -124,7 +122,7 @@ lma doctor
 lma start [config]
 lma init [--state-dir DIR] [--force]
 lma install-systemd [--user|--system] [--state-dir DIR]
-lma install-steer-plugin [--no-force]
+lma install-steer-plugin [--no-force]  # legacy; not needed on OpenClaw 2026.8+
 ```
 
 ## Quick start from source
@@ -449,6 +447,26 @@ Assistant replies are sent as Feishu CardKit v2 cards. Markdown is preprocessed 
 - GitHub-style pipe tables are converted into native CardKit `table` elements.
 
 For generated files/images/documents, agents should use the bridge attachment marker protocol instead of calling Feishu messaging tools directly. The bridge strips the marker from the visible reply, validates the file path under the configured attachment directory, uploads/sends the attachment, and records it in local context. Markdown documents can be converted into Feishu cloud documents through this path.
+
+## OpenClaw 2026.8 compatibility
+
+LMA targets Gateway protocol 4 and is built/tested against `openclaw@2026.8.2`.
+OpenClaw 2026.8 moves active session rows and transcripts into the per-agent
+SQLite database. LMA never opens that database or rewrites archived JSONL:
+`/compact` first requests semantic `sessions.compact`, then uses the same
+Gateway RPC with a bounded `maxLines` tail only if semantic compaction cannot
+run. Set `OPENCLAW_LARK_MULTI_AGENT_COMPACT_FALLBACK_MAX_LINES` to change the
+default tail size (`200`, minimum `20`).
+
+OpenClaw 2026.8 also separates model metadata from the override allowlist. Every
+model configured in LMA must be permitted by `agents.defaults.modelPolicy.allow`
+when that list is non-empty. Exact refs and `provider/*` wildcards are accepted.
+LMA now surfaces a model-policy rejection instead of logging a false “model
+ensured” success.
+
+Mid-run messages use the public `chat.send { queueMode: "steer" }` path. LMA
+keeps the durable trigger until `session.message` confirms consumption; this is
+also the signal for the visible Typing-to-Get transition.
 
 ## Live status
 

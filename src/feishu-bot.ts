@@ -11,7 +11,6 @@ import { basename, extname, join, resolve } from "path";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
-import { resolveSessionFilePath, toolTrimCompactFile } from "./session-file-compactor.js";
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -46,9 +45,13 @@ function steerInjectionPrefix(en: boolean): string {
     || "[New message inserted by the user mid-task; please handle it together with the current task]";
   return en ? enText : zh;
 }
-// How many of the most-recent tool calls (and their results) tool-trim keeps
-// intact — recent tool calls may still be relevant to the agent's next step.
-function toolTrimKeepRecent(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_TOOLTRIM_KEEP_RECENT || 3); }
+// Emergency transcript trim used only when semantic compaction cannot run.
+// The Gateway owns the transcript store (JSONL before 2026.8, SQLite after it),
+// so LMA must use sessions.compact instead of mutating storage directly.
+function compactFallbackMaxLines(): number {
+  const value = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_FALLBACK_MAX_LINES || 200);
+  return Number.isFinite(value) ? Math.max(20, Math.floor(value)) : 200;
+}
 // After a reply is delivered, if context usage reaches this percent, send the
 // user a one-time alert to compact. 0 disables the alert.
 function contextAlertPct(): number { return Number(process.env.OPENCLAW_LARK_MULTI_AGENT_CONTEXT_ALERT_PCT || 80); }
@@ -131,8 +134,15 @@ export class FeishuBot {
   private lastRealDeliveryAt: Map<string, number> = new Map();
   /** Per-chat: whether we've already sent the high-context alert this cycle. */
   private contextAlerted: Map<string, boolean> = new Map();
-  /** Active chatSend trigger target so final replies and proactive session.message share one delivery key. */
-  private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; timer?: ReturnType<typeof setTimeout>; liveStatus?: LiveStatusController }> = new Map();
+  /** Active pre-admission target for the current chat operation. */
+  private activeDeliveryTargets: Map<string, { triggerId: number; messageId: string; token: symbol; runId?: string; timer?: ReturnType<typeof setTimeout>; liveStatus?: LiveStatusController }> = new Map();
+  /** Stable targets for concurrent runs in one chat. A steer admission can
+   * become an ordinary run while another run remains active. */
+  private deliveryTargetsByRun: Map<string, { triggerId: number; messageId: string; liveStatus?: LiveStatusController; timer?: ReturnType<typeof setTimeout> }> = new Map();
+  /** Provisional native-steer correlations keyed by durable message row. If the
+   * message falls back to a normal run, cancel these before submission so a
+   * later identical steer cannot consume the stale observer/correlation. */
+  private pendingSteerCleanups: Map<number, () => void> = new Map();
   private adminOpenId: string | null;
   private locale: Locale;
   private configPath?: string;
@@ -274,7 +284,10 @@ export class FeishuBot {
         console.log(`[${this.config.name}] Session created: ${sessionKey} (model: ${this.config.model})`);
       }
     } catch (err) {
+      // Session/model setup is authoritative. Propagate policy/capability errors
+      // so the queue can notify the user and never continue on the wrong model.
       console.warn(`[${this.config.name}] ensureSession error:`, (err as Error).message);
+      throw err;
     }
 
     this.initializedSessions.add(sessionKey);
@@ -287,7 +300,11 @@ export class FeishuBot {
         console.log(`[${this.config.name}] ${sourceType === "verbose_transcript" ? "Verbose transcript" : "Proactive message"} for ${chatId.slice(-8)}`);
         const parsed = this.extractBridgeAttachments(text);
         if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) this.cancelDelayedFailure(chatId);
-        const activeTarget = this.activeDeliveryTargets.get(chatId);
+        const runTarget = meta?.runId ? this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId, meta.runId)) : undefined;
+        const candidateTarget = this.activeDeliveryTargets.get(chatId);
+        const activeTarget = runTarget || (candidateTarget && (!candidateTarget.runId || !meta?.runId || candidateTarget.runId === meta.runId)
+          ? candidateTarget
+          : undefined);
         try {
           await this.enqueueAndDispatchDelivery(
             chatId,
@@ -301,6 +318,7 @@ export class FeishuBot {
           );
           if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
             await activeTarget?.liveStatus?.complete().catch(() => {});
+            if (meta?.runId && runTarget) this.releaseRunDeliveryTargetAfter(chatId, meta.runId, 30_000);
           }
         } catch (err) {
           if (sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
@@ -971,42 +989,80 @@ export class FeishuBot {
         // Wrap the message so the agent knows it is a NEW user message inserted
         // mid-task. The live-status line and reactions still key off the original.
         const steerWrapped = `${steerInjectionPrefix(this.isEn(chatId))}\n${cleanText}`;
-        const steer = await this.openclawClient.steer(sessionKeyForSteer, steerWrapped, cleanText).catch(() => ({ status: "unavailable" as const }));
-        if (steer.status === "steered") {
-          // Accepted into the active run's steer queue, but NOT yet consumed by
-          // the model. Show "Typing" (awaiting insertion) now; flip to "Get" only
-          // when the model actually consumes it at a tool-call boundary (a
-          // matching sessionUser event), which also renders it on the live-status
-          // card in correct time order.
-          await this.addReaction(messageId, "Typing").catch(() => {});
-          pending.push({ messageId, emoji: "Typing", rowId: insertedId });
-          this.pendingAckMessages.set(chatId, pending);
-          const norm = cleanText.replace(/\s+/g, " ").trim();
-          this.openclawClient.onSteerConsumed(sessionKeyForSteer, (consumedText) => {
-            const cn = (consumedText || "").replace(/\s+/g, " ").trim();
-            if (cn !== norm && !cn.includes(norm)) return false; // not ours; keep waiting
-            // Flip Typing -> Get now that the model has actually read it.
-            void this.removeReaction(messageId, "Typing").catch(() => {});
-            void this.addReaction(messageId, "Get").catch(() => {});
-            const acks = this.pendingAckMessages.get(chatId) || [];
-            for (const a of acks) if (a.messageId === messageId) a.emoji = "Get";
-            this.pendingAckMessages.set(chatId, acks);
-            return true; // one-shot: matched, remove this callback
-          });
-          console.log(
-            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, STEERED (awaiting consumption): "${cleanText.substring(0, 50)}..."`
-          );
-          // The message is already in DB with a pending trigger. Clear that
-          // trigger so it is NOT re-run as a separate follow-up batch after the
-          // current run ends — it has already been injected into this run.
-          if (insertedId > 0) this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
-          return;
-        }
-        // Could not steer (no active run raced to idle, rejected, or plugin
-        // unavailable): fall back to the original behavior — queue and wait.
+        // Register the consumption observer before submitting so a fast
+        // session.message cannot race past the Feishu reaction transition.
         await this.addReaction(messageId, "Typing").catch(() => {});
         pending.push({ messageId, emoji: "Typing", rowId: insertedId });
         this.pendingAckMessages.set(chatId, pending);
+        const norm = cleanText.replace(/\s+/g, " ").trim();
+        const stopWatchingConsumption = this.openclawClient.onSteerConsumed(sessionKeyForSteer, steerWrapped, (consumedText) => {
+          const cn = (consumedText || "").replace(/\s+/g, " ").trim();
+          if (cn !== norm && !cn.includes(norm)) return false;
+          // Only transcript commitment/consumption transfers durable custody.
+          // Until this point the local pending trigger remains the fallback for
+          // detached dispatch rejection or an admission that never consumed.
+          if (insertedId > 0) {
+            this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
+            this.pendingSteerCleanups.delete(insertedId);
+          }
+          void this.removeReaction(messageId, "Typing").catch(() => {});
+          void this.addReaction(messageId, "Get").catch(() => {});
+          const acks = this.pendingAckMessages.get(chatId) || [];
+          for (const a of acks) if (a.messageId === messageId) a.emoji = "Get";
+          this.pendingAckMessages.set(chatId, acks);
+          return true;
+        });
+        const previousActiveTarget = this.activeDeliveryTargets.get(chatId);
+        // Install the new Feishu delivery target before admission. OpenClaw may
+        // race from "old run still active" to "dispatch a new run" while
+        // handling queueMode=steer, and that new run can emit events before the
+        // RPC response reaches LMA. Either outcome now routes to this message.
+        const releaseSteerDeliveryTarget = this.setActiveDeliveryTarget(chatId, insertedId, messageId);
+        const provisionalTarget = this.activeDeliveryTargets.get(chatId);
+        const steer = await this.openclawClient.steer(sessionKeyForSteer, steerWrapped, cleanText).catch(() => ({ status: "unavailable" as const }));
+        if (steer.status === "steered") {
+          if (insertedId > 0) {
+            this.pendingSteerCleanups.set(insertedId, () => {
+              stopWatchingConsumption();
+              if ("cancelPending" in steer) steer.cancelPending?.();
+            });
+          }
+          if (provisionalTarget && steer.runId) {
+            provisionalTarget.runId = steer.runId;
+            this.bindRunDeliveryTarget(chatId, steer.runId, provisionalTarget);
+            this.releaseRunDeliveryTargetAfter(chatId, steer.runId, 30 * 60_000);
+          }
+          // A steer admission may become an ordinary new run. Keep its run-bound
+          // reply target long enough for a real tool-heavy run; stale targets are
+          // harmless because later runIds no longer match.
+          releaseSteerDeliveryTarget(30 * 60_000);
+          // RPC acknowledgment is provisional. Keep the durable pending trigger
+          // until session.message confirms consumption; otherwise the normal
+          // queue drains it after the current run.
+          console.log(
+            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, steer accepted (awaiting transcript consumption): "${cleanText.substring(0, 50)}..."`
+          );
+          return;
+        }
+        // Native steer was not accepted. Restore the previous run's routing
+        // target and keep the already-created trigger/reaction for normal drain.
+        stopWatchingConsumption();
+        if ("cancelPending" in steer) steer.cancelPending?.();
+        const currentTarget = this.activeDeliveryTargets.get(chatId);
+        if (currentTarget && currentTarget.token === provisionalTarget?.token) {
+          if (currentTarget.timer) clearTimeout(currentTarget.timer);
+          this.activeDeliveryTargets.delete(chatId);
+          if (previousActiveTarget) {
+            const releaseRestoredTarget = this.setActiveDeliveryTarget(
+              chatId,
+              previousActiveTarget.triggerId,
+              previousActiveTarget.messageId,
+            );
+            const restored = this.activeDeliveryTargets.get(chatId);
+            if (restored) restored.liveStatus = previousActiveTarget.liveStatus;
+            releaseRestoredTarget();
+          }
+        }
         console.log(
           `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}), queuing: "${cleanText.substring(0, 50)}..."`
         );
@@ -1240,6 +1296,16 @@ export class FeishuBot {
       const runStartStopEpoch = this.stopEpoch.get(chatId) || 0;
       const mergedContent = mergedTriggers.map((m) => m.content).join("\n");
       const mergedTriggerIds = mergedTriggers.map((m) => m.id || 0).filter(Boolean);
+      // These rows are now taking the ordinary queue path. Remove any stale
+      // provisional native-steer correlation before chat.send so a later
+      // identical steer cannot acknowledge the wrong Feishu message.
+      for (const id of mergedTriggerIds) {
+        const cleanup = this.pendingSteerCleanups.get(id);
+        if (cleanup) {
+          cleanup();
+          this.pendingSteerCleanups.delete(id);
+        }
+      }
       const droppedTriggerIds = droppedMergedTriggers.map((m) => m.id || 0).filter(Boolean);
       const mergedTriggerIdSet = new Set(mergedTriggerIds);
       const completedTriggerIdSet = new Set([...droppedTriggerIds, ...mergedTriggerIds]);
@@ -1291,7 +1357,33 @@ export class FeishuBot {
       const processedMessages = [...contextMsgs, ...mergedTriggers].filter((m) => m.id);
 
       const queueStartedAt = Date.now();
-      const sessionKey = await this.ensureSession(chatId);
+      let sessionKey: string;
+      try {
+        sessionKey = await this.ensureSession(chatId);
+      } catch (err) {
+        // Model policy/capability failures happen before chat.send. Clear the
+        // busy marker, report the actionable error, and retire only this batch
+        // so the chat cannot remain wedged indefinitely.
+        this.busyChats.set(chatId, 0);
+        const errorText = this.formatUserVisibleError(err);
+        if (lastHuman.messageId) {
+          await this.enqueueAndDispatchDelivery(
+            chatId,
+            "provider_error",
+            `trigger:${triggerId}:session-setup-error`,
+            errorText,
+            [],
+            lastHuman.messageId,
+            `trigger:${triggerId}:session-setup-error`,
+          ).catch(() => {});
+        }
+        for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
+        this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, `${this.config.name}:${chatId}:${triggerId}:session-setup-failed`);
+        if (mergedTriggerIds.length > 0) this.store.markSynced(this.config.name, chatId, Math.max(...mergedTriggerIds));
+        const pendingAcks = this.pendingAckMessages.get(chatId) || [];
+        this.pendingAckMessages.set(chatId, pendingAcks.filter((ack) => !completedTriggerIdSet.has(ack.rowId)));
+        break;
+      }
 
       console.log(
         `[${this.config.name}] Sending ${mergedTriggers.length} trigger(s) as 1 run to OpenClaw for ${chatId.slice(-8)} (context=${contextMsgs.length}, dropped=${droppedTriggerIds.length})`
@@ -1360,6 +1452,12 @@ export class FeishuBot {
             },
             onSubmitted: (runId: string) => {
               runAcceptedByOpenClaw = true;
+              const target = this.activeDeliveryTargets.get(chatId);
+              if (target?.triggerId === triggerId) {
+                target.runId = runId;
+                this.bindRunDeliveryTarget(chatId, runId, target);
+                this.releaseRunDeliveryTargetAfter(chatId, runId, 30 * 60_000);
+              }
               // Refine state for logs/idempotent sync rows when OpenClaw returns
               // a runId. markSubmittedBatch is idempotent due to local flags and
               // INSERT OR IGNORE in message_sync.
@@ -2083,16 +2181,48 @@ export class FeishuBot {
     this.delayedFailureTimers.delete(chatId);
   }
 
-  private setActiveDeliveryTarget(chatId: string, triggerId: number, messageId: string): () => void {
+  private deliveryRunTargetKey(chatId: string, runId: string): string {
+    return `${chatId}\u0000${runId}`;
+  }
+
+  private bindRunDeliveryTarget(
+    chatId: string,
+    runId: string,
+    target: { triggerId: number; messageId: string; liveStatus?: LiveStatusController },
+  ): void {
+    if (!runId) return;
+    const key = this.deliveryRunTargetKey(chatId, runId);
+    const previous = this.deliveryTargetsByRun.get(key);
+    if (previous?.timer) clearTimeout(previous.timer);
+    this.deliveryTargetsByRun.set(key, {
+      triggerId: target.triggerId,
+      messageId: target.messageId,
+      liveStatus: target.liveStatus,
+    });
+  }
+
+  private releaseRunDeliveryTargetAfter(chatId: string, runId: string, delayMs: number): void {
+    const key = this.deliveryRunTargetKey(chatId, runId);
+    const target = this.deliveryTargetsByRun.get(key);
+    if (!target) return;
+    if (target.timer) clearTimeout(target.timer);
+    const timer = setTimeout(() => {
+      if (this.deliveryTargetsByRun.get(key)?.timer === timer) this.deliveryTargetsByRun.delete(key);
+    }, delayMs);
+    timer.unref?.();
+    target.timer = timer;
+  }
+
+  private setActiveDeliveryTarget(chatId: string, triggerId: number, messageId: string): (delayMs?: number) => void {
     const existing = this.activeDeliveryTargets.get(chatId);
     if (existing?.timer) clearTimeout(existing.timer);
     const token = Symbol(`${chatId}:${triggerId}`);
     this.activeDeliveryTargets.set(chatId, { triggerId, messageId, token });
-    return () => {
+    return (delayMs = 60_000) => {
       const timer = setTimeout(() => {
         const current = this.activeDeliveryTargets.get(chatId);
         if (current?.token === token) this.activeDeliveryTargets.delete(chatId);
-      }, 60_000);
+      }, delayMs);
       const current = this.activeDeliveryTargets.get(chatId);
       if (current?.token === token) current.timer = timer;
     };
@@ -2737,8 +2867,8 @@ export class FeishuBot {
       };
     }
     // Running: phase line + ticking elapsed footer.
-    const phaseLine = view.phase === "tool-trim"
-      ? (en ? "🧹 Native compaction is slow — switching to fast trim…" : "🧹 原生压缩较慢，已切换快速压缩…")
+    const phaseLine = view.phase === "transcript-trim"
+      ? (en ? "🧹 Semantic compaction unavailable — trimming transcript safely…" : "🧹 语义压缩不可用，正在安全裁剪转录…")
       : (en ? "🧹 Compacting session…" : "🧹 正在压缩 session…");
     const footer = en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`;
     return {
@@ -3496,25 +3626,24 @@ export class FeishuBot {
    * Handle /compact command: compress session context.
    */
   /**
-   * Compact a session with a fallback chain:
-   *   1. OpenClaw's native (LLM-summary) compaction — best semantics.
-   *   2. If that did not compact (or threw), fall back to "tool-trim": rewrite
-   *      the transcript file to drop tool calls/results while keeping the
-   *      conversation. This needs no model, so it works no matter how large the
-   *      session is (the native path itself fails to fit an oversized session
-   *      into the model). A backup is always written before any file change.
-   * Returns a structured result describing what happened.
+   * Compact a session with a Gateway-owned fallback chain:
+   *   1. Semantic compaction through `sessions.compact`.
+   *   2. If summarization cannot run, ask the same RPC to retain only a bounded
+   *      transcript tail via `maxLines`. This works with legacy JSONL and the
+   *      SQLite session store introduced in OpenClaw 2026.8.x, and preserves
+   *      OpenClaw's write locks, transcript invariants, and migration ownership.
+   *
+   * LMA deliberately never opens or rewrites OpenClaw transcript storage.
    */
   private async compactWithFallback(
     sessionKey: string,
-    onPhase?: (phase: "native" | "tool-trim") => void,
+    onPhase?: (phase: "native" | "transcript-trim") => void,
   ): Promise<{
     compacted: boolean;
-    method: "native" | "tool-trim" | "none";
+    method: "native" | "transcript-trim" | "none";
     reason?: string;
     detail?: string;
   }> {
-    // 1. Native compaction first.
     let nativeReason: string | undefined;
     try {
       const res = await this.openclawClient.compactSession(sessionKey);
@@ -3524,48 +3653,41 @@ export class FeishuBot {
       nativeReason = (err as Error).message;
     }
 
-    // 2. Fall back to tool-trim on the transcript file. Tell the caller so a
-    //    progress card can flip from "compacting" to "fast-trim" (this is the
-    //    slow→still-working transition the user most needs to see).
-    onPhase?.("tool-trim");
-    let sessionId: string | undefined;
+    onPhase?.("transcript-trim");
+    const maxLines = compactFallbackMaxLines();
     try {
-      const info = await this.openclawClient.getSessionInfo(sessionKey);
-      sessionId = info?.session?.sessionId;
-    } catch {
-      // ignore; handled below
+      const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines });
+      if (trimmed?.compacted === true) {
+        const kept = typeof trimmed?.kept === "number" ? trimmed.kept : maxLines;
+        return {
+          compacted: true,
+          method: "transcript-trim",
+          detail: `kept ${kept} transcript events`,
+        };
+      }
+      const trimReason = typeof trimmed?.reason === "string" ? trimmed.reason : undefined;
+      return {
+        compacted: false,
+        method: "none",
+        reason: trimReason || nativeReason || "transcript trim made no change",
+      };
+    } catch (err) {
+      const trimReason = (err as Error).message;
+      return {
+        compacted: false,
+        method: "none",
+        reason: nativeReason
+          ? `semantic compaction: ${nativeReason}; transcript trim: ${trimReason}`
+          : trimReason,
+      };
     }
-    if (!sessionId) {
-      return { compacted: false, method: "none", reason: nativeReason || "could not resolve session file" };
-    }
-    const filePath = resolveSessionFilePath(sessionKey, sessionId);
-    if (!filePath) {
-      return { compacted: false, method: "none", reason: nativeReason || "transcript file not found" };
-    }
-    const trim = toolTrimCompactFile(filePath, toolTrimKeepRecent());
-    if (!trim.ok) {
-      return { compacted: false, method: "none", reason: trim.reason || "tool-trim failed" };
-    }
-    const before = trim.bytesBefore || 0;
-    const after = trim.bytesAfter || 0;
-    if (before > 0 && after >= before) {
-      // Nothing meaningful trimmed.
-      return { compacted: false, method: "none", reason: trim.reason || "no tool content to trim" };
-    }
-    const pct = before > 0 ? Math.round((1 - after / before) * 100) : 0;
-    const mb = (n: number) => `${(n / 1024 / 1024).toFixed(1)}M`;
-    return {
-      compacted: true,
-      method: "tool-trim",
-      detail: `${mb(before)}→${mb(after)} (-${pct}%)`,
-    };
   }
 
   private async handleCompactCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     const en = this.isEn(chatId);
     // Large sessions can take tens of seconds to compact (native compaction may
-    // even time out before the tool-trim fallback kicks in). Show a ticking
+    // even time out before the transcript-trim fallback kicks in). Show a ticking
     // "compacting…" card so the user can SEE it is working instead of staring at
     // nothing and assuming nothing is happening. The card is created lazily, so
     // a fast compaction that finishes quickly never flashes a card at all.
@@ -3577,18 +3699,23 @@ export class FeishuBot {
     progress.start();
     try {
       const r = await this.compactWithFallback(sessionKey, (phase) => {
-        if (phase === "tool-trim") void progress.toToolTrim().catch(() => {});
+        if (phase === "transcript-trim") void progress.toTranscriptTrim().catch(() => {});
       });
       if (r.compacted) {
         // If a card was shown, patch it in place; otherwise (fast finish, no card)
         // fall back to a normal reply so the user still gets confirmation.
-        const detail = r.method === "tool-trim" && r.detail
-          ? (en ? `tool-trim ${r.detail}` : `删工具调用 ${r.detail}`)
+        const localizedTrimDetail = r.detail
+          ?.replace("kept ", en ? "kept " : "保留最近 ")
+          .replace(" transcript events", en ? " transcript events" : " 条转录事件");
+        const detail = r.method === "transcript-trim" && localizedTrimDetail
+          ? (en ? `transcript trim: ${localizedTrimDetail}` : `转录裁剪：${localizedTrimDetail}`)
           : (en ? "native" : "原生压缩");
         await progress.done(detail);
         if (!progress.id) {
-          await this.replyMessage(messageId, r.method === "tool-trim"
-            ? (en ? `✅ Session compacted (tool-trim${r.detail ? " " + r.detail : ""})` : `✅ Session 已压缩（删工具调用${r.detail ? " " + r.detail : ""}）`)
+          await this.replyMessage(messageId, r.method === "transcript-trim"
+            ? (en
+              ? `✅ Session compacted (transcript trim${localizedTrimDetail ? ": " + localizedTrimDetail : ""})`
+              : `✅ Session 已压缩（转录裁剪${localizedTrimDetail ? "：" + localizedTrimDetail : ""}）`)
             : (en ? `✅ Session compacted` : `✅ Session 已压缩`));
         }
       } else {

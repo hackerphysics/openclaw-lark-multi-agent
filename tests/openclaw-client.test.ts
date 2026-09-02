@@ -6,8 +6,8 @@ import { join } from "node:path";
 import { getBridgeAttachmentsDir, getDataDir } from "../src/paths.js";
 
 describe("OpenClawClient protocol compatibility", () => {
-  it("declares compatibility with gateway protocol 3 through 4", () => {
-    expect(GATEWAY_PROTOCOL_MIN).toBe(3);
+  it("targets the canonical OpenClaw Gateway protocol 4", () => {
+    expect(GATEWAY_PROTOCOL_MIN).toBe(4);
     expect(GATEWAY_PROTOCOL_MAX).toBe(4);
   });
 });
@@ -144,7 +144,7 @@ describe("OpenClawClient collectReply", () => {
     });
 
     const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
-    const rejection = expect(replyPromise).rejects.toThrow(/运行超时.*10 分钟.*provider/);
+    const rejection = expect(replyPromise).rejects.toThrow(/等待 Agent 运行结果超时.*10 分钟.*provider.*可能仍在继续/);
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "chat error" } });
     await vi.advanceTimersByTimeAsync(400);
 
@@ -512,15 +512,116 @@ describe("OpenClawClient collectReply", () => {
 
       await Promise.all([
         client.compactSession("s1"),
-        client.compactSession("s2"),
+        client.compactSession("s2", { maxLines: 200 }),
         client.compactSession("s3"),
       ]);
 
       expect(maxActive).toBe(1);
+      expect((client as any).rpc).toHaveBeenCalledWith("sessions.compact", { key: "agent:main:s2", maxLines: 200 }, 10 * 60 * 1000);
     } finally {
       if (previous === undefined) delete process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY;
       else process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY = previous;
     }
+  });
+});
+
+describe("OpenClawClient 2026.8 session model policy", () => {
+  it("does not patch an already-correct canonical model", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).getSessionInfo = vi.fn(async () => ({ session: { modelProvider: "p", model: "m" } }));
+    (client as any).patchSession = vi.fn();
+    await expect(client.ensureModel("s1", "p/m")).resolves.toBe(false);
+    expect((client as any).patchSession).not.toHaveBeenCalled();
+  });
+
+  it("surfaces model-policy rejection instead of claiming the model was ensured", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).getSessionInfo = vi.fn(async () => ({ session: { modelProvider: "old", model: "model" } }));
+    (client as any).patchSession = vi.fn(async () => { throw new Error("model not allowed by agents.defaults.modelPolicy.allow"); });
+    await expect(client.ensureModel("s1", "new/model")).rejects.toThrow(/modelPolicy\.allow/);
+    expect((client as any).patchSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("OpenClawClient native steering", () => {
+  it("uses public chat.send queueMode=steer and waits for transcript consumption", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "started" }));
+
+    await expect(client.steer("agent:main:s1", "wrapped input", "display input")).resolves.toMatchObject({
+      status: "steered",
+      runId: "run-steer",
+      cancelPending: expect.any(Function),
+    });
+    expect((client as any).rpc).toHaveBeenCalledWith("chat.send", expect.objectContaining({
+      sessionKey: "agent:main:s1",
+      message: "wrapped input",
+      queueMode: "steer",
+      deliver: false,
+      idempotencyKey: expect.any(String),
+    }), 10000);
+
+    const consumed = vi.fn(() => true);
+    client.onSteerConsumed("s1", "wrapped input", consumed);
+    expect((client as any).handleSteerConsumption("agent:main:s1", "prefix wrapped input suffix")).toBe(true);
+    expect(consumed).toHaveBeenCalledWith("wrapped input");
+  });
+
+  it("does not claim a rejected native steer as delivered", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "error" }));
+    await expect(client.steer("s1", "input")).resolves.toEqual({ status: "unavailable" });
+    expect((client as any).handleSteerConsumption("s1", "input")).toBe(false);
+  });
+
+  it("cancels stale provisional correlation before an identical later steer", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "started" }));
+    const stale = await client.steer("s1", "same text", "old");
+    stale.cancelPending?.();
+    const fresh = vi.fn(() => true);
+    await client.steer("s1", "same text", "new");
+    client.onSteerConsumed("s1", "same text", fresh);
+
+    expect((client as any).handleSteerConsumption("s1", "same text")).toBe(true);
+    expect(fresh).toHaveBeenCalledOnce();
+    expect((client as any).handleSteerConsumption("s1", "same text")).toBe(false);
+  });
+
+  it("correlates duplicate and overlapping steer text one transcript event at a time", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "started" }));
+    const first = vi.fn(() => true);
+    const duplicate = vi.fn(() => true);
+    const longer = vi.fn(() => true);
+
+    await client.steer("s1", "yes", "yes");
+    client.onSteerConsumed("s1", "yes", first);
+    await client.steer("s1", "yes", "yes duplicate");
+    client.onSteerConsumed("s1", "yes", duplicate);
+    await client.steer("s1", "yes please", "yes please");
+    client.onSteerConsumed("s1", "yes please", longer);
+
+    expect((client as any).handleSteerConsumption("s1", "yes please")).toBe(true);
+    expect(longer).toHaveBeenCalledTimes(1);
+    expect(first).not.toHaveBeenCalled();
+    expect(duplicate).not.toHaveBeenCalled();
+
+    expect((client as any).handleSteerConsumption("s1", "yes")).toBe(true);
+    expect(first).toHaveBeenCalledTimes(1);
+    expect(duplicate).not.toHaveBeenCalled();
+
+    expect((client as any).handleSteerConsumption("s1", "yes")).toBe(true);
+    expect(duplicate).toHaveBeenCalledTimes(1);
+    expect((client as any).handleSteerConsumption("s1", "yes")).toBe(false);
+  });
+
+  it("deduplicates canonical tool events against legacy item mirrors", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    expect((client as any).claimToolEvent("agent:main:s1", "tool:call-1", "start", 1000)).toBe(true);
+    expect((client as any).claimToolEvent("s1", "call-1", "start", 1001)).toBe(false);
+    expect((client as any).claimToolEvent("s1", "call-1", "end", 1002)).toBe(true);
+    expect((client as any).claimToolEvent("agent:main:s1", "tool:call-1", "error", 1003)).toBe(false);
   });
 });
 
@@ -632,29 +733,70 @@ describe("OpenClawClient proactive delivery mute", () => {
     expect(callback).toHaveBeenCalledWith(longText, { sourceType: "verbose_transcript" });
   });
 
-  it("keeps proactive transcript suppressed in verbose mode while chatSend owns delivery", () => {
+  it("suppresses only the bridge-owned run while allowing another run in the same session", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const callback = vi.fn();
     (client as any).sessionMessageCallbacks.set("s1", callback);
     (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
-    (client as any).suppressedSessions.add("s1");
-    (client as any).suppressedSessions.add("agent:main:s1");
-    client.setVerboseTranscriptDelivery("s1", true);
+    (client as any).ownDeliveryRun("owned-run");
 
-    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: [{ type: "text", text: "我先看代码" }, { type: "toolCall", name: "read" }] })).toBe(false);
+    expect((client as any).handleProactiveSessionMessage(
+      "agent:main:s1",
+      { role: "assistant", content: "owned answer" },
+      "owned-run",
+    )).toBe(false);
     expect(callback).not.toHaveBeenCalled();
+
+    expect((client as any).handleProactiveSessionMessage(
+      "agent:main:s1",
+      { role: "assistant", content: "separate answer" },
+      "steer-fallback-run",
+    )).toBe(true);
+    expect(callback).toHaveBeenCalledWith("separate answer", { runId: "steer-fallback-run" });
   });
 
-  it("drops proactive assistant messages while chatSend owns delivery", () => {
+  it("routes a same-session non-owned chat final while suppressing the owned final", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const callback = vi.fn();
     (client as any).sessionMessageCallbacks.set("s1", callback);
     (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
-    (client as any).suppressedSessions.add("s1");
-    (client as any).suppressedSessions.add("agent:main:s1");
+    (client as any).ownDeliveryRun("owned-run");
 
-    expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "hidden" })).toBe(false);
+    (client as any).trackChatEventSession("agent:main:s1", "final", {
+      runId: "owned-run",
+      message: { content: [{ type: "text", text: "owned answer" }] },
+    });
     expect(callback).not.toHaveBeenCalled();
+
+    (client as any).trackChatEventSession("agent:main:s1", "final", {
+      runId: "steer-fallback-run",
+      message: { content: [{ type: "text", text: "separate answer" }] },
+    });
+    expect(callback).toHaveBeenCalledWith("separate answer", { runId: "steer-fallback-run" });
+  });
+
+  it("routes async error and aborted terminals for a non-owned steer fallback run", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "***" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("agent:main:s1", callback);
+
+    (client as any).trackChatEventSession("agent:main:s1", "error", {
+      runId: "fallback-run",
+      errorMessage: "provider rejected",
+    });
+    expect(callback).toHaveBeenCalledWith(
+      "⚠️ Agent run failed: provider rejected",
+      { runId: "fallback-run", sourceType: "run_error" },
+    );
+
+    (client as any).trackChatEventSession("agent:main:s1", "aborted", {
+      runId: "aborted-run",
+      reason: "runtime stopped",
+    });
+    expect(callback).toHaveBeenCalledWith(
+      "⚠️ Agent run was aborted: runtime stopped",
+      { runId: "aborted-run", sourceType: "run_error" },
+    );
   });
 
   it("drops transcript messages while external chat is streaming but emits final", () => {
@@ -676,6 +818,28 @@ describe("OpenClawClient proactive delivery mute", () => {
 
 
 describe("OpenClawClient chat.send concurrency", () => {
+  it("does not suppress a foreign same-session run while waiting for a send slot", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const callback = vi.fn();
+    (client as any).sessionMessageCallbacks.set("s1", callback);
+    (client as any).chatSendConcurrency = 1;
+    (client as any).activeChatSends = 1;
+    (client as any).rpc = vi.fn(async () => ({ runId: "new-owned-run" }));
+    (client as any).collectReply = vi.fn(async () => "owned answer");
+
+    const pending = client.chatSend({ sessionKey: "s1", message: "new work" });
+    await Promise.resolve();
+    expect((client as any).handleProactiveSessionMessage(
+      "agent:main:s1",
+      { role: "assistant", content: "foreign answer" },
+      "foreign-run",
+    )).toBe(true);
+    expect(callback).toHaveBeenCalledWith("foreign answer", { runId: "foreign-run" });
+
+    (client as any).releaseChatSendSlot();
+    await expect(pending).resolves.toBe("owned answer");
+  });
+
   it("limits concurrent chat.send RPCs", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     (client as any).chatSendConcurrency = 2;

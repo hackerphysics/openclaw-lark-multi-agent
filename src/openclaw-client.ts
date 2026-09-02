@@ -19,8 +19,21 @@ export type ChatAttachment = {
   content: string;
 };
 
-export const GATEWAY_PROTOCOL_MIN = 3;
+export const GATEWAY_PROTOCOL_MIN = 4;
 export const GATEWAY_PROTOCOL_MAX = 4;
+const REQUIRED_GATEWAY_METHODS = [
+  "agent.wait",
+  "chat.abort",
+  "chat.send",
+  "sessions.compact",
+  "sessions.create",
+  "sessions.delete",
+  "sessions.describe",
+  "sessions.messages.subscribe",
+  "sessions.patch",
+  "sessions.reset",
+] as const;
+const REQUIRED_GATEWAY_EVENTS = ["agent", "chat", "session.message"] as const;
 
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
 const CONTEXT_SYNC_DIR = join(getDataDir(), "context-sync");
@@ -52,12 +65,15 @@ export class OpenClawClient {
   /** Callbacks for tool events (verbose mode) */
   private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
   private lastToolNamesByItemId: Map<string, string> = new Map();
-  private sessionMessageCallbacks: Map<string, (text: string, meta?: { sourceType?: string }) => void> = new Map();
+  /** Deduplicates 2026.8 canonical `agent.stream=tool` events against legacy
+   * `stream=item` mirrors when a runtime emits both representations. */
+  private recentToolEventKeys: Map<string, number> = new Map();
+  private sessionMessageCallbacks: Map<string, (text: string, meta?: { sourceType?: string; runId?: string }) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
-  /** Per-session steered messages awaiting consumption confirmation. Maps the
-   *  normalized text actually sent (possibly wrapped with an insertion prefix)
-   *  to the ORIGINAL display text shown on the live-status card. */
-  private pendingSteerTexts: Map<string, Map<string, string>> = new Map();
+  /** Per-session steered messages awaiting consumption confirmation. Each
+   * accepted message is retained independently so identical/overlapping text
+   * cannot overwrite another correlation. */
+  private pendingSteerTexts: Map<string, Array<{ submittedText: string; displayText: string }>> = new Map();
   /** Sessions where verbose mode should deliver visible transcript text even when mixed with tool blocks. */
   private verboseTranscriptSessions: Set<string> = new Set();
   private verboseAssistantTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -69,9 +85,11 @@ export class OpenClawClient {
   /** Session keys whose transcript/session.message updates are currently suppressed. */
   private suppressedSessions: Set<string> = new Set();
   private suppressedSessionTimers: Map<string, NodeJS.Timeout> = new Map();
-  /** Session keys whose delivery is owned by this bridge's chatSend final path. */
-  private ownedDeliverySessions: Set<string> = new Set();
-  private ownedDeliverySessionTimers: Map<string, NodeJS.Timeout> = new Map();
+  /** Run ids whose final delivery is owned by chatSend/collectReply. Delivery
+   * ownership must be run-scoped: a concurrent queueMode=steer admission may
+   * fall through to a separate ordinary run in the same session. */
+  private ownedDeliveryRuns: Set<string> = new Set();
+  private ownedDeliveryRunTimers: Map<string, NodeJS.Timeout> = new Map();
   /** Session keys whose proactive messages must be dropped by the bridge (e.g. discussion scheduler owns delivery). */
   private mutedProactiveSessions: Set<string> = new Set();
   private mutedProactiveSessionCounts: Map<string, number> = new Map();
@@ -133,19 +151,47 @@ export class OpenClawClient {
                   },
                   role: "operator",
                   scopes: ["operator.read", "operator.write", "operator.admin"],
+                  caps: ["tool-events"],
                   auth: { token: this.config.token },
                   userAgent: "openclaw-lark-multi-agent/1.0.0",
                 },
               })
             );
           } else if (frame.type === "res" && frame.ok && frame.payload?.type === "hello-ok") {
+            const negotiatedProtocol = Number(frame.payload.protocol);
+            if (negotiatedProtocol !== GATEWAY_PROTOCOL_MAX) {
+              reject(new Error(`Unsupported Gateway protocol ${frame.payload.protocol}; LMA requires protocol ${GATEWAY_PROTOCOL_MAX}`));
+              this.ws?.close();
+              return;
+            }
+            const advertisedMethods = Array.isArray(frame.payload.features?.methods)
+              ? new Set<string>(frame.payload.features.methods)
+              : null;
+            if (advertisedMethods) {
+              const missing = REQUIRED_GATEWAY_METHODS.filter((method) => !advertisedMethods.has(method));
+              if (missing.length > 0) {
+                reject(new Error(`Gateway is missing required methods: ${missing.join(", ")}`));
+                this.ws?.close();
+                return;
+              }
+            }
+            const advertisedEvents = Array.isArray(frame.payload.features?.events)
+              ? new Set<string>(frame.payload.features.events)
+              : null;
+            if (advertisedEvents) {
+              const missing = REQUIRED_GATEWAY_EVENTS.filter((event) => !advertisedEvents.has(event));
+              if (missing.length > 0) {
+                reject(new Error(`Gateway is missing required events: ${missing.join(", ")}`));
+                this.ws?.close();
+                return;
+              }
+            }
             handshakeDone = true;
             this.connected = true;
             console.log("[OpenClaw] Connected to Gateway WS");
             // Re-subscribe all previously subscribed sessions
             for (const key of this.subscribedKeys) {
-              this.rpc("sessions.messages.subscribe", { key }).catch(() => {});
-              this.rpc("sessions.messages.subscribe", { key: `agent:main:${key}` }).catch(() => {});
+              this.rpc("sessions.messages.subscribe", { key: this.canonicalSessionKey(key) }).catch(() => {});
             }
             resolve();
           } else if (frame.type === "res" && !frame.ok) {
@@ -254,7 +300,7 @@ export class OpenClawClient {
               data: { deltaText: visibleAssistantText, delta: visibleAssistantText, replace: true },
             });
           }
-          this.handleProactiveSessionMessage(rawKey, msg);
+          this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId);
 
           // Tool calls in assistant messages — skip, using agent item events instead
           // (session.message toolCall events are batched, not real-time)
@@ -287,14 +333,47 @@ export class OpenClawClient {
           }
 
           if (data.kind === "tool" && data.name && (data.phase === "start" || data.phase === "end" || data.phase === "error")) {
-            const phase = data.phase || "event";
-            const meta = data.meta || data.input || data.args || "";
+            const phase = data.phase as "start" | "end" | "error";
+            const eventId = String(data.toolCallId || data.itemId || data.id || data.name);
+            if (this.claimToolEvent(rawKey, eventId, phase)) {
+              const meta = data.meta || data.input || data.args || "";
+              const output = data.output || data.result || data.error || "";
+              if (toolCb) toolCb(`${data.name} ${phase}`.trim(), String(meta || ""), String(output || ""));
+              const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+              if (progressCb) {
+                const detail = phase === "start" ? String(meta || "") : String(output || meta || "");
+                void progressCb({ kind: "tool", phase, name: String(data.name), text: `${data.name} ${phase}${detail ? `: ${detail}` : ""}` });
+              }
+            }
+          }
+        }
+        // OpenClaw 2026.8 canonical tool stream. Some runtimes also emit the
+        // legacy item mirror, so claimToolEvent suppresses duplicate start/end.
+        if (frame.event === "agent" && frame.payload?.stream === "tool") {
+          const data = frame.payload.data || {};
+          const rawKey = frame.payload.sessionKey || "";
+          const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
+          const rawPhase = String(data.phase || "");
+          const phase: "start" | "end" | "error" | undefined = rawPhase === "start"
+            ? "start"
+            : rawPhase === "result"
+              ? (data.isError || data.error ? "error" : "end")
+              : undefined;
+          const name = String(data.name || data.toolName || "tool");
+          const eventId = String(data.toolCallId || data.itemId || data.id || name);
+          if (phase && this.claimToolEvent(rawKey, eventId, phase)) {
+            if (phase === "start") {
+              this.flushVerboseAssistantState(rawKey);
+              this.clearVerboseAssistantState(rawKey);
+            }
+            const input = data.input || data.args || data.meta || "";
             const output = data.output || data.result || data.error || "";
-            if (toolCb) toolCb(`${data.name} ${phase}`.trim(), String(meta || ""), String(output || ""));
+            const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
+            if (toolCb) toolCb(`${name} ${phase}`, String(input || ""), String(output || ""));
             const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
             if (progressCb) {
-              const detail = phase === "start" ? String(meta || "") : String(output || meta || "");
-              void progressCb({ kind: "tool", phase, name: String(data.name), text: `${data.name} ${phase}${detail ? `: ${detail}` : ""}` });
+              const detail = phase === "start" ? String(input || "") : String(output || input || "");
+              void progressCb({ kind: "tool", phase, name, text: `${name} ${phase}${detail ? `: ${detail}` : ""}` });
             }
           }
         }
@@ -392,6 +471,21 @@ export class OpenClawClient {
     }
   }
 
+  private claimToolEvent(sessionKey: string, eventId: string, phase: "start" | "end" | "error", now = Date.now()): boolean {
+    const normalizedPhase = phase === "error" ? "end" : phase;
+    const normalizedId = eventId.replace(/^(?:tool|command):/, "");
+    const key = `${this.shortKey(sessionKey)}:${normalizedId}:${normalizedPhase}`;
+    const seenAt = this.recentToolEventKeys.get(key);
+    if (seenAt !== undefined && now - seenAt < 60_000) return false;
+    this.recentToolEventKeys.set(key, now);
+    if (this.recentToolEventKeys.size > 2000) {
+      for (const [candidate, ts] of this.recentToolEventKeys) {
+        if (now - ts > 60_000) this.recentToolEventKeys.delete(candidate);
+      }
+    }
+    return true;
+  }
+
   private pruneVerboseCaches(now = Date.now()): void {
     for (const [key, ts] of this.verboseAssistantLastTouched) {
       if (now - ts > 10 * 60_000) {
@@ -406,6 +500,9 @@ export class OpenClawClient {
     if (this.lastToolNamesByItemId.size > 1000) {
       const overflow = this.lastToolNamesByItemId.size - 1000;
       for (const key of Array.from(this.lastToolNamesByItemId.keys()).slice(0, overflow)) this.lastToolNamesByItemId.delete(key);
+    }
+    for (const [key, ts] of this.recentToolEventKeys) {
+      if (now - ts > 60_000) this.recentToolEventKeys.delete(key);
     }
   }
 
@@ -455,7 +552,7 @@ export class OpenClawClient {
     }
   }
 
-  private handleProactiveSessionMessage(rawKey: string, msg: any): boolean {
+  private handleProactiveSessionMessage(rawKey: string, msg: any, runId?: string): boolean {
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
 
     // Proactive assistant text messages. Cron/session-targeted runs often emit
@@ -465,6 +562,10 @@ export class OpenClawClient {
     const allowVerboseTranscript = this.isVerboseTranscriptEnabled(rawKey);
     const proactiveText = this.extractVisibleAssistantText(msg, { allowMixedToolText: allowVerboseTranscript });
     if (!proactiveText) return false;
+    if (runId && this.ownedDeliveryRuns.has(runId)) {
+      console.log(`[OpenClaw] Dropping proactive msg for ${shortKey}; run delivery is owned by chatSend`);
+      return false;
+    }
     if (this.mutedProactiveSessions.has(rawKey) || this.mutedProactiveSessions.has(shortKey)) {
       console.log(`[OpenClaw] Dropping proactive msg for ${shortKey}; delivery is owned by the caller`);
       return false;
@@ -474,7 +575,10 @@ export class OpenClawClient {
       return false;
     }
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-    if (cb) cb(proactiveText);
+    if (cb) {
+      if (runId) cb(proactiveText, { runId });
+      else cb(proactiveText);
+    }
     return Boolean(cb);
   }
 
@@ -978,7 +1082,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         : 0;
       const elapsed = elapsedSeconds > 0 ? `（运行约 ${this.formatDurationSeconds(elapsedSeconds)}）` : "";
       const phase = timeoutPhase ? `，阶段：${timeoutPhase}` : "";
-      return `Agent 运行超时${elapsed}${phase}，已被 OpenClaw 终止`;
+      return `等待 Agent 运行结果超时${elapsed}${phase}；底层运行可能仍在继续`;
     }
     if (rawError) return rawError;
     if (stopReason === "stop" || stopReason === "rpc") return `Agent 被停止（${stopReason}）`;
@@ -1016,56 +1120,60 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   // --- Session management ---
 
   async createSession(params: { key: string; model: string; label?: string }): Promise<any> {
-    return this.rpc("sessions.create", params);
+    return this.rpc("sessions.create", { ...params, key: this.canonicalSessionKey(params.key) });
   }
 
   async patchSession(params: { key: string; model?: string; label?: string }): Promise<any> {
-    return this.rpc("sessions.patch", params, 10000);
+    return this.rpc("sessions.patch", { ...params, key: this.canonicalSessionKey(params.key) }, 10000);
   }
 
   async getSessionStatus(key: string): Promise<any> {
-    return this.rpc("sessions.describe", { key });
+    return this.rpc("sessions.describe", { key: this.canonicalSessionKey(key) });
   }
 
 
   async injectAssistantMessage(params: { sessionKey: string; message: string; label?: string }): Promise<any> {
-    return this.rpc("chat.inject", params, 10000);
+    return this.rpc("chat.inject", { ...params, sessionKey: this.canonicalSessionKey(params.sessionKey) }, 10000);
   }
 
   /**
-   * Steer a message into the ACTIVE run for a session via the lma-steer plugin's
-   * `lma.steer` gateway method. Unlike a plain new message, this injects the text
-   * at the next tool-call boundary of the run that is currently executing, so the
-   * user can nudge/correct a long run instead of waiting for it to finish.
-   *
-   * Returns a structured status so the bridge can render the right reaction:
-   *  - "steered"       -> queued into the active run (will be seen next boundary)
-   *  - "no_active_run" -> no active run; caller should fall back to normal queueing
-   *  - "rejected"      -> active run refused the injection (compacting/not streaming)
-   *  - "unavailable"   -> the lma-steer plugin/method is not available (e.g. not
-   *                       installed or gateway not restarted); caller falls back.
+   * Submit a mid-run message through OpenClaw's public atomic steer path.
+   * OpenClaw 2026.8 deprecated the synchronous plugin primitive previously used
+   * by `lma-steer`: its boolean only represented immediate eligibility and could
+   * still be rejected asynchronously. `chat.send queueMode=steer` owns admission
+   * and transcript persistence. LMA still treats the RPC result as provisional;
+   * the Feishu reaction flips to Get only after a matching `session.message`
+   * confirms that the input was committed/consumed.
    */
-  async steer(sessionKey: string, text: string, displayText?: string): Promise<{ status: "steered" | "no_active_run" | "rejected" | "unavailable"; sessionId?: string }> {
+  async steer(sessionKey: string, text: string, displayText?: string): Promise<{
+    status: "steered" | "unavailable";
+    runId?: string;
+    /** Cancel provisional transcript correlation when LMA falls back to a normal run. */
+    cancelPending?: () => void;
+  }> {
+    const key = this.canonicalSessionKey(sessionKey);
     try {
-      const res = await this.rpc("lma.steer", { sessionKey, text }, 10000);
+      const res = await this.rpc("chat.send", {
+        sessionKey: key,
+        message: text,
+        queueMode: "steer",
+        deliver: false,
+        idempotencyKey: randomUUID(),
+      }, 10000);
       const status = res?.status;
-      if (status === "steered" || status === "no_active_run" || status === "rejected") {
-        // On a successful steer, remember the text so that when the model
-        // actually consumes it (a matching sessionUser event on THIS run) we can
-        // render it on the live-status card in correct time order and let the
-        // bridge flip the reaction to Get only after real consumption. Match on
-        // the (possibly wrapped) text actually sent; display the original.
-        if (status === "steered") this.registerPendingSteer(sessionKey, text, displayText);
-        return { status, sessionId: typeof res?.sessionId === "string" ? res.sessionId : undefined };
+      if (status !== "started" && status !== "in_flight" && status !== "ok") {
+        return { status: "unavailable" };
       }
-      return { status: "unavailable" };
+      // This records only a provisional accepted input. Actual success is driven
+      // by handleSteerConsumption after the canonical transcript event arrives.
+      const cancelPending = this.registerPendingSteer(key, text, displayText);
+      return {
+        status: "steered",
+        runId: typeof res?.runId === "string" ? res.runId : undefined,
+        cancelPending,
+      };
     } catch (err) {
-      // Unknown method / plugin missing / transient RPC error -> caller falls back
-      // to normal queueing. Never throw into the message path.
-      const msg = (err as Error)?.message || String(err);
-      if (!/unknown method/i.test(msg)) {
-        console.warn(`[OpenClaw] lma.steer failed for ${sessionKey.slice(-8)}: ${msg}`);
-      }
+      console.warn(`[OpenClaw] native steer failed for ${key.slice(-8)}: ${(err as Error)?.message || String(err)}`);
       return { status: "unavailable" };
     }
   }
@@ -1075,30 +1183,71 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    *  be registered when several messages are steered during one run; each is
    *  invoked with the consumed text and decides whether it is the one it wants.
    *  Callbacks are one-shot: returning true removes them. */
-  private steerConsumedCallbacks: Map<string, Array<(text: string) => boolean | void>> = new Map();
+  private steerConsumedCallbacks: Map<string, Array<{
+    matchText: string;
+    cb: (text: string) => boolean | void;
+  }>> = new Map();
 
   /** Register a callback (per bare session key) invoked when a steered message
    *  is actually consumed by the active run. The bridge uses this to flip the
    *  Feishu reaction from "Typing" (awaiting insertion) to "Get" (inserted).
    *  Return true from the callback to consume/remove it (one-shot). */
-  onSteerConsumed(sessionKey: string, cb: (text: string) => boolean | void): void {
+  onSteerConsumed(sessionKey: string, matchText: string, cb: (text: string) => boolean | void): () => void {
     const key = this.shortKey(sessionKey);
+    const normalizedMatch = matchText.replace(/\s+/g, " ").trim();
     let list = this.steerConsumedCallbacks.get(key);
     if (!list) { list = []; this.steerConsumedCallbacks.set(key, list); }
-    list.push(cb);
+    const entry = { matchText: normalizedMatch, cb };
+    list.push(entry);
+    let active = true;
+    const remove = () => {
+      if (!active) return;
+      active = false;
+      clearTimeout(expiry);
+      const current = this.steerConsumedCallbacks.get(key);
+      if (!current) return;
+      const next = current.filter((candidate) => candidate !== entry);
+      if (next.length > 0) this.steerConsumedCallbacks.set(key, next);
+      else this.steerConsumedCallbacks.delete(key);
+    };
+    const expiry = setTimeout(remove, 30 * 60_000);
+    expiry.unref?.();
+    return remove;
   }
 
   private shortKey(sessionKey: string): string {
     return sessionKey.replace(/^agent:[^:]+:/, "");
   }
 
-  private registerPendingSteer(sessionKey: string, text: string, displayText?: string): void {
+  private canonicalSessionKey(sessionKey: string): string {
+    return /^agent:[^:]+:/.test(sessionKey) ? sessionKey : `agent:main:${sessionKey}`;
+  }
+
+  private registerPendingSteer(sessionKey: string, text: string, displayText?: string): () => void {
     const key = this.shortKey(sessionKey);
-    const norm = text.replace(/\s+/g, " ").trim();
-    if (!norm) return;
-    let map = this.pendingSteerTexts.get(key);
-    if (!map) { map = new Map(); this.pendingSteerTexts.set(key, map); }
-    map.set(norm, (displayText || text).trim());
+    const submittedText = text.replace(/\s+/g, " ").trim();
+    if (!submittedText) return () => {};
+    const displayTextValue = (displayText || text).trim();
+    const queue = this.pendingSteerTexts.get(key) || [];
+    const entry = { submittedText, displayText: displayTextValue };
+    queue.push(entry);
+    this.pendingSteerTexts.set(key, queue);
+    let active = true;
+    const remove = () => {
+      if (!active) return;
+      active = false;
+      clearTimeout(expiry);
+      const current = this.pendingSteerTexts.get(key);
+      if (!current) return;
+      const next = current.filter((candidate) => candidate !== entry);
+      if (next.length > 0) this.pendingSteerTexts.set(key, next);
+      else this.pendingSteerTexts.delete(key);
+    };
+    // Expire only this provisional correlation. A much later transcript must
+    // not consume a stale duplicate while another identical steer is pending.
+    const expiry = setTimeout(remove, 30 * 60_000);
+    expiry.unref?.();
+    return remove;
   }
 
   /**
@@ -1109,32 +1258,40 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    */
   private handleSteerConsumption(sessionKey: string, text: string): boolean {
     const key = this.shortKey(sessionKey);
-    const map = this.pendingSteerTexts.get(key);
-    if (!map || map.size === 0) return false;
+    const queue = this.pendingSteerTexts.get(key);
+    if (!queue || queue.length === 0) return false;
     const norm = (text || "").replace(/\s+/g, " ").trim();
     if (!norm) return false;
-    // Match exact, or the sessionUser text containing the steered text (the run
-    // may wrap it). Prefer the longest matching pending entry.
-    let matched: string | undefined;
-    for (const pending of map.keys()) {
-      if (norm === pending || norm.includes(pending)) {
-        if (!matched || pending.length > matched.length) matched = pending;
+    // One transcript event consumes exactly one pending steer. Prefer an exact
+    // match, otherwise the longest submitted wrapper contained in the event.
+    let matchedIndex = queue.findIndex((pending) => norm === pending.submittedText);
+    if (matchedIndex < 0) {
+      let matchedLength = -1;
+      for (let i = 0; i < queue.length; i++) {
+        const pending = queue[i];
+        if (norm.includes(pending.submittedText) && pending.submittedText.length > matchedLength) {
+          matchedIndex = i;
+          matchedLength = pending.submittedText.length;
+        }
       }
     }
-    if (!matched) return false;
-    const display = map.get(matched) || matched;
-    map.delete(matched);
-    if (map.size === 0) this.pendingSteerTexts.delete(key);
+    if (matchedIndex < 0) return false;
+    const [matched] = queue.splice(matchedIndex, 1);
+    if (queue.length === 0) this.pendingSteerTexts.delete(key);
     const progressCb = this.progressCallbacks.get(key) || this.progressCallbacks.get(`agent:main:${key}`);
-    if (progressCb) void progressCb({ kind: "steer", text: display });
+    if (progressCb) void progressCb({ kind: "steer", text: matched.displayText });
     const list = this.steerConsumedCallbacks.get(key);
     if (list && list.length > 0) {
-      // Invoke callbacks; a callback returning true is one-shot and removed.
-      const remaining = list.filter((cb) => {
-        try { return cb(matched!) !== true; } catch { return true; }
-      });
-      if (remaining.length > 0) this.steerConsumedCallbacks.set(key, remaining);
-      else this.steerConsumedCallbacks.delete(key);
+      // Match and remove exactly one observer for this consumed steer. This is
+      // important for duplicate text: one session.message must acknowledge one
+      // Feishu message, never all identical messages at once.
+      let callbackIndex = list.findIndex((entry) => entry.matchText === matched.submittedText);
+      if (callbackIndex < 0) callbackIndex = list.findIndex((entry) => norm.includes(entry.matchText));
+      if (callbackIndex >= 0) {
+        const [entry] = list.splice(callbackIndex, 1);
+        try { entry.cb(matched.submittedText); } catch { /* observer failures are isolated */ }
+      }
+      if (list.length === 0) this.steerConsumedCallbacks.delete(key);
     }
     return true;
   }
@@ -1143,7 +1300,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    * Get session info (model, tokens, etc.) for status display.
    */
   async getSessionInfo(sessionKey: string): Promise<any> {
-    return this.rpc("sessions.describe", { key: sessionKey });
+    return this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) });
   }
 
   /**
@@ -1151,35 +1308,54 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    * Returns true if a correction was made.
    */
   async ensureModel(sessionKey: string, expectedModel: string): Promise<boolean> {
+    const info = await this.getSessionInfo(sessionKey).catch(() => null);
+    const session = info?.session;
+    const modelId = typeof session?.model === "string" ? session.model.trim() : "";
+    const provider = typeof session?.modelProvider === "string"
+      ? session.modelProvider.trim()
+      : typeof session?.provider === "string" ? session.provider.trim() : "";
+    const currentModel = modelId.includes("/") ? modelId : provider && modelId ? `${provider}/${modelId}` : modelId;
+    if (currentModel === expectedModel) return false;
+
     try {
-      // Always patch to ensure model is correct — describe may return internal model names
-      // Use short timeout as sessions.patch may not return a response
-      await this.patchSession({ key: sessionKey, model: expectedModel }).catch(() => {});
-      // Also try with full key prefix
-      await this.patchSession({ key: `agent:main:${sessionKey}`, model: expectedModel }).catch(() => {});
-      console.log(`[OpenClaw] Model ensured: ${sessionKey} → ${expectedModel}`);
-    } catch (err) {
-      console.warn(`[OpenClaw] ensureModel patch failed:`, (err as Error).message);
+      await this.patchSession({ key: sessionKey, model: expectedModel });
+    } catch (firstErr) {
+      // Older gateways occasionally require the fully-qualified key. Do not hide
+      // model-policy/capability errors: retry only when the key itself was not
+      // resolved, otherwise surface the actionable rejection to the caller.
+      const message = (firstErr as Error).message || String(firstErr);
+      if (!/session (?:not found|unknown)|unknown session|invalid session key/i.test(message)) throw firstErr;
+      const fullKey = sessionKey.startsWith("agent:") ? sessionKey : `agent:main:${sessionKey}`;
+      await this.patchSession({ key: fullKey, model: expectedModel });
     }
-    return false;
+    console.log(`[OpenClaw] Model ensured: ${sessionKey} → ${expectedModel}`);
+    return Boolean(currentModel && currentModel !== expectedModel);
   }
 
   async deleteSession(key: string, deleteTranscript = true): Promise<any> {
-    return this.rpc("sessions.delete", { key, deleteTranscript });
+    return this.rpc("sessions.delete", { key: this.canonicalSessionKey(key), deleteTranscript });
   }
 
   async resetSession(key: string): Promise<any> {
     // sessions.reset may not return a response; use short timeout
-    return this.rpc("sessions.reset", { key }, 5000).catch(() => {});
+    return this.rpc("sessions.reset", { key: this.canonicalSessionKey(key) }, 5000).catch(() => {});
   }
 
-  async compactSession(key: string): Promise<any> {
+  async compactSession(key: string, options: { maxLines?: number } = {}): Promise<any> {
     const release = await this.acquireMaintenanceSlot("sessions.compact");
     const startedAt = Date.now();
+    const maxLines = Number.isFinite(options.maxLines)
+      ? Math.max(1, Math.floor(options.maxLines!))
+      : undefined;
     try {
-      return await this.rpc("sessions.compact", { key }, 10 * 60 * 1000);
+      return await this.rpc(
+        "sessions.compact",
+        { key: this.canonicalSessionKey(key), ...(maxLines !== undefined ? { maxLines } : {}) },
+        10 * 60 * 1000,
+      );
     } finally {
-      console.log(`[OpenClaw] sessions.compact finished for ${key} in ${Date.now() - startedAt}ms`);
+      const mode = maxLines === undefined ? "semantic" : `maxLines=${maxLines}`;
+      console.log(`[OpenClaw] sessions.compact (${mode}) finished for ${key} in ${Date.now() - startedAt}ms`);
       release();
     }
   }
@@ -1191,47 +1367,48 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    * deliver=false prevents OpenClaw from auto-posting to channels.
    */
   async abortChat(sessionKey: string, runId?: string): Promise<any> {
-    const key = sessionKey.startsWith("agent:main:") ? sessionKey.slice("agent:main:".length) : sessionKey;
+    const key = this.canonicalSessionKey(sessionKey);
     // chat.abort supports { sessionKey } with no runId to abort ALL active runs
     // for that session. Used by /stop to force-clear a stuck run.
     if (!runId) {
       // Mark the session so any in-flight collectReply finishes immediately
       // instead of treating the cancelled lifecycle as a transient state.
       this.forceAbortedSessions.add(key);
-      this.forceAbortedSessions.add(`agent:main:${key}`);
+      this.forceAbortedSessions.add(this.shortKey(key));
     }
     const params: any = runId ? { sessionKey: key, runId } : { sessionKey: key };
     return this.rpc("chat.abort", params, 5000).catch(() => {});
   }
 
   private sessionKeyVariants(key: string): string[] {
-    const shortKey = key.startsWith("agent:main:") ? key.slice("agent:main:".length) : key;
-    return [shortKey, `agent:main:${shortKey}`];
+    const shortKey = this.shortKey(key);
+    return Array.from(new Set([shortKey, this.canonicalSessionKey(key), key]));
   }
 
   private trackChatEventSession(sessionKey: string, state: string | undefined, payload: any): void {
     if (!sessionKey || sessionKey === "__default__") return;
     const keys = this.sessionKeyVariants(sessionKey);
-    if (this.isOwnedDeliverySession(sessionKey)) {
-      // This chat event belongs to a bridge-owned chat.send run. The final answer
-      // is delivered by collectReply/processQueue, so transcript session.message
-      // mirrors must stay suppressed briefly.
-      this.suppressSessionKeys(keys);
-      if (state === "final" || state === "error" || state === "aborted") this.releaseSuppressedSessionKeysAfter(keys, 30000);
+    const runId = typeof payload?.runId === "string" ? payload.runId : "";
+    if (runId && this.ownedDeliveryRuns.has(runId)) {
+      // collectReply owns this exact run. Do not suppress the whole session:
+      // queueMode=steer may concurrently create another ordinary run that must
+      // still reach the proactive callback.
       return;
     }
-    // External WebChat/Control UI chat against an LMA session: do not forward
-    // streaming transcript updates, but allow the final chat message to be
-    // delivered through the proactive callback after it is committed.
+    // External WebChat/Control UI (including a steer admission that became a
+    // separate run): hide streaming mirrors, then emit its final exactly once.
     if (state === "delta") {
       this.suppressSessionKeys(keys);
     } else if (state === "final") {
       const text = this.extractTextFromChatMessage(payload?.message);
-      if (text) this.emitProactiveForSession(sessionKey, text);
-      // Keep transcript mirrors suppressed briefly; chat final already emitted
-      // the user-visible result for external WebChat/Control UI turns.
+      if (text) this.emitProactiveForSession(sessionKey, text, runId);
       this.releaseSuppressedSessionKeysAfter(keys, 30000);
     } else if (state === "error" || state === "aborted") {
+      const detail = String(payload?.errorMessage || payload?.error || payload?.reason || "").trim();
+      const text = state === "error"
+        ? `⚠️ Agent run failed${detail ? `: ${detail}` : ""}`
+        : `⚠️ Agent run was aborted${detail ? `: ${detail}` : ""}`;
+      this.emitProactiveForSession(sessionKey, text, runId, "run_error");
       this.releaseSuppressedSessionKeysAfter(keys, 0);
     }
   }
@@ -1241,11 +1418,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     return parts.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
   }
 
-  private emitProactiveForSession(sessionKey: string, text: string): boolean {
+  private emitProactiveForSession(sessionKey: string, text: string, runId?: string, sourceType?: string): boolean {
     const [shortKey, fullKey] = this.sessionKeyVariants(sessionKey);
     const cb = this.sessionMessageCallbacks.get(fullKey) || this.sessionMessageCallbacks.get(shortKey);
     if (!cb) return false;
-    cb(text);
+    if (runId || sourceType) cb(text, { ...(runId ? { runId } : {}), ...(sourceType ? { sourceType } : {}) });
+    else cb(text);
     return true;
   }
 
@@ -1270,30 +1448,24 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     }
   }
 
-  private ownDeliverySessionKeys(keys: string[]): void {
-    for (const key of keys) {
-      const timer = this.ownedDeliverySessionTimers.get(key);
-      if (timer) clearTimeout(timer);
-      this.ownedDeliverySessionTimers.delete(key);
-      this.ownedDeliverySessions.add(key);
-    }
+  private ownDeliveryRun(runId: string): void {
+    if (!runId) return;
+    const timer = this.ownedDeliveryRunTimers.get(runId);
+    if (timer) clearTimeout(timer);
+    this.ownedDeliveryRunTimers.delete(runId);
+    this.ownedDeliveryRuns.add(runId);
   }
 
-  private releaseOwnedDeliverySessionKeysAfter(keys: string[], delayMs: number): void {
-    for (const key of keys) {
-      const oldTimer = this.ownedDeliverySessionTimers.get(key);
-      if (oldTimer) clearTimeout(oldTimer);
-      const timer = setTimeout(() => {
-        this.ownedDeliverySessions.delete(key);
-        this.ownedDeliverySessionTimers.delete(key);
-      }, delayMs);
-      this.ownedDeliverySessionTimers.set(key, timer);
-    }
-  }
-
-  private isOwnedDeliverySession(sessionKey: string): boolean {
-    const [shortKey, fullKey] = this.sessionKeyVariants(sessionKey);
-    return this.ownedDeliverySessions.has(shortKey) || this.ownedDeliverySessions.has(fullKey);
+  private releaseOwnedDeliveryRunAfter(runId: string, delayMs: number): void {
+    if (!runId) return;
+    const oldTimer = this.ownedDeliveryRunTimers.get(runId);
+    if (oldTimer) clearTimeout(oldTimer);
+    const timer = setTimeout(() => {
+      this.ownedDeliveryRuns.delete(runId);
+      this.ownedDeliveryRunTimers.delete(runId);
+    }, delayMs);
+    timer.unref?.();
+    this.ownedDeliveryRunTimers.set(runId, timer);
   }
 
   private addMutedProactiveKey(key: string): void {
@@ -1380,12 +1552,10 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     onSubmitted?: (runId: string) => void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
   }): Promise<string> {
-    const sk = params.sessionKey;
-    const fullSessionKey = `agent:main:${sk}`;
-    const suppressedKeys = [sk, fullSessionKey];
-    this.suppressSessionKeys(suppressedKeys);
-    this.ownDeliverySessionKeys(suppressedKeys);
+    const sk = this.shortKey(params.sessionKey);
+    const fullSessionKey = this.canonicalSessionKey(params.sessionKey);
     this.clearVerboseAssistantState(sk);
+    let ownedRunId = "";
     try {
       // Drop stale buffered events for this session before starting a new run.
       // This prevents an old final text (e.g. previous "ok") from being consumed by
@@ -1398,7 +1568,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       try {
         await params.onSendAttempt?.();
         result = await this.rpc("chat.send", {
-          sessionKey: sk,
+          sessionKey: this.canonicalSessionKey(sk),
           message: params.message,
           attachments: params.attachments,
           deliver: params.deliver ?? false,
@@ -1407,6 +1577,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       } finally {
         releaseChatSendSlot();
       }
+      ownedRunId = typeof result?.runId === "string" ? result.runId : "";
+      this.ownDeliveryRun(ownedRunId);
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       await params.onSubmitted?.(result.runId);
       if (params.onProgress) {
@@ -1422,8 +1594,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       // are unaffected because they do not go through chatSend.
       this.progressCallbacks.delete(sk);
       this.progressCallbacks.delete(fullSessionKey);
-      this.releaseSuppressedSessionKeysAfter(suppressedKeys, 30000);
-      this.releaseOwnedDeliverySessionKeysAfter(suppressedKeys, 30000);
+      this.releaseOwnedDeliveryRunAfter(ownedRunId, 30000);
     }
   }
 
@@ -1633,15 +1804,18 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     this.suppressedSessions.clear();
     this.mutedProactiveSessions.clear();
     this.mutedProactiveSessionCounts.clear();
-    for (const timer of this.ownedDeliverySessionTimers.values()) clearTimeout(timer);
-    this.ownedDeliverySessionTimers.clear();
+    for (const timer of this.ownedDeliveryRunTimers.values()) clearTimeout(timer);
+    this.ownedDeliveryRunTimers.clear();
     for (const timer of this.verboseAssistantTimers.values()) clearTimeout(timer);
     this.verboseAssistantTimers.clear();
     this.verboseAssistantLatest.clear();
     this.verboseAssistantSent.clear();
     this.verboseAssistantLastTouched.clear();
     this.lastToolNamesByItemId.clear();
-    this.ownedDeliverySessions.clear();
+    this.recentToolEventKeys.clear();
+    this.pendingSteerTexts.clear();
+    this.steerConsumedCallbacks.clear();
+    this.ownedDeliveryRuns.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;
@@ -1657,16 +1831,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
    */
   async subscribeSession(
     sessionKey: string,
-    onMessage: (text: string, meta?: { sourceType?: string }) => void
+    onMessage: (text: string, meta?: { sourceType?: string; runId?: string }) => void
   ): Promise<void> {
     // Register under both the short key and the full key with agent:main: prefix
     this.sessionMessageCallbacks.set(sessionKey, onMessage);
     this.sessionMessageCallbacks.set(`agent:main:${sessionKey}`, onMessage);
     this.subscribedKeys.add(sessionKey);
     try {
-      // Try subscribing with short key first, then full key
-      await this.rpc("sessions.messages.subscribe", { key: sessionKey }).catch(() => {});
-      await this.rpc("sessions.messages.subscribe", { key: `agent:main:${sessionKey}` }).catch(() => {});
+      await this.rpc("sessions.messages.subscribe", { key: this.canonicalSessionKey(sessionKey) });
     } catch (err) {
       console.warn(`[OpenClaw] Failed to subscribe ${sessionKey}:`, (err as Error).message);
     }
@@ -1689,7 +1861,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     this.setVerboseTranscriptDelivery(sessionKey, false);
     this.subscribedKeys.delete(sessionKey);
     try {
-      await this.rpc("sessions.messages.unsubscribe", { key: sessionKey });
+      await this.rpc("sessions.messages.unsubscribe", { key: this.canonicalSessionKey(sessionKey) });
     } catch {
       // ignore
     }

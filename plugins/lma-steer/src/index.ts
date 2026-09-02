@@ -11,18 +11,11 @@ import {
  * into the *active* OpenClaw run at the next tool-call boundary, instead of
  * making the user wait for the whole run to finish.
  *
- * Why a plugin (not the native `chat.send` + queue.mode=steer):
- *   - native `chat.send` only acks `{status:"started"}` — it can NOT tell the
- *     bridge whether the message actually steered into the active run, was
- *     queued as a followup, or was rejected.
- *   - this plugin uses the runtime primitives `resolveActiveEmbeddedRunSessionId`
- *     + `queueAgentHarnessMessage`, which DO expose that distinction, so the
- *     bridge can render an accurate Feishu reaction (e.g. "Get" = inserted).
- *
- * The plugin is deliberately thin: it does NOT detect tool-call boundaries
- * itself (the OpenClaw runtime already drains the steer queue between tool
- * calls — proxy turn loop). It just resolves the active run and queues with an
- * observable outcome.
+ * Legacy compatibility note:
+ * Current LMA releases use public `chat.send { queueMode: "steer" }` and do not
+ * call this Gateway method. This plugin remains packaged only for older LMA
+ * installations. Its synchronous queue result represents immediate eligibility,
+ * not proof that a later runtime boundary consumed the message.
  *
  * Gateway method: `lma.steer`
  *   params:  { sessionKey: string, text: string, steeringMode?: "all" }

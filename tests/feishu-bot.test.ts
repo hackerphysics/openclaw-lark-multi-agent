@@ -14,13 +14,13 @@ class MockOpenClaw {
   chatCalls: any[] = [];
   replies: string[] = [];
   resolvers: Array<(value: string) => void> = [];
-  sessionCallbacks = new Map<string, (text: string) => void>();
+  sessionCallbacks = new Map<string, (text: string, meta?: { sourceType?: string; runId?: string }) => void>();
   async getSessionInfo() { return { session: { totalTokens: 0 } }; }
   async ensureModel() { return false; }
   async createSession() {}
   patchSession = vi.fn(async (_params?: any) => ({}));
   async injectAssistantMessage(_params: any) { return { ok: true }; }
-  async subscribeSession(sessionKey: string, onMessage: (text: string) => void) { this.sessionCallbacks.set(sessionKey, onMessage); }
+  async subscribeSession(sessionKey: string, onMessage: (text: string, meta?: { sourceType?: string; runId?: string }) => void) { this.sessionCallbacks.set(sessionKey, onMessage); }
   onToolEvent() {}
   setVerboseTranscriptDelivery = vi.fn();
   muteProactiveDelivery = vi.fn(() => vi.fn());
@@ -34,11 +34,14 @@ class MockOpenClaw {
   abortChat = vi.fn(async () => {});
   // Steer stub: default to "steered" so busy-branch tests exercise the steer path.
   // Override per-test (e.g. return { status: "unavailable" }) to test fallback.
-  steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const, sessionId: "sid-1" }));
+  steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const, runId: "steer-run-1" }));
   // Consumed callbacks registered by the bridge; tests call fireSteerConsumed to
   // simulate the model actually consuming a steered message.
   steerConsumedCbs: Array<(text: string) => boolean | void> = [];
-  onSteerConsumed = vi.fn((_sessionKey: string, cb: (text: string) => boolean | void) => { this.steerConsumedCbs.push(cb); });
+  onSteerConsumed = vi.fn((_sessionKey: string, _matchText: string, cb: (text: string) => boolean | void) => {
+    this.steerConsumedCbs.push(cb);
+    return () => { this.steerConsumedCbs = this.steerConsumedCbs.filter((candidate) => candidate !== cb); };
+  });
   fireSteerConsumed(text: string) { for (const cb of this.steerConsumedCbs) cb(text); }
 }
 
@@ -80,6 +83,10 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   return { bot, store, openclaw, cleanup: () => {
     for (const timer of (bot as any).deliveryRetryTimers.values()) clearTimeout(timer);
     (bot as any).deliveryRetryTimers.clear();
+    for (const target of (bot as any).deliveryTargetsByRun.values()) if (target.timer) clearTimeout(target.timer);
+    (bot as any).deliveryTargetsByRun.clear();
+    for (const cleanup of (bot as any).pendingSteerCleanups.values()) cleanup();
+    (bot as any).pendingSteerCleanups.clear();
     store.close();
     rmSync(dir, { recursive: true, force: true });
   } };
@@ -252,6 +259,33 @@ describe("FeishuBot routing and queue behavior", () => {
 
       await (h.bot as any).ensureSession("chat1");
       expect(h.openclaw.injectAssistantMessage).not.toHaveBeenCalled();
+    } finally { h.cleanup(); }
+  });
+
+  it("propagates model-policy rejection and does not mark the session initialized", async () => {
+    const h = makeHarness();
+    try {
+      delete (h.bot as any).ensureSession;
+      h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 123 } })) as any;
+      h.openclaw.ensureModel = vi.fn(async () => { throw new Error("model not allowed by agents.defaults.modelPolicy.allow"); }) as any;
+
+      await expect((h.bot as any).ensureSession("chat1")).rejects.toThrow(/modelPolicy\.allow/);
+      expect((h.bot as any).initializedSessions.has("lma-gpt-chat1")).toBe(false);
+    } finally { h.cleanup(); }
+  });
+
+  it("reports session setup policy errors and always clears the busy marker", async () => {
+    const h = makeHarness();
+    try {
+      (h.bot as any).ensureSession = vi.fn(async () => { throw new Error("model not allowed by agents.defaults.modelPolicy.allow"); });
+      h.store.setBotMode("GPT", "chat1", "free");
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "run", messageId: "policy-fail" }));
+
+      expect((h.bot as any).busyChats.get("chat1")).toBe(0);
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("policy-fail", expect.stringContaining("modelPolicy.allow"));
+      const rowId = h.store.getMessageId("policy-fail")!;
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(rowId)).toBe(false);
     } finally { h.cleanup(); }
   });
 
@@ -2406,7 +2440,8 @@ describe("FeishuBot routing and queue behavior", () => {
     const h = makeHarness("GLM");
     try {
       h.store.setBotMode("GLM", "chat1", "free");
-      // Default mock steer returns "steered".
+      delete (h.bot as any).ensureSession;
+      // Default mock steer returns an acknowledged client run id.
       let releaseFirst!: (value: string) => void;
       (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -2430,18 +2465,98 @@ describe("FeishuBot routing and queue behavior", () => {
       // Before consumption: reaction is "Typing" (awaiting insertion), NOT "Get".
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
       expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("busy-2", "Get");
-      // Its pending trigger was cleared, so it will NOT run as a separate batch.
+      // RPC acceptance is provisional: retain the durable fallback until the
+      // canonical transcript confirms commitment/consumption.
       const secondRow = h.store.getMessageId("busy-2")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(true);
 
-      // Model consumes the steered message -> reaction flips Typing -> Get.
+      // The admission target is switched to the second Feishu message before
+      // native chat.send is invoked. If OpenClaw races to an ordinary new run,
+      // that run's proactive reply must still bind to busy-2, never busy-1.
+      const activeTargetDuringAdmission = (h.bot as any).activeDeliveryTargets.get("chat1");
+      expect(activeTargetDuringAdmission?.messageId).toBe("busy-2");
+      expect(activeTargetDuringAdmission?.triggerId).toBe(secondRow);
+      expect(activeTargetDuringAdmission?.runId).toBe("steer-run-1");
+      expect((h.bot as any).deliveryTargetsByRun.get("chat1\u0000steer-run-1")?.liveStatus).toBeUndefined();
+
+      // If native steer raced to an ordinary dispatch, its run-scoped proactive
+      // final is attached to the second Feishu message, not the old active one.
+      const sessionCb = h.openclaw.sessionCallbacks.get("lma-glm-chat1")!;
+      await sessionCb("race fallback answer", { runId: "steer-run-1" });
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("busy-2", "race fallback answer");
+
+      // Model consumption controls only the visible Typing -> Get transition.
       h.openclaw.fireSteerConsumed("中途插入的话");
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
 
       releaseFirst("first reply");
       await first;
       // No second chatSendWithContext run for the steered message.
       expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+
+  it("cancels stale steer correlation when a retained trigger takes the normal queue path", async () => {
+    const h = makeHarness("GLM");
+    try {
+      const rowId = h.store.insert({ chatId: "chat1", messageId: "fallback-normal", senderType: "human", senderName: "u", content: "same text", timestamp: 1 });
+      h.store.markPendingTrigger("GLM", "chat1", rowId);
+      const cleanup = vi.fn();
+      (h.bot as any).pendingSteerCleanups.set(rowId, cleanup);
+
+      await (h.bot as any).processQueue("chat1");
+
+      expect(cleanup).toHaveBeenCalledOnce();
+      expect((h.bot as any).pendingSteerCleanups.has(rowId)).toBe(false);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+
+  it("keeps independent Feishu reply targets for concurrent runs in one chat", async () => {
+    const h = makeHarness("GLM");
+    try {
+      delete (h.bot as any).ensureSession;
+      await (h.bot as any).ensureSession("chat1");
+      (h.bot as any).bindRunDeliveryTarget("chat1", "run-b", { triggerId: 2, messageId: "msg-b" });
+      (h.bot as any).bindRunDeliveryTarget("chat1", "run-c", { triggerId: 3, messageId: "msg-c" });
+      const sessionCb = h.openclaw.sessionCallbacks.get("lma-glm-chat1")!;
+
+      await sessionCb("answer b", { runId: "run-b" });
+      await sessionCb("answer c", { runId: "run-c" });
+
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("msg-b", "answer b");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("msg-c", "answer c");
+    } finally { h.cleanup(); }
+  });
+
+  it("restores the previous delivery target when native steer admission is unavailable", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setBotMode("GLM", "chat1", "free");
+      let releaseFirst!: (value: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn((params: any) => {
+        h.openclaw.chatCalls.push(params);
+        if (h.openclaw.chatCalls.length === 1) return new Promise<string>((resolve) => { releaseFirst = resolve; });
+        return Promise.resolve("second reply");
+      }) as any;
+      h.openclaw.steer = vi.fn(async () => ({ status: "unavailable" as const }));
+
+      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "第一条", messageId: "restore-1" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      const firstTarget = (h.bot as any).activeDeliveryTargets.get("chat1");
+      expect(firstTarget?.messageId).toBe("restore-1");
+
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "第二条", messageId: "restore-2" }));
+      const restored = (h.bot as any).activeDeliveryTargets.get("chat1");
+      expect(restored?.messageId).toBe("restore-1");
+      const secondRow = h.store.getMessageId("restore-2")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(true);
+
+      releaseFirst("first reply");
+      await first;
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
+      expect(h.openclaw.chatCalls[1].currentMessage).toBe("第二条");
     } finally { h.cleanup(); }
   });
 
@@ -2987,56 +3102,43 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("reports a no-op when native did not compact AND tool-trim has no file to trim", async () => {
+    it("reports a no-op when semantic compaction and Gateway transcript trim both skip", async () => {
       const h = makeHarness("GPT");
       try {
-        // Native resolves fine but did NOT compact (the original bug).
-        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
-        // No sessionId -> tool-trim fallback cannot find a file -> overall no-op.
-        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 0 } })) as any;
+        h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines
+          ? ({ ok: true, compacted: false, reason: "transcript too small" })
+          : ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1");
+        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(1, expect.any(String));
+        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 200 });
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("未压缩"));
       } finally { h.cleanup(); }
     });
 
-    it("falls back to tool-trim when native compaction does not compact", async () => {
+    it("falls back to Gateway-owned transcript trim for SQLite-compatible compaction", async () => {
       const h = makeHarness("GPT");
       try {
-        // Native fails to compact (e.g. session too big to summarize).
-        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
-        // getSessionInfo provides a sessionId so tool-trim can locate the file.
-        const sid = "trimtest-" + Date.now();
-        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { sessionId: sid, totalTokens: 900000 } })) as any;
-        // Lay down a tool-heavy transcript at the path resolveSessionFilePath builds:
-        // <OPENCLAW_HOME>/agents/main/sessions/<sid>.jsonl
-        const home = mkdtempSync(join(tmpdir(), "lma-oc-home-"));
-        process.env.OPENCLAW_HOME = home;
-        const sdir = join(home, "agents", "main", "sessions");
-        mkdirSync(sdir, { recursive: true });
-        const rows: string[] = [JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: "go" }] } })];
-        for (let i = 0; i < 30; i++) {
-          rows.push(JSON.stringify({ type: "message", message: { role: "assistant", stopReason: "toolUse", content: [{ type: "text", text: "s" }, { type: "toolCall", id: "t" + i, name: "read", arguments: {} }] } }));
-          rows.push(JSON.stringify({ type: "message", message: { role: "toolResult", toolCallId: "t" + i, content: [{ type: "text", text: "Z".repeat(2000) }] } }));
-        }
-        writeFileSync(join(sdir, sid + ".jsonl"), rows.join("\n") + "\n");
-
+        h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines
+          ? ({ ok: true, compacted: true, kept: 137 })
+          : ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1");
-        // Reported success via tool-trim.
-        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("删工具调用"));
-        rmSync(home, { recursive: true, force: true });
-        delete process.env.OPENCLAW_HOME;
+        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 200 });
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("转录裁剪"));
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("137"));
       } finally { h.cleanup(); }
     });
 
-    it("reports failure when native compaction throws and there is no fallback file", async () => {
+    it("reports both failures when semantic compaction and transcript trim throw", async () => {
       const h = makeHarness("GPT");
       try {
-        // Native throws; tool-trim cannot find a file -> overall no-op (not success).
-        h.openclaw.compactSession = vi.fn(async () => { throw new Error("rpc timeout"); }) as any;
-        h.openclaw.getSessionInfo = vi.fn(async () => ({ session: { totalTokens: 0 } })) as any;
+        h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => {
+          if (options?.maxLines) throw new Error("trim rpc timeout");
+          throw new Error("semantic rpc timeout");
+        }) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1");
-        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("semantic rpc timeout"));
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("trim rpc timeout"));
       } finally { h.cleanup(); }
     });
   });

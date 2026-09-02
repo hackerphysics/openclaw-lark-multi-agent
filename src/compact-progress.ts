@@ -12,7 +12,7 @@ const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_ST
 const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_STATUS_TICK_MS || 1000);
 
 /** Coarse phase of the compaction flow, drives the card's primary line. */
-export type CompactPhase = "native" | "tool-trim";
+export type CompactPhase = "native" | "transcript-trim";
 
 /** Terminal outcome used by the renderer to pick color/emoji. */
 export type CompactState = "running" | "done" | "failed" | "noop";
@@ -45,7 +45,7 @@ export type CompactProgressOptions = {
 };
 
 /**
- * Lifecycle: start() → (optional) toToolTrim() when native gives up → one of
+ * Lifecycle: start() → (optional) toTranscriptTrim() when native gives up → one of
  * done()/noop()/fail(). The card is created lazily after `delayMs` so a fast
  * compaction that finishes first never shows a card at all. All terminal calls
  * are idempotent and safe even if the card was never created.
@@ -81,10 +81,10 @@ export class CompactProgressController {
     this.createTimer.unref?.();
   }
 
-  /** Native compaction gave up (timeout/no-op); switch the card to fast-trim. */
-  async toToolTrim(): Promise<void> {
-    if (this.finalized || this.phase === "tool-trim") return;
-    this.phase = "tool-trim";
+  /** Native compaction gave up; switch to Gateway-owned transcript-tail trim. */
+  async toTranscriptTrim(): Promise<void> {
+    if (this.finalized || this.phase === "transcript-trim") return;
+    this.phase = "transcript-trim";
     await this.refresh();
   }
 

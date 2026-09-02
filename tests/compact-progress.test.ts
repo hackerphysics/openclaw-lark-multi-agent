@@ -41,7 +41,7 @@ describe("CompactProgressController (compaction progress card)", () => {
     vi.useRealTimers();
   });
 
-  it("flips the phase to tool-trim while running", async () => {
+  it("flips the phase to transcript-trim while running", async () => {
     vi.useFakeTimers();
     const views: CompactProgressView[] = [];
     const create = vi.fn(async (view: CompactProgressView) => { views.push(view); return "msg1"; });
@@ -50,11 +50,11 @@ describe("CompactProgressController (compaction progress card)", () => {
 
     p.start();
     await vi.advanceTimersByTimeAsync(0);
-    await p.toToolTrim();
+    await p.toTranscriptTrim();
 
     const running = views.filter((v) => v.state === "running");
     expect(running.some((v) => v.phase === "native")).toBe(true);
-    expect(running.some((v) => v.phase === "tool-trim")).toBe(true);
+    expect(running.some((v) => v.phase === "transcript-trim")).toBe(true);
     vi.useRealTimers();
   });
 
@@ -148,7 +148,7 @@ describe("CompactProgressController (compaction progress card)", () => {
 
     p.start();
     await vi.advanceTimersByTimeAsync(0);
-    await p.toToolTrim();
+    await p.toTranscriptTrim();
     await p.done("native");
 
     expect(p.id).toBeUndefined();
