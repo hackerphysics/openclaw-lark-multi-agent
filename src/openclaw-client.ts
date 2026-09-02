@@ -338,10 +338,12 @@ export class OpenClawClient {
             if (this.claimToolEvent(rawKey, eventId, phase)) {
               const meta = data.meta || data.input || data.args || "";
               const output = data.output || data.result || data.error || "";
-              if (toolCb) toolCb(`${data.name} ${phase}`.trim(), String(meta || ""), String(output || ""));
+              const inputText = this.formatToolValue(meta, String(data.name), "start");
+              const outputText = this.formatToolValue(output, String(data.name), phase);
+              if (toolCb) toolCb(`${data.name} ${phase}`.trim(), inputText, outputText);
               const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
               if (progressCb) {
-                const detail = phase === "start" ? String(meta || "") : String(output || meta || "");
+                const detail = phase === "start" ? inputText : (outputText || inputText);
                 void progressCb({ kind: "tool", phase, name: String(data.name), text: `${data.name} ${phase}${detail ? `: ${detail}` : ""}` });
               }
             }
@@ -368,11 +370,13 @@ export class OpenClawClient {
             }
             const input = data.input || data.args || data.meta || "";
             const output = data.output || data.result || data.error || "";
+            const inputText = this.formatToolValue(input, name, "start");
+            const outputText = this.formatToolValue(output, name, phase);
             const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
-            if (toolCb) toolCb(`${name} ${phase}`, String(input || ""), String(output || ""));
+            if (toolCb) toolCb(`${name} ${phase}`, inputText, outputText);
             const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
             if (progressCb) {
-              const detail = phase === "start" ? String(input || "") : String(output || input || "");
+              const detail = phase === "start" ? inputText : (outputText || inputText);
               void progressCb({ kind: "tool", phase, name, text: `${name} ${phase}${detail ? `: ${detail}` : ""}` });
             }
           }
@@ -469,6 +473,67 @@ export class OpenClawClient {
       this.verboseAssistantSent.delete(key);
       this.verboseAssistantLastTouched.delete(key);
     }
+  }
+
+  /** Render protocol-4 structured tool args/results without `[object Object]`.
+   * Prefer useful, non-secret fields and keep the fallback bounded. */
+  private formatToolValue(value: unknown, toolName: string, phase: "start" | "end" | "error"): string {
+    if (value === null || value === undefined || value === "") return "";
+    if (typeof value === "string") return value.trim();
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
+    if (Array.isArray(value)) {
+      const items = value.slice(0, 4).map((item) => this.formatToolValue(item, toolName, phase)).filter(Boolean);
+      return items.join("; ");
+    }
+    if (typeof value !== "object") return String(value);
+
+    const record = value as Record<string, unknown>;
+    const read = (key: string) => this.formatToolValue(record[key], toolName, phase);
+    const first = (...keys: string[]) => {
+      for (const key of keys) {
+        if (!(key in record)) continue;
+        const text = read(key);
+        if (text) return text;
+      }
+      return "";
+    };
+
+    // Tool-specific start summaries put the primary operation first.
+    if (phase === "start") {
+      if (toolName === "exec") {
+        const command = first("command", "cmd", "script");
+        const cwd = first("workdir", "cwd");
+        if (command) return cwd ? `${command} (cwd: ${cwd})` : command;
+      }
+      if (toolName === "read" || toolName === "write" || toolName === "edit" || toolName === "apply_patch") {
+        const path = first("path", "file", "filename");
+        if (path) return path;
+      }
+      if (toolName === "web_fetch") {
+        const url = first("url");
+        if (url) return url;
+      }
+      if (toolName === "web_search") {
+        const query = first("query");
+        if (query) return query;
+      }
+    }
+
+    const primary = phase === "start"
+      ? first("command", "path", "url", "query", "action", "target", "sessionKey", "key", "name", "description", "text")
+      : first("error", "message", "status", "exitCode", "output", "stdout", "stderr", "text", "result");
+    if (primary) return primary;
+
+    // Safe generic fallback: omit fields that commonly carry credentials or
+    // large payloads, then serialize a few scalar fields only.
+    const blocked = /token|secret|password|auth|credential|cookie|buffer|content|data|env/i;
+    const parts: string[] = [];
+    for (const [key, raw] of Object.entries(record)) {
+      if (blocked.test(key) || raw === null || raw === undefined || typeof raw === "object") continue;
+      parts.push(`${key}=${String(raw)}`);
+      if (parts.length >= 4) break;
+    }
+    return parts.join(", ");
   }
 
   private claimToolEvent(sessionKey: string, eventId: string, phase: "start" | "end" | "error", now = Date.now()): boolean {

@@ -616,6 +616,22 @@ describe("OpenClawClient native steering", () => {
     expect((client as any).handleSteerConsumption("s1", "yes")).toBe(false);
   });
 
+  it("formats structured protocol-4 tool details instead of object coercion", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "***" } as any);
+    expect((client as any).formatToolValue(
+      { command: "npm test -- --reporter=dot", workdir: "/repo", env: { SECRET: "hidden" } },
+      "exec",
+      "start",
+    )).toBe("npm test -- --reporter=dot (cwd: /repo)");
+    expect((client as any).formatToolValue({ path: "/repo/src/app.ts", offset: 10 }, "read", "start"))
+      .toBe("/repo/src/app.ts");
+    expect((client as any).formatToolValue({ status: "completed", exitCode: 0 }, "exec", "end"))
+      .toBe("completed");
+    expect((client as any).formatToolValue({ env: { TOKEN: "hidden" }, count: 3 }, "tool", "start"))
+      .toBe("count=3");
+    expect((client as any).formatToolValue({ foo: "bar" }, "tool", "start")).not.toContain("[object Object]");
+  });
+
   it("deduplicates canonical tool events against legacy item mirrors", () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     expect((client as any).claimToolEvent("agent:main:s1", "tool:call-1", "start", 1000)).toBe(true);
