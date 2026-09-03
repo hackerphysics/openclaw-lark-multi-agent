@@ -1895,11 +1895,12 @@ export class FeishuBot {
     }
   }
 
-  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "locale">, emoji = "✅"): string {
+  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "model" | "locale">, emoji = "✅"): string {
     const en = meta.locale === "en";
-    return en
+    const core = en
       ? `${emoji} ${meta.toolCalls} tool call${meta.toolCalls === 1 ? "" : "s"} · ⏱ ${meta.elapsed}`
       : `${emoji} 累计${meta.toolCalls} 次工具调用 · ⏱ 耗时${meta.elapsed}`;
+    return meta.model?.trim() ? `${core} · 🧠 ${this.escapeCardText(meta.model.trim())}` : core;
   }
 
   /** Best-effort terminal cleanup for status-only rows and legacy v1.4.3
@@ -2747,6 +2748,7 @@ export class FeishuBot {
       const summary = this.completionSummary({
         toolCalls: view.toolCalls,
         elapsed: view.elapsed,
+        model: view.model,
         locale: en ? "en" : "zh",
       }, statusEmoji);
       return {
@@ -2779,10 +2781,11 @@ export class FeishuBot {
       elements.push({ tag: "markdown", content: en ? "_working…_" : "_正在启动…_" });
     }
     elements.push({ tag: "hr" });
-    // Running/failed status owns timing; model attribution belongs to the final
-    // reply card so the two messages have clear, non-duplicated responsibilities.
-    const footer = en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`;
-    elements.push({ tag: "markdown", content: `<font color='grey'>${footer}</font>` });
+    // Keep the active model visible while the run is in progress or failed.
+    // The final reply also keeps model attribution so it remains self-contained.
+    const footerBits = [en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`];
+    if (view.model?.trim()) footerBits.push(`🧠 ${this.escapeCardText(view.model.trim())}`);
+    elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
     const template = view.state === "failed" ? "orange" : "blue";
     return {
       schema: "2.0",

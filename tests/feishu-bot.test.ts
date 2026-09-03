@@ -2039,11 +2039,11 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(doneText).toContain("✅");
       expect(doneText).toContain("累计7 次工具调用");
       expect(doneText).toContain("⏱ 耗时2:15");
-      expect(doneText).not.toContain("🧠");
+      expect(doneText).toContain("🧠 phgeek-gw/claude-opus-4.8");
       expect(doneText).toContain("<font color='grey'>"); // unobtrusive grey, footer-like
 
-      // The separate final card owns model attribution only; tool calls and
-      // elapsed remain exclusively in the live-status card above.
+      // The separate final answer remains self-contained with model attribution;
+      // the live-status card also keeps the model visible during and after work.
       const finalCard = (h.bot as any).buildMarkdownCard("## 最终结论\n\n内容", "phgeek-gw/claude-opus-4.8");
       const finalText = finalCard.body.elements.map((e: any) => e.content || "").join("\n");
       expect(finalText).toContain("最终结论");
@@ -2067,10 +2067,12 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(failContent).toContain("read: a.ts"); // recent activity retained
       expect(failContent).toContain("read: ok");
       expect(failContent).toContain("累计2 次工具调用"); // summary retained
-      // Running card still has header + footer
+      expect(failContent).toContain("🧠 phgeek-gw/claude-opus-4.8");
+      // Running card still has header + footer, including the active model.
       const runningCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "running", title: "Claude 正在执行", lines: [{ kind: "tool_start", text: "read: a.ts", at: 2 }] }, "chat1");
       expect(runningCard.header).toBeDefined();
       expect(runningCard.body.elements.length).toBeGreaterThan(1); // content + hr + footer
+      expect(runningCard.body.elements.map((e: any) => e.content || "").join("\n")).toContain("🧠 phgeek-gw/claude-opus-4.8");
     } finally { h.cleanup(); }
   });
 
