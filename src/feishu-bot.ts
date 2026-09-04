@@ -1012,13 +1012,6 @@ export class FeishuBot {
           this.pendingAckMessages.set(chatId, acks);
           return true;
         });
-        const previousActiveTarget = this.activeDeliveryTargets.get(chatId);
-        // Install the new Feishu delivery target before admission. OpenClaw may
-        // race from "old run still active" to "dispatch a new run" while
-        // handling queueMode=steer, and that new run can emit events before the
-        // RPC response reaches LMA. Either outcome now routes to this message.
-        const releaseSteerDeliveryTarget = this.setActiveDeliveryTarget(chatId, insertedId, messageId);
-        const provisionalTarget = this.activeDeliveryTargets.get(chatId);
         const steer = await this.openclawClient.steer(sessionKeyForSteer, steerWrapped, cleanText).catch(() => ({ status: "unavailable" as const }));
         if (steer.status === "steered") {
           if (insertedId > 0) {
@@ -1027,42 +1020,19 @@ export class FeishuBot {
               if ("cancelPending" in steer) steer.cancelPending?.();
             });
           }
-          if (provisionalTarget && steer.runId) {
-            provisionalTarget.runId = steer.runId;
-            this.bindRunDeliveryTarget(chatId, steer.runId, provisionalTarget);
-            this.releaseRunDeliveryTargetAfter(chatId, steer.runId, 30 * 60_000);
-          }
-          // A steer admission may become an ordinary new run. Keep its run-bound
-          // reply target long enough for a real tool-heavy run; stale targets are
-          // harmless because later runIds no longer match.
-          releaseSteerDeliveryTarget(30 * 60_000);
-          // RPC acknowledgment is provisional. Keep the durable pending trigger
-          // until session.message confirms consumption; otherwise the normal
-          // queue drains it after the current run.
+          // The plugin confirmed queueing into the existing embedded run. Keep
+          // that run's original delivery target and retain the durable trigger
+          // until session.message proves this specific input was consumed.
           console.log(
-            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, steer accepted (awaiting transcript consumption): "${cleanText.substring(0, 50)}..."`
+            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, plugin steer accepted (awaiting transcript consumption): "${cleanText.substring(0, 50)}..."`
           );
           return;
         }
-        // Native steer was not accepted. Restore the previous run's routing
-        // target and keep the already-created trigger/reaction for normal drain.
+        // Plugin missing/no active run/rejected: keep the durable trigger for
+        // normal queue drain. Never claim that ambiguous native admission was an
+        // in-run insertion.
         stopWatchingConsumption();
         if ("cancelPending" in steer) steer.cancelPending?.();
-        const currentTarget = this.activeDeliveryTargets.get(chatId);
-        if (currentTarget && currentTarget.token === provisionalTarget?.token) {
-          if (currentTarget.timer) clearTimeout(currentTarget.timer);
-          this.activeDeliveryTargets.delete(chatId);
-          if (previousActiveTarget) {
-            const releaseRestoredTarget = this.setActiveDeliveryTarget(
-              chatId,
-              previousActiveTarget.triggerId,
-              previousActiveTarget.messageId,
-            );
-            const restored = this.activeDeliveryTargets.get(chatId);
-            if (restored) restored.liveStatus = previousActiveTarget.liveStatus;
-            releaseRestoredTarget();
-          }
-        }
         console.log(
           `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}), queuing: "${cleanText.substring(0, 50)}..."`
         );

@@ -209,12 +209,12 @@ function runCapture(cmd: string, args: string[]): { code: number; spawnError?: s
 }
 
 /**
- * Install the legacy bundled lma-steer plugin. Current LMA uses OpenClaw's
- * public `chat.send { queueMode: "steer" }` API and does not call this plugin;
- * the command remains only for operators maintaining older LMA deployments.
+ * Install the bundled lma-steer plugin used for observable realtime mid-run
+ * insertion. LMA remains functional without it, but busy messages queue until
+ * the active run completes.
  */
 function cmdInstallSteerPlugin(args: string[]) {
-  console.warn("Note: current LMA releases use native chat.send queueMode=steer; this legacy plugin is not required on OpenClaw 2026.8+.");
+  console.warn("Note: lma-steer is required for confirmed realtime mid-run insertion; without it, busy messages remain safely queued.");
   // Default to --force so reinstalling an updated bundled plugin overwrites the
   // previously installed copy. Pass --no-force to keep an existing install.
   const noForce = hasFlag(args, "--no-force");

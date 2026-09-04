@@ -543,23 +543,19 @@ describe("OpenClawClient 2026.8 session model policy", () => {
   });
 });
 
-describe("OpenClawClient native steering", () => {
-  it("uses public chat.send queueMode=steer and waits for transcript consumption", async () => {
+describe("OpenClawClient plugin steering", () => {
+  it("uses lma.steer and waits for transcript consumption", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "started" }));
+    (client as any).rpc = vi.fn(async () => ({ sessionId: "active-session", status: "steered" }));
 
     await expect(client.steer("agent:main:s1", "wrapped input", "display input")).resolves.toMatchObject({
       status: "steered",
-      runId: "run-steer",
       cancelPending: expect.any(Function),
     });
-    expect((client as any).rpc).toHaveBeenCalledWith("chat.send", expect.objectContaining({
+    expect((client as any).rpc).toHaveBeenCalledWith("lma.steer", {
       sessionKey: "agent:main:s1",
-      message: "wrapped input",
-      queueMode: "steer",
-      deliver: false,
-      idempotencyKey: expect.any(String),
-    }), 10000);
+      text: "wrapped input",
+    }, 10000);
 
     const consumed = vi.fn(() => true);
     client.onSteerConsumed("s1", "wrapped input", consumed);
@@ -567,16 +563,24 @@ describe("OpenClawClient native steering", () => {
     expect(consumed).toHaveBeenCalledWith("wrapped input");
   });
 
-  it("does not claim a rejected native steer as delivered", async () => {
+  it.each(["no_active_run", "rejected"])("does not claim plugin status %s as inserted", async (status) => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "error" }));
+    (client as any).rpc = vi.fn(async () => ({ status }));
     await expect(client.steer("s1", "input")).resolves.toEqual({ status: "unavailable" });
     expect((client as any).handleSteerConsumption("s1", "input")).toBe(false);
+    expect((client as any).rpc).not.toHaveBeenCalledWith("chat.send", expect.anything(), expect.anything());
+  });
+
+  it("queues safely instead of using ambiguous native steering when the plugin is missing", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    (client as any).rpc = vi.fn(async () => { throw new Error("unknown method: lma.steer"); });
+    await expect(client.steer("s1", "input")).resolves.toEqual({ status: "unavailable" });
+    expect((client as any).rpc).toHaveBeenCalledTimes(1);
   });
 
   it("cancels stale provisional correlation before an identical later steer", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "started" }));
+    (client as any).rpc = vi.fn(async () => ({ sessionId: "active-session", status: "steered" }));
     const stale = await client.steer("s1", "same text", "old");
     stale.cancelPending?.();
     const fresh = vi.fn(() => true);
@@ -590,7 +594,7 @@ describe("OpenClawClient native steering", () => {
 
   it("correlates duplicate and overlapping steer text one transcript event at a time", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ runId: "run-steer", status: "started" }));
+    (client as any).rpc = vi.fn(async () => ({ sessionId: "active-session", status: "steered" }));
     const first = vi.fn(() => true);
     const duplicate = vi.fn(() => true);
     const longer = vi.fn(() => true);

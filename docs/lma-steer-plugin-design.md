@@ -1,13 +1,13 @@
-# LMA Steer Plugin — Historical Design Spec (obsolete)
+# LMA Steer Plugin — Design History
 
-> **Archived compatibility note (OpenClaw 2026.8+):** This document records the
-> original July 2026 design and is not the current architecture. Current LMA uses
-> the public `chat.send { queueMode: "steer" }` API, advertises `tool-events`, and
-> confirms model consumption from `session.message`. It does not call
-> `lma.steer`, and new installations must not install or enable the legacy
-> plugin. See the root README's **Real-time steering** section.
+> **Current behavior (OpenClaw 2026.8+):** LMA again uses `lma.steer` for
+> observable active-run queueing, then waits for `session.message` to confirm
+> consumption. Public `chat.send { queueMode: "steer" }` proved ambiguous in
+> production: consecutive messages could receive `started` while one fell
+> through to a later ordinary run. The original rationale below therefore
+> remains relevant; implementation details may still be historical.
 
-## Original draft (historical)
+## Original design notes
 
 > Goal (Stephen, 2026-07-01): An OpenClaw plugin **inside the LMA project**, installed
 > by command, that detects tool-call execution and **injects a user's message in the

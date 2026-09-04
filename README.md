@@ -101,18 +101,17 @@ lma install-windows-service
 
 ### Real-time steering
 
-When the agent is mid-run and a new message arrives, the bridge submits it via
-OpenClaw's public `chat.send` API with `queueMode: "steer"`. The RPC
-acknowledgment is provisional: LMA retains its durable pending trigger until a
-matching `session.message` proves transcript commitment/consumption, and only
-then switches Feishu from Typing to Get. Async `error`/`aborted` terminals are
-routed by run id, while unconsumed input remains available for normal queue
-fallback. This replaces the deprecated synchronous plugin primitive whose
-boolean could not represent later runtime rejection.
+When the agent is mid-run and a new message arrives, the bridge calls the
+bundled `lma-steer` plugin. The plugin resolves the active embedded run and only
+returns `steered` after queueing the message into that run. LMA then retains its
+durable pending trigger until a matching `session.message` proves transcript
+commitment/consumption, and only then switches Feishu from Typing to Get.
 
-OpenClaw 2026.8+ no longer requires the bundled `lma-steer` plugin. The
-`install-steer-plugin` command remains temporarily for older installations but
-current LMA releases do not call its private Gateway method.
+OpenClaw's public `chat.send { queueMode: "steer" }` returns `started` even when
+a message falls through to a later ordinary run, so LMA does not use that
+ambiguous response as proof of realtime insertion. If the plugin is unavailable,
+there is no active run, or injection is rejected, the message safely stays in
+the normal queue and is never falsely shown as inserted.
 
 Useful CLI commands:
 
@@ -122,7 +121,7 @@ lma doctor
 lma start [config]
 lma init [--state-dir DIR] [--force]
 lma install-systemd [--user|--system] [--state-dir DIR]
-lma install-steer-plugin [--no-force]  # legacy; not needed on OpenClaw 2026.8+
+lma install-steer-plugin [--no-force]  # required for realtime mid-run insertion
 ```
 
 ## Quick start from source
@@ -464,9 +463,11 @@ when that list is non-empty. Exact refs and `provider/*` wildcards are accepted.
 LMA now surfaces a model-policy rejection instead of logging a false “model
 ensured” success.
 
-Mid-run messages use the public `chat.send { queueMode: "steer" }` path. LMA
-keeps the durable trigger until `session.message` confirms consumption; this is
-also the signal for the visible Typing-to-Get transition.
+Mid-run messages use the bundled `lma-steer` plugin because public
+`chat.send { queueMode: "steer" }` cannot distinguish true in-run insertion from
+a later ordinary run. LMA keeps the durable trigger until `session.message`
+confirms consumption; this is also the signal for the visible Typing-to-Get
+transition. Without the plugin, messages remain safely queued.
 
 ## Live status
 

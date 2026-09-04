@@ -32,9 +32,9 @@ class MockOpenClaw {
   compactSession = vi.fn(async () => ({ ok: true, compacted: true }));
   async resetSession() { return "ok"; }
   abortChat = vi.fn(async () => {});
-  // Steer stub: default to "steered" so busy-branch tests exercise the steer path.
-  // Override per-test (e.g. return { status: "unavailable" }) to test fallback.
-  steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const, runId: "steer-run-1" }));
+  // Plugin steer stub: `steered` means queued into the existing active run.
+  // Override with unavailable to test safe normal-queue fallback.
+  steer = vi.fn(async (_sessionKey: string, _text: string) => ({ status: "steered" as const }));
   // Consumed callbacks registered by the bridge; tests call fireSteerConsumed to
   // simulate the model actually consuming a steered message.
   steerConsumedCbs: Array<(text: string) => boolean | void> = [];
@@ -2443,7 +2443,7 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       h.store.setBotMode("GLM", "chat1", "free");
       delete (h.bot as any).ensureSession;
-      // Default mock steer returns an acknowledged client run id.
+      // Default mock plugin steer confirms queueing into the existing run.
       let releaseFirst!: (value: string) => void;
       (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -2472,20 +2472,11 @@ describe("FeishuBot routing and queue behavior", () => {
       const secondRow = h.store.getMessageId("busy-2")!;
       expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(true);
 
-      // The admission target is switched to the second Feishu message before
-      // native chat.send is invoked. If OpenClaw races to an ordinary new run,
-      // that run's proactive reply must still bind to busy-2, never busy-1.
-      const activeTargetDuringAdmission = (h.bot as any).activeDeliveryTargets.get("chat1");
-      expect(activeTargetDuringAdmission?.messageId).toBe("busy-2");
-      expect(activeTargetDuringAdmission?.triggerId).toBe(secondRow);
-      expect(activeTargetDuringAdmission?.runId).toBe("steer-run-1");
-      expect((h.bot as any).deliveryTargetsByRun.get("chat1\u0000steer-run-1")?.liveStatus).toBeUndefined();
-
-      // If native steer raced to an ordinary dispatch, its run-scoped proactive
-      // final is attached to the second Feishu message, not the old active one.
-      const sessionCb = h.openclaw.sessionCallbacks.get("lma-glm-chat1")!;
-      await sessionCb("race fallback answer", { runId: "steer-run-1" });
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("busy-2", "race fallback answer");
+      // A confirmed plugin steer belongs to the existing run; it must not replace
+      // that run's original final-reply target with the inserted message.
+      const activeTargetDuringSteer = (h.bot as any).activeDeliveryTargets.get("chat1");
+      expect(activeTargetDuringSteer?.messageId).toBe("busy-1");
+      expect((h.bot as any).deliveryTargetsByRun.size).toBe(0);
 
       // Model consumption controls only the visible Typing -> Get transition.
       h.openclaw.fireSteerConsumed("中途插入的话");
@@ -2532,7 +2523,7 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("restores the previous delivery target when native steer admission is unavailable", async () => {
+  it("keeps the previous delivery target when plugin steer is unavailable", async () => {
     const h = makeHarness("GLM");
     try {
       h.store.setBotMode("GLM", "chat1", "free");

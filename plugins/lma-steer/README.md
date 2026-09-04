@@ -1,38 +1,35 @@
-# lma-steer (legacy compatibility plugin)
+# lma-steer
 
-This plugin is retained for older `openclaw-lark-multi-agent` deployments that
-called the private `lma.steer` Gateway method.
+`lma-steer` provides observable mid-run insertion for
+`openclaw-lark-multi-agent`.
 
-Current LMA releases on OpenClaw 2026.8+ do **not** use this plugin. They submit
-mid-run input through the public protocol API:
+OpenClaw's public `chat.send { queueMode: "steer" }` acknowledges admission with
+`started` even when the message falls through to a later ordinary run. That is
+not enough for LMA to tell users whether a message actually entered the active
+run. This plugin resolves the active embedded run and reports one of:
 
-```text
-chat.send { queueMode: "steer" }
-```
+- `steered` — queued into the active embedded run;
+- `no_active_run` — no active embedded run was found;
+- `rejected` — the runtime refused queueing.
 
-The public path owns admission, while LMA retains its durable fallback trigger
-until a matching `session.message` confirms transcript consumption. Only then
-is the Feishu acknowledgement changed from Typing to Get, so provisional
-acceptance and actual model consumption remain distinct.
+LMA treats `steered` as provisional until the matching `session.message`
+confirms transcript consumption. Any other outcome remains in LMA's durable
+normal queue.
 
-## Legacy installation
+## Installation
 
-Only install this plugin when maintaining an older LMA release that explicitly
-requires `lma.steer`:
+Realtime mid-run insertion requires this plugin:
 
 ```bash
 lma install-steer-plugin
 ```
 
-Restart the OpenClaw Gateway after installation. For new deployments, skip this
-step.
+Restart the OpenClaw Gateway after installation. LMA itself remains functional
+without the plugin, but messages received during a run wait safely in the
+normal queue.
 
-## Legacy method
+## Gateway method
 
 - method: `lma.steer`
 - params: `{ sessionKey: string, text: string }`
 - result: `{ status: "steered" | "no_active_run" | "rejected", sessionId?: string }`
-
-Its synchronous `steered` result reflects immediate queue eligibility only; it
-cannot prove later runtime consumption. This limitation is why current LMA uses
-the public native steering path instead.

@@ -11,11 +11,11 @@ import {
  * into the *active* OpenClaw run at the next tool-call boundary, instead of
  * making the user wait for the whole run to finish.
  *
- * Legacy compatibility note:
- * Current LMA releases use public `chat.send { queueMode: "steer" }` and do not
- * call this Gateway method. This plugin remains packaged only for older LMA
- * installations. Its synchronous queue result represents immediate eligibility,
- * not proof that a later runtime boundary consumed the message.
+ * Current LMA uses this method because public
+ * `chat.send { queueMode: "steer" }` cannot distinguish queueing into the active
+ * run from falling through to a later ordinary run. The plugin's `steered`
+ * outcome confirms active-run queueing; LMA separately waits for session.message
+ * before treating the message as consumed.
  *
  * Gateway method: `lma.steer`
  *   params:  { sessionKey: string, text: string, steeringMode?: "all" }

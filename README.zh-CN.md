@@ -414,7 +414,7 @@ LMA 以 Gateway protocol 4 为基线，并使用 `openclaw@2026.8.2` 构建和�
 
 新版把模型元数据与模型覆盖允许列表分开。如果 `agents.defaults.modelPolicy.allow` 非空，LMA 配置中的每个模型都必须被该列表的精确模型引用或 `provider/*` 通配符允许。遇到拒绝时，LMA 会直接报告 model policy 错误，不再错误记录“模型已确保”。
 
-执行中插入的消息改用公开的 `chat.send { queueMode: "steer" }`。RPC 成功返回只是暂时接受；LMA 会继续保留本地 pending trigger，只有匹配的 `session.message` 确认消息已写入转录并被消费后才清除，同时把飞书标记从 Typing 切换为 Get。异步 `error`/`aborted` 按 runId 投递，未消费的输入仍由普通队列兜底。这样不再依赖无法表达后续异步拒绝的旧同步插件原语。
+执行中插入的消息使用内置 `lma-steer` 插件。插件会解析当前 active embedded run，只有消息确实排入该 run 时才返回 `steered`。LMA 仍会保留本地 pending trigger，直到匹配的 `session.message` 确认消息已写入转录并被消费后才清除，同时把飞书标记从 Typing 切换为 Get。公开的 `chat.send { queueMode: "steer" }` 即使退化为稍后的普通 run 也只返回 `started`，因此不再把它当作实时插入成功的证据。插件不可用、没有 active run 或拒绝插入时，消息会安全保留在普通队列中，不会伪报已插入。
 
 ## Live Status 与最终回复
 

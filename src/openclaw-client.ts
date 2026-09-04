@@ -1202,13 +1202,17 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   }
 
   /**
-   * Submit a mid-run message through OpenClaw's public atomic steer path.
-   * OpenClaw 2026.8 deprecated the synchronous plugin primitive previously used
-   * by `lma-steer`: its boolean only represented immediate eligibility and could
-   * still be rejected asynchronously. `chat.send queueMode=steer` owns admission
-   * and transcript persistence. LMA still treats the RPC result as provisional;
-   * the Feishu reaction flips to Get only after a matching `session.message`
-   * confirms that the input was committed/consumed.
+   * Submit a mid-run message through the lma-steer plugin.
+   *
+   * OpenClaw's public `chat.send { queueMode: "steer" }` returns `started` even
+   * when it falls through to a later ordinary run; it therefore cannot tell the
+   * bridge whether THIS message entered the active run. The plugin resolves the
+   * active embedded run and reports `steered` only when it actually queued there.
+   * A matching session.message remains the final consumption confirmation.
+   *
+   * If the plugin is missing, stale, or rejects the injection, return unavailable
+   * and let LMA's durable trigger run normally after the current turn. Never use
+   * the ambiguous public admission as a realtime-insertion success signal.
    */
   async steer(sessionKey: string, text: string, displayText?: string): Promise<{
     status: "steered" | "unavailable";
@@ -1218,27 +1222,18 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   }> {
     const key = this.canonicalSessionKey(sessionKey);
     try {
-      const res = await this.rpc("chat.send", {
-        sessionKey: key,
-        message: text,
-        queueMode: "steer",
-        deliver: false,
-        idempotencyKey: randomUUID(),
-      }, 10000);
-      const status = res?.status;
-      if (status !== "started" && status !== "in_flight" && status !== "ok") {
+      const res = await this.rpc("lma.steer", { sessionKey: key, text }, 10000);
+      if (res?.status !== "steered") {
+        if (res?.status && res.status !== "no_active_run") {
+          console.warn(`[OpenClaw] lma.steer ${res.status} for ${key.slice(-8)}`);
+        }
         return { status: "unavailable" };
       }
-      // This records only a provisional accepted input. Actual success is driven
-      // by handleSteerConsumption after the canonical transcript event arrives.
       const cancelPending = this.registerPendingSteer(key, text, displayText);
-      return {
-        status: "steered",
-        runId: typeof res?.runId === "string" ? res.runId : undefined,
-        cancelPending,
-      };
+      return { status: "steered", cancelPending };
     } catch (err) {
-      console.warn(`[OpenClaw] native steer failed for ${key.slice(-8)}: ${(err as Error)?.message || String(err)}`);
+      const message = (err as Error)?.message || String(err);
+      console.warn(`[OpenClaw] lma.steer unavailable for ${key.slice(-8)}: ${message}`);
       return { status: "unavailable" };
     }
   }
