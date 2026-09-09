@@ -12,6 +12,13 @@ export type ProgressEvent =
   | { kind: "steer"; text: string }
   | { kind: "lifecycle"; text: string };
 
+export class InactiveRunObservation extends Error {
+  constructor() {
+    super("Gateway 确认当前会话已空闲，但旧运行结果未能确认；追加消息将继续处理，未停止任何后台任务。");
+    this.name = "InactiveRunObservation";
+  }
+}
+
 export type ChatAttachment = {
   type?: string;
   mimeType?: string;
@@ -62,6 +69,8 @@ export class OpenClawClient {
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;
   private shouldReconnect = true;
+  /** Read-only reconciliation for a collector whose plugin reports no active run. */
+  private runStateChecks = new Map<string, () => Promise<void>>();
   /** Callbacks for tool events (verbose mode) */
   private toolEventCallbacks: Map<string, (toolName: string, toolInput: string, toolOutput: string) => void> = new Map();
   private lastToolNamesByItemId: Map<string, string> = new Map();
@@ -687,11 +696,13 @@ export class OpenClawClient {
    * Collect agent reply by polling accumulated events.
    * Matches by initial runId OR sessionKey to handle multi-turn tool calling
    * where OpenClaw creates new runIds for each tool-call round.
-   * No aggressive timeout — waits for lifecycle end as the source of truth.
-   * 30-minute safety net only for catastrophic WS disconnection.
+   * Existing event/anchor matching is retained. After 30 minutes of silence,
+   * reconcile the original run instead of aborting or treating a draft as final.
+   * Explicit terminal/error/disconnect paths keep their existing behavior.
    */
 private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string }): Promise<string> {
-    return new Promise((resolve, reject) => {
+    let cleanupObservation = () => {};
+    return new Promise<string>((resolve, reject) => {
       // Whether we were connected when the run started. We only treat a later
       // disconnect as a mid-run gateway drop (fail fast) if we began connected;
       // this keeps unit tests that drive collectReply without a live socket from
@@ -725,29 +736,47 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       };
 
       let idleTimer: ReturnType<typeof setTimeout>;
-      const resetIdleTimer = () => {
-        if (idleTimer) clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          clearInterval(poller);
-          if (chatFinalTimer) clearTimeout(chatFinalTimer);
-          if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
-          if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
-          if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
-          console.warn(`[OpenClaw] collectReply idle timeout for runId=${runId} sessionKey=${sessionKey}`);
-          this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
-            console.warn(`[OpenClaw] abort after collectReply idle timeout failed:`, (err as Error).message);
-          });
-          const visibleText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
-          if (visibleText) {
-            resolve(visibleText);
-          } else if (pendingRuntimeFailureText) {
-            resolve(`${pendingRuntimeFailureText}\n\nLMA 已连续 ${Math.round(timeoutMs / 60000)} 分钟没有收到新的工具输出或最终回复，已停止等待。`);
-          } else if (lastActivitySummary) {
-            resolve(`⚠️ Agent 长时间没有产生最终回复\n最后活动: ${lastActivitySummary}\n时间: ${new Date(lastActivityAt).toLocaleString()}\n\nLMA 已连续 ${Math.round(timeoutMs / 60000)} 分钟没有收到新的工具输出或最终回复，已停止等待。`);
-          } else {
-            resolve("(timeout: no reply received)");
+      let observationClosed = false;
+      let checkingState = false;
+      let lastStateCheckAt = -Infinity;
+      let quietNotified = false;
+      const checkRunState = async () => {
+        if (observationClosed || checkingState || Date.now() - lastStateCheckAt < 60_000) return;
+        checkingState = true;
+        lastStateCheckAt = Date.now();
+        try {
+          const snapshot = await this.rpc("agent.wait", { runId, timeoutMs: 1500 }, 2500);
+          if (observationClosed || snapshot?.runId !== runId || snapshot?.pendingError === true
+            || snapshot?.timeoutPhase === "queue" || snapshot?.timeoutPhase === "gateway_draining") return;
+          // A bare wait timeout is not an execution timeout. Require a recorded
+          // terminal time; never infer failure from stopReason or replay flags.
+          const ended = snapshot.endedAt;
+          if (typeof ended !== "number" || !Number.isFinite(ended) || ended <= 0
+            || (typeof snapshot.startedAt === "number" && ended < snapshot.startedAt)) return;
+          if (snapshot.status === "ok" && snapshot.yielded !== true) {
+            const terminal = snapshot.terminalReply;
+            const visible = terminal?.disposition === "visible" && typeof terminal.text === "string"
+              ? terminal.text : terminal?.disposition === "silent" ? "NO_REPLY"
+                : this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
+            resolve(visible || "NO_REPLY");
+          } else if (snapshot.status === "error" || snapshot.status === "timeout") {
+            reject(new Error(`Agent error: ${typeof snapshot.error === "string" && snapshot.error.trim()
+              ? snapshot.error : `Gateway 已确认运行以 ${snapshot.status} 结束`}`));
           }
-        }, timeoutMs);
+        } catch { /* Unavailable evidence means keep waiting, never abort/replay. */ }
+        finally { checkingState = false; }
+      };
+      const resetIdleTimer = (delayMs = timeoutMs) => {
+        if (idleTimer) clearTimeout(idleTimer);
+        if (observationClosed) return;
+        idleTimer = setTimeout(async () => {
+          if (!quietNotified) {
+            quietNotified = true;
+            console.warn(`[OpenClaw] quiet run ${runId}; checking Gateway state without stopping execution`);
+          }
+          await checkRunState();
+          if (!observationClosed) resetIdleTimer(60_000);
+        }, delayMs);
       };
       const summarizeActivity = (ev: any): string => {
         if (ev.stream === "item") {
@@ -1107,7 +1136,38 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
           }
         }
       }, 50);
-    });
+      const observationKey = targetSessionKey ? this.canonicalSessionKey(targetSessionKey) : "";
+      const checkAfterNoActiveRun = async () => {
+        await checkRunState();
+        if (observationClosed || !observationKey) return;
+        try {
+          // Used only after the plugin reports no active run. Missing terminal
+          // history is not failure, but an explicit idle session must not keep
+          // a phantom queue owner blocking this newly-arrived user message.
+          const history = await this.rpc("chat.history", { sessionKey: observationKey, limit: 1 }, 2500);
+          if (!observationClosed && history?.sessionKey === observationKey && history?.sessionInfo?.hasActiveRun === false) {
+            reject(new InactiveRunObservation());
+          }
+        } catch { /* Unknown activity cannot authorize releasing an active owner. */ }
+      };
+      if (observationKey) this.runStateChecks.set(observationKey, checkAfterNoActiveRun);
+      // Bound local resources without cancelling an execution we cannot prove stuck.
+      const observationHorizon = setTimeout(() => reject(new Error(
+        "LMA 本地监听达到 24 小时上限，结果未确认；未发送停止请求，请检查原运行。"
+      )), 24 * 60 * 60_000);
+      observationHorizon.unref?.();
+      cleanupObservation = () => {
+        observationClosed = true;
+        clearTimeout(idleTimer);
+        clearTimeout(observationHorizon);
+        clearInterval(poller);
+        if (chatFinalTimer) clearTimeout(chatFinalTimer);
+        if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
+        if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
+        if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
+        if (observationKey && this.runStateChecks.get(observationKey) === checkAfterNoActiveRun) this.runStateChecks.delete(observationKey);
+      };
+    }).finally(() => cleanupObservation());
   }
 
   /**
@@ -1221,17 +1281,23 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     cancelPending?: () => void;
   }> {
     const key = this.canonicalSessionKey(sessionKey);
+    // Consumption can arrive before the plugin RPC response at a tool boundary.
+    const cancelPending = this.registerPendingSteer(key, text, displayText);
     try {
       const res = await this.rpc("lma.steer", { sessionKey: key, text }, 10000);
       if (res?.status !== "steered") {
+        // A locally busy collector can outlive the actual Gateway turn. Check
+        // its exact terminal record now, rather than parking input for 30 min.
+        if (res?.status === "no_active_run") await this.runStateChecks.get(key)?.();
         if (res?.status && res.status !== "no_active_run") {
           console.warn(`[OpenClaw] lma.steer ${res.status} for ${key.slice(-8)}`);
         }
+        cancelPending();
         return { status: "unavailable" };
       }
-      const cancelPending = this.registerPendingSteer(key, text, displayText);
       return { status: "steered", cancelPending };
     } catch (err) {
+      cancelPending();
       const message = (err as Error)?.message || String(err);
       console.warn(`[OpenClaw] lma.steer unavailable for ${key.slice(-8)}: ${message}`);
       return { status: "unavailable" };

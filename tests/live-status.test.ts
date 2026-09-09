@@ -2,6 +2,25 @@ import { describe, expect, it, vi } from "vitest";
 import { LiveStatusController, type LiveStatusView } from "../src/live-status.js";
 
 describe("LiveStatusController (interactive card)", () => {
+  it("freezes an unconfirmed idle result without showing success or interrupted status", async () => {
+    vi.useFakeTimers();
+    try {
+      const views: LiveStatusView[] = [];
+      const live = new LiveStatusController({ create: async () => "card", edit: async (_id, view) => { views.push(view); } }, { botName: "GPT", delayMs: 0 });
+      live.start(); await vi.advanceTimersByTimeAsync(0);
+      await live.progress({ kind: "tool", name: "exec", phase: "start", text: "exec start: npm test" });
+      await live.pauseForUnconfirmedResult("旧结果未确认；继续处理新消息");
+      const final = views.at(-1)!;
+      expect(final.title).toBe("GPT 结果未确认");
+      expect(final.state).not.toBe("done");
+      expect(final.state).not.toBe("failed");
+      expect(final.lines.some(l => l.text.includes("npm test"))).toBe(true);
+      const count = views.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(views.length).toBe(count);
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
   it("sets title to done on complete", async () => {
     vi.useFakeTimers();
     const views: LiveStatusView[] = [];

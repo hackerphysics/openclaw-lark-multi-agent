@@ -22,6 +22,7 @@ describe("OpenClawClient collectReply", () => {
     events.set(fullKey, []);
     events.set(shortKey, []);
 
+    (client as any).rpc = vi.fn(async () => ({ runId: "chat-run", status: "error", endedAt: Date.now(), error: "Agent 未正常完成" }));
     const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
     events.get(shortKey)!.push({
       runId: "chat-run",
@@ -30,7 +31,7 @@ describe("OpenClawClient collectReply", () => {
       data: { phase: "end", livenessState: "aborted", stopReason: "rpc" },
     });
 
-    await expect(replyPromise).resolves.toContain("Agent 未正常完成");
+    await expect(replyPromise).rejects.toThrow("Agent 未正常完成");
   });
 
   it("ignores empty lifecycle end and waits for later real text", async () => {
@@ -320,7 +321,7 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("real transcript reply");
   });
 
-  it("does not surface replayInvalid before the idle timeout and includes last activity when it times out", async () => {
+  it("does not turn replayInvalid plus silence into failure while Gateway remains pending", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
@@ -341,11 +342,16 @@ describe("OpenClawClient collectReply", () => {
       data: { phase: "end", livenessState: "abandoned", replayInvalid: true },
     });
 
-    const reply = await replyPromise;
-    expect(reply).toContain("Agent 未正常完成");
-    expect(reply).toContain("状态: abandoned, replayInvalid");
-    expect(reply).toContain("最后活动: 工具 end exec: curl timed out after 300s; received 788MB/1.12GB");
-    expect(reply).toContain("没有收到新的工具输出或最终回复");
+    (client as any).rpc = vi.fn(async () => ({ runId: "chat-run", status: "timeout" }));
+    const abort = vi.spyOn(client, "abortChat");
+    let settled = false;
+    void replyPromise.then(() => { settled = true; });
+    await new Promise(r => setTimeout(r, 550));
+    expect(settled).toBe(false);
+    expect(abort).not.toHaveBeenCalled();
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "late final" } });
+    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+    await expect(replyPromise).resolves.toBe("late final");
   });
 
   it("clears a pending replayInvalid failure when later tool activity arrives", async () => {
@@ -398,7 +404,7 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("late real reply");
   });
 
-  it("surfaces cancelled/rpc lifecycle only after idle timeout if no real reply arrives", async () => {
+  it("surfaces cancelled/rpc failure only after Gateway confirms a terminal error", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
@@ -413,11 +419,8 @@ describe("OpenClawClient collectReply", () => {
       data: { phase: "end", livenessState: "cancelled", stopReason: "rpc" },
     });
 
-    const reply = await replyPromise;
-    expect(reply).toContain("Agent 未正常完成");
-    expect(reply).toContain("状态: cancelled");
-    expect(reply).toContain("原因: rpc");
-    expect(reply).toContain("没有收到新的工具输出或最终回复");
+    (client as any).rpc = vi.fn(async () => ({ runId: "chat-run", status: "error", endedAt: Date.now(), error: "Gateway confirmed cancellation" }));
+    await expect(replyPromise).rejects.toThrow("Gateway confirmed cancellation");
   });
 
   it("extracts visible assistant text from text-only transcript messages", () => {

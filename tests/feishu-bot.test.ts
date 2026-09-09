@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
+import { InactiveRunObservation } from "../src/openclaw-client.js";
 import { MessageStore } from "../src/message-store.js";
 import type { BotConfig } from "../src/config.js";
 
@@ -2405,6 +2406,72 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("pending-killed", "mock reply");
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally { h.cleanup(); }
+  });
+
+  it("drains new input after an idle Gateway releases the phantom old queue owner", async () => {
+    const h = makeHarness("GPT");
+    try {
+      let rejectOld!: (err: Error) => void;
+      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.();
+        if (h.openclaw.chatCalls.length === 1) return new Promise<string>((_resolve, reject) => { rejectOld = reject; });
+        return "new answer";
+      });
+      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "old task", messageId: "idle-old" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1 && Boolean(rejectOld), { timeout: 1000 });
+      h.openclaw.steer = vi.fn(async () => {
+        rejectOld(new InactiveRunObservation());
+        return { status: "unavailable" as const };
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "new task", messageId: "idle-new" }));
+      await first;
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
+      await ((h.bot as any).queueRuns.get("chat1") || Promise.resolve());
+      expect(h.openclaw.chatCalls.map(p => p.currentMessage)).toEqual(["old task", "new task"]);
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("idle-old", "DONE");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("idle-new", "new answer");
+    } finally { h.cleanup(); }
+  });
+
+  it("retains no stale cleanup when the inserted message is consumed before the RPC ack", async () => {
+    const h = makeHarness("GPT");
+    try {
+      let release!: (text: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn((p: any) => { h.openclaw.chatCalls.push(p); return new Promise<string>(r => { release = r; }); });
+      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "first", messageId: "pre-ack-first" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      h.openclaw.steer = vi.fn(async (_key: string, text: string) => { h.openclaw.fireSteerConsumed(text); return { status: "steered" as const }; });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "fast insert", messageId: "pre-ack-second" }));
+      const row = h.store.getMessageId("pre-ack-second")!;
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(row)).toBe(false);
+      expect((h.bot as any).pendingSteerCleanups.has(row)).toBe(false);
+      release("done"); await first;
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+
+  it("still steers input after a healthy queue owner has run for over 30 minutes", async () => {
+    const h = makeHarness("GPT");
+    let clock: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      let release!: (text: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
+        h.openclaw.chatCalls.push(p);
+        return new Promise<string>(r => { release = r; });
+      });
+      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "long task", messageId: "long-owner" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      const later = Date.now() + 31 * 60_000;
+      clock = vi.spyOn(Date, "now").mockReturnValue(later);
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "insert after thirty minutes", messageId: "long-insert" }));
+      expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("insert after thirty minutes"), "insert after thirty minutes");
+      h.openclaw.fireSteerConsumed("insert after thirty minutes");
+      release("finished");
+      await first;
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { clock?.mockRestore(); h.cleanup(); }
   });
 
   it("does not mark queued mid-run messages DONE or synced before processing", async () => {

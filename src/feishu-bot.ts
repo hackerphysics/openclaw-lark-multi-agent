@@ -2,7 +2,7 @@ import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
-import { OpenClawClient } from "./openclaw-client.js";
+import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { MessageStore } from "./message-store.js";
@@ -976,9 +976,9 @@ export class FeishuBot {
       }
 
       // --- Queue-based sending: if agent is busy, just accumulate ---
-      const busySince = this.busyChats.get(chatId) || 0;
-      const BUSY_TIMEOUT_MS = 1_800_000; // 30 minutes, matches collectReply safety timeout
-      const isBusy = busySince > 0 && (Date.now() - busySince) < BUSY_TIMEOUT_MS;
+      // The actual queue owner, not elapsed wall time, decides whether input
+      // should steer/queue. Long healthy runs must not lose their busy ownership.
+      const isBusy = this.queueRuns.has(chatId);
 
       if (isBusy) {
         // The agent is mid-run. Instead of only queuing to wait for the current
@@ -995,9 +995,11 @@ export class FeishuBot {
         pending.push({ messageId, emoji: "Typing", rowId: insertedId });
         this.pendingAckMessages.set(chatId, pending);
         const norm = cleanText.replace(/\s+/g, " ").trim();
+        let consumedBeforeAck = false;
         const stopWatchingConsumption = this.openclawClient.onSteerConsumed(sessionKeyForSteer, steerWrapped, (consumedText) => {
           const cn = (consumedText || "").replace(/\s+/g, " ").trim();
           if (cn !== norm && !cn.includes(norm)) return false;
+          consumedBeforeAck = true;
           // Only transcript commitment/consumption transfers durable custody.
           // Until this point the local pending trigger remains the fallback for
           // detached dispatch rejection or an admission that never consumed.
@@ -1014,7 +1016,7 @@ export class FeishuBot {
         });
         const steer = await this.openclawClient.steer(sessionKeyForSteer, steerWrapped, cleanText).catch(() => ({ status: "unavailable" as const }));
         if (steer.status === "steered") {
-          if (insertedId > 0) {
+          if (insertedId > 0 && !consumedBeforeAck) {
             this.pendingSteerCleanups.set(insertedId, () => {
               stopWatchingConsumption();
               if ("cancelPending" in steer) steer.cancelPending?.();
@@ -1036,16 +1038,15 @@ export class FeishuBot {
         console.log(
           `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}), queuing: "${cleanText.substring(0, 50)}..."`
         );
-        return; // Message is in DB, will be picked up when agent finishes
-      }
-
-      if (busySince > 0) {
-        // Busy timeout expired — unlock but don't processQueue here;
-        // let the next new message trigger it naturally to avoid concurrent runs
-        console.warn(
-          `[${this.config.name}] Busy timeout expired for ${chatId.slice(-8)} (${Math.round((Date.now() - busySince) / 1000)}s), unlocking (will process on next message)`
-        );
-        this.busyChats.set(chatId, 0);
+        // Reconciliation may have finished the old owner during the steer RPC.
+        // Ensure this new, still-pending input is drained even when that owner
+        // exited through an error path. Already-consumed input is never replayed.
+        const owner = this.queueRuns.get(chatId);
+        const drainPending = () => {
+          if (insertedId > 0 && this.store.getPendingTriggerIds(this.config.name, chatId).has(insertedId)) return this.processQueue(chatId);
+        };
+        if (owner) void owner.then(drainPending, drainPending).catch(err => console.warn(`[${this.config.name}] pending drain failed:`, (err as Error).message));
+        else await drainPending();
         return;
       }
 
@@ -1645,6 +1646,16 @@ export class FeishuBot {
         }
         this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
+        if (err instanceof InactiveRunObservation) {
+          await liveStatus?.pauseForUnconfirmedResult(err.message).catch(() => {});
+          if (!liveStatus?.id && lastHuman.messageId) await this.replyMessage(lastHuman.messageId, `ℹ️ ${err.message}`).catch(() => {});
+          const acks = this.pendingAckMessages.get(chatId) || [];
+          for (const ack of acks) if (completedTriggerIdSet.has(ack.rowId)) await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+          this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
+          // No DONE/delivered mark and no replay of the old input. The new
+          // pending trigger resumes after this queue owner's finally releases.
+          break;
+        }
         if (err instanceof UnhealthySessionError) {
           // stopForUnhealthySession already warned the user; mark the live
           // status as interrupted. The user can send another message to retry

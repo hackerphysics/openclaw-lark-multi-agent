@@ -145,6 +145,20 @@ export class LiveStatusController {
     await this.safeEdit(this.buildView());
   }
 
+  /** Release only local observation of a now-idle session, without claiming
+   * the previous task succeeded or was aborted. Normal progress is unchanged. */
+  async pauseForUnconfirmedResult(detail: string): Promise<void> {
+    if (this.finalized) return;
+    this.pushLine("lifecycle", detail);
+    this.finalized = true;
+    this.stopTimers();
+    if (this.createPromise) await this.createPromise.catch(() => {});
+    if (!this.messageId || this.disabled) return;
+    const view = this.buildView();
+    view.title = this.opts.locale === "en" ? `${this.opts.botName} result unconfirmed` : `${this.opts.botName} 结果未确认`;
+    await this.safeEditFinal(view);
+  }
+
   async complete(): Promise<void> {
     this.state = "done";
     this.finalized = true;
