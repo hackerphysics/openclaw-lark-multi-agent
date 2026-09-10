@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, type SessionRuntimeStatus } from "./session-status.js";
 import { randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve, sep } from "path";
@@ -700,7 +701,7 @@ export class OpenClawClient {
    * reconcile the original run instead of aborting or treating a draft as final.
    * Explicit terminal/error/disconnect paths keep their existing behavior.
    */
-private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string }): Promise<string> {
+private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
     let cleanupObservation = () => {};
     return new Promise<string>((resolve, reject) => {
       // Whether we were connected when the run started. We only treat a later
@@ -740,6 +741,25 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let checkingState = false;
       let lastStateCheckAt = -Infinity;
       let quietNotified = false;
+      let decidingTimeout = false;
+      let waitNoticeSent = false;
+      const handleTimeoutResult = async (error: Error) => {
+        if (observationClosed) return;
+        if (chatFinalText.trim()) { finish(chatFinalText); return; }
+        if (error instanceof SessionWaitPaused && options?.onWaitPaused) {
+          // Foreground notice, background observation. Keep the original queue
+          // owner/progress path so later input still steers into the same run.
+          if (!waitNoticeSent) {
+            waitNoticeSent = true;
+            try { await options.onWaitPaused(error); }
+            catch { console.warn("[OpenClaw] wait notice delivery pending; observation retained"); }
+          }
+          decidingTimeout = false;
+          if (!observationClosed) resetIdleTimer(60_000, false);
+          return;
+        }
+        reject(error);
+      };
       const checkRunState = async () => {
         if (observationClosed || checkingState || Date.now() - lastStateCheckAt < 60_000) return;
         checkingState = true;
@@ -760,13 +780,19 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 : this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
             resolve(visible || "NO_REPLY");
           } else if (snapshot.status === "error" || snapshot.status === "timeout") {
+            if (snapshot.status === "timeout" || isWaitTimeout(String(snapshot.error || ""))) {
+              const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
+              if (!observationClosed && status.running) { await handleTimeoutResult(new SessionWaitPaused(status, true)); return; }
+            }
+            if (observationClosed) return;
             reject(new Error(`Agent error: ${typeof snapshot.error === "string" && snapshot.error.trim()
               ? snapshot.error : `Gateway 已确认运行以 ${snapshot.status} 结束`}`));
           }
         } catch { /* Unavailable evidence means keep waiting, never abort/replay. */ }
         finally { checkingState = false; }
       };
-      const resetIdleTimer = (delayMs = timeoutMs) => {
+      const resetIdleTimer = (delayMs = timeoutMs, activity = true) => {
+        if (activity) { waitNoticeSent = false; quietNotified = false; }
         if (idleTimer) clearTimeout(idleTimer);
         if (observationClosed) return;
         idleTimer = setTimeout(async () => {
@@ -775,7 +801,11 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
             console.warn(`[OpenClaw] quiet run ${runId}; checking Gateway state without stopping execution`);
           }
           await checkRunState();
-          if (!observationClosed) resetIdleTimer(60_000);
+          if (!observationClosed) {
+            const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
+            if (!observationClosed && status.running) { await handleTimeoutResult(new SessionWaitPaused(status)); return; }
+          }
+          if (!observationClosed) resetIdleTimer(60_000, false);
         }, delayMs);
       };
       const summarizeActivity = (ev: any): string => {
@@ -1043,7 +1073,12 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                     return;
                   }
                   if (state !== "working") {
-                    finish(failureText);
+                    if (isWaitTimeout(failureText)) {
+                      if (!decidingTimeout) {
+                        decidingTimeout = true;
+                        void this.classifyWaitTimeout(failureText, targetSessionKey || sessionKey).then(handleTimeoutResult);
+                      }
+                    } else finish(failureText);
                     return;
                   }
                   console.warn(`[OpenClaw] empty lifecycle end ignored for runId=${evRunId || runId}; waiting for real text or idle timeout`);
@@ -1078,6 +1113,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 console.warn(`[OpenClaw] recoverable lifecycle error for runId=${evRunId || runId}; deferring (agent may auto-recover): ${errText.slice(0, 120)}`);
                 return;
               }
+              if (isWaitTimeout(errText)) {
+                bucket.splice(i, 1);
+                if (!decidingTimeout) {
+                  decidingTimeout = true;
+                  void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(handleTimeoutResult);
+                }
+                continue;
+              }
               clearTimeout(idleTimer);
               clearInterval(poller);
               if (chatFinalTimer) clearTimeout(chatFinalTimer);
@@ -1101,13 +1144,15 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 if (!genericChatErrorTimer) {
                   genericChatErrorTimer = setTimeout(() => {
                     genericChatErrorTimer = null;
-                    void this.resolveTerminalChatError(evRunId || runId).then((detail) => {
+                    void this.resolveTerminalChatError(evRunId || runId, targetSessionKey || sessionKey).then((detail) => {
+                      if (observationClosed) return;
+                      if (chatFinalText.trim()) { finish(chatFinalText); return; }
                       clearTimeout(idleTimer);
                       clearInterval(poller);
                       if (chatFinalTimer) clearTimeout(chatFinalTimer);
                       if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
                       reject(new Error(`Agent error: ${detail}`));
-                    });
+                    }, error => { void handleTimeoutResult(error); });
                   }, 350);
                 }
                 continue;
@@ -1117,6 +1162,14 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
                 resetIdleTimer();
                 console.warn(`[OpenClaw] recoverable chat error for runId=${evRunId || runId}; deferring: ${errText.slice(0, 120)}`);
                 bucket.splice(i, 1);
+                continue;
+              }
+              if (isWaitTimeout(errText)) {
+                bucket.splice(i, 1);
+                if (!decidingTimeout) {
+                  decidingTimeout = true;
+                  void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(handleTimeoutResult);
+                }
                 continue;
               }
               clearTimeout(idleTimer);
@@ -1183,11 +1236,16 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     return t === "chat error" || t === "agent error: chat error";
   }
 
-  private async resolveTerminalChatError(runId: string): Promise<string> {
+  private async resolveTerminalChatError(runId: string, sessionKey?: string): Promise<string> {
     try {
       const snapshot = await this.rpc("agent.wait", { runId, timeoutMs: 1500 }, 2500);
+      if (sessionKey && (snapshot?.status === "timeout" || isWaitTimeout(String(snapshot?.error || "")))) {
+        const status = await this.getSessionRuntimeStatus(sessionKey);
+        if (status.running) throw new SessionWaitPaused(status, true);
+      }
       return this.formatTerminalRunError(snapshot);
     } catch (err) {
+      if (err instanceof SessionWaitPaused) throw err;
       const detail = err instanceof Error ? err.message : String(err);
       return `OpenClaw 运行失败，但未返回具体原因${detail ? `（${detail}）` : ""}`;
     }
@@ -1425,6 +1483,32 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
   /**
    * Get session info (model, tokens, etc.) for status display.
    */
+  /** Stop claiming an exact run's final output after observation has paused. */
+  releasePausedWait(runId: string): void {
+    if (!runId) return;
+    const timer = this.ownedDeliveryRunTimers.get(runId);
+    if (timer) clearTimeout(timer);
+    this.ownedDeliveryRunTimers.delete(runId);
+    this.ownedDeliveryRuns.delete(runId);
+  }
+
+  async getSessionRuntimeStatus(sessionKey: string): Promise<SessionRuntimeStatus> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const value = await Promise.race([
+        this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) }, 1500),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("status lookup timeout")), 1500); }),
+      ]);
+      return normalizeSessionRuntimeStatus(value);
+    } catch { return normalizeSessionRuntimeStatus(undefined); }
+    finally { if (timer) clearTimeout(timer); }
+  }
+
+  private async classifyWaitTimeout(text: string, sessionKey: string): Promise<Error> {
+    const status = await this.getSessionRuntimeStatus(sessionKey).catch(() => normalizeSessionRuntimeStatus(undefined));
+    return status.running ? new SessionWaitPaused(status, true) : new Error(`Agent error: ${text}`);
+  }
+
   async getSessionInfo(sessionKey: string): Promise<any> {
     return this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) });
   }
@@ -1677,11 +1761,13 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the user message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
+    onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
   }): Promise<string> {
     const sk = this.shortKey(params.sessionKey);
     const fullSessionKey = this.canonicalSessionKey(params.sessionKey);
     this.clearVerboseAssistantState(sk);
     let ownedRunId = "";
+    let waitPaused = false;
     try {
       // Drop stale buffered events for this session before starting a new run.
       // This prevents an old final text (e.g. previous "ok") from being consumed by
@@ -1712,7 +1798,10 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         this.progressCallbacks.set(fullSessionKey, params.onProgress);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message });
+      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
+    } catch (error) {
+      waitPaused = error instanceof SessionWaitPaused;
+      throw error;
     } finally {
       // OpenClaw can emit the final assistant session.message a moment after
       // collectReply returns. Keep a short grace window so normal chat replies
@@ -1720,7 +1809,8 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       // are unaffected because they do not go through chatSend.
       this.progressCallbacks.delete(sk);
       this.progressCallbacks.delete(fullSessionKey);
-      this.releaseOwnedDeliveryRunAfter(ownedRunId, 30000);
+      if (waitPaused) this.releasePausedWait(ownedRunId);
+      else this.releaseOwnedDeliveryRunAfter(ownedRunId, 30000);
     }
   }
 
@@ -1769,6 +1859,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the combined message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
+    onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
   }): Promise<string> {
     const includeContext = params.includeContext !== false;
     const includeBridgeAttachmentHint = params.includeBridgeAttachmentHint !== false;
@@ -1791,6 +1882,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         onSendAttempt: params.onSendAttempt,
         onSubmitted: params.onSubmitted,
         onProgress: params.onProgress,
+        onWaitPaused: params.onWaitPaused,
       });
     }
 
@@ -1829,6 +1921,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       onSendAttempt: params.onSendAttempt,
       onSubmitted: params.onSubmitted,
       onProgress: params.onProgress,
+      onWaitPaused: params.onWaitPaused,
     });
   }
 

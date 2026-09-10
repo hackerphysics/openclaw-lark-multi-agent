@@ -82,6 +82,7 @@ export class LiveStatusController {
   private tickTimer?: NodeJS.Timeout;
   private createPromise?: Promise<void>;
   private finalized = false;
+  private waitingForResult = false;
   private disabled = false;
   /** Consecutive safeEdit failures. A single transient Feishu error (e.g. card
    *  patch code=2200 "Internal Error") must NOT permanently disable the card:
@@ -141,13 +142,23 @@ export class LiveStatusController {
     } else {
       return; // lifecycle ticks: ignore (footer timer already advances)
     }
+    this.waitingForResult = false;
+    await this.ensureCreatedNow();
+    await this.safeEdit(this.buildView());
+  }
+
+  /** A foreground wait notice does not end the original background observer. */
+  async showWaitingForResult(detail: string): Promise<void> {
+    if (this.disabled || this.finalized) return;
+    this.waitingForResult = true;
+    this.pushLine("lifecycle", detail);
     await this.ensureCreatedNow();
     await this.safeEdit(this.buildView());
   }
 
   /** Release only local observation of a now-idle session, without claiming
    * the previous task succeeded or was aborted. Normal progress is unchanged. */
-  async pauseForUnconfirmedResult(detail: string): Promise<void> {
+  async pauseForUnconfirmedResult(detail: string, title?: string): Promise<void> {
     if (this.finalized) return;
     this.pushLine("lifecycle", detail);
     this.finalized = true;
@@ -155,7 +166,7 @@ export class LiveStatusController {
     if (this.createPromise) await this.createPromise.catch(() => {});
     if (!this.messageId || this.disabled) return;
     const view = this.buildView();
-    view.title = this.opts.locale === "en" ? `${this.opts.botName} result unconfirmed` : `${this.opts.botName} 结果未确认`;
+    view.title = title || (this.opts.locale === "en" ? `${this.opts.botName} result unconfirmed` : `${this.opts.botName} 结果未确认`);
     await this.safeEditFinal(view);
   }
 
@@ -392,6 +403,7 @@ export class LiveStatusController {
     let title: string;
     if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
     else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
+    else if (this.waitingForResult) title = en ? `${this.opts.botName} waiting for results` : `${this.opts.botName} 等待后续结果`;
     else title = en ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
     // On a clean finish (done / NO_REPLY) show only the compact summary. On a
     // failure (error / killed / timeout) keep the recent activity window too, so

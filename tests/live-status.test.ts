@@ -2,6 +2,22 @@ import { describe, expect, it, vi } from "vitest";
 import { LiveStatusController, type LiveStatusView } from "../src/live-status.js";
 
 describe("LiveStatusController (interactive card)", () => {
+  it("shows waiting without ending observation and resumes on real tool activity", async () => {
+    vi.useFakeTimers();
+    try {
+      const views: LiveStatusView[] = [];
+      const live = new LiveStatusController({ create: async () => "card", edit: async (_id, view) => { views.push(view); } }, { botName: "GPT", delayMs: 0 });
+      live.start(); await vi.advanceTimersByTimeAsync(0);
+      await live.showWaitingForResult("waiting for background result");
+      expect(views.at(-1)!.title).toContain("等待后续结果");
+      expect(views.at(-1)!.state).toBe("running");
+      await live.progress({ kind: "tool", name: "exec", phase: "start", text: "exec start" });
+      expect(views.at(-1)!.title).toContain("正在执行");
+      expect(views.at(-1)!.toolCalls).toBe(1);
+      await live.complete(); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
   it("freezes an unconfirmed idle result without showing success or interrupted status", async () => {
     vi.useFakeTimers();
     try {

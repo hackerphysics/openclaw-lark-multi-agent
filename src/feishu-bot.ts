@@ -3,6 +3,7 @@ import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
+import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, type SessionRuntimeStatus } from "./session-status.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { MessageStore } from "./message-store.js";
@@ -128,6 +129,8 @@ export class FeishuBot {
    * command/error/card sends with model attribution. */
   private replyModelFooters: Map<string, string> = new Map();
   private sendModelFooters: Map<string, string> = new Map();
+  private replyStatusFooters = new Map<string, string>();
+  private sendStatusFooters = new Map<string, string>();
   /** Per-chat durable outbox retry timer. */
   private deliveryRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
@@ -1435,6 +1438,10 @@ export class FeishuBot {
               markSubmittedBatch(`submitted:${runId}`);
             },
             onProgress: (event) => liveStatus?.progress(event),
+            onWaitPaused: async notice => {
+              await liveStatus?.showWaitingForResult(notice.message);
+              if (Date.now() - (this.lastRealDeliveryAt.get(chatId) || 0) >= 5000) await this.sendWaitPaused(chatId, triggerId, lastHuman.messageId, notice);
+            },
           }));
         } catch (mainErr) {
           // The main run failed before returning a reply. Surface the error; we
@@ -1646,6 +1653,25 @@ export class FeishuBot {
         }
         this.pendingAckMessages.set(chatId, remainingAcks);
       } catch (err) {
+        let pause = err instanceof SessionWaitPaused ? err : undefined;
+        if (!pause && isWaitTimeout(err instanceof Error ? err.message : String(err))) {
+          const state = await this.readSessionStatus(chatId);
+          if (state.running) pause = new SessionWaitPaused(state, true);
+        }
+        if (pause) {
+          const target = this.activeDeliveryTargets.get(chatId);
+          if (target?.triggerId === triggerId && target.runId) this.openclawClient.releasePausedWait?.(target.runId);
+          await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · running`).catch(() => {});
+          await this.sendWaitPaused(chatId, triggerId, lastHuman.messageId, pause).catch(() => {});
+          // A wait notice is not the final answer and must never claim its key.
+          // Do not mark DONE, retry this input, or abort the running session.
+          for (const id of mergedTriggerIds) this.store.clearPendingTrigger(this.config.name, chatId, id);
+          this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, `${this.config.name}:${chatId}:${triggerId}:wait-paused`);
+          const acks = this.pendingAckMessages.get(chatId) || [];
+          for (const ack of acks) if (completedTriggerIdSet.has(ack.rowId)) await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
+          this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
+          break;
+        }
         if (err instanceof InactiveRunObservation) {
           await liveStatus?.pauseForUnconfirmedResult(err.message).catch(() => {});
           if (!liveStatus?.id && lastHuman.messageId) await this.replyMessage(lastHuman.messageId, `ℹ️ ${err.message}`).catch(() => {});
@@ -1849,13 +1875,13 @@ export class FeishuBot {
     return s;
   }
 
-  private buildMarkdownCard(text: string, model?: string) {
+  private buildMarkdownCard(text: string, model?: string, status?: string) {
     const elements: any[] = buildFeishuCardElements(text);
     if (model?.trim()) {
       elements.push({ tag: "hr" });
       elements.push({
         tag: "markdown",
-        content: `<font color='grey'>🧠 ${this.escapeCardText(model.trim())}</font>`,
+        content: `<font color='grey'>🧠 ${this.escapeCardText(model.trim())}${status ? ` · status: ${this.escapeCardText(status)}（查询时）` : ""}</font>`,
       });
     }
     return {
@@ -1899,7 +1925,19 @@ export class FeishuBot {
     await this.patchLiveStatusCard(messageId, view, chatId);
   }
 
+  private async readSessionStatus(chatId: string): Promise<SessionRuntimeStatus> {
+    try {
+      return await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId));
+    } catch { return normalizeSessionRuntimeStatus(undefined); }
+  }
+
+  private async sendWaitPaused(chatId: string, triggerId: number, messageId: string | undefined, notice: SessionWaitPaused): Promise<void> {
+    const key = triggerId ? `trigger:${triggerId}:wait-paused` : `wait-paused:${notice.snapshot.checkedAt}`;
+    await this.enqueueAndDispatchDelivery(chatId, "wait_paused", key, notice.message, [], messageId, key, this.config.model);
+  }
+
   private formatUserVisibleError(err: unknown): string {
+    if (err instanceof SessionWaitPaused) return err.message;
     const raw = err instanceof Error ? err.message : String(err);
     let reason = raw.replace(/\s+/g, " ").trim();
     if (/quota/i.test(reason) || /exceeded/i.test(reason)) {
@@ -2127,8 +2165,13 @@ export class FeishuBot {
           includeContext: false,
           includeBridgeAttachmentHint: false,
           onProgress: (event) => liveStatus?.progress(event),
+          onWaitPaused: async notice => {
+            await liveStatus?.showWaitingForResult(notice.message);
+            await this.sendWaitPaused(chatId, triggerId, lastHumanMessageId, notice);
+          },
         }));
       } catch (err) {
+        if (err instanceof SessionWaitPaused) throw err;
         // The confirmation round itself failed (timeout/unhealthy). Do not spin:
         // deliver the existing (truncated-looking) reply as-is.
         console.warn(`[${this.config.name}] auto-retry probe failed for ${chatId.slice(-8)}:`, this.errorSummary(err));
@@ -2219,10 +2262,15 @@ export class FeishuBot {
     this.cancelDelayedFailure(chatId);
     const timer = setTimeout(() => {
       this.delayedFailureTimers.delete(chatId);
-      void this.enqueueAndDispatchDelivery(chatId, "delayed_error", `trigger:${triggerId}:delayed-error`, text, [], replyToMessageId, `trigger:${triggerId}:delayed-error`)
-        .then(() => {
-          if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
-        })
+      void (async () => {
+        if (isWaitTimeout(text)) {
+          const status = await this.readSessionStatus(chatId);
+          if (Date.now() - (this.lastRealDeliveryAt.get(chatId) || 0) < 90_000) return;
+          if (status.running) { await this.sendWaitPaused(chatId, triggerId, replyToMessageId, new SessionWaitPaused(status, true)); return; }
+        }
+        await this.enqueueAndDispatchDelivery(chatId, "delayed_error", `trigger:${triggerId}:delayed-error`, text, [], replyToMessageId, `trigger:${triggerId}:delayed-error`);
+        if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
+      })()
         .catch((err) => {
           console.warn(`[${this.config.name}] delayed failure delivery failed:`, (err as Error).message);
         });
@@ -2432,6 +2480,7 @@ export class FeishuBot {
               || item.sourceType === "verbose_transcript"
               || item.sourceType === "provider_error"
               || item.sourceType === "delayed_error"
+              || item.sourceType === "wait_paused"
             );
             let finalModel: string | undefined;
             try {
@@ -2439,11 +2488,14 @@ export class FeishuBot {
               finalModel = typeof meta.model === "string" && meta.model.trim() ? meta.model.trim() : undefined;
             } catch { /* legacy/malformed metadata: send without model footer */ }
 
+            const needsStatus = Boolean(finalModel) || item.sourceType.startsWith("assistant_visible") || ["provider_error", "delayed_error", "wait_paused"].includes(item.sourceType);
+            const finalStatus = needsStatus ? (await this.readSessionStatus(chatId)).status : undefined;
+            if (needsStatus && !finalModel) finalModel = this.config.model;
             if (shouldReplyToSource) {
-              try { await this.replyFinalMessage(replyTarget!, item.content, finalModel); }
-              catch { await this.sendFinalMessage(chatId, item.content, finalModel); }
+              try { await this.replyFinalMessage(replyTarget!, item.content, finalModel, finalStatus); }
+              catch { await this.sendFinalMessage(chatId, item.content, finalModel, finalStatus); }
             } else {
-              await this.sendFinalMessage(chatId, item.content, finalModel);
+              await this.sendFinalMessage(chatId, item.content, finalModel, finalStatus);
             }
 
             // Rows created by v1.4.3 may still target a live-status card. Preserve
@@ -2647,6 +2699,7 @@ export class FeishuBot {
       : undefined;
     liveStatus?.start(meta ? `第 ${meta.round}/${meta.maxRounds} 轮讨论` : "讨论中");
     let reply: string;
+    let discussionWaitPaused = false;
     try {
       reply = await this.openclawClient.chatSendWithContext({
         sessionKey,
@@ -2657,15 +2710,28 @@ export class FeishuBot {
         timeoutMs: 1_800_000,
         emptyFinalAsNoReply: true,
         onProgress: (event) => { void liveStatus?.progress(event).catch((err) => console.warn(`[${this.config.name}] live status progress failed:`, err instanceof Error ? err.message : err)); },
+        onWaitPaused: async notice => {
+          await liveStatus?.showWaitingForResult(notice.message);
+          await this.sendWaitPaused(chatId, 0, undefined, notice);
+        },
       });
     } catch (err) {
-      await liveStatus?.fail().catch(() => {});
-      throw err;
+      let pause = err instanceof SessionWaitPaused ? err : undefined;
+      if (!pause && isWaitTimeout(err instanceof Error ? err.message : String(err))) {
+        const status = await this.readSessionStatus(chatId);
+        if (status.running) pause = new SessionWaitPaused(status, true);
+      }
+      if (pause) {
+        discussionWaitPaused = true;
+        await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · running`).catch(() => {});
+        await this.sendWaitPaused(chatId, 0, undefined, pause).catch(() => {});
+      } else await liveStatus?.fail().catch(() => {});
+      throw pause || err;
     } finally {
       // OpenClaw can emit the final assistant session.message shortly after
       // chatSend/collectReply returns. Keep discussion proactive muted briefly;
       // the discussion coordinator already owns user-visible delivery.
-      releaseProactiveMute(120_000);
+      releaseProactiveMute(discussionWaitPaused ? 0 : 120_000);
     }
     const parsedReply = this.extractBridgeAttachments(reply);
     const rawVisibleReply = parsedReply.text.trim();
@@ -2933,20 +2999,23 @@ export class FeishuBot {
     await this.client.im.v1.message.delete({ path: { message_id: messageId } });
   }
 
-  private async replyFinalMessage(messageId: string, text: string, model?: string): Promise<string | undefined> {
+  private async replyFinalMessage(messageId: string, text: string, model?: string, status?: string): Promise<string | undefined> {
     if (!model?.trim()) return this.replyMessage(messageId, text);
     this.replyModelFooters.set(messageId, model.trim());
+    if (status) this.replyStatusFooters.set(messageId, status);
     try {
       return await this.replyMessage(messageId, text);
     } finally {
       this.replyModelFooters.delete(messageId);
+      this.replyStatusFooters.delete(messageId);
     }
   }
 
   private async replyMessage(messageId: string, text: string): Promise<string | undefined> {
     // Use Feishu CardKit v2 markdown component for full Markdown rendering.
     const model = this.replyModelFooters.get(messageId);
-    const card = this.buildMarkdownCard(text, model);
+    const status = this.replyStatusFooters.get(messageId);
+    const card = this.buildMarkdownCard(text, model, status);
     try {
       const res = await this.client.im.message.reply({
         path: { message_id: messageId },
@@ -2958,7 +3027,7 @@ export class FeishuBot {
       return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch {
       // Fallback to plain text if card fails; retain model attribution.
-      const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}` : text;
+      const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · status: ${status}（查询时）` : ""}` : text;
       const res = await this.client.im.message.reply({
         path: { message_id: messageId },
         data: {
@@ -3275,19 +3344,22 @@ export class FeishuBot {
   /**
    * Send a proactive message to a chat (not a reply).
    */
-  private async sendFinalMessage(chatId: string, text: string, model?: string): Promise<string | undefined> {
+  private async sendFinalMessage(chatId: string, text: string, model?: string, status?: string): Promise<string | undefined> {
     if (!model?.trim()) return this.sendMessage(chatId, text);
     this.sendModelFooters.set(chatId, model.trim());
+    if (status) this.sendStatusFooters.set(chatId, status);
     try {
       return await this.sendMessage(chatId, text);
     } finally {
       this.sendModelFooters.delete(chatId);
+      this.sendStatusFooters.delete(chatId);
     }
   }
 
   private async sendMessage(chatId: string, text: string): Promise<string | undefined> {
     const model = this.sendModelFooters.get(chatId);
-    const card = this.buildMarkdownCard(text, model);
+    const status = this.sendStatusFooters.get(chatId);
+    const card = this.buildMarkdownCard(text, model, status);
     try {
       const res = await this.client.im.message.create({
         params: { receive_id_type: "chat_id" },
@@ -3304,7 +3376,7 @@ export class FeishuBot {
       if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
       // Fallback to plain text; retain model attribution.
       try {
-        const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}` : text;
+        const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · status: ${status}（查询时）` : ""}` : text;
         const res = await this.client.im.message.create({
           params: { receive_id_type: "chat_id" },
           data: {

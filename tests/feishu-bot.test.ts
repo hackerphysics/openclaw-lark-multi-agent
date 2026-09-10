@@ -7,6 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
+import { SessionWaitPaused } from "../src/session-status.js";
 import { InactiveRunObservation } from "../src/openclaw-client.js";
 import { MessageStore } from "../src/message-store.js";
 import type { BotConfig } from "../src/config.js";
@@ -110,6 +111,96 @@ afterEach(() => {
 });
 
 describe("FeishuBot routing and queue behavior", () => {
+  it("adds current session status after model without changing stored answer or model metadata", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ status: "running", running: true, checkedAt: Date.now() }));
+      const footers: string[] = [];
+      (h.bot as any).replyMessage = vi.fn(async (id: string, text: string) => {
+        const model = (h.bot as any).replyModelFooters.get(id);
+        const status = (h.bot as any).replyStatusFooters.get(id);
+        const card = (h.bot as any).buildMarkdownCard(text, model, status);
+        footers.push(card.body.elements.at(-1).content);
+      });
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "footer-test", "answer", [], "original", "footer-test", "model-GPT");
+      expect(footers[0]).toContain("🧠 model-GPT · status: running");
+      expect(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")?.content).toBe("answer");
+      expect(JSON.parse(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")!.deliveryMetaJson)).toEqual({ model: "model-GPT" });
+      (h.openclaw as any).getSessionRuntimeStatus.mockResolvedValue({ status: "idle", running: false, checkedAt: Date.now() });
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "footer-test-2", "answer2", [], "original2", "footer-test-2", "model-GPT");
+      expect(footers[1]).toContain("status: idle");
+      expect((h.bot as any).replyStatusFooters.size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+  it("retains model and status in plain-text fallback", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const reply = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ data: { message_id: "sent" } });
+      (h.bot as any).client = { im: { message: { reply } } };
+      (h.bot as any).replyMessage = (FeishuBot.prototype as any).replyMessage.bind(h.bot);
+      await (h.bot as any).replyFinalMessage("source", "answer", "model-GPT", "running");
+      expect(JSON.parse(reply.mock.calls[1][0].data.content).text).toContain("🧠 model-GPT · status: running");
+      expect((h.bot as any).replyStatusFooters.size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+  it("keeps discussion pause notices nonfatal and releases proactive mute immediately", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const status = { status: "running", running: true, checkedAt: Date.now() };
+      const pause = new SessionWaitPaused(status);
+      const unmute = vi.fn(); h.openclaw.muteProactiveDelivery = vi.fn(() => unmute);
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => status);
+      h.openclaw.chatSendWithContext = vi.fn(async () => { throw pause; });
+      await expect((h.bot as any).runDiscussionTurn("chat1", "test")).rejects.toBe(pause);
+      expect(unmute).toHaveBeenCalledWith(0);
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("暂停本轮等待"));
+    } finally { h.cleanup(); }
+  });
+  it("returns a wait notice while keeping the normal queue owner until the actual result", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ status: "running", running: true, checkedAt: Date.now() }));
+      let submitted: any; let finish!: (value: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn(async (p: any) => {
+        h.openclaw.chatCalls.push(p); await p.onSendAttempt?.(); await p.onSubmitted?.("r"); submitted = p;
+        return new Promise<string>(resolve => { finish = resolve; });
+      });
+      const work = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "work", messageId: "wait-notice" }));
+      await vi.waitUntil(() => Boolean(finish), { timeout: 1000 });
+      await submitted.onWaitPaused(new SessionWaitPaused({status:"running",running:true,checkedAt:Date.now()}));
+      const row = h.store.getMessageId("wait-notice")!;
+      expect((h.bot as any).queueRuns.has("chat1")).toBe(true);
+      expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(false);
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      finish("real final"); await work;
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("wait-notice", "real final");
+      expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(true);
+    } finally { h.cleanup(); }
+  });
+  it("emits a normal wait notice without DONE or final-answer ownership, allowing the later answer", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ status: "running", running: true, checkedAt: Date.now() }));
+      (h.openclaw as any).releasePausedWait = vi.fn();
+      h.openclaw.chatSendWithContext = vi.fn(async (p: any) => {
+        h.openclaw.chatCalls.push(p); await p.onSendAttempt?.(); await p.onSubmitted?.("original-run");
+        throw new Error("RPC wait timed out");
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "task", messageId: "paused-source" }));
+      const row = h.store.getMessageId("paused-source")!;
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("paused-source", "DONE");
+      expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(false);
+      expect(h.store.getDeliveryByKey("GPT", "chat1", `trigger:${row}:wait-paused`)?.content).toContain("已暂停");
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(row)).toBe(false);
+      expect((h.openclaw as any).releasePausedWait).toHaveBeenCalledWith("original-run");
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "late-result", "real final", [], "paused-source", `trigger:${row}`, "model-GPT");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("paused-source", "real final");
+    } finally { h.cleanup(); }
+  });
+
   it("does not respond to unmentioned group messages by default", async () => {
     const h = makeHarness();
     try {
