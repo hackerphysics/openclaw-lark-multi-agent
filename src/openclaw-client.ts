@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, type SessionRuntimeStatus } from "./session-status.js";
+import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve, sep } from "path";
@@ -701,7 +701,7 @@ export class OpenClawClient {
    * reconcile the original run instead of aborting or treating a draft as final.
    * Explicit terminal/error/disconnect paths keep their existing behavior.
    */
-private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
+private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
     let cleanupObservation = () => {};
     return new Promise<string>((resolve, reject) => {
       // Whether we were connected when the run started. We only treat a later
@@ -743,12 +743,16 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       let quietNotified = false;
       let decidingTimeout = false;
       let waitNoticeSent = false;
+      let foregroundPaused = false;
+      let foregroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
       const handleTimeoutResult = async (error: Error) => {
         if (observationClosed) return;
         if (chatFinalText.trim()) { finish(chatFinalText); return; }
         if (error instanceof SessionWaitPaused && options?.onWaitPaused) {
           // Foreground notice, background observation. Keep the original queue
           // owner/progress path so later input still steers into the same run.
+          foregroundPaused = true;
+          if (foregroundWaitTimer) clearTimeout(foregroundWaitTimer);
           if (!waitNoticeSent) {
             waitNoticeSent = true;
             try { await options.onWaitPaused(error); }
@@ -792,7 +796,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         finally { checkingState = false; }
       };
       const resetIdleTimer = (delayMs = timeoutMs, activity = true) => {
-        if (activity) { waitNoticeSent = false; quietNotified = false; }
+        if (activity) { if (!foregroundPaused) waitNoticeSent = false; quietNotified = false; }
         if (idleTimer) clearTimeout(idleTimer);
         if (observationClosed) return;
         idleTimer = setTimeout(async () => {
@@ -1204,6 +1208,18 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         } catch { /* Unknown activity cannot authorize releasing an active owner. */ }
       };
       if (observationKey) this.runStateChecks.set(observationKey, checkAfterNoActiveRun);
+      // Fixed foreground budget: tool/assistant activity must not keep a card
+      // refreshing indefinitely. The original result observer stays alive.
+      if (options?.onWaitPaused) {
+        foregroundWaitTimer = setTimeout(async () => {
+          if (observationClosed || foregroundPaused) return;
+          await checkRunState();
+          if (observationClosed || foregroundPaused) return;
+          const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
+          if (!observationClosed && !foregroundPaused) await handleTimeoutResult(new SessionWaitPaused(status));
+        }, timeoutMs);
+        foregroundWaitTimer.unref?.();
+      }
       // Bound local resources without cancelling an execution we cannot prove stuck.
       const observationHorizon = setTimeout(() => reject(new Error(
         "LMA 本地监听达到 24 小时上限，结果未确认；未发送停止请求，请检查原运行。"
@@ -1212,6 +1228,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
       cleanupObservation = () => {
         observationClosed = true;
         clearTimeout(idleTimer);
+        if (foregroundWaitTimer) clearTimeout(foregroundWaitTimer);
         clearTimeout(observationHorizon);
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
@@ -1798,7 +1815,7 @@ private collectReply(runId: string, timeoutMs = 1800000, targetSessionKey?: stri
         this.progressCallbacks.set(fullSessionKey, params.onProgress);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      return await this.collectReply(result.runId, params.timeoutMs || 1800000, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
+      return await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
     } catch (error) {
       waitPaused = error instanceof SessionWaitPaused;
       throw error;

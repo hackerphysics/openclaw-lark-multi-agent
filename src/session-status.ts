@@ -1,3 +1,6 @@
+/** Frontend budget only; does not change Gateway execution limits. */
+export const FOREGROUND_WAIT_MS = 10 * 60_000;
+
 export type SessionRuntimeStatus = {
   status: string;
   running: boolean;

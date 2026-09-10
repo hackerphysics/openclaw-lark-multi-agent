@@ -3,7 +3,7 @@ import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
-import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, type SessionRuntimeStatus } from "./session-status.js";
+import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { MessageStore } from "./message-store.js";
@@ -1415,7 +1415,7 @@ export class FeishuBot {
             deliver: false,
             // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
             // instead of leaving reactions stuck forever.
-            timeoutMs: 1_800_000,
+            timeoutMs: FOREGROUND_WAIT_MS,
             includeContext: !isNativeCommandTrigger,
             includeBridgeAttachmentHint: !isNativeCommandTrigger,
             onSendAttempt: () => {
@@ -1661,7 +1661,7 @@ export class FeishuBot {
         if (pause) {
           const target = this.activeDeliveryTargets.get(chatId);
           if (target?.triggerId === triggerId && target.runId) this.openclawClient.releasePausedWait?.(target.runId);
-          await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · running`).catch(() => {});
+          await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · ${pause.snapshot.status}`).catch(() => {});
           await this.sendWaitPaused(chatId, triggerId, lastHuman.messageId, pause).catch(() => {});
           // A wait notice is not the final answer and must never claim its key.
           // Do not mark DONE, retry this input, or abort the running session.
@@ -2161,7 +2161,7 @@ export class FeishuBot {
           currentMessage: probe,
           currentSenderName: senderName,
           deliver: false,
-          timeoutMs: 1_800_000,
+          timeoutMs: FOREGROUND_WAIT_MS,
           includeContext: false,
           includeBridgeAttachmentHint: false,
           onProgress: (event) => liveStatus?.progress(event),
@@ -2707,7 +2707,7 @@ export class FeishuBot {
         currentMessage: prompt,
         currentSenderName: "Discussion Scheduler",
         deliver: false,
-        timeoutMs: 1_800_000,
+        timeoutMs: FOREGROUND_WAIT_MS,
         emptyFinalAsNoReply: true,
         onProgress: (event) => { void liveStatus?.progress(event).catch((err) => console.warn(`[${this.config.name}] live status progress failed:`, err instanceof Error ? err.message : err)); },
         onWaitPaused: async notice => {
@@ -2723,7 +2723,7 @@ export class FeishuBot {
       }
       if (pause) {
         discussionWaitPaused = true;
-        await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · running`).catch(() => {});
+        await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · ${pause.snapshot.status}`).catch(() => {});
         await this.sendWaitPaused(chatId, 0, undefined, pause).catch(() => {});
       } else await liveStatus?.fail().catch(() => {});
       throw pause || err;

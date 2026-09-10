@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { LiveStatusController, type LiveStatusView } from "../src/live-status.js";
 
 describe("LiveStatusController (interactive card)", () => {
-  it("shows waiting without ending observation and resumes on real tool activity", async () => {
+  it("freezes waiting-card updates while retaining a final one-time summary", async () => {
     vi.useFakeTimers();
     try {
       const views: LiveStatusView[] = [];
@@ -11,10 +11,36 @@ describe("LiveStatusController (interactive card)", () => {
       await live.showWaitingForResult("waiting for background result");
       expect(views.at(-1)!.title).toContain("等待后续结果");
       expect(views.at(-1)!.state).toBe("running");
+      const frozenEdits = views.length;
       await live.progress({ kind: "tool", name: "exec", phase: "start", text: "exec start" });
-      expect(views.at(-1)!.title).toContain("正在执行");
+      await vi.advanceTimersByTimeAsync(60 * 60_000);
+      await live.showWaitingForResult("repeated notice");
+      expect(views).toHaveLength(frozenEdits);
+      expect(vi.getTimerCount()).toBe(0);
+      await live.complete();
+      expect(views).toHaveLength(frozenEdits + 1);
       expect(views.at(-1)!.toolCalls).toBe(1);
-      await live.complete(); expect(vi.getTimerCount()).toBe(0);
+      expect(views.at(-1)!.state).toBe("done");
+      expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("caps card refresh at ten minutes even if acceptance or tool progress keeps arriving", async () => {
+    vi.useFakeTimers();
+    try {
+      const edit = vi.fn(async () => {});
+      const live = new LiveStatusController({ create: async () => "card", edit }, { botName: "GPT", delayMs: 0, tickMs: 60_000 });
+      live.start(); await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await live.progress({ kind: "tool", name: "exec", phase: "start", text: "working" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      const count = edit.mock.calls.length;
+      expect(vi.getTimerCount()).toBe(0);
+      await live.progress({ kind: "assistant_note", text: "more work" });
+      await vi.advanceTimersByTimeAsync(20 * 60_000);
+      expect(edit.mock.calls).toHaveLength(count);
+      const meta = await live.prepareFinalDelivery();
+      expect(meta?.messageId).toBe("card");
     } finally { vi.useRealTimers(); }
   });
 

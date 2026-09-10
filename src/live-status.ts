@@ -1,4 +1,5 @@
 import type { ProgressEvent } from "./openclaw-client";
+import { FOREGROUND_WAIT_MS } from "./session-status.js";
 
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
 const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS || 120);
@@ -70,6 +71,8 @@ export type LiveStatusOptions = {
   historySize?: number;
   /** Footer/auto-refresh cadence in ms. */
   tickMs?: number;
+  /** Fixed card refresh lifetime; activity does not extend it. */
+  refreshBudgetMs?: number;
 };
 
 export class LiveStatusController {
@@ -80,9 +83,11 @@ export class LiveStatusController {
   private startedAt = Date.now();
   private createTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
+  private refreshBudgetTimer?: NodeJS.Timeout;
   private createPromise?: Promise<void>;
   private finalized = false;
   private waitingForResult = false;
+  private updatesFrozen = false;
   private disabled = false;
   /** Consecutive safeEdit failures. A single transient Feishu error (e.g. card
    *  patch code=2200 "Internal Error") must NOT permanently disable the card:
@@ -101,8 +106,14 @@ export class LiveStatusController {
   get id(): string | undefined { return this.messageId; }
 
   start(initialDetail?: string): void {
-    if (this.disabled || this.finalized || this.createTimer || this.messageId) return;
+    if (this.disabled || this.finalized || this.updatesFrozen || this.createTimer || this.messageId) return;
     this.startedAt = Date.now();
+    this.refreshBudgetTimer = setTimeout(() => {
+      void this.showWaitingForResult(this.opts.locale === "en"
+        ? "Foreground refresh budget reached; background results are still monitored."
+        : "前台刷新时间已到，过程卡停止实时刷新；后台继续接收结果。").catch(err => this.callbacks.warn?.("live status freeze failed", err));
+    }, this.opts.refreshBudgetMs ?? FOREGROUND_WAIT_MS);
+    this.refreshBudgetTimer.unref?.();
     if (initialDetail && initialDetail.trim()) {
       this.pushLine("lifecycle", initialDetail.trim());
     }
@@ -114,6 +125,11 @@ export class LiveStatusController {
 
   async progress(event: ProgressEvent | string): Promise<void> {
     if (this.disabled || this.finalized) return;
+    if (this.updatesFrozen) {
+      // Keep only the cheap local counter for the eventual one-time summary.
+      if (typeof event !== "string" && event.kind === "tool" && event.phase === "start") this.toolCallCount++;
+      return;
+    }
     // Card patch has no 20-edit cap (verified against Feishu im.message.patch),
     // so we can show a small rolling window of recent activity: tool start, tool
     // end, and intermediate assistant text each count as one line. We ignore
@@ -147,13 +163,17 @@ export class LiveStatusController {
     await this.safeEdit(this.buildView());
   }
 
-  /** A foreground wait notice does not end the original background observer. */
+  /** Freeze recurring/progress edits, not the original result observer.
+   * A single final/error summary remains allowed when the real outcome arrives. */
   async showWaitingForResult(detail: string): Promise<void> {
-    if (this.disabled || this.finalized) return;
+    if (this.disabled || this.finalized || this.updatesFrozen) return;
+    this.updatesFrozen = true;
     this.waitingForResult = true;
     this.pushLine("lifecycle", detail);
-    await this.ensureCreatedNow();
-    await this.safeEdit(this.buildView());
+    this.stopTimers();
+    if (this.createPromise) await this.createPromise.catch(() => {});
+    this.stopTimers();
+    if (this.messageId && !this.disabled) await this.safeEditFinal(this.buildView());
   }
 
   /** Release only local observation of a now-idle session, without claiming
@@ -275,6 +295,7 @@ export class LiveStatusController {
   }
 
   private stopTimers(): void {
+    if (this.refreshBudgetTimer) { clearTimeout(this.refreshBudgetTimer); this.refreshBudgetTimer = undefined; }
     if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = undefined; }
     if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = undefined; }
   }
@@ -308,10 +329,10 @@ export class LiveStatusController {
 
   /** Refresh the elapsed-time footer periodically even with no new activity. */
   private startTicker(): void {
-    if (this.tickTimer || this.disabled || this.finalized) return;
+    if (this.tickTimer || this.disabled || this.finalized || this.updatesFrozen) return;
     const tickMs = this.opts.tickMs ?? DEFAULT_TICK_MS;
     this.tickTimer = setInterval(() => {
-      if (this.finalized || this.disabled || !this.messageId) return;
+      if (this.finalized || this.disabled || this.updatesFrozen || !this.messageId) return;
       void this.safeEdit(this.buildView());
     }, tickMs);
     this.tickTimer.unref?.();
@@ -319,7 +340,7 @@ export class LiveStatusController {
 
   private async safeEdit(view: LiveStatusView, force = false): Promise<boolean> {
     if (!this.messageId || this.disabled) return false;
-    if (!force && this.finalized) return false;
+    if (!force && (this.finalized || this.updatesFrozen)) return false;
     const sig = this.signature(view);
     if (!force && sig === this.lastSentSignature) return true;
     try {
@@ -403,7 +424,7 @@ export class LiveStatusController {
     let title: string;
     if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
     else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
-    else if (this.waitingForResult) title = en ? `${this.opts.botName} waiting for results` : `${this.opts.botName} 等待后续结果`;
+    else if (this.waitingForResult) title = en ? `${this.opts.botName} waiting (card frozen)` : `${this.opts.botName} 等待后续结果（已停止刷新）`;
     else title = en ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
     // On a clean finish (done / NO_REPLY) show only the compact summary. On a
     // failure (error / killed / timeout) keep the recent activity window too, so
