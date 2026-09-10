@@ -222,6 +222,25 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     await final(); expect(await run.result).toEqual({ text: "actual final" });
   });
 
+  it("does not repeat an existing timeout notice when the same collector later yields", async () => {
+    const run = await start();
+    await vi.advanceTimersByTimeAsync(FOREGROUND_WAIT_MS);
+    expect(notice).toHaveBeenCalledOnce();
+    expect(notice.mock.calls[0][0].reason).toBe("timeout");
+    chat({ yielded: true });
+    await vi.advanceTimersByTimeAsync(6100);
+    expect(notice).toHaveBeenCalledOnce(); expect(run.settled()).toBe(false); noAbort();
+    await final(); expect(await run.result).toEqual({ text: "actual final" });
+  });
+
+  it("retains final observation when the yield notice callback fails", async () => {
+    notice.mockRejectedValue(new Error("notice temporarily unavailable"));
+    const run = await start(); chat({ yielded: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(notice).toHaveBeenCalledOnce(); expect(run.settled()).toBe(false); noAbort();
+    await final(); expect(await run.result).toEqual({ text: "actual final" });
+  });
+
   it.each([false, true])("retains a new-run proactive route without consuming it as the old final (anchored lifecycle=%s)", async anchored => {
     const proactive = vi.fn(); c.sessionMessageCallbacks.set(KEY, proactive);
     const run = await start();

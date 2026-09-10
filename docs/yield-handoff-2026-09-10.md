@@ -39,7 +39,7 @@ npm test
 The suite uses `tests/normal-flow-offline.config.ts` and its existing guard, which rejects real TCP sockets (localhost included) and real fetch. New tests mock WebSocket with an in-memory EventEmitter and exercise the **actual wire normalization and collector**, not just hand-built collector events. Feishu tests use the existing mocked delivery harness and temporary SQLite stores. No live Gateway chat, model inference or Feishu delivery is used.
 
 - Clean baseline: **335/335**, 11 files, build passed.
-- Final suite: **366 tests**, 12 files (29 new wire/collector tests, 2 additional bot cases). The external validation logs record the final run result.
+- Child suite: **366 tests**, 12 files. Parent independent build/regression: **369/369 tests**, 12 files after adding timeout→yield, failed-notice callback and persisted trigger reentry coverage.
 - New coverage: immediate empty yield/no interim text; notice at most once; no abort/no resend; lifecycle-first paused and working 5-second races; duplicate yield/blank final; actual-final priority in both orders; same-batch error priority; late final without lifecycle; tools-only resume/re-yield; unconfirmed/fake tool evidence; private argument/result redaction; explicit stop; ten-minute timeout; retained run ownership; new-run proactive route with/without anchored lifecycle; discussion notice/continuation; card ticker/progress freeze and final update.
 - Existing suite remains enabled for collector, queue/steer, stop, attachments, routing, model selection, discussions, status footer integer K formatting and dedupe.
 
@@ -52,3 +52,13 @@ Fresh worktrees need build before the existing CLI tests (`dist/cli.js` is not t
 - Discussion retains the pre-existing distinction: transcript mute suppresses `session.message` mirrors, but does not suppress independent external `chat final` callbacks. The offline test verifies both the scheduler collector result and that unchanged callback path. It does **not** prove duplicate-free end-to-end Feishu delivery for a different-run discussion completion; changing that policy would be a separate routing change.
 - Normal different-run completion is deliberately not consumed as the old collector's final. The old observation/queue owner remains until its existing settlement, stop, no-active-run reconciliation or local 24-hour horizon. No new replay, cancellation or correlation heuristic is introduced.
 - Outbox dedupe and existing retries are reused. Real Feishu delivery latency/failure recovery, process restart persistence and Gateway reconnection across yield have not been live-validated. Offline results do not claim deployed behavior or user-visible delivery receipts.
+
+## Parent review: notification identity
+
+Notice dedupe is deliberately once per original trigger (and once per collector),
+not once per continuation run. A timeout notice already tells the user that
+foreground waiting has stopped; a later yield keeps it rather than posting
+another waiting notice. Reentered callbacks with the same trigger reuse the
+persisted waiting-notice key, leaving the real final key untouched. The parent
+regression verifies these paths and failed-notice callback observation retention.
+It does not claim live reconnect/restart delivery or per-run discussion dedupe.

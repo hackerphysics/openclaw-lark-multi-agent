@@ -204,6 +204,32 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(true);
     } finally { h.cleanup(); }
   });
+  it("reuses the persisted trigger notice across timeout, yield and reentered callbacks without taking the final key", async () => {
+    const h = makeHarness("GPT");
+    try {
+      let submitted: any; let finish!: (value: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn(async (p: any) => {
+        submitted = p; return new Promise<string>(resolve => { finish = resolve; });
+      });
+      const work = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "work", messageId: "yield-reentry" }));
+      await vi.waitUntil(() => Boolean(finish), { timeout: 1000 });
+      const snapshot = { status: "running", running: true, checkedAt: Date.now() };
+      const timeout = new SessionWaitPaused(snapshot);
+      await submitted.onWaitPaused(timeout);
+      await submitted.onWaitPaused(new SessionWaitPaused({ ...snapshot, checkedAt: snapshot.checkedAt + 1 }, false, "yield"));
+      const row = h.store.getMessageId("yield-reentry")!;
+      // Recreated callbacks/changed run attribution for this original trigger
+      // retain the same notice key; this is deliberate trigger-level dedupe.
+      await (h.bot as any).sendWaitPaused("chat1", row, "yield-reentry", new SessionWaitPaused({ ...snapshot, checkedAt: snapshot.checkedAt + 2 }, false, "yield"));
+      expect(h.store.getDeliveryByKey("GPT", "chat1", `trigger:${row}:wait-paused`)?.content).toBe(timeout.message);
+      expect((h.bot as any).replyMessage.mock.calls.filter((call: any[]) => call[1].startsWith("⏳"))).toHaveLength(1);
+      expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(false);
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      finish("actual result"); await work;
+      expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(true);
+    } finally { h.cleanup(); }
+  });
+
   it("keeps a discussion yield notice nonterminal until the scheduler receives the real result", async () => {
     const h = makeHarness("GPT");
     try {
