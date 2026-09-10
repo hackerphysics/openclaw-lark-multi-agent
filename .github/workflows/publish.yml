@@ -15,6 +15,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Require a release commit on main
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ] && [[ "${GITHUB_REF}" != refs/tags/* ]]; then
+            echo "Publishing is restricted to main or a tag on main" >&2
+            exit 1
+          fi
+          git merge-base --is-ancestor HEAD origin/main
       - uses: actions/setup-node@v4
         with:
           # Node 24 includes a recent npm CLI with Trusted Publishing/OIDC support.

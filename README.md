@@ -590,3 +590,21 @@ If a secret is ever committed, remove it from the current tree and rewrite git h
 ## License
 
 MIT
+
+### Reply status and context usage (v1.4.9)
+
+Final text replies include a compact footer, for example:
+
+`🧠 provider/model · running · 85K/200K`
+
+State and context usage come from one bounded Gateway status lookup. K values
+are rounded integers (1000 tokens per K); unavailable/stale values are not shown
+as zero. The footer is a send-time snapshot, not a live status widget.
+
+LMA's foreground result wait and live-card refresh budget are now 10 minutes.
+When the session is still running, LMA sends a normal wait notice instead of
+claiming execution failed. The old card stops periodic/progress edits; background
+result handling and the original queue remain, with no automatic abort/replay.
+Real results are sent separately; necessary terminal card cleanup is retained.
+This does not shorten the Gateway's execution limit. Unverified steer V2 and
+question adapters are not included in this release.

@@ -14,7 +14,7 @@ import {
  * Current LMA uses this method because public
  * `chat.send { queueMode: "steer" }` cannot distinguish queueing into the active
  * run from falling through to a later ordinary run. The plugin's `steered`
- * outcome confirms active-run queueing; LMA separately waits for session.message
+ * outcome is provisional eligibility; LMA separately waits for session.message
  * before treating the message as consumed.
  *
  * Gateway method: `lma.steer`
@@ -22,8 +22,8 @@ import {
  *   result:  { status: "steered" | "no_active_run" | "rejected",
  *              sessionId?: string }
  *
- *   - "steered"      -> message was queued into the active embedded run; it will
- *                       be picked up at the next model/tool boundary. (Feishu: Get)
+ *   - "steered"      -> synchronous eligibility only, not proof of asynchronous
+ *                       acceptance/consumption. Feishu Get waits for transcript confirmation.
  *   - "no_active_run"-> no active run for this session; the bridge should fall
  *                       back to its normal "send as a new message" path.
  *   - "rejected"     -> there was an active run but the runtime refused the

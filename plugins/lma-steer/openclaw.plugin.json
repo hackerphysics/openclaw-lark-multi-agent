@@ -2,13 +2,68 @@
   "id": "lma-steer",
   "name": "LMA Steer",
   "description": "Inject (steer) a queued user message into the active OpenClaw run at the next tool-call boundary, with an observable outcome the LMA bridge can render as a Feishu reaction.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "activation": {
     "onStartup": true
   },
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {}
+    "properties": {
+      "questionBridge": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "issuer",
+          "publicKeyFile",
+          "sources"
+        ],
+        "properties": {
+          "issuer": {
+            "type": "string",
+            "minLength": 1
+          },
+          "publicKeyFile": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 128,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "botId",
+                "chatId",
+                "senderIds",
+                "sessionKey"
+              ],
+              "properties": {
+                "botId": {
+                  "type": "string"
+                },
+                "chatId": {
+                  "type": "string"
+                },
+                "sessionKey": {
+                  "type": "string"
+                },
+                "senderIds": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 128,
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "description": "Deprecated configuration compatibility only; ignored by this release. Does not enable question handling."
+      }
+    }
   }
 }

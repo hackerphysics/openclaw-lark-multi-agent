@@ -33,3 +33,13 @@ normal queue.
 - method: `lma.steer`
 - params: `{ sessionKey: string, text: string }`
 - result: `{ status: "steered" | "no_active_run" | "rejected", sessionId?: string }`
+
+## 0.1.1 compatibility refresh
+
+This release retains the existing `lma.steer` runtime behavior. A synchronous
+`steered` result is provisional; LMA waits for a matching transcript message
+before reporting consumption. The experimental steer V2 and question service
+are not part of this release. A previously installed strict `questionBridge`
+configuration shape is accepted for upgrade compatibility only; the plugin
+ignores it and does not enable question handling. Existing values need not be
+removed or exposed during this update.
