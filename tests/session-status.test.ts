@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { OpenClawClient } from '../src/openclaw-client.js';
-import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout } from '../src/session-status.js';
+import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, formatSessionFooter } from '../src/session-status.js';
 const key='agent:main:test-status';
 let c:any;
 beforeEach(()=>{vi.useFakeTimers();vi.setSystemTime(new Date('2026-09-10T00:00:00Z'));c=new OpenClawClient({baseUrl:'ws://offline.invalid',token:'test'});c.agentEvents.set(key,[]);});
@@ -14,6 +14,26 @@ describe('session status and paused waits',()=>{
   expect(normalizeSessionRuntimeStatus(undefined).status).toBe('unknown');
   expect(normalizeSessionRuntimeStatus({session:{status:'<script>running</script>'}}).status).toBe('unknown');
   expect(isWaitTimeout('invalid timeout parameter')).toBe(false);
+ });
+ it.each([
+  [{status:'running',totalTokens:84501,contextTokens:200000,totalTokensFresh:true}, 'running · 85K/200K'],
+  [{status:'idle',totalTokens:578384,contextTokens:1000000}, 'idle · 578K/1000K'],
+  [{status:'running',totalTokens:210000,contextTokens:200000}, 'running · 210K/200K'],
+  [{status:'idle',totalTokens:0,contextTokens:200000,totalTokensFresh:true}, 'idle · 0K/200K'],
+  [{status:'running',contextTokens:200000}, 'running · ?K/200K'],
+  [{status:'running',totalTokens:85000}, 'running · 85K/?K'],
+  [{status:'running',totalTokens:85000,contextTokens:200000,totalTokensFresh:false}, 'running · ?K/200K'],
+  [{status:'running',totalTokens:-1,contextTokens:0}, 'running'],
+  [{status:'running',totalTokens:Infinity,contextTokens:NaN}, 'running'],
+ ])('formats compact integer K usage without hiding overflow or inventing missing counts: %j', (session, expected) => {
+  expect(formatSessionFooter(normalizeSessionRuntimeStatus({session}))).toBe(expected);
+ });
+ it('obtains state and context counters in one metadata query',async()=>{
+  c.rpc=vi.fn(async()=>({session:{status:'running',totalTokens:84501,contextTokens:200000,totalTokensFresh:true}}));
+  const snapshot=await c.getSessionRuntimeStatus(key);
+  expect(formatSessionFooter(snapshot)).toBe('running · 85K/200K');
+  expect(c.rpc).toHaveBeenCalledOnce();
+  expect(c.rpc.mock.calls[0][0]).toBe('sessions.describe');
  });
  it('bounds an unavailable status query without stopping execution',async()=>{
   c.rpc=vi.fn(()=>new Promise(()=>{}));

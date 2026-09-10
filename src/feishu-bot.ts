@@ -3,7 +3,7 @@ import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
-import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, type SessionRuntimeStatus } from "./session-status.js";
+import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, type SessionRuntimeStatus } from "./session-status.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { MessageStore } from "./message-store.js";
@@ -1881,7 +1881,7 @@ export class FeishuBot {
       elements.push({ tag: "hr" });
       elements.push({
         tag: "markdown",
-        content: `<font color='grey'>🧠 ${this.escapeCardText(model.trim())}${status ? ` · status: ${this.escapeCardText(status)}（查询时）` : ""}</font>`,
+        content: `<font color='grey'>🧠 ${this.escapeCardText(model.trim())}${status ? ` · ${this.escapeCardText(status)}` : ""}</font>`,
       });
     }
     return {
@@ -2489,7 +2489,7 @@ export class FeishuBot {
             } catch { /* legacy/malformed metadata: send without model footer */ }
 
             const needsStatus = Boolean(finalModel) || item.sourceType.startsWith("assistant_visible") || ["provider_error", "delayed_error", "wait_paused"].includes(item.sourceType);
-            const finalStatus = needsStatus ? (await this.readSessionStatus(chatId)).status : undefined;
+            const finalStatus = needsStatus ? formatSessionFooter(await this.readSessionStatus(chatId)) : undefined;
             if (needsStatus && !finalModel) finalModel = this.config.model;
             if (shouldReplyToSource) {
               try { await this.replyFinalMessage(replyTarget!, item.content, finalModel, finalStatus); }
@@ -3027,7 +3027,7 @@ export class FeishuBot {
       return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch {
       // Fallback to plain text if card fails; retain model attribution.
-      const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · status: ${status}（查询时）` : ""}` : text;
+      const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · ${status}` : ""}` : text;
       const res = await this.client.im.message.reply({
         path: { message_id: messageId },
         data: {
@@ -3376,7 +3376,7 @@ export class FeishuBot {
       if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
       // Fallback to plain text; retain model attribution.
       try {
-        const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · status: ${status}（查询时）` : ""}` : text;
+        const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · ${status}` : ""}` : text;
         const res = await this.client.im.message.create({
           params: { receive_id_type: "chat_id" },
           data: {

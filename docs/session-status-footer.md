@@ -3,7 +3,13 @@
 Base: cf5827d. This branch is separate from the unverified steer V2 work.
 It does not include a plugin or Gateway configuration change.
 
-Final text replies show `🧠 <model> · status: <session state>（查询时）`.
+Final text replies show `🧠 <model> · <session state> · 85K/200K`.
+No `status:` prefix or snapshot wording is printed in the footer.
+Context uses the existing /status counters (`totalTokens` / `contextTokens`),
+from the same metadata query. K means 1000 tokens, rounded to integers.
+The numbers are not clamped at the limit. Missing/explicitly stale used counts
+show `?K`; a missing limit shows `?K`. If neither count is available, omit the
+fraction rather than inventing zero usage.
 The state is fetched from the same sessions.describe source used by /status,
 bounded to 1.5 seconds. Unknown/unavailable state is shown as unknown, not guessed.
 The footer is a send-time snapshot, not a continuously updating status widget.

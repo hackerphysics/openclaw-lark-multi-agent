@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { FeishuBot } from "../src/feishu-bot.js";
-import { SessionWaitPaused } from "../src/session-status.js";
+import { SessionWaitPaused, normalizeSessionRuntimeStatus } from "../src/session-status.js";
 import { InactiveRunObservation } from "../src/openclaw-client.js";
 import { MessageStore } from "../src/message-store.js";
 import type { BotConfig } from "../src/config.js";
@@ -114,7 +114,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("adds current session status after model without changing stored answer or model metadata", async () => {
     const h = makeHarness("GPT");
     try {
-      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ status: "running", running: true, checkedAt: Date.now() }));
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => normalizeSessionRuntimeStatus({session: { status: "running", totalTokens: 84501, contextTokens: 200000, totalTokensFresh: true }}));
       const footers: string[] = [];
       (h.bot as any).replyMessage = vi.fn(async (id: string, text: string) => {
         const model = (h.bot as any).replyModelFooters.get(id);
@@ -123,12 +123,14 @@ describe("FeishuBot routing and queue behavior", () => {
         footers.push(card.body.elements.at(-1).content);
       });
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "footer-test", "answer", [], "original", "footer-test", "model-GPT");
-      expect(footers[0]).toContain("🧠 model-GPT · status: running");
+      expect(footers[0]).toContain("🧠 model-GPT · running · 85K/200K");
+      expect(footers[0]).not.toMatch(/status:|查询时/);
       expect(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")?.content).toBe("answer");
       expect(JSON.parse(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")!.deliveryMetaJson)).toEqual({ model: "model-GPT" });
-      (h.openclaw as any).getSessionRuntimeStatus.mockResolvedValue({ status: "idle", running: false, checkedAt: Date.now() });
+      (h.openclaw as any).getSessionRuntimeStatus.mockResolvedValue(normalizeSessionRuntimeStatus({session: {status: "idle", totalTokens: 120000, contextTokens: 200000}}));
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "footer-test-2", "answer2", [], "original2", "footer-test-2", "model-GPT");
-      expect(footers[1]).toContain("status: idle");
+      expect(footers[1]).toContain("idle · 120K/200K");
+      expect((h.openclaw as any).getSessionRuntimeStatus).toHaveBeenCalledTimes(2);
       expect((h.bot as any).replyStatusFooters.size).toBe(0);
     } finally { h.cleanup(); }
   });
@@ -138,9 +140,25 @@ describe("FeishuBot routing and queue behavior", () => {
       const reply = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ data: { message_id: "sent" } });
       (h.bot as any).client = { im: { message: { reply } } };
       (h.bot as any).replyMessage = (FeishuBot.prototype as any).replyMessage.bind(h.bot);
-      await (h.bot as any).replyFinalMessage("source", "answer", "model-GPT", "running");
-      expect(JSON.parse(reply.mock.calls[1][0].data.content).text).toContain("🧠 model-GPT · status: running");
+      await (h.bot as any).replyFinalMessage("source", "answer", "model-GPT", "running · 85K/200K");
+      expect(JSON.parse(reply.mock.calls[1][0].data.content).text).toContain("🧠 model-GPT · running · 85K/200K");
+      expect(JSON.parse(reply.mock.calls[1][0].data.content).text).not.toMatch(/status:|查询时/);
       expect((h.bot as any).replyStatusFooters.size).toBe(0);
+    } finally { h.cleanup(); }
+  });
+  it("retains compact state and context in new-message plain-text fallback", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const create = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ data: { message_id: "sent" } });
+      (h.bot as any).client = { im: { message: { create } } };
+      (h.bot as any).sendMessage = (FeishuBot.prototype as any).sendMessage.bind(h.bot);
+      await (h.bot as any).sendFinalMessage("chat1", "answer", "model-GPT", "running · 85K/200K");
+      const card = JSON.parse(create.mock.calls[0][0].data.content);
+      expect(card.body.elements.at(-1).content).toContain("🧠 model-GPT · running · 85K/200K");
+      const text = JSON.parse(create.mock.calls[1][0].data.content).text;
+      expect(text).toContain("🧠 model-GPT · running · 85K/200K");
+      expect(text).not.toMatch(/status:|查询时/);
+      expect((h.bot as any).sendStatusFooters.size).toBe(0);
     } finally { h.cleanup(); }
   });
   it("keeps discussion pause notices nonfatal and releases proactive mute immediately", async () => {
