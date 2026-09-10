@@ -18,3 +18,11 @@ Release from main, including the previously local cf5827d reconciliation fix.
 
 Not included: unverified steer V2 or ask_user adaptations. Those are preserved
 separately in wip/steer-v2-20260910 and must not be packed into this release.
+
+## Dependency verification before publication
+
+The production-only audit identified inherited high-severity advisories. The
+release now requires @larksuiteoapi/node-sdk >=1.73.3 within major 1 and locks
+axios 1.20.0, form-data 4.0.6 and protobufjs 7.6.6. `npm audit --omit=dev` reports
+zero vulnerabilities for the tested production tree. Development-only advisories
+remain separate; no blanket `npm audit fix --force` or OpenClaw upgrade is used.
