@@ -175,7 +175,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("暂停本轮等待"));
     } finally { h.cleanup(); }
   });
-  it("returns a wait notice while keeping the normal queue owner until the actual result", async () => {
+  it.each(["timeout", "yield"] as const)("returns a %s notice while keeping the normal queue owner until the actual result", async reason => {
     const h = makeHarness("GPT");
     try {
       (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ status: "running", running: true, checkedAt: Date.now() }));
@@ -186,8 +186,15 @@ describe("FeishuBot routing and queue behavior", () => {
       });
       const work = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "work", messageId: "wait-notice" }));
       await vi.waitUntil(() => Boolean(finish), { timeout: 1000 });
-      await submitted.onWaitPaused(new SessionWaitPaused({status:"running",running:true,checkedAt:Date.now()}));
+      // A recent unrelated delivery must not suppress a confirmed yield notice.
+      if (reason === "yield") (h.bot as any).lastRealDeliveryAt.set("chat1", Date.now());
+      const pause = new SessionWaitPaused({status:"unknown",running:false,checkedAt:Date.now()}, false, reason);
+      await submitted.onWaitPaused(pause);
+      if (reason === "yield") await submitted.onWaitPaused(pause); // outbox dedupe, independently of collector dedupe
       const row = h.store.getMessageId("wait-notice")!;
+      expect(h.store.getDeliveryByKey("GPT", "chat1", `trigger:${row}:wait-paused`)?.content).toBe(pause.message);
+      expect((h.bot as any).replyMessage.mock.calls.filter((call: any[]) => call[1] === pause.message)).toHaveLength(1);
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("wait-notice", "DONE");
       expect((h.bot as any).queueRuns.has("chat1")).toBe(true);
       expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(false);
       expect(h.openclaw.abortChat).not.toHaveBeenCalled();
@@ -195,6 +202,27 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(h.openclaw.chatCalls).toHaveLength(1);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("wait-notice", "real final");
       expect(h.store.hasDeliveredReply("GPT", "chat1", row)).toBe(true);
+    } finally { h.cleanup(); }
+  });
+  it("keeps a discussion yield notice nonterminal until the scheduler receives the real result", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const unmute = vi.fn(); h.openclaw.muteProactiveDelivery = vi.fn(() => unmute);
+      let submitted: any; let finish!: (value: string) => void;
+      h.openclaw.chatSendWithContext = vi.fn(async (p: any) => {
+        submitted = p; return new Promise<string>(resolve => { finish = resolve; });
+      });
+      const work = (h.bot as any).runDiscussionTurn("chat1", "discussion question");
+      await vi.waitUntil(() => Boolean(finish), { timeout: 1000 });
+      expect(submitted.emptyFinalAsNoReply).toBe(true);
+      const pause = new SessionWaitPaused({ status: "unknown", running: false, checkedAt: Date.now() }, false, "yield");
+      await submitted.onWaitPaused(pause);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", pause.message);
+      expect(unmute).not.toHaveBeenCalled(); expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      finish("discussion final"); await work;
+      expect(unmute).toHaveBeenCalledWith(120_000);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledWith("chat1", "discussion final");
+      expect(h.openclaw.chatSendWithContext).toHaveBeenCalledOnce();
     } finally { h.cleanup(); }
   });
   it("emits a normal wait notice without DONE or final-answer ownership, allowing the later answer", async () => {

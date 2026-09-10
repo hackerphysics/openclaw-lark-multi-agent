@@ -256,7 +256,9 @@ export class OpenClawClient {
               this.agentEvents.get(sk)!.push({
                 ...frame.payload,
                 stream: "chatFinal",
-                data: { text: textParts.join("\n") },
+                // Only the Gateway chat-final envelope confirms a handoff.
+                // Never infer it from tool names, arguments or raw tool output.
+                data: { text: textParts.join("\n"), gatewayYielded: frame.payload?.yielded === true },
               });
             } else if (state === "error") {
               // A chat-level error (e.g. "Request timed out before a response")
@@ -488,6 +490,10 @@ export class OpenClawClient {
   /** Render protocol-4 structured tool args/results without `[object Object]`.
    * Prefer useful, non-secret fields and keep the fallback bounded. */
   private formatToolValue(value: unknown, toolName: string, phase: "start" | "end" | "error"): string {
+    // sessions_yield.message is private resumed context. Do not mirror its
+    // arguments/results (including JSON strings) into process cards or verbose
+    // tool replies. This is redaction only, never evidence of a handoff.
+    if (toolName === "sessions_yield") return "";
     if (value === null || value === undefined || value === "") return "";
     if (typeof value === "string") return value.trim();
     if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
@@ -703,7 +709,7 @@ export class OpenClawClient {
    */
 private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
     let cleanupObservation = () => {};
-    return new Promise<string>((resolve, reject) => {
+    return new Promise<string>((resolveResult, rejectResult) => {
       // Whether we were connected when the run started. We only treat a later
       // disconnect as a mid-run gateway drop (fail fast) if we began connected;
       // this keeps unit tests that drive collectReply without a live socket from
@@ -712,6 +718,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let text = "";
       let chatDeltaText = "";
       let chatFinalText = "";
+      let chatFinalSeen = false;
       let transcriptAssistantText = "";
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey.replace(/^agent:[^:]+:/, "")}` : "";
       let shortSessionKey = targetSessionKey ? targetSessionKey.replace(/^agent:[^:]+:/, "") : "";
@@ -738,12 +745,18 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
       let idleTimer: ReturnType<typeof setTimeout>;
       let observationClosed = false;
+      // Close synchronously: a deferred yield notice must not overtake a final
+      // or error just because Promise.finally cleanup has not run yet.
+      const resolve = (value: string) => { observationClosed = true; resolveResult(value); };
+      const reject = (error: Error) => { observationClosed = true; rejectResult(error); };
       let checkingState = false;
       let lastStateCheckAt = -Infinity;
       let quietNotified = false;
       let decidingTimeout = false;
       let waitNoticeSent = false;
       let foregroundPaused = false;
+      let foregroundYielded = false;
+      let turnYielded = false;
       let foregroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
       const handleTimeoutResult = async (error: Error) => {
         if (observationClosed) return;
@@ -941,6 +954,17 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               continue;
             }
 
+            // After handoff, an unowned new run (including requester-settle)
+            // retains its existing proactive delivery route. A session/lifecycle
+            // start alone must not turn it into the old run's final. Discussion's
+            // transcript mute marks scheduler-owned collection; retain its existing
+            // anchored collector path rather than changing discussion routing.
+            if (eventSessionMatches && foregroundYielded && evRunId && !matchesRun
+              && !this.mutedProactiveSessions.has(sessionKey) && !this.mutedProactiveSessions.has(shortSessionKey)) {
+              bucket.splice(i, 1);
+              continue;
+            }
+
             if (eventSessionMatches && expectedUserText && !anchorSeen && !matchesRun) {
               bucket.splice(i, 1);
               preAnchorEvents.push(ev);
@@ -993,6 +1017,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               pendingRuntimeFailureText = "";
             }
 
+            // A matched resumed turn can again complete via the existing
+            // assistant/transcript + lifecycle path, even without chat final.
+            if (ev.stream === "lifecycle" && ev.data?.phase === "start") turnYielded = false;
             if (ev.stream === "lifecycle" && ev.data?.phase === "start" && !lifecycleStartedLogged) {
               lifecycleStartedLogged = true;
               console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
@@ -1020,17 +1047,39 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               }
             }
             if (ev.stream === "chatFinal") {
+              chatFinalSeen = true;
+              if (ev.data?.gatewayYielded === true) {
+                // A yielded turn is not a terminal answer, even if its buffered
+                // message contains a preface. Preserve the collector/queue owner
+                // and final-delivery key; only pause foreground presentation.
+                if (chatFinalText.trim()) continue; // an actual final wins
+                foregroundYielded = true;
+                turnYielded = true;
+                text = chatDeltaText = transcriptAssistantText = "";
+                if (chatFinalTimer) { clearTimeout(chatFinalTimer); chatFinalTimer = null; }
+                if (lifecycleEndTimer) { clearTimeout(lifecycleEndTimer); lifecycleEndTimer = null; }
+                // Finish scanning this batch first so an already-arrived real
+                // final/error wins over a stale waiting notice. No status RPC
+                // (or ten-minute budget) is needed to confirm this wire fact.
+                if (options?.onWaitPaused) void Promise.resolve().then(() => handleTimeoutResult(
+                  new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined), false, "yield")
+                ));
+                continue;
+              }
               chatFinalText = ev.data?.text || "";
+              if (chatFinalText.trim()) turnYielded = false;
+              else if (turnYielded) continue;
               // Fallback: if lifecycle end doesn't arrive within 5s, resolve
               if (!chatFinalTimer) {
                 chatFinalTimer = setTimeout(() => {
                   console.warn(`[OpenClaw] collectReply: lifecycle end missing, using chatFinal fallback`);
-                  this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
-                    console.warn(`[OpenClaw] abort after chatFinal fallback failed:`, (err as Error).message);
-                  });
                   // Prefer final chat message over accumulated deltas: some providers may
                   // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
                   const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
+                  // Never abort a yielded original run, nor an empty final.
+                  if (!foregroundYielded && latestFinalText) this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
+                    console.warn(`[OpenClaw] abort after chatFinal fallback failed:`, (err as Error).message);
+                  });
                   if (latestFinalText) {
                     finish(latestFinalText);
                   } else if (options?.emptyFinalAsNoReply) {
@@ -1043,6 +1092,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               }
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
+              // paused/end_turn can beat the confirming chat event, including
+              // discussion's emptyFinalAsNoReply path. It is neither success
+              // nor failure and alone does NOT authorize a handoff notice.
+              if (!chatFinalText.trim() && (turnYielded || (ev.data?.livenessState === "paused" && ev.data?.stopReason === "end_turn"))) continue;
               // Prefer final chat message over accumulated deltas: some providers may
               // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
               const finalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
@@ -1093,7 +1146,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
               // If lifecycle end beats chat final, a short delta like "N" can be a truncated
               // final reply. Wait for chatFinal before resolving; otherwise suppress lone "N".
-              if (!options?.emptyFinalAsNoReply && ev.data?.livenessState === "working" && !chatFinalText && text.length <= 1) {
+              if ((!options?.emptyFinalAsNoReply && ev.data?.livenessState === "working" && !chatFinalText && text.length <= 1)
+                || (options?.emptyFinalAsNoReply && !chatFinalSeen && !finalText)) {
+                // A lifecycle-only empty discussion end also needs this small
+                // window for a confirming yielded chat final, not instant NO_REPLY.
+                if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
                 lifecycleEndTimer = setTimeout(finishFromLifecycle, 5000);
               } else {
                 finishFromLifecycle();

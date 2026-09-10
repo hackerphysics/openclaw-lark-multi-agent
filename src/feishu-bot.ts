@@ -1440,7 +1440,10 @@ export class FeishuBot {
             onProgress: (event) => liveStatus?.progress(event),
             onWaitPaused: async notice => {
               await liveStatus?.showWaitingForResult(notice.message);
-              if (Date.now() - (this.lastRealDeliveryAt.get(chatId) || 0) >= 5000) await this.sendWaitPaused(chatId, triggerId, lastHuman.messageId, notice);
+              // Yield is a confirmed handoff, not the timeout heuristic. A
+              // recent unrelated reply must not suppress this turn's notice.
+              if (notice.reason === "yield" ? !this.store.hasDeliveredReply(this.config.name, chatId, triggerId)
+                : Date.now() - (this.lastRealDeliveryAt.get(chatId) || 0) >= 5000) await this.sendWaitPaused(chatId, triggerId, lastHuman.messageId, notice);
             },
           }));
         } catch (mainErr) {
