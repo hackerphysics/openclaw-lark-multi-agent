@@ -1,4 +1,5 @@
-/** Frontend budget only; does not change Gateway execution limits. */
+/** Consecutive effective-activity silence, not a total foreground lifetime.
+ * Starts with accepted-request collection; does not change Gateway execution limits. */
 export const FOREGROUND_WAIT_MS = 10 * 60_000;
 
 export type SessionRuntimeStatus = {
@@ -43,7 +44,7 @@ export class SessionWaitPaused extends Error {
       ? "⏳ 本轮已转入后台等待；若有后续结果，将继续在此回复。未发送停止请求，也未自动重发请求。"
       : reportedTimeout
       ? "⏳ 本轮返回了超时，LMA 已暂停本次等待，但不据此认定整个会话已经结束。会话状态见下方；你可以继续等待后续结果。"
-      : "⏳ 本次等待时间已到，LMA 暂停本轮等待，先返回会话状态供你判断。\n没有因此停止运行或自动重发本次请求；你可以继续等待后续结果。");
+      : "⏳ 本轮连续无有效进展的等待时间已到，LMA 暂停本轮等待，先返回会话状态供你判断。\n没有因此停止运行或自动重发本次请求；你可以继续等待后续结果。");
     this.name = "SessionWaitPaused";
   }
 }

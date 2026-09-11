@@ -1,5 +1,9 @@
 # Yield foreground handoff — isolated code review
 
+> Historical release behavior below. The fixed foreground/card budget is
+> superseded in the working tree by [consecutive-silence timing](foreground-idle-2026-09-11.md).
+> The yield and no-auto-thaw behavior remains unchanged; this correction is not yet released.
+
 ## Scope and contract
 
 Base: `main` at `def24569ab2812b143e41236cb43cba55bf1e844` (package 1.4.9).

@@ -1,6 +1,6 @@
 import WebSocket from "ws";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve, sep } from "path";
 import { OpenClawConfig } from "./config.js";
@@ -757,7 +757,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let foregroundPaused = false;
       let foregroundYielded = false;
       let turnYielded = false;
-      let foregroundWaitTimer: ReturnType<typeof setTimeout> | undefined;
       const handleTimeoutResult = async (error: Error) => {
         if (observationClosed) return;
         if (chatFinalText.trim()) { finish(chatFinalText); return; }
@@ -765,7 +764,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // Foreground notice, background observation. Keep the original queue
           // owner/progress path so later input still steers into the same run.
           foregroundPaused = true;
-          if (foregroundWaitTimer) clearTimeout(foregroundWaitTimer);
           if (!waitNoticeSent) {
             waitNoticeSent = true;
             try { await options.onWaitPaused(error); }
@@ -777,7 +775,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         }
         reject(error);
       };
-      const checkRunState = async () => {
+      const checkRunState = async (idleStillCurrent = () => true) => {
         if (observationClosed || checkingState || Date.now() - lastStateCheckAt < 60_000) return;
         checkingState = true;
         lastStateCheckAt = Date.now();
@@ -799,7 +797,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           } else if (snapshot.status === "error" || snapshot.status === "timeout") {
             if (snapshot.status === "timeout" || isWaitTimeout(String(snapshot.error || ""))) {
               const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
-              if (!observationClosed && status.running) { await handleTimeoutResult(new SessionWaitPaused(status, true)); return; }
+              collectEvents();
+              if (!observationClosed && status.running) {
+                if (idleStillCurrent()) await handleTimeoutResult(new SessionWaitPaused(status, true));
+                return;
+              }
             }
             if (observationClosed) return;
             reject(new Error(`Agent error: ${typeof snapshot.error === "string" && snapshot.error.trim()
@@ -808,22 +810,86 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         } catch { /* Unavailable evidence means keep waiting, never abort/replay. */ }
         finally { checkingState = false; }
       };
+      // One clock for foreground silence and subsequent low-frequency observation.
+      // A generation fences status RPCs that complete after newer real activity.
+      let idleGeneration = 0;
       const resetIdleTimer = (delayMs = timeoutMs, activity = true) => {
         if (activity) { if (!foregroundPaused) waitNoticeSent = false; quietNotified = false; }
+        const generation = ++idleGeneration;
+        const idleStillCurrent = () => !observationClosed && generation === idleGeneration;
         if (idleTimer) clearTimeout(idleTimer);
         if (observationClosed) return;
         idleTimer = setTimeout(async () => {
+          // Drain already-received frames before judging silence: the 50ms
+          // collection poll may otherwise run just after this deadline.
+          collectEvents();
+          if (!idleStillCurrent()) return;
           if (!quietNotified) {
             quietNotified = true;
             console.warn(`[OpenClaw] quiet run ${runId}; checking Gateway state without stopping execution`);
           }
-          await checkRunState();
-          if (!observationClosed) {
-            const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
-            if (!observationClosed && status.running) { await handleTimeoutResult(new SessionWaitPaused(status)); return; }
+          await checkRunState(idleStillCurrent);
+          if (!idleStillCurrent()) return;
+          const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
+          collectEvents();
+          if (!idleStillCurrent()) return;
+          // With a foreground callback, silence freezes presentation even when
+          // status is unknown/idle; never invent running. Without one, retain
+          // the published running-only typed outcome and background checks.
+          if (status.running || options?.onWaitPaused) {
+            await handleTimeoutResult(new SessionWaitPaused(status));
+            return;
           }
-          if (!observationClosed) resetIdleTimer(60_000, false);
+          resetIdleTimer(60_000, false);
         }, delayMs);
+      };
+      // Activity filtering is deliberately separate from reply assembly/matching:
+      // legacy session fallback must keep delivering replies as before, but an
+      // unrelated/unidentified run must not extend this run's foreground wait.
+      const activityKeys = new Set<string>();
+      const activityText = new Map<string, string>();
+      const claimActivity = (value: string) => {
+        // Retain fingerprints rather than copies of cumulative/private text.
+        const key = createHash("sha256").update(value).digest("hex");
+        if (activityKeys.has(key)) return false;
+        activityKeys.add(key);
+        return true;
+      };
+      const hasEffectiveActivity = (ev: any): boolean => {
+        if (!ev.runId || !activeRunIds.has(ev.runId)) return false;
+        const data = ev.data || {};
+        const run = String(ev.runId);
+        if (ev.stream === "tool" || (ev.stream === "item" && data.kind === "tool")) {
+          const phase = data.phase === "result" ? (data.isError || data.error ? "error" : "end") : data.phase;
+          if (phase !== "start" && phase !== "end" && phase !== "error") return false;
+          // Canonical tool and legacy item mirrors share identity and phase.
+          // Without a call id, conservatively recognize each name/phase once.
+          const id = data.toolCallId || data.itemId || data.id || data.name || data.toolName;
+          return Boolean(id) && claimActivity(JSON.stringify([run, "tool", id, phase]));
+        }
+        if (ev.stream === "lifecycle" && data.phase === "start") {
+          return claimActivity(JSON.stringify([run, "start"]));
+        }
+        if (ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") {
+          const fullText = typeof data.text === "string" ? data.text : "";
+          const chunk = fullText || data.deltaText || data.delta;
+          const replace = Boolean(fullText || data.replace);
+          if (typeof chunk !== "string" || !chunk.trim()) return false;
+          const source = JSON.stringify([run, ev.stream]);
+          // seq identifies repeated incremental frames, not progress by itself.
+          // No-seq identical fragments are ambiguous: do not let replay extend idle.
+          if (!claimActivity(JSON.stringify([source, ev.seq ?? null, replace, chunk]))) return false;
+          const previous = activityText.get(source) || "";
+          const next = replace ? chunk : previous + chunk;
+          activityText.set(source, next);
+          if (next === previous || (replace && previous.includes(next))) return false;
+          // Replayed replacement snapshots and assistant/chat/transcript mirrors
+          // with the same accumulated text are not additional task progress.
+          return claimActivity(JSON.stringify([run, "text", next]));
+        }
+        // Usage, ticks, user receipts, status/wait responses and unknown streams
+        // are not verified task progress. Tool output is counted at completion.
+        return false;
       };
       const summarizeActivity = (ev: any): string => {
         if (ev.stream === "item") {
@@ -883,10 +949,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         resolve(finalText);
       };
 
-      const poller = setInterval(() => {
+      const collectEvents = () => {
+        if (observationClosed) return;
         // Gateway connection dropped mid-run (e.g. gateway restart): the run will
         // never deliver a reply on this connection, so stop waiting instead of
-        // hanging until the 30-min idle timeout. Failing fast lets the bridge
+        // hanging until the idle timeout. Failing fast lets the bridge
         // release its busy lock so new messages are not stuck "waiting".
         if (startedConnected && !this.connected) {
           clearInterval(poller);
@@ -933,7 +1000,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               bucket.splice(i, 1);
               if (!anchorSeen && isExpectedUserText(ev.data?.text || "")) {
                 anchorSeen = true;
-                resetIdleTimer();
                 for (const pendingEv of preAnchorEvents) {
                   const pendingRunId = typeof pendingEv.runId === "string" ? pendingEv.runId : "";
                   if (pendingRunId && pendingEv.stream === "lifecycle" && pendingEv.data?.phase === "start") {
@@ -1002,10 +1068,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
 
             bucket.splice(i, 1);
-            // Any matching event — including toolCall/toolResult/item/lifecycle —
-            // means the agent is still alive. Use an idle timeout, not an absolute
-            // wall-clock timeout, so long tool-heavy tasks are not killed while active.
-            resetIdleTimer();
+            if (hasEffectiveActivity(ev)) resetIdleTimer();
             rememberActivity(ev);
             // If more events arrive after a replay-invalid lifecycle end, that lifecycle
             // was not terminal for the user-visible run. Keep waiting for the real final.
@@ -1060,7 +1123,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 if (lifecycleEndTimer) { clearTimeout(lifecycleEndTimer); lifecycleEndTimer = null; }
                 // Finish scanning this batch first so an already-arrived real
                 // final/error wins over a stale waiting notice. No status RPC
-                // (or ten-minute budget) is needed to confirm this wire fact.
+                // (or ten-minute silence) is needed to confirm this wire fact.
                 if (options?.onWaitPaused) void Promise.resolve().then(() => handleTimeoutResult(
                   new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined), false, "yield")
                 ));
@@ -1170,7 +1233,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               // back to this text.
               if (this.isRecoverableAgentError(errText)) {
                 pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
-                resetIdleTimer();
                 console.warn(`[OpenClaw] recoverable lifecycle error for runId=${evRunId || runId}; deferring (agent may auto-recover): ${errText.slice(0, 120)}`);
                 return;
               }
@@ -1220,7 +1282,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               }
               if (this.isRecoverableAgentError(errText)) {
                 pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
-                resetIdleTimer();
                 console.warn(`[OpenClaw] recoverable chat error for runId=${evRunId || runId}; deferring: ${errText.slice(0, 120)}`);
                 bucket.splice(i, 1);
                 continue;
@@ -1249,7 +1310,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
           }
         }
-      }, 50);
+      };
+      const poller = setInterval(collectEvents, 50);
       const observationKey = targetSessionKey ? this.canonicalSessionKey(targetSessionKey) : "";
       const checkAfterNoActiveRun = async () => {
         await checkRunState();
@@ -1265,18 +1327,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         } catch { /* Unknown activity cannot authorize releasing an active owner. */ }
       };
       if (observationKey) this.runStateChecks.set(observationKey, checkAfterNoActiveRun);
-      // Fixed foreground budget: tool/assistant activity must not keep a card
-      // refreshing indefinitely. The original result observer stays alive.
-      if (options?.onWaitPaused) {
-        foregroundWaitTimer = setTimeout(async () => {
-          if (observationClosed || foregroundPaused) return;
-          await checkRunState();
-          if (observationClosed || foregroundPaused) return;
-          const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
-          if (!observationClosed && !foregroundPaused) await handleTimeoutResult(new SessionWaitPaused(status));
-        }, timeoutMs);
-        foregroundWaitTimer.unref?.();
-      }
       // Bound local resources without cancelling an execution we cannot prove stuck.
       const observationHorizon = setTimeout(() => reject(new Error(
         "LMA 本地监听达到 24 小时上限，结果未确认；未发送停止请求，请检查原运行。"
@@ -1285,7 +1335,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       cleanupObservation = () => {
         observationClosed = true;
         clearTimeout(idleTimer);
-        if (foregroundWaitTimer) clearTimeout(foregroundWaitTimer);
         clearTimeout(observationHorizon);
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
@@ -1828,6 +1877,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     message: string;
     attachments?: ChatAttachment[];
     deliver?: boolean;
+    /** Consecutive effective-activity silence after admission/collector start; default 10 minutes, not total run time. */
     timeoutMs?: number;
     emptyFinalAsNoReply?: boolean;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
@@ -1922,6 +1972,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     currentMessage: string;
     currentSenderName: string;
     deliver?: boolean;
+    /** Consecutive effective-activity silence after admission/collector start; default 10 minutes, not total run time. */
     timeoutMs?: number;
     emptyFinalAsNoReply?: boolean;
     /** Native escaped commands (//status -> /status) should not receive catch-up context. */

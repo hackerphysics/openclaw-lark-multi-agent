@@ -214,7 +214,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     expect(c.rpc.mock.calls.filter(([method]: string[]) => method === "chat.send")).toHaveLength(1);
   });
 
-  it("keeps ordinary ten-minute timeout semantics separate", async () => {
+  it("keeps ordinary ten-minute consecutive-silence semantics separate", async () => {
     const run = await start(); await vi.advanceTimersByTimeAsync(FOREGROUND_WAIT_MS - 1);
     expect(notice).not.toHaveBeenCalled(); await vi.advanceTimersByTimeAsync(1);
     expect(notice).toHaveBeenCalledOnce(); expect(notice.mock.calls[0][0].reason).toBe("timeout");
@@ -288,4 +288,73 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     await final(); expect(await run.result).toEqual({ text: "actual final" });
     await live.complete(); expect(edit).toHaveBeenCalledTimes(count + 1); noAbort();
   });
+  it("write completes at 9:35: neither 9:59 nor 10:00 freezes; silence expires no earlier than 19:35", async () => {
+    const views: any[] = [];
+    const live = new LiveStatusController({ create: async () => "card", edit: async (_id, view) => { views.push(view); } }, { botName: "GPT", delayMs: 0, tickMs: 1000 });
+    live.start(); await vi.advanceTimersByTimeAsync(0);
+    notice.mockImplementation((pause: SessionWaitPaused) => live.showWaitingForResult(pause.message));
+    const run = await start({ onProgress: (ev: any) => live.progress(ev) });
+    // Deliver just before the poll at 9:35, so receipt is processed at 9:35.
+    await vi.advanceTimersByTimeAsync(575000 - 1);
+    agent("tool", { name: "write", toolCallId: "write:1", phase: "result", result: "done" });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(views.at(-1).lines.some((line: any) => line.kind === "tool_end")).toBe(true);
+    await vi.advanceTimersByTimeAsync(24000); // 9:59
+    expect(notice).not.toHaveBeenCalled(); expect(views.at(-1).title).not.toContain("停止刷新");
+    await vi.advanceTimersByTimeAsync(1000); // 10:00
+    expect(notice).not.toHaveBeenCalled(); expect(views.at(-1).elapsed).toBe("10:00");
+    await vi.advanceTimersByTimeAsync(575000 - 1); // 19:34.999
+    expect(notice).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(notice).toHaveBeenCalledOnce(); expect(views.at(-1).title).toContain("停止刷新");
+    const frozen = views.length;
+    // Published ordinary-pause policy: real later progress does NOT thaw the card.
+    agent("tool", { name: "exec", toolCallId: "later", phase: "start" });
+    await vi.advanceTimersByTimeAsync(11 * 60000);
+    expect(views).toHaveLength(frozen); expect(notice).toHaveBeenCalledOnce();
+    expect(run.settled()).toBe(false); expect(c.ownedDeliveryRuns.has("r")).toBe(true);
+    await final(); expect(await run.result).toEqual({ text: "actual final" });
+    await live.complete(); expect(views).toHaveLength(frozen + 1);
+    noAbort(); expect(c.rpc.mock.calls.filter(([method]: string[]) => method === "chat.send")).toHaveLength(1);
+  });
+
+  it.each(["slot", "acceptance", "submitted callback"])("card time before %s is not charged as task silence", async delay => {
+    let release!: (value?: any) => void;
+    const normalRpc = c.rpc;
+    if (delay === "slot") c.acquireChatSendSlot = () => new Promise(resolve => { release = () => resolve(() => {}); });
+    if (delay === "acceptance") c.rpc = vi.fn((method: string, ...args: any[]) => method === "chat.send"
+      ? new Promise(resolve => { release = resolve; }) : normalRpc(method, ...args));
+    const edit = vi.fn(async () => {});
+    const live = new LiveStatusController({ create: async () => "card", edit }, { botName: "GPT", delayMs: 0, tickMs: 60000 });
+    live.start(); await vi.advanceTimersByTimeAsync(0);
+    notice.mockImplementation((pause: SessionWaitPaused) => live.showWaitingForResult(pause.message));
+    const run = await start({ onProgress: (ev: any) => live.progress(ev),
+      ...(delay === "submitted callback" ? { onSubmitted: () => new Promise(resolve => { release = resolve; }) } : {}),
+    });
+    await vi.advanceTimersByTimeAsync(11 * 60000);
+    expect(notice).not.toHaveBeenCalled(); expect(run.settled()).toBe(false);
+    const beforeAccepted = edit.mock.calls.length;
+    release({ runId: "r" }); await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(FOREGROUND_WAIT_MS - 1);
+    expect(notice).not.toHaveBeenCalled(); expect(edit.mock.calls.length).toBeGreaterThan(beforeAccepted);
+    await vi.advanceTimersByTimeAsync(1); expect(notice).toHaveBeenCalledOnce();
+    const frozen = edit.mock.calls.length;
+    await final(); expect(await run.result).toEqual({ text: "actual final" });
+    await live.complete(); expect(edit).toHaveBeenCalledTimes(frozen + 1); noAbort();
+  });
+
+  it("cleans up the pre-admission card on a rejected send without starting an idle clock", async () => {
+    let reject!: (error: Error) => void;
+    c.rpc = vi.fn(() => new Promise((_resolve, fail) => { reject = fail; }));
+    const edit = vi.fn(async () => {});
+    const live = new LiveStatusController({ create: async () => "card", edit }, { botName: "GPT", delayMs: 0 });
+    live.start(); await vi.advanceTimersByTimeAsync(0);
+    const run = await start();
+    await vi.advanceTimersByTimeAsync(11 * 60000); expect(notice).not.toHaveBeenCalled();
+    reject(new Error("admission failed")); expect((await run.result).error?.message).toBe("admission failed");
+    await live.fail(); expect(vi.getTimerCount()).toBe(0);
+    const count = edit.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(11 * 60000); expect(edit).toHaveBeenCalledTimes(count);
+  });
+
 });

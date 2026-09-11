@@ -1,6 +1,7 @@
 # Session status footer and nonfatal wait notices
 
-Base: cf5827d. This branch is separate from the unverified steer V2 work.
+Originally based on cf5827d; consecutive-silence correction based on 1.4.10 /
+ce3fd98. This work is separate from the unverified steer V2 work.
 It does not include a plugin or Gateway configuration change.
 
 Final text replies show `🧠 <model> · <session state> · 85K/200K`.
@@ -22,11 +23,26 @@ Commands and textless attachment replies do not gain fabricated answer text.
 When a wait reports a timeout and a fresh status is running, LMA sends a normal
 wait-paused notice, not an execution-failed warning. For normal in-flight requests,
 foreground waiting is paused but the original background observer, queue ownership
-and result handling remain. The default accepted-request foreground budget is
-**10 minutes**, independent of new activity. The process card also has its own
-fixed 10-minute refresh lifetime from start, including time spent before admission.
-It is frozen when the budget expires: elapsed ticks and later tool/assistant
-progress do not edit it or restart its ticker. Local tool counting may continue
+and result handling remain. The default foreground threshold is **10 consecutive
+minutes without effective task activity**, NOT ten minutes of total runtime.
+The existing collector idle timer is the only silence clock; no independent
+card lifetime remains. It starts when accepted-request collection begins, after
+chat.send acceptance and the onSubmitted callback. Card creation, waiting for a
+send slot and pre-collection bookkeeping are not charged as task silence.
+New owned assistant text, distinct tool start/completion and a first owned run
+start reset this clock; see [activity rules and parameters](foreground-idle-2026-09-11.md).
+Card elapsed ticks, status/agent.wait polling, usage-only and duplicate events do
+not reset it. For example, write completion at 9:35 prevents a 10:00 freeze;
+silence can expire no earlier than 19:35. Continuous activity can run past ten
+minutes without a foreground pause.
+
+On local silence expiry the foreground callback receives a normal pause even if
+status is idle/unknown (the actual state is shown, never invented). A confirmed
+Gateway chat-final yielded:true still pauses immediately, without waiting for
+silence or a status lookup. Once either pause freezes the card, elapsed ticks and
+later tool/assistant progress do not edit it or restart its ticker. This retains
+the published no-auto-thaw policy for ordinary silence as well as yield.
+Local tool counting may continue
 for one final summary. A real final result is sent separately, and the old card
 may receive one necessary terminal cleanup; this is not recurring refresh.
 No abort or new model request is issued for the wait notice. The notice has its own outbox key and does not mark the
@@ -45,9 +61,10 @@ The Gateway's own execution budgets and explicit /stop behavior are unchanged.
 Background event reception and low-frequency Gateway state reconciliation remain;
 freezing the card removes recurring Feishu card-edit calls, not all network traffic.
 
-Verification: build; full offline normal-flow regression suite including original
-305 tests; added coverage for footer placement, plain-text fallback, lookup bound,
-running vs idle timeout handling, no abort/no automatic retry, notice-vs-answer
-ownership, background wait continuation, final-vs-timeout races, and process-card
-fixed-budget/frozen-card behavior. No live Feishu message or production restart is performed
-by these tests. Production activation remains a separate step.
+Verification of this correction: build and **431 offline tests in 13 files**
+passed. The existing 369 tests are retained (the two fixed-budget tests now assert
+consecutive-silence semantics), with 62 additional cases. Coverage includes footer
+placement/fallback, lookup bounds, timeout classification, no abort/replay,
+notice/answer ownership, background continuation, progress/timeout races and card
+freeze/cleanup. See [correction details](foreground-idle-2026-09-11.md). No live
+Feishu message, production restart or publication is performed by these tests.

@@ -1,5 +1,9 @@
 # v1.4.10
 
+> Historical release behavior below. The fixed foreground/card budget is
+> superseded in the working tree by [consecutive-silence timing](foreground-idle-2026-09-11.md).
+> The yield and no-auto-thaw behavior remains unchanged; this correction is not yet released.
+
 Published from main. Adds Gateway-confirmed yield foreground handoff on top of
 1.4.9's compact context/status footer and ten-minute foreground/card budget.
 

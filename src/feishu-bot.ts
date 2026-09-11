@@ -1413,8 +1413,8 @@ export class FeishuBot {
             currentMessage: mergedContent,
             currentSenderName: lastHuman.senderName,
             deliver: false,
-            // Keep bridge UX responsive; long agent/tool loops should surface a clear failure
-            // instead of leaving reactions stuck forever.
+            // Pause foreground only after consecutive effective-activity silence;
+            // active long-running tool loops are not a failure.
             timeoutMs: FOREGROUND_WAIT_MS,
             includeContext: !isNativeCommandTrigger,
             includeBridgeAttachmentHint: !isNativeCommandTrigger,

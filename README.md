@@ -601,10 +601,20 @@ State and context usage come from one bounded Gateway status lookup. K values
 are rounded integers (1000 tokens per K); unavailable/stale values are not shown
 as zero. The footer is a send-time snapshot, not a live status widget.
 
-LMA's foreground result wait and live-card refresh budget are now 10 minutes.
-When the session is still running, LMA sends a normal wait notice instead of
-claiming execution failed. The old card stops periodic/progress edits; background
+LMA pauses foreground waiting after **10 consecutive minutes without effective
+task activity**, not after ten minutes of total runtime. New owned assistant
+text or distinct tool start/completion resets the collector's idle clock;
+card elapsed ticks, status polling, usage-only and duplicate events do not.
+There is no independent card lifetime, and time before chat.send admission /
+collector start is not charged as task silence. A write completion at 9:35 means
+no silence freeze before 19:35, not a freeze at 10:00.
+LMA sends a normal wait notice rather than claiming execution failed, displaying
+the actual status even if unavailable. Confirmed chat-final `yielded: true`
+still pauses immediately. Once frozen, the old card does not auto-resume after
+later tool activity (same published policy for silence and yield); background
 result handling and the original queue remain, with no automatic abort/replay.
 Real results are sent separately; necessary terminal card cleanup is retained.
 This does not shorten the Gateway's execution limit. Unverified steer V2 and
 question adapters are not included in this release.
+
+Timing/API parameters and limitations: [foreground idle semantics](docs/foreground-idle-2026-09-11.md).

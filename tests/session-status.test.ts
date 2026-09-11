@@ -109,20 +109,26 @@ describe('session status and paused waits',()=>{
   await vi.advanceTimersByTimeAsync(100); expect(await p).toBe('real result');
   expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
  });
- it('uses a fixed ten-minute foreground budget despite ongoing activity, then still returns the real result',async()=>{
+ it('waits ten silent minutes after ongoing activity, not ten total minutes, and still returns the real result',async()=>{
   expect(FOREGROUND_WAIT_MS).toBe(600000);
   c.rpc=vi.fn(async(method:string)=>method==='chat.send'?{runId:'r'}:method==='sessions.describe'?{session:{status:'running'}}:{runId:'r',status:'timeout'});
   const notice=vi.fn(); let settled=false;
   const p=c.chatSend({sessionKey:key,message:'test',onWaitPaused:notice}).then((v:string)=>{settled=true;return v;});
-  await vi.advanceTimersByTimeAsync(9*60000);
-  event('assistant',{delta:'working'}); await vi.advanceTimersByTimeAsync(50);
+  for (let i=0;i<5;i++) {
+   await vi.advanceTimersByTimeAsync(4*60000);
+   event('assistant',{delta:`step ${i}`}); await vi.advanceTimersByTimeAsync(50);
+   expect(notice).not.toHaveBeenCalled();
+  }
+  // More than twenty minutes of progress; only the last progress starts silence.
+  await vi.advanceTimersByTimeAsync(FOREGROUND_WAIT_MS-1);
   expect(notice).not.toHaveBeenCalled();
-  await vi.advanceTimersByTimeAsync(60000-50);
+  await vi.advanceTimersByTimeAsync(1);
   expect(notice).toHaveBeenCalledOnce(); expect(settled).toBe(false); expect(c.ownedDeliveryRuns.has('r')).toBe(true);
   event('assistant',{delta:' more work'}); await vi.advanceTimersByTimeAsync(11*60000);
   expect(notice).toHaveBeenCalledOnce();
   event('chatFinal',{text:'real final'}); event('lifecycle',{phase:'end',livenessState:'working'});
   await vi.advanceTimersByTimeAsync(100); expect(await p).toBe('real final');
+  expect(c.rpc.mock.calls.filter((v:any[])=>v[0]==='chat.send')).toHaveLength(1);
   expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
  });
  it('releases exact run final-delivery ownership immediately after pausing',async()=>{

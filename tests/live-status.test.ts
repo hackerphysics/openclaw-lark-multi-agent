@@ -25,15 +25,20 @@ describe("LiveStatusController (interactive card)", () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it("caps card refresh at ten minutes even if acceptance or tool progress keeps arriving", async () => {
+  it("has no independent ten-minute cap before admission or during collector-owned progress", async () => {
     vi.useFakeTimers();
     try {
       const edit = vi.fn(async () => {});
       const live = new LiveStatusController({ create: async () => "card", edit }, { botName: "GPT", delayMs: 0, tickMs: 60_000 });
       live.start(); await vi.advanceTimersByTimeAsync(0);
-      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      // Card creation can precede queue admission by more than ten minutes.
+      await vi.advanceTimersByTimeAsync(11 * 60_000);
+      expect(vi.getTimerCount()).toBe(1); // elapsed ticker only, no independent idle clock
+      const beforeProgress = edit.mock.calls.length;
       await live.progress({ kind: "tool", name: "exec", phase: "start", text: "working" });
-      await vi.advanceTimersByTimeAsync(60_000);
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(edit.mock.calls.length).toBeGreaterThan(beforeProgress);
+      await live.showWaitingForResult("collector verified consecutive silence");
       const count = edit.mock.calls.length;
       expect(vi.getTimerCount()).toBe(0);
       await live.progress({ kind: "assistant_note", text: "more work" });
@@ -43,6 +48,25 @@ describe("LiveStatusController (interactive card)", () => {
       expect(meta?.messageId).toBe("card");
     } finally { vi.useRealTimers(); }
   });
+
+  it.each(["showWaitingForResult", "complete", "fail", "noReply", "prepareFinalDelivery", "dispose"] as const)(
+    "does not restart timers when card creation finishes after %s", async method => {
+      vi.useFakeTimers();
+      try {
+        let created!: (id: string) => void;
+        const edit = vi.fn(async () => {});
+        const live = new LiveStatusController({ create: () => new Promise(resolve => { created = resolve; }), edit }, { botName: "GPT", delayMs: 0 });
+        live.start(); await vi.advanceTimersByTimeAsync(0);
+        const done = method === "showWaitingForResult" ? live.showWaitingForResult("silence") : live[method]();
+        created("late-card"); await done;
+        expect(vi.getTimerCount()).toBe(0);
+        const count = edit.mock.calls.length;
+        await live.progress({ kind: "tool", name: "write", phase: "end", text: "finished" });
+        await vi.advanceTimersByTimeAsync(20 * 60_000);
+        expect(edit).toHaveBeenCalledTimes(count);
+      } finally { vi.useRealTimers(); }
+    },
+  );
 
   it("freezes an unconfirmed idle result without showing success or interrupted status", async () => {
     vi.useFakeTimers();

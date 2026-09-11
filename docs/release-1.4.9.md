@@ -1,5 +1,9 @@
 # v1.4.9
 
+> Historical release behavior below. The fixed foreground/card budget is
+> superseded in the working tree by [consecutive-silence timing](foreground-idle-2026-09-11.md).
+> The yield and no-auto-thaw behavior remains unchanged; this correction is not yet released.
+
 Release from main, including the previously local cf5827d reconciliation fix.
 
 - Compact final footer: model · session state · integer-K context used/limit.

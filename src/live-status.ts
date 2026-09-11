@@ -1,5 +1,4 @@
 import type { ProgressEvent } from "./openclaw-client";
-import { FOREGROUND_WAIT_MS } from "./session-status.js";
 
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
 const DEFAULT_MAX_CHARS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_MAX_CHARS || 120);
@@ -71,8 +70,6 @@ export type LiveStatusOptions = {
   historySize?: number;
   /** Footer/auto-refresh cadence in ms. */
   tickMs?: number;
-  /** Fixed card refresh lifetime; activity does not extend it. */
-  refreshBudgetMs?: number;
 };
 
 export class LiveStatusController {
@@ -83,7 +80,6 @@ export class LiveStatusController {
   private startedAt = Date.now();
   private createTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
-  private refreshBudgetTimer?: NodeJS.Timeout;
   private createPromise?: Promise<void>;
   private finalized = false;
   private waitingForResult = false;
@@ -108,12 +104,9 @@ export class LiveStatusController {
   start(initialDetail?: string): void {
     if (this.disabled || this.finalized || this.updatesFrozen || this.createTimer || this.messageId) return;
     this.startedAt = Date.now();
-    this.refreshBudgetTimer = setTimeout(() => {
-      void this.showWaitingForResult(this.opts.locale === "en"
-        ? "Foreground refresh budget reached; background results are still monitored."
-        : "前台刷新时间已到，过程卡停止实时刷新；后台继续接收结果。").catch(err => this.callbacks.warn?.("live status freeze failed", err));
-    }, this.opts.refreshBudgetMs ?? FOREGROUND_WAIT_MS);
-    this.refreshBudgetTimer.unref?.();
+    // Presentation may start before chat.send admission. Only the collector's
+    // effective-activity idle decision (or confirmed yield) freezes this card;
+    // elapsed ticks are presentation, never evidence of task progress.
     if (initialDetail && initialDetail.trim()) {
       this.pushLine("lifecycle", initialDetail.trim());
     }
@@ -295,7 +288,6 @@ export class LiveStatusController {
   }
 
   private stopTimers(): void {
-    if (this.refreshBudgetTimer) { clearTimeout(this.refreshBudgetTimer); this.refreshBudgetTimer = undefined; }
     if (this.createTimer) { clearTimeout(this.createTimer); this.createTimer = undefined; }
     if (this.tickTimer) { clearInterval(this.tickTimer); this.tickTimer = undefined; }
   }
