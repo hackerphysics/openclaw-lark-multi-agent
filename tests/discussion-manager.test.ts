@@ -195,3 +195,59 @@ describe("DiscussionManager", () => {
   });
 
 });
+
+describe("discussion stop boundaries", () => {
+  it("stops before chairman when cleared during an in-flight participant", async () => {
+    const manager = new DiscussionManager();
+    let finish!: (value: any) => void;
+    const p = { name: "GPT", runDiscussionTurn: vi.fn(() => new Promise<any>(resolve => { finish = resolve; })) };
+    const chair = { name: "Claude", runDiscussionTurn: vi.fn(async () => ({ botName: "Claude", text: "continue", visible: true })) };
+    const completed = vi.fn();
+    manager.startIfAbsent({ chatId: "c", rootMessageId: "r", topic: "t", maxRounds: 3, participants: [p], chairman: chair, onComplete: completed });
+    expect(p.runDiscussionTurn).toHaveBeenCalledOnce();
+    manager.stop("c");
+    finish({ botName: "GPT", text: "old result", visible: true });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(p.runDiscussionTurn).toHaveBeenCalledOnce();
+    expect(chair.runDiscussionTurn).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    expect(manager.status("c")).toBeNull();
+  });
+
+  it("stops before chairman if cleared while a round notice is in flight", async () => {
+    const manager = new DiscussionManager();
+    let release!: () => void;
+    const calls: Array<{ name: string; prompt: string }> = [];
+    const chair = { name: "Chair", runDiscussionTurn: vi.fn(async () => ({ botName: "Chair", text: "continue", visible: true })) };
+    const send = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    manager.startIfAbsent({ chatId: "c", rootMessageId: "r", topic: "t", maxRounds: 3,
+      participants: [participant("GPT", ["point"], calls), participant("Claude", ["NO_REPLY"], calls)], chairman: chair, sendSystemMessage: send });
+    await vi.waitUntil(() => Boolean(release));
+    manager.stop("c"); release();
+    await new Promise(resolve => setImmediate(resolve));
+    expect(chair.runDiscussionTurn).not.toHaveBeenCalled();
+    expect(calls).toHaveLength(2);
+    expect(manager.status("c")).toBeNull();
+  });
+
+  it.each(["FINAL_SUMMARY: old", "CHAIRMAN_NOTE: continue"])("old chairman completion cannot mutate a replacement session: %s", async reply => {
+    const manager = new DiscussionManager();
+    let finishOld!: (value: any) => void, finishNew!: (value: any) => void;
+    const oldChair = { name: "Old", runDiscussionTurn: vi.fn(() => new Promise<any>(resolve => { finishOld = resolve; })) };
+    const completed = vi.fn();
+    manager.startIfAbsent({ chatId: "c", rootMessageId: "old", topic: "old", maxRounds: 1, participants: [], chairman: oldChair, onComplete: completed });
+    await vi.waitUntil(() => Boolean(finishOld));
+    manager.stop("c");
+    const next = { name: "Next", runDiscussionTurn: vi.fn(() => new Promise<any>(resolve => { finishNew = resolve; })) };
+    manager.startIfAbsent({ chatId: "c", rootMessageId: "new", topic: "new", maxRounds: 3, participants: [next] });
+    const newId = manager.status("c")!.id;
+    finishOld({ botName: "Old", text: reply, visible: true });
+    await new Promise(resolve => setImmediate(resolve));
+    expect(manager.status("c")!.id).toBe(newId);
+    expect(manager.status("c")!.currentRound).toBe(1);
+    expect(oldChair.runDiscussionTurn).toHaveBeenCalledOnce();
+    expect(completed).not.toHaveBeenCalled();
+    manager.stop("c"); finishNew({ botName: "Next", text: "NO_REPLY", visible: false });
+    await new Promise(resolve => setImmediate(resolve));
+  });
+});

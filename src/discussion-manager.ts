@@ -176,10 +176,15 @@ export class DiscussionManager {
         await sendSystemMessage(t.discussionRoundNotice(current.currentRound, current.maxRounds, parts.join(current.locale === "zh" ? "；" : "; "))).catch(() => {});
       }
 
+      // stop/preemption may occur while a system notice is being delivered.
+      if (this.sessions.get(session.chatId)?.id !== sessionId || current.status !== "running") return;
       const mustFinish = allNoReply || current.currentRound >= current.maxRounds;
       if (chairman) {
         const chairmanPrompt = this.buildChairmanPrompt(current, replies, mustFinish);
         const chairResult = await chairman.runDiscussionTurn(current.chatId, chairmanPrompt, { round: current.currentRound, maxRounds: current.maxRounds });
+        // An old in-flight Chairman may finish after stop or replacement. Its
+        // delivery belongs to that turn, but it must not mutate the new session.
+        if (this.sessions.get(session.chatId)?.id !== sessionId || current.status !== "running") return;
         const chairText = (chairResult.text || "").trim();
         replies[chairman.name] = chairText;
         const latest = current.completedRounds[current.completedRounds.length - 1];

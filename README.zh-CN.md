@@ -236,7 +236,7 @@ openclaw-lark-multi-agent install-windows-service
 - `/mute` — 开关当前 bot 在当前群聊里的 mute 模式
 - `/mode` — 查看当前 bot 在当前聊天里的模式
 - `/discuss on|off|status|stop|rounds N` — 控制群级多 bot 讨论模式（需先设置 Chairman；默认 10 轮）
-- `/chairman [@Bot|off]` — 设置/查看/清除本群唯一 Chairman
+- `/chairman [@Bot|配置名|off]` — 设置/切换/清除本群唯一 Chairman
 - `/locale [zh|en]` — 设置/查看当前群语言
 
 如果你想把 slash command 直接发给 OpenClaw，可以用双斜杠转义：
@@ -284,14 +284,22 @@ openclaw-lark-multi-agent install-windows-service
 
 - 被直接 @；
 - 消息里出现 `@all` / `@_all`；
-- 当前 bot 开启了 Free 模式，并且这是一条没有定向 @ 的普通人类消息。
+- 本群已设置 Chairman、当前 bot 开启了 Free 模式，且这是一条无 @ 的普通人类消息；
+- 本群已设置 Chairman、没有 Free bot，由 Chairman 兜底（即使 Chairman 是 mute）。
 
 Free 模式是 per-bot 且保守的：
 
-- Free 模式允许 bot 在没有被 @ 时回复普通人类消息。
+- Free 模式**仅在本群已设置 Chairman 时**允许 bot 回复无 @ 的普通人类消息。
 - 如果人类消息 @ 了另一个 bot，只有被 @ 的 bot 可以回复，其他 Free 模式 bot 保持静默。
 - 如果人类消息 @ 了普通人，Free 模式 bot 保持静默。
-- `@all` 仍然是广播触发，可激活所有符合条件的 bot。
+- `@all` 仍然是广播触发，可激活所有符合条件的 bot；但同时定向 @ 其他人/bot 且没有 @ 当前 bot 时，定向排他优先。
+- 单 bot 和多 bot 群、Free/Chairman/Discuss、`/help`、`/free` 等本地命令统一遵循定向排他规则；coordinator 或单 bot 不能兜底抢答。
+- 点名身份仅由匹配的配置 `app_id` 或启动探测已确认的 bot `open_id` 确定。已知 app/open ID 冲突时拒绝匹配，不按顺序让其中一个优先；尚未探测的 open ID 不能独立确认身份，但匹配的 app ID 仍可确认。名字、同名人/外部机器人、括号后缀不构成身份依据，消息元数据不会覆盖已探测身份。
+- 富文本结构化 `at` 节点只在缺少 mention 元数据时可按已知 open ID 确认目标，不能覆盖冲突元数据。缺元数据的 `@name` / 平台占位符及无法确认的目标保持安静；邮箱或普通文字内嵌的 `@` 不当作指令或身份信号。
+
+**Chairman off 不是 mute，但禁止无 @ 的普通新消息触发模型。** `/chairman off`（也支持 `clear` / `none`）原子持久化清空群 Chairman 并关闭 Discuss，停止尚未开始的讨论轮次；即使 bot 原来 Free 或数据库遗留 Discuss on，无 Chairman 时普通新消息也不会触发。不会 abort 已执行 agent、改变旧队列任务身份或阻止其最终结果回传；明确 @ 自己/多目标含自己、单独 `@all`、私聊仍按原规则，Free/mute 设置不清除。
+
+本地管理命令先于普通聊天门禁处理。可无 @ 发送 `/chairman 精确配置名`，或通过可靠点名 `/chairman @Bot` 恢复；之后 Free/Chairman 兜底恢复原行为。Discuss 需重新 `/discuss on` 且必须已有 Chairman。无目标管理命令保留原 coordinator 规则；裸 `/chairman` 返回用法，查看状态用 `/status`。
 
 支持“纯 @ 触发”。例如用户先发：
 
@@ -323,8 +331,8 @@ catch-up 上下文是 bot 随当前消息一起拿到的群里未看到的发言
 
 `/discuss` 是显式的群级多智能体讨论调度器，和 Free 模式分工不同：
 
-- `/free` 控制单个 bot 是否可以响应普通人类消息。
-- `/discuss on` 需先设置 Chairman（`/chairman @Bot`）。它让一个 coordinator 接管普通人类消息，并按 barrier-style round 调度所有 Free 模式 bot 加上 Chairman。
+- `/free` 控制单个 bot 是否可以在已设 Chairman 的群响应普通人类消息。
+- `/discuss on` 需先设置 Chairman（`/chairman @Bot`）。它让一个 coordinator 接管普通人类消息，并按 barrier-style round 调度所有非 mute bot 加上 Chairman，忽略 Free 开关。
 - 定向 @ 仍然走普通路由，所以 discuss 开启时 `@GPT hello` 仍会只触发 GPT。
 - 每个参与 bot 在同一轮拿到相同 prompt，本轮内看不到其他 bot 的回复，下一轮才会看到上一轮结果。
 - Chairman 每轮最后发言：先给出自己的观点，质疑薄弱点，调停分歧，并决定继续还是总结。
@@ -352,11 +360,11 @@ catch-up 上下文是 bot 随当前消息一起拿到的群里未看到的发言
 
 ```text
 /chairman @Bot   设置 Chairman
-/chairman        查看当前 Chairman
+/chairman        显示设置用法；查看状态请用 /status
 /chairman off    清除 Chairman
 ```
 
-`/chairman` 是群级命令，由一个 coordinator bot 统一处理，只产生一条回复。
+`/chairman` 是群级命令：定向设置由目标 bot 处理，无目标管理由 coordinator 处理；多目标错误由第一个可靠目标回复，未被点名的 coordinator 不抢答。
 
 ### `/locale` 语言
 

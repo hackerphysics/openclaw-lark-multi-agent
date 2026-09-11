@@ -306,14 +306,22 @@ By default, a bot responds when:
 
 - it is directly mentioned;
 - `@all` / `@_all` appears in the message;
-- this bot's Free mode is enabled and the message is a plain human message with no targeted mentions.
+- a Chairman is set for this group, and this bot's Free mode is enabled for a plain human message with no mentions;
+- a Chairman is set, no bot is Free, and this bot is the Chairman (even if muted).
 
 Free mode is intentionally per-bot and conservative:
 
-- Free mode lets a bot reply to ordinary human messages without being mentioned.
+- Free mode lets a bot reply to ordinary unmentioned human messages **only while this group has a Chairman**.
 - If a human message mentions another bot, only that bot may respond. Other Free-mode bots stay silent.
 - If a human message mentions a regular person, Free-mode bots stay silent.
-- `@all` remains a broadcast trigger and may activate every eligible bot.
+- `@all` remains a broadcast trigger and may activate every eligible bot. If the message also targets somebody else but not this bot, target exclusivity wins.
+- These rules apply equally to one-bot and multi-bot groups, including local commands such as `/help` and `/free`: no coordinator or single-bot fallback may answer a mention addressed elsewhere.
+- Mention identity requires a matching configured `app_id` or an already probed bot `open_id`. Known conflicting app/open IDs veto a match; neither wins by order. An unprobed open ID cannot establish identity (a matching app ID still can). Display names, including exact names and parenthesized suffixes, never establish identity. Message metadata never updates probed identities.
+- Structured rich-post `at` nodes can supply an already known open ID when mention metadata is absent; they cannot override conflicting metadata. Missing/unresolved mentions or standalone `@name`/platform placeholders fail closed. Embedded `@` in email addresses or ordinary text is not a command or identity signal.
+
+**Clearing Chairman is not mute.** `/chairman off` (also `clear` / `none`) atomically clears the canonical group Chairman and persists Discuss off, stops not-yet-started discussion turns, and blocks **new unmentioned group model triggers**, including Free bots and stale Discuss-on state after reopening the database. It does not abort an executing agent, change an existing queue task's identity, or suppress its eventual result. Explicit verified self/multi-target mentions, standalone `@all`, and private chats retain their normal behavior. Free/mute settings are not reset.
+
+Local management commands are evaluated before the ordinary-chat gate. Use `/chairman <exact configured bot name>` without mentions, or a verified `/chairman @Bot`, to restore the group; Free/Chairman fallback then works again. `/discuss on` still requires a Chairman and must be enabled again after off. Bare group help/settings retain their existing single-coordinator routing; bare `/chairman` shows usage, not status (use `/status`).
 
 Mention-only routing is supported. If a user first sends content and then sends only a bot mention, for example:
 
@@ -344,7 +352,7 @@ Persistent constraints (such as "do not call Feishu send tools directly" and the
 
 `/discuss` is an explicit group-level multi-agent discussion scheduler. It is separate from Free mode:
 
-- `/free` controls whether a single bot may answer plain human messages.
+- `/free` controls whether a single bot may answer plain human messages in a group with a Chairman.
 - `/discuss on` requires a chairman to be set first (`/chairman @Bot`). It lets one coordinator take over plain human messages and run all non-muted bots plus the chairman in barrier-style rounds. Free mode is ignored inside discussion: every bot that is not muted participates regardless of its Free setting.
 - Targeted mentions still fall through to normal routing, so `@GPT hello` works even while discuss mode is enabled.
 - Each participant receives the same round prompt and does not see other participants' replies from the current round until the next round.
@@ -373,11 +381,11 @@ Each group can have exactly one chairman, set with `/chairman @Bot`. Setting a n
 
 ```text
 /chairman @Bot   set the chairman
-/chairman        show the current chairman
+/chairman        show usage (use /status for current chairman)
 /chairman off    clear the chairman
 ```
 
-`/chairman` is a group-level command handled by one coordinator bot, so it produces a single reply.
+`/chairman` is a group-level command: the verified target handles targeted setup, and the coordinator handles untargeted management. Multiple-target errors belong to the first verified target, never an unmentioned coordinator.
 
 ### `/locale`
 

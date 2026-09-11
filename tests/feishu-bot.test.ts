@@ -6,6 +6,7 @@ process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RETRY = "0";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { discussionManager } from "../src/discussion-manager.js";
 import { FeishuBot } from "../src/feishu-bot.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus } from "../src/session-status.js";
 import { InactiveRunObservation } from "../src/openclaw-client.js";
@@ -82,7 +83,7 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   (bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
   (bot as any).patchLiveStatusCard = vi.fn(async () => {});
   (bot as any).patchLiveStatusDoneSummary = vi.fn(async () => {});
-  return { bot, store, openclaw, cleanup: () => {
+  return { bot, store, openclaw, dbPath: join(dir, "messages.db"), cleanup: () => {
     for (const timer of (bot as any).deliveryRetryTimers.values()) clearTimeout(timer);
     (bot as any).deliveryRetryTimers.clear();
     for (const target of (bot as any).deliveryTargetsByRun.values()) if (target.timer) clearTimeout(target.timer);
@@ -619,6 +620,7 @@ describe("FeishuBot routing and queue behavior", () => {
     const gpt = makeHarness("GPT");
     const claude = makeHarness("Claude");
     try {
+      gpt.store.setChairmanBot("chat1", "Claude"); // Ordinary group triggers require a Chairman.
       // The production app shares one MessageStore instance across bots.
       (claude.bot as any).store = gpt.store;
       (claude.bot as any).openclawClient = claude.openclaw;
@@ -633,7 +635,7 @@ describe("FeishuBot routing and queue behavior", () => {
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "讨论一下", messageId: "topic" }));
       await vi.waitUntil(() => gpt.openclaw.chatCalls.length === 1 && claude.openclaw.chatCalls.length === 1, { timeout: 1000 });
       expect(gpt.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
-      expect(claude.openclaw.chatCalls[0].currentMessage).toContain("多智能体结构化讨论");
+      expect(claude.openclaw.chatCalls[0].currentMessage).toContain("你是本群的 Chairman");
       expect(gpt.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
       expect(gpt.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
     } finally {
@@ -677,6 +679,7 @@ describe("FeishuBot routing and queue behavior", () => {
     const gpt = makeHarness("GPT");
     const ghost = makeHarness("Ghost");
     try {
+      gpt.store.setChairmanBot("chat1", "GPT"); // Ordinary group triggers require a Chairman.
       (ghost.bot as any).store = gpt.store;
       (ghost.bot as any).openclawClient = ghost.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
@@ -700,6 +703,7 @@ describe("FeishuBot routing and queue behavior", () => {
     const gpt = makeHarness("GPT");
     const claude = makeHarness("Claude");
     try {
+      gpt.store.setChairmanBot("chat1", "GPT"); // Ordinary group triggers require a Chairman.
       (claude.bot as any).store = gpt.store;
       (claude.bot as any).openclawClient = claude.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
@@ -723,6 +727,7 @@ describe("FeishuBot routing and queue behavior", () => {
     const gpt = makeHarness("GPT");
     const ghost = makeHarness("Ghost");
     try {
+      gpt.store.setChairmanBot("chat1", "GPT"); // Ordinary group triggers require a Chairman.
       (ghost.bot as any).store = gpt.store;
       (ghost.bot as any).openclawClient = ghost.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
@@ -745,6 +750,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("notifies when a new discuss topic preempts an active discussion", async () => {
     const h = makeHarness("GPT");
     try {
+      h.store.setChairmanBot("chat1", "GPT"); // Ordinary group triggers require a Chairman.
       FeishuBot.getAllBots().set("app-GPT", h.bot as any);
       h.store.setDiscussMode("chat1", true);
       h.store.setDiscussMaxRounds("chat1", 10);
@@ -1012,7 +1018,7 @@ describe("FeishuBot routing and queue behavior", () => {
 
 
 
-  it("recognizes parenthesized bot display names from other deployments", async () => {
+  it("recognizes parenthesized bot display names only with verified identity", async () => {
     const coordinator = makeHarness("GPT");
     const target = makeHarness("Claude");
     try {
@@ -1024,7 +1030,7 @@ describe("FeishuBot routing and queue behavior", () => {
         chatType: "group",
         text: "/chairman @光子 (Claude)",
         messageId: "chair-photon-claude",
-        mentions: [{ name: "光子 (Claude)", id: {} }],
+        mentions: [{ name: "光子 (Claude)", id: { app_id: "app-Claude" } }],
       });
       await (coordinator.bot as any).handleMessage(cmd);
       expect(coordinator.store.getChairmanBot("chat1")).toBeFalsy();
@@ -1309,6 +1315,7 @@ describe("FeishuBot routing and queue behavior", () => {
     const gpt = makeHarness("GPT");
     const claude = makeHarness("Claude");
     try {
+      gpt.store.setChairmanBot("chat1", "GPT"); // Ordinary group triggers require a Chairman.
       (claude.bot as any).store = gpt.store;
       (claude.bot as any).openclawClient = claude.openclaw;
       FeishuBot.getAllBots().set("app-GPT", gpt.bot as any);
@@ -1356,6 +1363,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("does not silently swallow discuss messages when no participants exist", async () => {
     const gpt = makeHarness("GPT");
     try {
+      gpt.store.setChairmanBot("chat1", "UnavailableChair"); // Ordinary group triggers require a Chairman.
       gpt.store.setDiscussMode("chat1", true);
       await (gpt.bot as any).handleMessage(event({ chatType: "group", text: "plain topic", messageId: "discuss-empty" }));
       expect((gpt.bot as any).sendMessage).toHaveBeenCalledWith("chat1", expect.stringContaining("没有可参与者"));
@@ -1399,6 +1407,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("lets free mode respond to plain human messages", async () => {
     const h = makeHarness("Claude");
     try {
+      h.store.setChairmanBot("chat1", "Claude"); // Ordinary group triggers require a Chairman.
       h.store.setBotMode("Claude", "chat1", "free");
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "plain question", messageId: "plain" }));
       expect(h.openclaw.chatCalls).toHaveLength(1);
@@ -2164,6 +2173,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("notifies the group when provider errors happen", async () => {
     const h = makeHarness("GLM");
     try {
+      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
       h.store.setBotMode("GLM", "chat1", "free");
       (h.openclaw as any).chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -2180,6 +2190,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("does not replay accepted truly empty replies", async () => {
     const h = makeHarness("GLM");
     try {
+      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
       h.store.setBotMode("GLM", "chat1", "free");
       h.openclaw.replies.push("");
       await (h.bot as any).handleMessage(event({ chatType: "group", text: "需要回答的问题", messageId: "empty-reply" }));
@@ -2640,6 +2651,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("does not mark queued mid-run messages DONE or synced before processing", async () => {
     const h = makeHarness("GLM");
     try {
+      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
       h.store.setBotMode("GLM", "chat1", "free");
       // Force the queue-and-wait fallback (steer unavailable) so this test keeps
       // validating the original mid-run queuing behavior.
@@ -2671,6 +2683,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("steers a mid-run message into the active run instead of queuing a second run", async () => {
     const h = makeHarness("GLM");
     try {
+      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
       h.store.setBotMode("GLM", "chat1", "free");
       delete (h.bot as any).ensureSession;
       // Default mock plugin steer confirms queueing into the existing run.
@@ -2756,6 +2769,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("keeps the previous delivery target when plugin steer is unavailable", async () => {
     const h = makeHarness("GLM");
     try {
+      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
       h.store.setBotMode("GLM", "chat1", "free");
       let releaseFirst!: (value: string) => void;
       h.openclaw.chatSendWithContext = vi.fn((params: any) => {
@@ -3421,5 +3435,354 @@ describe("FeishuBot routing and queue behavior", () => {
         expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
       } finally { h.cleanup(); }
     });
+  });
+});
+
+describe("explicit group routing (2026-09-11)", () => {
+  const self = { name: "GPT", id: { app_id: "app-GPT", open_id: "ou_gpt" } };
+  const other = { name: "Claude", id: { app_id: "app-Claude", open_id: "ou_claude" } };
+  const targets = [
+    ["other-managed", other],
+    ["external-bot", { name: "External", id: { app_id: "external-app", open_id: "ou_external" } }],
+    ["human", { name: "张三", id: { open_id: "ou_human" } }],
+    ["same-name-human", { name: "GPT", id: { open_id: "ou_human" } }],
+    ["same-name-external", { name: "GPT", id: { app_id: "external-app" } }],
+    ["suffix-external", { name: "光子 (GPT)", id: { app_id: "external-app", open_id: "ou_external" } }],
+    ["unknown-id", { name: "万万（GPT）", id: { open_id: "ou_unknown" } }],
+    ["only-name", { name: "GPT" }],
+    ["only-suffix", { name: "光子 (GPT)", id: {} }],
+    ["user-id-only", { name: "GPT", id: { user_id: "unknown-user" } }],
+    ["conflicting-app", { name: "GPT", id: { app_id: "external-app", open_id: "ou_gpt" } }],
+    ["conflicting-open", { name: "GPT", id: { app_id: "app-GPT", open_id: "ou_external" } }],
+    ["cross-bot-ids", { name: "GPT", id: { app_id: "app-GPT", open_id: "ou_claude" } }],
+    ["human-called-all", { name: "所有人", id: { open_id: "ou_human" } }],
+  ] as const;
+
+  function group(count: number) {
+    const h = makeHarness("GPT");
+    const second = count === 2 ? makeHarness("Claude") : undefined;
+    (h.bot as any).botOpenId = "ou_gpt"; // Stand-in for the existing startup probe.
+    FeishuBot.getAllBots().set("app-GPT", h.bot);
+    if (second) {
+      (second.bot as any).store = h.store;
+      (second.bot as any).botOpenId = "ou_claude";
+      FeishuBot.getAllBots().set("app-Claude", second.bot);
+    }
+    return { h, second, cleanup() { discussionManager.stop("chat1"); second?.cleanup(); h.cleanup(); } };
+  }
+
+  for (const count of [1, 2]) {
+    for (const mode of ["normal", "free", "mute", "discuss"] as const) {
+      it.each(targets)(`${count} bots / ${mode}: never answers %s without self`, async (_label, mention) => {
+        const g = group(count), { h } = g;
+        try {
+          h.store.setChairmanBot("chat1", "GPT");
+          h.store.setBotMode("GPT", "chat1", mode === "discuss" ? "free" : mode);
+          h.store.setDiscussMode("chat1", mode === "discuss");
+          for (const text of ["@_user_1 question", "@_all @_user_1 question"]) {
+            await (h.bot as any).handleMessage(event({ text, mentions: [mention] }));
+          }
+          expect(h.openclaw.chatCalls).toHaveLength(0);
+          expect(h.openclaw.steer).not.toHaveBeenCalled();
+          expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+          expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+          expect(h.store.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+          expect((h.bot as any).botOpenId).toBe("ou_gpt");
+          expect(discussionManager.isActive("chat1")).toBe(false);
+        } finally { g.cleanup(); }
+      });
+
+      it.each(["self", "self+other", "all"])(`${count} bots / ${mode}: preserves %s`, async target => {
+        const g = group(count), { h } = g;
+        try {
+          h.store.setChairmanBot("chat1", "GPT");
+          h.store.setBotMode("GPT", "chat1", mode === "discuss" ? "normal" : mode);
+          h.store.setDiscussMode("chat1", mode === "discuss");
+          h.store.setDiscussMaxRounds("chat1", 1);
+          const msg = event({ text: target === "all" ? "@_all question" : "@_user_1 question", mentions: target === "all" ? [] : target === "self" ? [self] : [self, other] });
+          await (h.bot as any).handleMessage(msg);
+          await vi.waitUntil(() => h.openclaw.chatCalls.length === 1 && !discussionManager.isActive("chat1"));
+          expect(h.openclaw.chatCalls).toHaveLength(1);
+          // Only broadcast Discuss may schedule other participants.
+          expect(g.second?.openclaw.chatCalls.length || 0).toBe(0);
+        } finally { g.cleanup(); }
+      });
+    }
+
+    for (const mode of ["normal", "free", "mute"] as const) {
+      it(`${count} bots / ${mode}: clear persists, blocks new plain triggers, and can be restored locally`, async () => {
+        const g = group(count), { h } = g;
+        let reopened: MessageStore | undefined;
+        try {
+          h.store.setChairmanBot("chat1", "GPT");
+          h.store.setBotMode("GPT", "chat1", mode);
+          if (g.second) h.store.setBotMode("Claude", "chat1", mode);
+          h.store.setDiscussMode("chat1", true);
+          const off = event({ text: "/chairman off", messageId: "clear-chair" });
+          await (h.bot as any).handleMessage(off);
+          if (g.second) await (g.second.bot as any).handleMessage(off);
+          expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(1);
+          expect(g.second && (g.second.bot as any).replyMessage.mock.calls.length || 0).toBe(0);
+          expect(h.store.getChairmanBot("chat1")).toBe("");
+          expect(h.store.getChatInfo("chat1")?.discuss).toBe(false);
+          expect(h.store.getBotMode("GPT", "chat1")).toBe(mode);
+          h.store.close();
+          reopened = new MessageStore(h.dbPath);
+          (h.bot as any).store = reopened;
+          if (g.second) (g.second.bot as any).store = reopened;
+          (h.bot as any).fetchAndCacheChatInfo = async () => {};
+          if (g.second) (g.second.bot as any).fetchAndCacheChatInfo = async () => {};
+          expect(reopened.getChairmanBot("chat1")).toBe("");
+          expect(reopened.getChatInfo("chat1")?.discuss).toBe(false);
+          for (const staleDiscuss of [false, true]) {
+            reopened.setDiscussMode("chat1", staleDiscuss);
+            const plain = event({ text: "ordinary after clear" });
+            await (h.bot as any).handleMessage(plain);
+            if (g.second) await (g.second.bot as any).handleMessage(plain);
+          }
+          expect(h.openclaw.chatCalls).toHaveLength(0);
+          expect(g.second?.openclaw.chatCalls.length || 0).toBe(0);
+          expect(reopened.getPendingTriggerIds("GPT", "chat1").size).toBe(0);
+          reopened.setDiscussMode("chat1", false);
+          await (h.bot as any).handleMessage(event({ text: "/discuss on" }));
+          expect(reopened.getChatInfo("chat1")?.discuss).toBe(false);
+          await (h.bot as any).handleMessage(event({ text: "/chairman GPT" }));
+          expect(reopened.getChairmanBot("chat1")).toBe("GPT");
+          await (h.bot as any).handleMessage(event({ text: "ordinary after restore" }));
+          expect(h.openclaw.chatCalls).toHaveLength(1);
+          expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+        } finally { reopened?.close(); g.cleanup(); }
+      });
+    }
+
+    it.each(["/help", "/free on", "/chairman off", "/chairman GPT", "/discuss on", "/locale en", "/model", "//status"])(`${count} bots: targeted %s cannot fall back to coordinator or single bot`, async command => {
+      const g = group(count), { h } = g;
+      try {
+        h.store.setChairmanBot("chat1", "GPT");
+        h.store.setBotMode("GPT", "chat1", "free");
+        for (const [, mention] of targets) {
+          await (h.bot as any).handleMessage(event({ text: `@_user_1 ${command}`, mentions: [mention] }));
+        }
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+        expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+        expect(h.openclaw.chatCalls).toHaveLength(0);
+        expect(h.store.getChairmanBot("chat1")).toBe("GPT");
+        expect(h.store.getChatLocale("chat1")).toBe("");
+      } finally { g.cleanup(); }
+    });
+  }
+
+  it.each(["@_user_1 hello", "你好@_user_1你好", "@GPT hello", "@光子 (GPT) hello", "@_user_1 /help", "/chairman @GPT", "@GPT //status"])("missing metadata stays silent: %s", async text => {
+    const g = group(1), { h } = g;
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      h.store.setBotMode("GPT", "chat1", "free");
+      h.store.setDiscussMode("chat1", true);
+      await (h.bot as any).handleMessage(event({ text }));
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+    } finally { g.cleanup(); }
+  });
+
+  it.each(["email user@example.com", "expression a@b", "普通文字包含@但不是点名", "explain /help, not a command"])("does not parse embedded @ or command text as routing: %s", async text => {
+    const g = group(1), { h } = g;
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      await (h.bot as any).handleMessage(event({ text }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe(text);
+    } finally { g.cleanup(); }
+  });
+
+  it.each([
+    ["human", { tag: "at", user_id: "ou_human", user_name: "GPT" }, false],
+    ["onlyname", { tag: "at", user_name: "光子 (GPT)" }, false],
+    ["self", { tag: "at", user_id: "ou_gpt", user_name: "GPT" }, true],
+    ["all", { tag: "at", user_id: "all", user_name: "所有人" }, true],
+  ] as const)("routes structured richpost %s without metadata", async (_label, node, respond) => {
+    const g = group(1), { h } = g;
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      h.store.setBotMode("GPT", "chat1", "free");
+      const msg = event({ text: "unused" });
+      msg.message.message_type = "post";
+      msg.message.content = JSON.stringify({ content: [[node, { tag: "text", text: "question" }]] });
+      await (h.bot as any).handleMessage(msg);
+      expect(h.openclaw.chatCalls).toHaveLength(respond ? 1 : 0);
+      if (!respond) expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+    } finally { g.cleanup(); }
+  });
+
+  it("uses app ID if open identity is not probed, but never learns it from messages", async () => {
+    const g = group(1), { h } = g;
+    try {
+      (h.bot as any).botOpenId = null;
+      await (h.bot as any).handleMessage(event({ text: "hello", mentions: [self] }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect((h.bot as any).botOpenId).toBeNull();
+      await (h.bot as any).handleMessage(event({ text: "hello", mentions: [{ name: "GPT", id: { open_id: "ou_gpt" } }] }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { g.cleanup(); }
+  });
+
+  it("routes open-ID-only self and targeted escaped commands without Chairman", async () => {
+    const g = group(2), { h } = g;
+    try {
+      const msg = event({ text: "@_user_1 //status", mentions: [{ name: "anything", id: { open_id: "ou_gpt" } }] });
+      await (h.bot as any).handleMessage(msg);
+      await (g.second!.bot as any).handleMessage(msg);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.chatCalls[0].currentMessage).toBe("/status");
+      expect(g.second!.openclaw.chatCalls).toHaveLength(0);
+    } finally { g.cleanup(); }
+  });
+
+  it("lets a targeted non-coordinator clear chairman while coordinator stays silent", async () => {
+    const g = group(2), { h, second } = g;
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      const msg = event({ text: "@_user_1 /chairman off", mentions: [other] });
+      await (h.bot as any).handleMessage(msg);
+      await (second!.bot as any).handleMessage(msg);
+      expect(h.store.getChairmanBot("chat1")).toBe("");
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+      expect((second!.bot as any).replyMessage).toHaveBeenCalledOnce();
+    } finally { g.cleanup(); }
+  });
+
+  it("Chairman off stops scheduling but lets the in-flight discussion agent deliver", async () => {
+    const g = group(1), { h } = g;
+    let finish!: (value: string) => void;
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      h.store.setBotMode("GPT", "chat1", "free");
+      h.store.setDiscussMode("chat1", true);
+      h.openclaw.chatSendWithContext = vi.fn(async params => {
+        h.openclaw.chatCalls.push(params);
+        return new Promise<string>(resolve => { finish = resolve; });
+      });
+      await (h.bot as any).handleMessage(event({ text: "topic", messageId: "inflight-discussion" }));
+      await vi.waitUntil(() => Boolean(finish));
+      await (h.bot as any).handleMessage(event({ text: "/chairman off" }));
+      expect(discussionManager.isActive("chat1")).toBe(false);
+      await (h.bot as any).handleMessage(event({ text: "new ordinary message" }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      finish("FINAL_SUMMARY: old agent result");
+      await vi.waitUntil(() => (h.bot as any).sendMessage.mock.calls.some((c: any[]) => c[1].includes("old agent result")));
+      expect(h.store.getChatInfo("chat1")?.discuss).toBe(false);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect((h.bot as any).sendMessage.mock.calls.some((c: any[]) => c[1].includes("已自动关闭"))).toBe(false);
+    } finally { g.cleanup(); }
+  });
+
+  it("Chairman off preserves active normal queue identity and final return without steering new plain messages", async () => {
+    const g = group(1), { h } = g;
+    let finish!: (value: string) => void;
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      h.store.setBotMode("GPT", "chat1", "free");
+      h.openclaw.chatSendWithContext = vi.fn(async params => {
+        h.openclaw.chatCalls.push(params);
+        return new Promise<string>(resolve => { finish = resolve; });
+      });
+      const active = (h.bot as any).handleMessage(event({ text: "work", messageId: "original-work" }));
+      await vi.waitUntil(() => Boolean(finish));
+      const owner = (h.bot as any).queueRuns.get("chat1");
+      const target = (h.bot as any).activeDeliveryTargets.get("chat1");
+      await (h.bot as any).handleMessage(event({ text: "/chairman off" }));
+      await (h.bot as any).handleMessage(event({ text: "do not steer", messageId: "after-off" }));
+      expect((h.bot as any).queueRuns.get("chat1")).toBe(owner);
+      expect((h.bot as any).activeDeliveryTargets.get("chat1")).toBe(target);
+      expect(h.openclaw.steer).not.toHaveBeenCalled();
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(h.store.getMessageId("after-off")!)).toBe(false);
+      finish("old normal result"); await active;
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("original-work", "old normal result");
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { g.cleanup(); }
+  });
+});
+
+describe("routing identity edge representations", () => {
+  it.each([true, false])("richpost nodes cannot override conflicting metadata (localized=%s)", async localized => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).botOpenId = "ou_gpt";
+      h.store.setChairmanBot("chat1", "GPT");
+      const content = { title: "topic", content: [[{ tag: "at", user_id: "ou_gpt", user_name: "GPT" }, { tag: "text", text: "hi" }]] };
+      const msg = event({ text: "", mentions: [{ name: "GPT", id: { app_id: "external-app", open_id: "ou_gpt" } }] });
+      msg.message.message_type = "post";
+      msg.message.content = JSON.stringify(localized ? { title: "topic", zh_cn: content } : content);
+      await (h.bot as any).handleMessage(msg);
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+    } finally { h.cleanup(); }
+  });
+
+  it.each(["@_user_1 question", "@GPT question"])("richpost text-only missing mentions stay silent: %s", async text => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.setChairmanBot("chat1", "GPT");
+      const msg = event({ text: "" });
+      msg.message.message_type = "post";
+      msg.message.content = JSON.stringify({ content: [[{ tag: "text", text }]] });
+      await (h.bot as any).handleMessage(msg);
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+    } finally { h.cleanup(); }
+  });
+
+  it("preserves metadata @all placeholders and stale-discuss broadcast with no Chairman", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.store.setDiscussMode("chat1", true); // Legacy inconsistent DB: never schedule without Chairman.
+      await (h.bot as any).handleMessage(event({ text: "@_user_1 question", mentions: [{ key: "@_user_1", name: "所有人", id: { open_id: "all" } }] }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(discussionManager.isActive("chat1")).toBe(false);
+      expect(h.store.getChairmanBot("chat1")).toBe("");
+    } finally { h.cleanup(); }
+  });
+
+  it("preserves broadcast chairman management and targeted self+external commands", async () => {
+    const h = makeHarness("GPT");
+    try {
+      FeishuBot.getAllBots().set("app-GPT", h.bot);
+      await (h.bot as any).handleMessage(event({ text: "@_all /chairman GPT" }));
+      expect(h.store.getChairmanBot("chat1")).toBe("GPT");
+      await (h.bot as any).handleMessage(event({ text: "@_user_1 /help", mentions: [{ id: { app_id: "app-GPT" } }, { id: { open_id: "ou_human" } }] }));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledTimes(2);
+      expect(h.openclaw.chatCalls).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+
+  it("does not affect p2p messages mentioning somebody else without Chairman", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "@human hello", mentions: [{ id: { open_id: "ou_human" } }] }));
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+});
+
+describe("rich-post chairman commands", () => {
+  it("uses the same verified rich-post targets for command ownership and chairman setup", async () => {
+    const h = makeHarness("GPT"), target = makeHarness("Claude");
+    try {
+      (target.bot as any).store = h.store;
+      (target.bot as any).botOpenId = "ou_claude";
+      FeishuBot.getAllBots().set("app-GPT", h.bot);
+      FeishuBot.getAllBots().set("app-Claude", target.bot);
+      const msg = event({ text: "" });
+      msg.message.message_type = "post";
+      msg.message.content = JSON.stringify({ content: [[{ tag: "text", text: "/chairman" }, { tag: "at", user_id: "ou_claude", user_name: "Claude" }]] });
+      await (h.bot as any).handleMessage(msg);
+      await (target.bot as any).handleMessage(msg);
+      expect(h.store.getChairmanBot("chat1")).toBe("Claude");
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+      expect((target.bot as any).replyMessage).toHaveBeenCalledOnce();
+      expect(target.openclaw.chatCalls).toHaveLength(0);
+    } finally { target.cleanup(); h.cleanup(); }
   });
 });

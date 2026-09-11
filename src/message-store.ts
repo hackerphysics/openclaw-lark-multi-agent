@@ -1025,7 +1025,12 @@ export class MessageStore {
   }
 
   clearChairmanBot(chatId: string): void {
-    this.setChairmanBot(chatId, '');
+    // Persist both fields atomically so reopening cannot revive Discuss after off.
+    this.db.prepare(`
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, chairman_bot, discuss, updated_at)
+      VALUES (?, 'group', '', '', 0, ?)
+      ON CONFLICT (chat_id) DO UPDATE SET chairman_bot = '', discuss = 0, updated_at = excluded.updated_at
+    `).run(chatId, Date.now());
   }
 
   getChairmanBot(chatId: string): string {

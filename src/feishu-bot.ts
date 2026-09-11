@@ -477,15 +477,8 @@ export class FeishuBot {
       const messageId: string = message.message_id;
       const isBot = sender?.sender_type === "app";
 
-      // Extract bot open_id from mentions
-      if (message.mentions) {
-        for (const m of message.mentions) {
-          const bot = FeishuBot.allBots.get(m.id?.app_id || "");
-          if (bot && m.id?.open_id) {
-            bot.botOpenId = m.id.open_id;
-          }
-        }
-      }
+      // Identity comes from the startup probe, never from message mentions:
+      // a conflicting app_id/open_id pair must not overwrite a known identity.
 
       if (messageType !== "text" && messageType !== "image" && messageType !== "file" && messageType !== "audio" && messageType !== "sticker" && messageType !== "post" && messageType !== "share_doc") return;
 
@@ -571,7 +564,7 @@ export class FeishuBot {
 
       if (!cleanText.trim()) return;
 
-      const routing = this.getRoutingIntent(chatType, message, messageType === "text" ? (content.text || "") : "");
+      const routing = this.getRoutingIntent(chatType, message, messageType === "text" ? (content.text || "") : "", content);
 
       // Commands may be prefixed by @all / @bot in group chats. Strip those
       // leading routing mentions before deciding whether this is a bridge command
@@ -613,6 +606,10 @@ export class FeishuBot {
       });
       if (insertedId < 0) insertedId = this.store.getMessageId(messageId) || -1;
 
+      // Target exclusivity precedes ALL group command/coordinator, broadcast,
+      // single-bot, mute, Free and Discuss paths. Unknown targets are not self.
+      if (chatType !== "p2p" && routing.hasTargetedMention && !routing.isCurrentBotMentioned) return;
+
       // --- Commands: in p2p always respond; in group, check shouldRespond first ---
       // Single slash commands are handled by the bridge. Double slash commands were
       // already unescaped above and should pass through to OpenClaw instead.
@@ -645,33 +642,26 @@ export class FeishuBot {
               if (!this.isDiscussionCoordinator()) return;
             }
           } else if (isChairmanCommand) {
-            // /chairman @Bot is owned by the mentioned bot itself. This avoids
-            // requiring a coordinator to parse another bot's mention metadata,
-            // which can vary across Feishu clients/bridges. Untargeted/status,
-            // @all, and clear/off remain coordinator-owned group commands.
-            //
-            // Target resolution uses both Feishu mention metadata AND a text
-            // fallback (parsing "@Bot" / "Bot" from the raw message), so a
-            // /chairman that arrives without mention metadata still routes to
-            // the intended bot instead of silently failing.
+            // Verified mentions belong to the targeted bot. Bare configured
+            // names remain local management arguments, not mention identity.
             const chairmanArg = this.stripLeadingCommandMentions(this.cleanMentions(rawText)).replace(/^\s*\/chairman\b/i, "").trim().toLowerCase();
             const isClearArg = ["off", "clear", "none"].includes(chairmanArg.split(/\s+/)[0] || "");
             const hasMentionMeta = (message.mentions || []).some((m: any) => !this.isAllMentionItem(m));
-            const targets = this.resolveChairmanTargets(message.mentions || [], cleanText, rawText);
+            const targets = routing.hasTargetedMention ? routing.targetedBotNames : this.resolveChairmanTargets(message.mentions || [], cleanText, rawText);
             // A pure status query: no clear keyword, no mention metadata, and no
             // textual argument at all. Anything else is a set/route attempt.
             const isStatusArg = !isClearArg && !hasMentionMeta && chairmanArg.length === 0;
             if (isClearArg || isStatusArg) {
-              // Group-level status/clear: one coordinator handles it.
-              if (!this.isDiscussionCoordinator()) return;
+              // One eligible owner: first verified target, or bare coordinator.
+              if (routing.hasTargetedMention ? routing.targetedBotNames[0] !== this.config.name : !this.isDiscussionCoordinator()) return;
             } else if (targets.length >= 1) {
               // Targets resolved: only the (single) targeted bot acts. If
-              // multiple distinct targets resolved, the coordinator handles
-              // the "only one chairman" error once.
+              // multiple distinct targets resolved, the first target handles
+              // the "only one chairman" error once (never an unmentioned bot).
               const uniqueTargets = Array.from(new Set(targets));
               const targetedSelf = uniqueTargets.includes(this.config.name);
               if (uniqueTargets.length > 1) {
-                if (!this.isDiscussionCoordinator()) return;
+                if (uniqueTargets[0] !== this.config.name) return;
               } else if (!targetedSelf) {
                 return;
               }
@@ -842,6 +832,7 @@ export class FeishuBot {
           if (next === "free") {
             await this.replyMessage(messageId, `🔓 ${this.config.name} 已切换到 free 模式
 不需要 @ 也可以回复普通人类消息；如果消息明确 @ 了其他 bot 或普通人，我不会抢答。
+需先设置本群 Chairman，Free 才会回答无 @ 的普通消息。
 如需多轮自动讨论，请使用群级命令 /discuss on。`);
           } else {
             await this.replyMessage(messageId, `🔒 ${this.config.name} 已切换到 normal 模式
@@ -884,7 +875,7 @@ export class FeishuBot {
           return;
         }
         if (commandName === "/chairman") {
-          await this.handleChairmanCommand(chatId, chatType, messageId, message.mentions || [], cleanText.trim(), rawText);
+          await this.handleChairmanCommand(chatId, chatType, messageId, message.mentions || [], cleanText.trim(), rawText, routing.hasTargetedMention ? routing.targetedBotNames : undefined);
           markCommandSynced();
           return;
         }
@@ -895,11 +886,16 @@ export class FeishuBot {
         }
       }
 
+      // Local management commands above can restore Chairman. Only NEW
+      // unmentioned human triggers are gated; existing queue/delivery owners stay.
+      if (chatType !== "p2p" && !isBot && !routing.hasTargetedMention && !routing.isAllMention
+        && !this.store.getChairmanBot(chatId)) return;
+
       // --- Discuss mode: group-level multi-bot round scheduler. It takes over
       // plain human messages so normal Free mode does not duplicate Round 1.
       // Targeted mentions must fall through to normal routing so @GPT still
       // works while discuss mode is enabled.
-      if (chatType !== "p2p" && !isBot && this.store.getChatInfo(chatId)?.discuss) {
+      if (chatType !== "p2p" && !isBot && this.store.getChairmanBot(chatId) && this.store.getChatInfo(chatId)?.discuss) {
         // Discuss mode owns ordinary and @all human messages. Explicit @bot/@human
         // falls through to normal targeted routing.
         if (!routing.hasTargetedMention) {
@@ -1746,9 +1742,8 @@ export class FeishuBot {
   ): boolean {
     if (chatType === "p2p") return !isBot;
     if (isBot) return false;
-    const mentions: any[] = message.mentions || [];
-    if (this.isAllMention(rawText, mentions)) return true;
-    return this.isMentioned(mentions);
+    const routing = this.getRoutingIntent(chatType, message, rawText);
+    return routing.hasTargetedMention ? routing.isCurrentBotMentioned : routing.isAllMention;
   }
 
   private shouldRespond(
@@ -1763,17 +1758,15 @@ export class FeishuBot {
     // Bot messages: only respond if this bot is explicitly mentioned.
     if (isBot) return routing.isCurrentBotMentioned;
 
-    // @all is an explicit broadcast to all non-muted bots.
-    if (routing.isAllMention) return true;
-
     // Explicit targeted mentions are exclusive. If this bot is not one of the
     // mentioned bots, free/chairman must not steal the turn.
     if (routing.hasTargetedMention) return routing.isCurrentBotMentioned;
 
-    // Human-only mentions are also exclusive; free/chairman should not jump in.
-    if (routing.hasHumanMention) return false;
+    // @all alone is an explicit broadcast, not an unmentioned message.
+    if (routing.isAllMention) return true;
 
     if (chatId) {
+      if (!this.store.getChairmanBot(chatId)) return false;
       if (this.store.getBotMode(this.config.name, chatId) === "free") return true;
 
       // Chairman fallback: if nobody is in free mode, the unique chairman
@@ -1785,12 +1778,42 @@ export class FeishuBot {
     return false;
   }
 
-  private getRoutingIntent(chatType: string, message: any, rawText?: string): RoutingIntent {
-    const mentions: any[] = message.mentions || [];
+  private getRoutingIntent(chatType: string, message: any, rawText = "", content?: any): RoutingIntent {
+    const metadata: any[] = message.mentions || [];
+    const mentions: any[] = [...metadata];
+    const mentionTexts = [rawText];
+    if (message.message_type === "post") {
+      // Only structured post nodes carry mention semantics; do not interpret
+      // arbitrary JSON strings as identity or broaden attachment handling.
+      const posts = [content, ...Object.values(content || {})];
+      for (const post of posts) {
+        if (!Array.isArray((post as any)?.content)) continue;
+        if (typeof (post as any).title === "string") mentionTexts.push((post as any).title);
+        for (const paragraph of (post as any).content) {
+          if (!Array.isArray(paragraph)) continue;
+          for (const node of paragraph) {
+            if (node?.tag === "text" && typeof node.text === "string") mentionTexts.push(node.text);
+            if (node?.tag !== "at") continue;
+            // Rich-post user_id is matched only to an already probed open_id.
+            mentions.push({ id: { open_id: node.user_id }, name: node.user_name });
+          }
+        }
+      }
+    }
     const isAllMention = chatType !== "p2p" && this.isAllMention(rawText, mentions);
-    const targetedBotNames = this.mentionedBotNames(mentions);
+    // Structured nodes fill missing metadata, not override conflicting metadata.
+    const targetedBotNames = this.mentionedBotNames(metadata.length ? metadata : mentions);
+    // Missing metadata must not turn a platform placeholder or standalone @name
+    // into an unmentioned Free/Chairman trigger. This grants NO identity. Emails
+    // and embedded @ characters remain ordinary text, not commands or mentions.
+    const unresolvedTextMention = mentionTexts.some(text => {
+      const withoutAllPlaceholders = text.replace(/@_user_\d+/g, key =>
+        metadata.some(m => m.key === key && this.isAllMentionItem(m)) ? " " : key);
+      return /@_user_\d+/.test(withoutAllPlaceholders)
+        || /(^|\s)@(?!(?:_all|all|所有人)(?=\s|$))[^\s@]+/iu.test(withoutAllPlaceholders);
+    });
     const hasHumanMention = mentions.some((m: any) => !this.isAllMentionItem(m) && !this.mentionedBotName(m));
-    const hasTargetedMention = targetedBotNames.length > 0 || hasHumanMention;
+    const hasTargetedMention = targetedBotNames.length > 0 || hasHumanMention || unresolvedTextMention;
     return {
       isAllMention,
       targetedBotNames,
@@ -1810,42 +1833,28 @@ export class FeishuBot {
   }
 
   private isAllMentionItem(mention: any): boolean {
-    return mention.key === "all" || mention.key === "@_all" || mention.id?.user_id === "all" || mention.id?.open_id === "all" || mention.name === "所有人";
+    const id = mention.id || {};
+    // A display name cannot override a concrete non-broadcast identity.
+    if (id.app_id || (id.open_id && id.open_id !== "all") || (id.user_id && id.user_id !== "all")) return false;
+    return mention.key === "all" || mention.key === "@_all" || id.user_id === "all" || id.open_id === "all";
   }
 
   private mentionedBotName(mention: any): string | null {
     if (this.isAllMentionItem(mention)) return null;
-    const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this)];
-    for (const bot of candidates) {
-      if (mention.id?.app_id && mention.id.app_id === bot.config.appId) return bot.config.name;
-      if (bot.botOpenId && mention.id?.open_id && mention.id.open_id === bot.botOpenId) return bot.config.name;
-    }
-
-    // Name is only a fallback because Feishu should normally provide app_id/open_id.
-    // Keep it exact to avoid shared-prefix bots like 万万（GPT） / 万万（Claude）
-    // stealing each other's mentions.
-    if (typeof mention.name === "string") {
-      const raw = mention.name.trim().replace(/^@+/, "").replace(/\s+/g, "").toLowerCase();
-      for (const bot of candidates) {
-        const botName = bot.config.name.trim().replace(/\s+/g, "").toLowerCase();
-        const exactNames = [
-          botName,
-          `万万（${botName}）`,
-          `万万(${botName})`,
-        ];
-        if (exactNames.includes(raw)) return bot.config.name;
-        // Generic display-name fallback: many deployments name bots like
-        // "光子 (Claude)" or "万万（GPT）". Match only when the parenthesized
-        // suffix is exactly the configured bot name, avoiding loose substring
-        // matches that caused shared-prefix bots to steal each other's mentions.
-        if (new RegExp(`^[^()（）]+[（(]${this.escapeRegExp(botName)}[）)]$`, "i").test(raw)) return bot.config.name;
-      }
-    }
-    return null;
-  }
-
-  private escapeRegExp(value: string): string {
-    return value.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+    const id = mention.id || {};
+    const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this && bot.store === this.store)];
+    const matches = candidates.filter((bot) => {
+      // Known conflicting app/open credentials veto, regardless of order. An
+      // unprobed open_id cannot establish identity, but a matching app_id can.
+      if (id.app_id && id.app_id !== bot.config.appId) return false;
+      if (id.open_id && bot.botOpenId && id.open_id !== bot.botOpenId) return false;
+      if (id.open_id && candidates.some((other) => other !== bot && other.botOpenId === id.open_id)) return false;
+      return (id.app_id && id.app_id === bot.config.appId)
+        || (id.open_id && bot.botOpenId && id.open_id === bot.botOpenId);
+    });
+    // Names (including exact/parenthesized suffixes) and unverified user/union
+    // IDs never establish bot identity. Ambiguous matches fail closed.
+    return matches.length === 1 ? matches[0].config.name : null;
   }
 
   private resolveBotName(sender: any): string | null {
@@ -2587,47 +2596,15 @@ export class FeishuBot {
     return Array.from(new Set(names));
   }
 
-  private mentionedBotNamesFromChairmanText(...texts: string[]): string[] {
-    const normalizedTexts = texts
-      .filter(Boolean)
-      .map((text) => text.replace(/^\s*\/chairman\b/i, "").trim())
-      .filter(Boolean)
-      .map((text) => text.replace(/^@+/, "").replace(/\s+/g, "").toLowerCase());
-    if (normalizedTexts.length === 0) return [];
-    const names: string[] = [];
-    const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this && bot.store === this.store)];
-    for (const raw of normalizedTexts) {
-      for (const bot of candidates) {
-        const botName = bot.config.name.trim().replace(/\s+/g, "").toLowerCase();
-        const displayNames = [
-          botName,
-          `@${botName}`,
-          `万万（${botName}）`,
-          `@万万（${botName}）`,
-          `万万(${botName})`,
-          `@万万(${botName})`,
-        ];
-        if (displayNames.includes(raw) || new RegExp(`^@?[^()（）]+[（(]${this.escapeRegExp(botName)}[）)]$`, "i").test(raw)) {
-          names.push(bot.config.name);
-        }
-      }
-    }
-    return Array.from(new Set(names));
-  }
-
-  /**
-   * Resolve the target bot name(s) for a /chairman command using every signal
-   * available, in priority order:
-   *   1. Feishu mention metadata (app_id / open_id / name).
-   *   2. Text fallback: "@Bot" or "Bot" written in the message body.
-   *
-   * This keeps /chairman working even when a Feishu client or bridge omits
-   * mention metadata. Returns a de-duplicated, order-preserving list.
-   */
   private resolveChairmanTargets(mentions: any[], text: string, rawText = ""): string[] {
-    const fromMeta = this.mentionedBotNames(mentions);
-    if (fromMeta.length > 0) return fromMeta;
-    return this.mentionedBotNamesFromChairmanText(text, rawText);
+    if (mentions.some((m: any) => !this.isAllMentionItem(m))) return this.mentionedBotNames(mentions);
+    // Only a bare, exact configured name is a local management argument. Never
+    // reinterpret an unresolved @name/placeholder as authority to target a bot.
+    const argument = text.replace(/^\s*\/chairman\b/i, "").trim().toLowerCase();
+    if (/(^|\s)@(?!(?:_all|all|所有人)(?=\s|$))[^\s@]+/iu.test(rawText) || argument.includes("@")) return [];
+    return [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this && bot.store === this.store)]
+      .filter((bot) => bot.config.name.toLowerCase() === argument)
+      .map((bot) => bot.config.name);
   }
 
   private isDiscussionCoordinator(): boolean {
@@ -3531,7 +3508,7 @@ export class FeishuBot {
     ].join("\n"));
   }
 
-  private async handleChairmanCommand(chatId: string, chatType: string, messageId: string, mentions: any[], text: string, rawText = ""): Promise<void> {
+  private async handleChairmanCommand(chatId: string, chatType: string, messageId: string, mentions: any[], text: string, rawText = "", routedTargets?: string[]): Promise<void> {
     if (chatType === "p2p") {
       await this.replyMessage(messageId, "❌ Chairman 只在群聊中可用");
       return;
@@ -3541,11 +3518,13 @@ export class FeishuBot {
     if (["off", "clear", "none"].includes(action)) {
       const previous = this.store.getChairmanBot(chatId);
       this.store.clearChairmanBot(chatId);
-      await this.replyMessage(messageId, previous ? `✅ 已清除当前群 Chairman（原 ${previous}）` : "✅ 当前群没有 Chairman");
+      discussionManager.stop(chatId); // Stop future turns; never abort in-flight agents.
+      await this.replyMessage(messageId, (previous ? `✅ 已清除当前群 Chairman（原 ${previous}）` : "✅ 当前群没有 Chairman")
+        + "\nDiscuss 已关闭；无 @ 的普通新消息不再触发回复（含 Free）。这不是 mute，明确 @ 仍按原规则处理；已执行任务不被中止。");
       return;
     }
 
-    const resolvedBotNames = this.resolveChairmanTargets(mentions, text, rawText);
+    const resolvedBotNames = routedTargets ?? this.resolveChairmanTargets(mentions, text, rawText);
     if (resolvedBotNames.length === 0) {
       // /chairman is intentionally not a status query. Status lives in /status;
       // this command is only for switching or clearing the Chairman. Keeping the
