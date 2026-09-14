@@ -489,6 +489,22 @@ describe("client → bot → persistent notice → guarded outbox", () => {
     expect(h.row("stop-race")?.status).toBe("stopped"); expect(h.bot.sendErrorNotice).not.toHaveBeenCalled();
   });
 
+  it("rechecks exact stop receipts arriving during the final task lookup", async () => {
+    const h = await harness([task({ deliveryStatus: "failed", terminalOutcome: "blocked" })]);
+    const base = memoryRPC(h.tasks); let gets = 0; let finishLookup!: (value: any) => void;
+    h.rpc.mockImplementation(async (method: string, params: any) => {
+      if (method === "chat.abort") return { aborted: true, runIds: [directRun] };
+      if (method === "tasks.get" && ++gets === 2) return new Promise(resolve => { finishLookup = resolve; });
+      return base(method, params);
+    });
+    const pending = h.event(directRun);
+    for (let n = 0; n < 30 && !finishLookup; n++) await Promise.resolve();
+    expect(finishLookup).toBeDefined();
+    await h.client.abortChat(sessionKey);
+    finishLookup({ task: h.tasks[0] }); await pending;
+    expect(h.row()?.status).toBe("stopped"); expect(h.bot.sendErrorNotice).not.toHaveBeenCalled();
+  });
+
   it("nested typed error provenance wins over a conflicting final-envelope stop reason", async () => {
     const h = await harness([task({ deliveryStatus: "delivered" })]);
     await h.event(directRun, "final", { stopReason: "stop", message: { stopReason: "error", content: [{ type: "text", text: generic }] } });

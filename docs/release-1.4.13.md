@@ -20,7 +20,7 @@ Gateway/assistant error path. Preserve normal collector and result delivery.
 - Do not replay historic messages/model requests or directly resend raw child text.
 
 Independent review found and reproduced issues in the initial candidate; this
-release includes the repairs and regression tests. Build and 692 offline tests
+release includes the repairs and regression tests. Build and 693 offline tests
 passed before clean release validation. Live Feishu acceptance/ambiguous network
 exactly-once behavior is not claimed by offline tests.
 

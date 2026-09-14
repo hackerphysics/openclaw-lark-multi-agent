@@ -87,3 +87,7 @@ Authoritative final payloads with verified session/run identity bypass fuzzy
 overlap suppression; identical same-run payloads retain stable receipt evidence
 and are not resent. Expanded final details are delivered rather than discarded
 as a near-duplicate of a preamble. Uncorrelated content keeps its existing policy.
+
+Final stop-race verification checks the cancellation receipt both before and
+after asynchronous task/wait evidence, including a stop arriving during the
+send-time (second) lookup. The confirmed exact run is never reported as an error.

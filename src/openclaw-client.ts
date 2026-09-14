@@ -1803,7 +1803,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (this.isExplicitlyStoppedRun(provenance.sessionKey, provenance.runId)) {
       return { state: "stopped" as const, reason: "exact_run_abort_receipt" };
     }
-    return inspectError(provenance, (method, params, timeout) => this.rpc(method, params, timeout));
+    const verdict = await inspectError(provenance, (method, params, timeout) => this.rpc(method, params, timeout));
+    // A stop request can begin while task/wait evidence is in flight.
+    await this.pendingExplicitStops.get(this.canonicalSessionKey(provenance.sessionKey));
+    return this.isExplicitlyStoppedRun(provenance.sessionKey, provenance.runId)
+      ? { state: "stopped" as const, reason: "exact_run_abort_receipt" } : verdict;
   }
 
   private extractTextFromChatMessage(message: any): string {
