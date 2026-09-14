@@ -112,6 +112,33 @@ afterEach(() => {
 });
 
 describe("FeishuBot routing and queue behavior", () => {
+  it.each([false, true])("silently corrects model drift without a Feishu notification (initialized=%s)", async initialized => {
+    const h = makeHarness("GPT");
+    const create = vi.spyOn((h.bot as any).client.im.message, "create").mockResolvedValue({} as any);
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const key = h.bot.getSessionKey("chat1");
+      if (initialized) (h.bot as any).initializedSessions.add(key);
+      h.openclaw.ensureModel = vi.fn(async () => true);
+      const result = await (FeishuBot.prototype as any).ensureSession.call(h.bot, "chat1");
+      expect(result).toBe(key);
+      expect(h.openclaw.ensureModel).toHaveBeenCalledWith(key, "model-GPT");
+      expect(create).not.toHaveBeenCalled();
+      expect((h.bot as any).sendMessage).not.toHaveBeenCalled();
+      expect((h.bot as any).replyMessage).not.toHaveBeenCalled();
+      expect(log).toHaveBeenCalledWith("[GPT] Model auto-corrected to model-GPT");
+    } finally { create.mockRestore(); log.mockRestore(); h.cleanup(); }
+  });
+
+  it("does not hide a failed model correction in an initialized session", async () => {
+    const h = makeHarness("GPT");
+    try {
+      (h.bot as any).initializedSessions.add(h.bot.getSessionKey("chat1"));
+      h.openclaw.ensureModel = vi.fn(async () => { throw new Error("model policy rejected"); });
+      await expect((FeishuBot.prototype as any).ensureSession.call(h.bot, "chat1")).rejects.toThrow("model policy rejected");
+    } finally { h.cleanup(); }
+  });
+
   it("adds current session status after model without changing stored answer or model metadata", async () => {
     const h = makeHarness("GPT");
     try {

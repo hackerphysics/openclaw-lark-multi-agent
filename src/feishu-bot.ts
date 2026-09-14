@@ -260,7 +260,6 @@ export class FeishuBot {
       const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
       if (corrected) {
         console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
-        await this.notifyModelDrift(chatId, sessionKey);
       }
       return sessionKey;
     }
@@ -275,7 +274,6 @@ export class FeishuBot {
         const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
         if (corrected) {
           console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
-          await this.notifyModelDrift(chatId, sessionKey);
         }
       } else {
         // Session doesn't exist — create new
@@ -4074,9 +4072,6 @@ export class FeishuBot {
     }
   }
 
-  /**
-   * Send a model-drift notification to the affected chat.
-   */
   private async hydrateInlineImageKeys(text: string, messageId: string): Promise<string> {
     const imageKeyPattern = /\[Image: (img_[^\]\n]+)\]/g;
     const replacements: Array<{ from: string; to: string }> = [];
@@ -4293,24 +4288,4 @@ export class FeishuBot {
     return this.cleanMentions(parts.join(" "));
   }
 
-  private async notifyModelDrift(chatId: string, _sessionKey: string): Promise<void> {
-    try {
-      const chatInfo = this.store.getChatInfo(chatId);
-      const chatLabel = chatInfo?.chatName || chatId.slice(-8);
-
-      await this.client.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: {
-          receive_id: chatId,
-          content: JSON.stringify({
-            text: `⚠️ 模型漂移已自动纠正\n期望: ${this.config.model}\n已恢复`,
-          }),
-          msg_type: "text",
-        },
-      });
-      console.log(`[${this.config.name}] Drift notification sent to ${chatLabel}`);
-    } catch (err) {
-      console.warn(`[${this.config.name}] Failed to notify drift:`, (err as Error).message);
-    }
-  }
 }
