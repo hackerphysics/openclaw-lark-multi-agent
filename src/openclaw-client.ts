@@ -1,4 +1,5 @@
 import WebSocket from "ws";
+import { inspectError, genericFailure, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -78,7 +79,7 @@ export class OpenClawClient {
   /** Deduplicates 2026.8 canonical `agent.stream=tool` events against legacy
    * `stream=item` mirrors when a runtime emits both representations. */
   private recentToolEventKeys: Map<string, number> = new Map();
-  private sessionMessageCallbacks: Map<string, (text: string, meta?: { sourceType?: string; runId?: string }) => void> = new Map();
+  private sessionMessageCallbacks: Map<string, (text: string, meta?: ProactiveMessageMeta) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
   /** Per-session steered messages awaiting consumption confirmation. Each
    * accepted message is retained independently so identical/overlapping text
@@ -640,6 +641,16 @@ export class OpenClawClient {
     // structured content arrays rather than a plain string. Extract only visible
     // text parts and ignore thinking/tool blocks so the bridge can deliver final
     // cron results via the bot.
+    if (msg?.role === "assistant" && ["error", "aborted"].includes(msg?.stopReason)) {
+      if (this.mutedProactiveSessions.has(rawKey) || this.mutedProactiveSessions.has(shortKey)) return false;
+      if (runId && this.ownedDeliveryRuns.has(runId)) return false;
+      return this.emitProactiveForSession(rawKey, String(msg.errorMessage || "Agent run failed"), {
+        sourceType: "run_error", runId,
+        error: { sessionKey: this.canonicalSessionKey(rawKey), runId: runId || "", source: "session.message",
+          state: "final", stopReason: msg.stopReason, detail: String(msg.errorMessage || ""),
+          ...(this.sessionKeyVariants(rawKey).some(key => this.forceAbortedSessions.has(key)) ? { userStop: true } : {}) },
+      });
+    }
     const allowVerboseTranscript = this.isVerboseTranscriptEnabled(rawKey);
     const proactiveText = this.extractVisibleAssistantText(msg, { allowMixedToolText: allowVerboseTranscript });
     if (!proactiveText) return false;
@@ -657,7 +668,8 @@ export class OpenClawClient {
     }
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
     if (cb) {
-      if (runId) cb(proactiveText, { runId });
+      if (runId) cb(proactiveText, { runId, sessionKey: this.canonicalSessionKey(rawKey), final: msg?.stopReason === "stop",
+        ...(!msg?.stopReason && genericFailure(proactiveText) ? { genericErrorCandidate: true } : {}) });
       else cb(proactiveText);
     }
     return Boolean(cb);
@@ -1728,22 +1740,34 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // still reach the proactive callback.
       return;
     }
-    // External WebChat/Control UI (including a steer admission that became a
-    // separate run): hide streaming mirrors, then emit its final exactly once.
-    if (state === "delta") {
+    const stopReason = [payload?.stopReason, payload?.message?.stopReason].find(reason => reason === "error" || reason === "aborted")
+      || payload?.stopReason || payload?.message?.stopReason;
+    const isError = state === "error" || state === "aborted" || stopReason === "error" || stopReason === "aborted";
+    if (isError) {
+      const detail = String(payload?.errorMessage || payload?.message?.errorMessage || payload?.error || payload?.reason || "").trim();
+      const aborted = state === "aborted" || stopReason === "aborted";
+      const text = `⚠️ Agent run ${aborted ? "was aborted" : "failed"}${detail ? `: ${detail}` : ""}`;
+      this.emitProactiveForSession(sessionKey, text, {
+        sourceType: "run_error", runId,
+        error: { sessionKey: this.canonicalSessionKey(sessionKey), runId, source: "chat", state: state || "final",
+          ...(typeof stopReason === "string" ? { stopReason } : {}), detail,
+          ...(keys.some(key => this.forceAbortedSessions.has(key)) ? { userStop: true } : {}) },
+      });
+      this.releaseSuppressedSessionKeysAfter(keys, 0);
+    } else if (state === "delta") {
       this.suppressSessionKeys(keys);
     } else if (state === "final") {
       const text = this.extractTextFromChatMessage(payload?.message);
-      if (text) this.emitProactiveForSession(sessionKey, text, runId);
+      if (text) this.emitProactiveForSession(sessionKey, text, {
+        runId, sessionKey: this.canonicalSessionKey(sessionKey), final: payload?.yielded !== true,
+        ...(!stopReason && genericFailure(text) ? { genericErrorCandidate: true } : {}),
+      });
       this.releaseSuppressedSessionKeysAfter(keys, 30000);
-    } else if (state === "error" || state === "aborted") {
-      const detail = String(payload?.errorMessage || payload?.error || payload?.reason || "").trim();
-      const text = state === "error"
-        ? `⚠️ Agent run failed${detail ? `: ${detail}` : ""}`
-        : `⚠️ Agent run was aborted${detail ? `: ${detail}` : ""}`;
-      this.emitProactiveForSession(sessionKey, text, runId, "run_error");
-      this.releaseSuppressedSessionKeysAfter(keys, 0);
     }
+  }
+
+  async inspectRunError(provenance: ErrorProvenance) {
+    return inspectError(provenance, (method, params, timeout) => this.rpc(method, params, timeout));
   }
 
   private extractTextFromChatMessage(message: any): string {
@@ -1751,12 +1775,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return parts.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
   }
 
-  private emitProactiveForSession(sessionKey: string, text: string, runId?: string, sourceType?: string): boolean {
+  private emitProactiveForSession(sessionKey: string, text: string, meta?: ProactiveMessageMeta): boolean {
     const [shortKey, fullKey] = this.sessionKeyVariants(sessionKey);
     const cb = this.sessionMessageCallbacks.get(fullKey) || this.sessionMessageCallbacks.get(shortKey);
     if (!cb) return false;
-    if (runId || sourceType) cb(text, { ...(runId ? { runId } : {}), ...(sourceType ? { sourceType } : {}) });
-    else cb(text);
+    cb(text, meta);
     return true;
   }
 
@@ -2175,7 +2198,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    */
   async subscribeSession(
     sessionKey: string,
-    onMessage: (text: string, meta?: { sourceType?: string; runId?: string }) => void
+    onMessage: (text: string, meta?: ProactiveMessageMeta) => void
   ): Promise<void> {
     // Register under both the short key and the full key with agent:main: prefix
     this.sessionMessageCallbacks.set(sessionKey, onMessage);

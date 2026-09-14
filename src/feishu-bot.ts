@@ -6,7 +6,8 @@ import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
-import { MessageStore } from "./message-store.js";
+import { MessageStore, type PendingErrorNotice } from "./message-store.js";
+import { errorIdentity, type ErrorVerdict, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve } from "path";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
@@ -146,6 +147,8 @@ export class FeishuBot {
    * message falls back to a normal run, cancel these before submission so a
    * later identical steer cannot consume the stale observer/correlation. */
   private pendingSteerCleanups: Map<number, () => void> = new Map();
+  private errorNoticeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private errorNoticeChecks = new Map<string, Promise<void>>();
   private adminOpenId: string | null;
   private locale: Locale;
   private configPath?: string;
@@ -299,6 +302,17 @@ export class FeishuBot {
     this.openclawClient.setVerboseTranscriptDelivery(sessionKey, this.store.getBotVerbose(this.config.name, chatId));
     await this.openclawClient.subscribeSession(sessionKey, async (text, meta) => {
       try {
+        let provenance = meta?.error;
+        if (!provenance && meta?.genericErrorCandidate && meta.runId && meta.sessionKey) {
+          provenance = this.store.getErrorNotice(this.config.name, chatId, errorIdentity(meta.sessionKey, meta.runId))?.provenance;
+        }
+        if (meta?.sourceType === "run_error" || provenance) {
+          if (provenance) {
+            this.store.observeRunError(this.config.name, chatId, provenance);
+            await this.reconcileErrorNotices(chatId);
+          } else console.warn(`[${this.config.name}] Uncorrelated run_error retained in logs; no finality evidence`);
+          return; // errors never cancel pending results or complete live cards
+        }
         const sourceType = meta?.sourceType === "verbose_transcript" ? "verbose_transcript" : "assistant_visible";
         console.log(`[${this.config.name}] ${sourceType === "verbose_transcript" ? "Verbose transcript" : "Proactive message"} for ${chatId.slice(-8)}`);
         const parsed = this.extractBridgeAttachments(text);
@@ -318,6 +332,7 @@ export class FeishuBot {
             activeTarget?.messageId,
             activeTarget ? `trigger:${activeTarget.triggerId}` : undefined,
             sourceType === "verbose_transcript" ? undefined : this.config.model,
+            meta,
           );
           if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
             await activeTarget?.liveStatus?.complete().catch(() => {});
@@ -420,6 +435,7 @@ export class FeishuBot {
 
         // Re-subscribe to existing sessions
         await this.ensureSession(chat.chatId);
+        drainTasks.push(this.reconcileErrorNotices(chat.chatId));
 
         // Drain only messages that were explicitly marked as reply triggers.
         // Context-only messages should not start an OpenClaw run after restart.
@@ -2321,15 +2337,18 @@ export class FeishuBot {
     replyToMessageId?: string,
     deliveryKey?: string,
     finalReplyModel?: string,
+    provenance?: ProactiveMessageMeta,
+    errorNoticeId?: string,
   ): Promise<void> {
     if (!text.trim() && attachments.length === 0) return;
     const attachmentsJson = JSON.stringify(attachments);
     const normalizedPayload = `${text.trim()}|${attachmentsJson}`;
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
-    const deliveryMetaJson = finalReplyModel?.trim()
-      ? JSON.stringify({ model: finalReplyModel.trim() })
-      : "{}";
+    const deliveryMetaJson = JSON.stringify({
+      ...(finalReplyModel?.trim() ? { model: finalReplyModel.trim() } : {}),
+      ...(provenance ? { provenance } : {}), ...(errorNoticeId ? { errorNoticeId } : {}),
+    });
     if (sourceType === "verbose_transcript") {
       if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
       if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
@@ -2358,6 +2377,16 @@ export class FeishuBot {
       // answer again on a second card. The original outbox row remains the sole
       // owner of text delivery; a different newly-frozen card is only collapsed.
       const existing = this.store.getDeliveryByKey(this.config.name, chatId, finalDeliveryKey);
+
+      if (sourceType === "run_error") {
+        // A withdrawn unsent notice may become terminal later. Keep its one
+        // task key; never use the result recovery/correction/attachment paths.
+        if (existing?.status === "failed" && !existing.textDelivered && existing.attempts < DELIVERY_MAX_ATTEMPTS) {
+          this.store.renewUnsentErrorDelivery(existing.id!, text, contentHash, deliveryMetaJson);
+        }
+        await this.dispatchPendingDeliveries(chatId);
+        return;
+      }
 
       // A failed owner must not permanently poison a logical trigger. Re-enqueue
       // the payload under a deterministic recovery key so a later authoritative
@@ -2457,6 +2486,97 @@ export class FeishuBot {
     }
   }
 
+  private async inspectErrorNotice(record: PendingErrorNotice): Promise<ErrorVerdict> {
+    if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, true)) {
+      return { state: "suppressed", reason: "exact_run_final_platform_delivery_confirmed" };
+    }
+    if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, false)) {
+      return { state: "pending", reason: "exact_run_final_delivery_pending" };
+    }
+    let verdict: ErrorVerdict;
+    try { verdict = await this.openclawClient.inspectRunError(record.provenance); }
+    catch { verdict = { state: "pending", reason: "inspection_unavailable" }; }
+    // A stop or final may have arrived during the read-only lookup.
+    const latest = this.store.getErrorNotice(this.config.name, record.chatId, record.noticeId);
+    if (latest?.provenance.userStop) {
+      record.provenance.userStop = true;
+      return { state: "stopped", reason: "explicit_bridge_stop" };
+    }
+    if (latest && (latest.provenance.source !== record.provenance.source || latest.provenance.state !== record.provenance.state || latest.provenance.stopReason !== record.provenance.stopReason)) {
+      record.provenance = latest.provenance;
+      record.checks = latest.checks;
+      return { state: "pending", reason: "stronger_terminal_evidence_observed" };
+    }
+    if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, true)) {
+      return { state: "suppressed", reason: "exact_run_final_platform_delivery_confirmed" };
+    }
+    if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, false)) {
+      return { state: "pending", reason: "exact_run_final_delivery_pending" };
+    }
+    return verdict;
+  }
+
+  private deferErrorNotice(record: PendingErrorNotice, verdict: ErrorVerdict): void {
+    const delays = [15_000, 60_000, 120_000, 300_000, FOREGROUND_WAIT_MS];
+    record.verdict = verdict;
+    record.status = record.checks >= 6 ? "parked" : "pending";
+    record.nextCheckAt = Date.now() + (delays[Math.max(0, record.checks - 1)] || FOREGROUND_WAIT_MS);
+    this.store.saveErrorNotice(record);
+    this.scheduleErrorNoticeCheck(record.chatId);
+  }
+
+  private scheduleErrorNoticeCheck(chatId: string): void {
+    const previous = this.errorNoticeTimers.get(chatId);
+    if (previous) clearTimeout(previous);
+    this.errorNoticeTimers.delete(chatId);
+    const next = this.store.listPendingErrorNotices(this.config.name, chatId)[0];
+    if (!next) return;
+    const timer = setTimeout(() => {
+      this.errorNoticeTimers.delete(chatId);
+      void this.reconcileErrorNotices(chatId).catch(err => console.warn(`[${this.config.name}] Error notice check unavailable:`, this.errorSummary(err)));
+    }, Math.max(1000, next.nextCheckAt - Date.now()));
+    timer.unref?.();
+    this.errorNoticeTimers.set(chatId, timer);
+  }
+
+  /** Six read-only checks per observed run, durable across restarts. No model polls. */
+  private async reconcileErrorNotices(chatId: string): Promise<void> {
+    const running = this.errorNoticeChecks.get(chatId);
+    if (running) return running;
+    const work = async () => {
+      const timer = this.errorNoticeTimers.get(chatId);
+      if (timer) clearTimeout(timer);
+      this.errorNoticeTimers.delete(chatId);
+      for (const record of this.store.listPendingErrorNotices(this.config.name, chatId)) {
+        if (record.nextCheckAt > Date.now()) continue;
+        if (record.checks >= 6) { this.deferErrorNotice(record, record.verdict || { state: "pending", reason: "budget_exhausted" }); continue; }
+        record.checks++;
+        // Reserve the budget before awaiting RPC, including crash/disconnect.
+        this.store.saveErrorNotice(record);
+        const verdict = await this.inspectErrorNotice(record);
+        console.log(`[${this.config.name}] Error notice ${record.noticeId}: ${verdict.state}/${verdict.reason}`);
+        if (verdict.state === "pending") { this.deferErrorNotice(record, verdict); continue; }
+        record.verdict = verdict;
+        this.store.saveErrorNotice(record);
+        if (verdict.state === "terminal" && verdict.terminalKey && verdict.text) {
+          // Independent identity: never take the result's trigger/final key.
+          await this.enqueueAndDispatchDelivery(chatId, "run_error", verdict.terminalKey, verdict.text,
+            [], undefined, verdict.terminalKey, undefined,
+            { sourceType: "run_error", runId: record.provenance.runId, error: record.provenance, terminalEvidence: verdict }, record.noticeId);
+          // The send-time recheck may have parked or suppressed the observation.
+          const refreshed = this.store.getErrorNotice(this.config.name, chatId, record.noticeId);
+          if (refreshed?.verdict && ["pending", "suppressed", "stopped"].includes(refreshed.verdict.state)) continue;
+        }
+        record.status = verdict.state;
+        this.store.saveErrorNotice(record);
+      }
+      this.scheduleErrorNoticeCheck(chatId);
+    };
+    const promise = work().finally(() => { this.errorNoticeChecks.delete(chatId); });
+    this.errorNoticeChecks.set(chatId, promise);
+    return promise;
+  }
+
   private scheduleDeliveryRetry(chatId: string, attempt: number): void {
     if (this.deliveryRetryTimers.has(chatId)) return;
     const delay = Math.min(30_000, DELIVERY_RETRY_BASE_MS * Math.max(1, 2 ** Math.max(0, attempt - 1)));
@@ -2503,6 +2623,21 @@ export class FeishuBot {
             const needsStatus = Boolean(finalModel) || item.sourceType.startsWith("assistant_visible") || ["provider_error", "delayed_error", "wait_paused"].includes(item.sourceType);
             const finalStatus = needsStatus ? formatSessionFooter(await this.readSessionStatus(chatId)) : undefined;
             if (needsStatus && !finalModel) finalModel = this.config.model;
+            if (item.sourceType === "run_error") {
+              const meta = JSON.parse(item.deliveryMetaJson || "{}");
+              const record = this.store.getErrorNotice(this.config.name, chatId, meta.errorNoticeId || "");
+              const verdict = record ? await this.inspectErrorNotice(record) : { state: "pending", reason: "missing_persisted_provenance" } as ErrorVerdict;
+              if (verdict.state !== "terminal" || verdict.terminalKey !== item.deliveryKey || verdict.text !== item.content) {
+                this.store.withdrawErrorDelivery(item.id);
+                if (record) {
+                  if (verdict.state === "pending" || verdict.state === "terminal") this.deferErrorNotice(record, { ...verdict, state: "pending" });
+                  else { record.status = verdict.state; record.verdict = verdict; this.store.saveErrorNotice(record); }
+                }
+                return;
+              }
+              record!.verdict = verdict;
+              this.store.saveErrorNotice(record!);
+            }
             if (shouldReplyToSource) {
               try { await this.replyFinalMessage(replyTarget!, item.content, finalModel, finalStatus); }
               catch { await this.sendFinalMessage(chatId, item.content, finalModel, finalStatus); }
@@ -2565,6 +2700,7 @@ export class FeishuBot {
           }
 
           this.store.markDeliveryFailed(item.id);
+          if (item.sourceType === "run_error") return;
           const label = failureStage === "attachment" ? "附件发送失败" : "最终回复发送失败";
           const errorText = `⚠️ ${label}（已重试 ${DELIVERY_MAX_ATTEMPTS} 次）：${this.errorSummary(err)}`;
           const replyTarget = item.replyToMessageId || replyToMessageId;

@@ -1,3 +1,4 @@
+import { errorIdentity, type ErrorProvenance, type ErrorVerdict } from "./terminal-errors.js";
 import Database from "better-sqlite3";
 import { resolve } from "path";
 import { mkdirSync } from "fs";
@@ -68,6 +69,18 @@ export interface DeliveryOutboxItem {
   updatedAt: number;
 }
 
+export interface PendingErrorNotice {
+  botName: string;
+  chatId: string;
+  noticeId: string;
+  provenance: ErrorProvenance;
+  checks: number;
+  nextCheckAt: number;
+  createdAt: number;
+  status: "pending" | "parked" | "terminal" | "suppressed" | "stopped";
+  verdict?: ErrorVerdict;
+}
+
 export class MessageStore {
   private db: Database.Database;
 
@@ -81,8 +94,84 @@ export class MessageStore {
     this.init();
   }
 
+  observeRunError(botName: string, chatId: string, provenance: ErrorProvenance): PendingErrorNotice {
+    const noticeId = errorIdentity(provenance.sessionKey, provenance.runId);
+    const previous = this.getErrorNotice(botName, chatId, noticeId);
+    if (previous) {
+      if (provenance.userStop) {
+        previous.provenance.userStop = true;
+        previous.status = "stopped";
+        previous.verdict = { state: "stopped", reason: "explicit_bridge_stop" };
+        this.saveErrorNotice(previous);
+      }
+      // A committed transcript abort is weaker than a gateway terminal error.
+      // One stronger envelope can wake a parked observation; repeats cannot.
+      const terminalChat = (p: ErrorProvenance) => p.source === "chat" && (p.state === "error" || (p.state === "final" && p.stopReason === "error"));
+      if (!provenance.userStop && !previous.provenance.userStop && terminalChat(provenance) && !terminalChat(previous.provenance)
+          && ["pending", "parked"].includes(previous.status)) {
+        previous.provenance = provenance;
+        previous.status = "pending";
+        previous.checks = Math.min(previous.checks, 5);
+        previous.nextCheckAt = Date.now();
+        this.saveErrorNotice(previous);
+      }
+      return previous; // duplicate/late events never reset the budget
+    }
+    const record: PendingErrorNotice = { botName, chatId, noticeId, provenance, checks: 0,
+      nextCheckAt: Date.now(), createdAt: Date.now(), status: "pending" };
+    this.saveErrorNotice(record);
+    return record;
+  }
+
+  getErrorNotice(botName: string, chatId: string, noticeId: string): PendingErrorNotice | undefined {
+    const row = this.db.prepare("SELECT record_json FROM error_notices WHERE bot_name=? AND chat_id=? AND notice_id=?")
+      .get(botName, chatId, noticeId) as any;
+    return row ? JSON.parse(row.record_json) : undefined;
+  }
+
+  saveErrorNotice(record: PendingErrorNotice): void {
+    this.db.prepare(`INSERT INTO error_notices (bot_name,chat_id,notice_id,record_json,next_check_at,status)
+      VALUES (?,?,?,?,?,?) ON CONFLICT(bot_name,chat_id,notice_id) DO UPDATE SET
+      record_json=excluded.record_json,next_check_at=excluded.next_check_at,status=excluded.status`)
+      .run(record.botName, record.chatId, record.noticeId, JSON.stringify(record), record.nextCheckAt, record.status);
+  }
+
+  listPendingErrorNotices(botName: string, chatId: string): PendingErrorNotice[] {
+    return (this.db.prepare("SELECT record_json FROM error_notices WHERE bot_name=? AND chat_id=? AND status='pending' ORDER BY next_check_at LIMIT 100")
+      .all(botName, chatId) as any[]).map(row => JSON.parse(row.record_json));
+  }
+
+  hasRunFinalDelivery(botName: string, chatId: string, p: ErrorProvenance, confirmed: boolean): boolean {
+    return Boolean(p.runId && this.db.prepare(`SELECT 1 FROM delivery_outbox
+      WHERE bot_name=? AND chat_id=? AND source_type='assistant_visible'
+      AND json_valid(delivery_meta_json)
+      AND json_extract(delivery_meta_json,'$.provenance.final')=1
+      AND json_extract(delivery_meta_json,'$.provenance.sessionKey')=?
+      AND json_extract(delivery_meta_json,'$.provenance.runId')=?
+      AND ${confirmed ? "status='delivered'" : "status IN ('pending','delivering')"} LIMIT 1`)
+      .get(botName, chatId, p.sessionKey, p.runId));
+  }
+
+  renewUnsentErrorDelivery(id: number, content: string, contentHash: string, metadata: string): void {
+    this.db.prepare(`UPDATE delivery_outbox SET status='pending',content=?,content_hash=?,delivery_meta_json=?,updated_at=?
+      WHERE id=? AND source_type='run_error' AND status='failed' AND text_delivered=0`)
+      .run(content, contentHash, metadata, Date.now(), id);
+  }
+
+  /** Withdraw only an unsent error notice. Never claim it was delivered or touch a result row. */
+  withdrawErrorDelivery(id: number): void {
+    this.db.prepare("UPDATE delivery_outbox SET status='failed', updated_at=? WHERE id=? AND source_type='run_error' AND text_delivered=0")
+      .run(Date.now(), id);
+  }
+
   private init() {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS error_notices (
+        bot_name TEXT NOT NULL, chat_id TEXT NOT NULL, notice_id TEXT NOT NULL,
+        record_json TEXT NOT NULL, next_check_at INTEGER NOT NULL,
+        status TEXT NOT NULL, PRIMARY KEY(bot_name, chat_id, notice_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_error_notices_due ON error_notices(bot_name, chat_id, status, next_check_at);
       CREATE TABLE IF NOT EXISTS messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id TEXT NOT NULL,

@@ -775,7 +775,7 @@ describe("OpenClawClient proactive delivery mute", () => {
       { role: "assistant", content: "separate answer" },
       "steer-fallback-run",
     )).toBe(true);
-    expect(callback).toHaveBeenCalledWith("separate answer", { runId: "steer-fallback-run" });
+    expect(callback).toHaveBeenCalledWith("separate answer", { runId: "steer-fallback-run", sessionKey: "agent:main:s1", final: false });
   });
 
   it("routes a same-session non-owned chat final while suppressing the owned final", () => {
@@ -795,7 +795,7 @@ describe("OpenClawClient proactive delivery mute", () => {
       runId: "steer-fallback-run",
       message: { content: [{ type: "text", text: "separate answer" }] },
     });
-    expect(callback).toHaveBeenCalledWith("separate answer", { runId: "steer-fallback-run" });
+    expect(callback).toHaveBeenCalledWith("separate answer", { runId: "steer-fallback-run", sessionKey: "agent:main:s1", final: true });
   });
 
   it("routes async error and aborted terminals for a non-owned steer fallback run", () => {
@@ -809,7 +809,7 @@ describe("OpenClawClient proactive delivery mute", () => {
     });
     expect(callback).toHaveBeenCalledWith(
       "⚠️ Agent run failed: provider rejected",
-      { runId: "fallback-run", sourceType: "run_error" },
+      expect.objectContaining({ runId: "fallback-run", sourceType: "run_error", error: expect.objectContaining({ source: "chat", state: "error" }) }),
     );
 
     (client as any).trackChatEventSession("agent:main:s1", "aborted", {
@@ -818,7 +818,7 @@ describe("OpenClawClient proactive delivery mute", () => {
     });
     expect(callback).toHaveBeenCalledWith(
       "⚠️ Agent run was aborted: runtime stopped",
-      { runId: "aborted-run", sourceType: "run_error" },
+      expect.objectContaining({ runId: "aborted-run", sourceType: "run_error", error: expect.objectContaining({ source: "chat", state: "aborted" }) }),
     );
   });
 
@@ -833,7 +833,7 @@ describe("OpenClawClient proactive delivery mute", () => {
     expect(callback).not.toHaveBeenCalled();
 
     (client as any).trackChatEventSession("agent:main:s1", "final", { message: { content: [{ type: "text", text: "final answer" }] } });
-    expect(callback).toHaveBeenCalledWith("final answer");
+    expect(callback).toHaveBeenCalledWith("final answer", { runId: "", sessionKey: "agent:main:s1", final: true });
     expect((client as any).handleProactiveSessionMessage("agent:main:s1", { role: "assistant", content: "final answer" })).toBe(false);
     expect(callback).toHaveBeenCalledTimes(1);
   });
@@ -857,7 +857,7 @@ describe("OpenClawClient chat.send concurrency", () => {
       { role: "assistant", content: "foreign answer" },
       "foreign-run",
     )).toBe(true);
-    expect(callback).toHaveBeenCalledWith("foreign answer", { runId: "foreign-run" });
+    expect(callback).toHaveBeenCalledWith("foreign answer", { runId: "foreign-run", sessionKey: "agent:main:s1", final: false });
 
     (client as any).releaseChatSendSlot();
     await expect(pending).resolves.toBe("owned answer");

@@ -249,7 +249,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     if (anchored) agent("lifecycle", { phase: "start" }, "announce:requester-settle:new-run");
     chat({ message: message("requester continuation result") }, "announce:requester-settle:new-run");
     await vi.advanceTimersByTimeAsync(6000);
-    expect(proactive).toHaveBeenCalledExactlyOnceWith("requester continuation result", { runId: "announce:requester-settle:new-run" });
+    expect(proactive).toHaveBeenCalledExactlyOnceWith("requester continuation result", { runId: "announce:requester-settle:new-run", sessionKey: "agent:main:yield-test", final: true });
     expect(run.settled()).toBe(false); expect(c.ownedDeliveryRuns.has("r")).toBe(true); noAbort();
     await final(); expect(await run.result).toEqual({ text: "actual final" });
   });
@@ -270,7 +270,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     expect(await run.result).toEqual({ text: "discussion continuation result" });
     // Existing mute applies to transcript mirrors, not external chat-final
     // callbacks; preserve that independent route (no new session-wide mute).
-    expect(proactive).toHaveBeenCalledExactlyOnceWith("discussion continuation result", { runId: "continuation" });
+    expect(proactive).toHaveBeenCalledExactlyOnceWith("discussion continuation result", { runId: "continuation", sessionKey: "agent:main:yield-test", final: true });
     noAbort(); release(0);
   });
 
