@@ -106,10 +106,10 @@ export class OpenClawClient {
   private mutedProactiveSessionCounts: Map<string, number> = new Map();
   /** Sessions force-aborted by /stop; collectReply should finish immediately instead of waiting for idle timeout. */
   private forceAbortedSessions: Set<string> = new Set();
-  /** Explicit-stop evidence is scoped to runs known active at the request, never
-   * to the persistent session flag used by the original collector. */
-  private observedActiveChatRuns = new Map<string, Set<string>>();
+  /** Explicit-stop evidence comes from exact authorized abort response run IDs,
+   * never the persistent session flag used by the original collector. */
   private explicitlyStoppedRuns = new Map<string, number>();
+  private pendingExplicitStops = new Map<string, Promise<void>>();
   private isExplicitlyStoppedRun(sessionKey: string, runId?: string): boolean {
     if (!runId) return false;
     const key = JSON.stringify([this.canonicalSessionKey(sessionKey), runId]);
@@ -1728,9 +1728,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     // chat.abort supports { sessionKey } with no runId to abort ALL active runs
     // for that session. Used by /stop to force-clear a stuck run.
     if (!runId) {
-      for (const activeRun of this.observedActiveChatRuns.get(key) || []) {
-        this.explicitlyStoppedRuns.set(JSON.stringify([key, activeRun]), Date.now());
-      }
       for (const [identity, at] of this.explicitlyStoppedRuns) if (Date.now() - at > 24 * 60 * 60_000) this.explicitlyStoppedRuns.delete(identity);
       // Mark the session so any in-flight collectReply finishes immediately
       // instead of treating the cancelled lifecycle as a transient state.
@@ -1740,7 +1737,24 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       }
     }
     const params: any = runId ? { sessionKey: key, runId } : { sessionKey: key };
-    return this.rpc("chat.abort", params, 5000).catch(() => {});
+    if (runId) return this.rpc("chat.abort", params, 5000).catch(() => {});
+    let resolveStop!: () => void;
+    const barrier = new Promise<void>(resolve => { resolveStop = resolve; });
+    this.pendingExplicitStops.set(key, barrier);
+    try {
+      const result = await this.rpc("chat.abort", params, 5000).catch(() => undefined);
+      // The authorized abort response names the exact runs actually stopped;
+      // it also covers queued/unseen runs with no local status/delta event.
+      if (result?.aborted === true && Array.isArray(result.runIds)) {
+        for (const stopped of result.runIds) if (typeof stopped === "string" && stopped) {
+          this.explicitlyStoppedRuns.set(JSON.stringify([key, stopped]), Date.now());
+        }
+      }
+      return result;
+    } finally {
+      resolveStop();
+      if (this.pendingExplicitStops.get(key) === barrier) this.pendingExplicitStops.delete(key);
+    }
   }
 
   private sessionKeyVariants(key: string): string[] {
@@ -1752,13 +1766,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (!sessionKey || sessionKey === "__default__") return;
     const keys = this.sessionKeyVariants(sessionKey);
     const runId = typeof payload?.runId === "string" ? payload.runId : "";
-    const canonicalKey = this.canonicalSessionKey(sessionKey);
-    if (runId && (state === "delta" || state === "status")) {
-      const active = this.observedActiveChatRuns.get(canonicalKey) || new Set<string>();
-      active.add(runId); this.observedActiveChatRuns.set(canonicalKey, active);
-    } else if (runId && ["final", "error", "aborted"].includes(state || "")) {
-      this.observedActiveChatRuns.get(canonicalKey)?.delete(runId);
-    }
     if (runId && this.ownedDeliveryRuns.has(runId)) {
       // collectReply owns this exact run. Do not suppress the whole session:
       // queueMode=steer may concurrently create another ordinary run that must
@@ -1792,6 +1799,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }
 
   async inspectRunError(provenance: ErrorProvenance) {
+    await this.pendingExplicitStops.get(this.canonicalSessionKey(provenance.sessionKey));
+    if (this.isExplicitlyStoppedRun(provenance.sessionKey, provenance.runId)) {
+      return { state: "stopped" as const, reason: "exact_run_abort_receipt" };
+    }
     return inspectError(provenance, (method, params, timeout) => this.rpc(method, params, timeout));
   }
 
@@ -2208,7 +2219,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     this.pendingSteerTexts.clear();
     this.steerConsumedCallbacks.clear();
     this.ownedDeliveryRuns.clear();
-    this.observedActiveChatRuns.clear();
     this.explicitlyStoppedRuns.clear();
     if (this.ws) {
       this.ws.close();

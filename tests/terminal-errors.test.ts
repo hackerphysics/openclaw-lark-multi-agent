@@ -181,6 +181,9 @@ describe("client → bot → persistent notice → guarded outbox", () => {
   });
   it("explicit stop metadata stays diagnostic and emits no abort cascade", async () => {
     const h = await harness();
+    const base = memoryRPC(h.tasks);
+    h.rpc.mockImplementation(async (method: string, params: any) => method === "chat.abort"
+      ? { aborted: true, runIds: ["stopped-run", "stopped-run-2"] } : base(method, params));
     h.client.trackChatEventSession(sessionKey, "status", { runId: "stopped-run" });
     h.client.trackChatEventSession(sessionKey, "status", { runId: "stopped-run-2" });
     await h.client.abortChat(sessionKey);
@@ -454,6 +457,36 @@ describe("client → bot → persistent notice → guarded outbox", () => {
     h.tasks[0].deliveryStatus = "failed"; h.tasks[0].terminalOutcome = "blocked";
     await vi.advanceTimersByTimeAsync(5 * 60_000);
     expect(h.row()?.status).toBe("terminal"); expect(h.bot.sendErrorNotice).toHaveBeenCalledOnce();
+  });
+
+  it("delivers expanded authoritative final text instead of suppressing it as an overlapping transcript", async () => {
+    const h = await harness(); const run = "expanded-final";
+    await h.transcript(run, undefined, "Actual successful answer");
+    await h.event(run, "final", { stopReason: "stop", message: { content: [{ type: "text", text: "Actual successful answer with final verified details." }] } });
+    expect(h.bot.sendFinalMessage).toHaveBeenCalledTimes(2);
+    expect(h.bot.sendFinalMessage.mock.calls[1][1]).toContain("verified details");
+    await h.event(run, "error", { errorMessage: "stale error" });
+    expect(h.row(run)?.status).toBe("suppressed"); expect(h.bot.sendFinalMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it("honors exact abort response IDs even when the stopped run was unseen locally", async () => {
+    const h = await harness();
+    h.rpc.mockImplementation(async (method: string, params: any) => method === "chat.abort"
+      ? { aborted: true, runIds: ["unseen-stopped"] } : { runId: params.runId, status: "error", startedAt: 1, endedAt: 2 });
+    await h.client.abortChat(sessionKey);
+    await h.event("unseen-stopped");
+    expect(h.row("unseen-stopped")?.status).toBe("stopped"); expect(h.bot.sendErrorNotice).not.toHaveBeenCalled();
+  });
+
+  it("waits for an in-flight explicit stop receipt before classifying its abort event", async () => {
+    const h = await harness(); let finishStop!: (value: any) => void;
+    h.rpc.mockImplementation(async (method: string, params: any) => method === "chat.abort"
+      ? new Promise(resolve => { finishStop = resolve; }) : { runId: params.runId, status: "error", startedAt: 1, endedAt: 2 });
+    const stop = h.client.abortChat(sessionKey);
+    const aborted = h.event("stop-race");
+    await Promise.resolve(); expect(h.bot.sendErrorNotice).not.toHaveBeenCalled();
+    finishStop({ aborted: true, runIds: ["stop-race"] }); await stop; await aborted;
+    expect(h.row("stop-race")?.status).toBe("stopped"); expect(h.bot.sendErrorNotice).not.toHaveBeenCalled();
   });
 
   it("nested typed error provenance wins over a conflicting final-envelope stop reason", async () => {

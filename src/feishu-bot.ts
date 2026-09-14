@@ -2349,13 +2349,19 @@ export class FeishuBot {
       ...(finalReplyModel?.trim() ? { model: finalReplyModel.trim() } : {}),
       ...(provenance ? { provenance } : {}), ...(errorNoticeId ? { errorNoticeId } : {}),
     });
-    if (sourceType === "assistant_visible" && provenance?.final && provenance.runId && provenance.sessionKey) {
-      this.store.promoteExactRunFinal(this.config.name, chatId, provenance.sessionKey, provenance.runId, contentHash, text, attachmentsJson);
+    const correlatedFinal = sourceType === "assistant_visible" && provenance?.final && Boolean(provenance.runId && provenance.sessionKey);
+    if (correlatedFinal) {
+      const identity = { sessionKey: provenance!.sessionKey!, runId: provenance!.runId! };
+      this.store.promoteExactRunFinal(this.config.name, chatId, identity.sessionKey, identity.runId, contentHash, text, attachmentsJson);
+      if (!deliveryKey && this.store.hasExactRunFinalPayload(this.config.name, chatId, identity, text, attachmentsJson)) {
+        await this.dispatchPendingDeliveries(chatId);
+        return;
+      }
     }
     if (sourceType === "verbose_transcript") {
       if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
       if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
-    } else if (!deliveryKey) {
+    } else if (!deliveryKey && !correlatedFinal) {
       if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, [sourceType])) return;
       if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, [sourceType])) return;
     }

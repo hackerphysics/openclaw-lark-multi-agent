@@ -156,6 +156,16 @@ export class MessageStore {
       AND json_extract(delivery_meta_json,'$.provenance.runId')=?`).run(botName, chatId, contentHash, content, attachmentsJson, sessionKey, runId);
   }
 
+  hasExactRunFinalPayload(botName: string, chatId: string, p: { sessionKey: string; runId: string }, content: string, attachmentsJson: string): boolean {
+    return Boolean(this.db.prepare(`SELECT 1 FROM delivery_outbox
+      WHERE bot_name=? AND chat_id=? AND source_type='assistant_visible'
+      AND content=? AND attachments_json=? AND status IN ('pending','delivering','delivered')
+      AND json_valid(delivery_meta_json) AND json_extract(delivery_meta_json,'$.provenance.final')=1
+      AND json_extract(delivery_meta_json,'$.provenance.sessionKey')=?
+      AND json_extract(delivery_meta_json,'$.provenance.runId')=? LIMIT 1`)
+      .get(botName, chatId, content, attachmentsJson, p.sessionKey, p.runId));
+  }
+
   hasRunFinalDelivery(botName: string, chatId: string, p: ErrorProvenance, confirmed: boolean): boolean {
     return Boolean(p.runId && this.db.prepare(`SELECT 1 FROM delivery_outbox
       WHERE bot_name=? AND chat_id=? AND source_type='assistant_visible'

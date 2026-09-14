@@ -60,7 +60,7 @@ Gateway `deliveryStatus=delivered` confirms that task's gateway return path, **n
 - Before every actual notice send (including existing bounded platform retries), re-read task finality and check durable exact-run finals again. A matching queued final, delivered final, changed task, stop, or unavailable lookup withdraws the unsent notice and retains the appropriate state. These send-time reads are additional to the six scheduled checks and bounded by existing outbox attempts.
 - Error notices use one plain-text platform operation per guarded outbox attempt, with no interactive→text fallback bypass; require a nonempty platform message ID. A pre-send withdrawal refunds only the current unsent claim, not a prior failed or ambiguous platform attempt.
 - A later exact successful final upgrades only an identical payload's existing outbox provenance for the same session/run before text deduplication, retaining successful receipt evidence without double-sending. Other run identities and merely overlapping text cannot qualify.
-- Explicit-stop error provenance is captured against exact observed active run IDs, not the collector's session-wide flag. An idle stop does not leave a force-stop flag for a future collector. No inference from a shared session is used to suppress later unrelated errors.
+- Explicit-stop error provenance is captured against exact run IDs in the authorized abort response (including unseen/queued runs), with in-flight stop settlement awaited before error classification, not the collector's session-wide flag. An idle stop does not leave a force-stop flag for a future collector. No inference from a shared session is used to suppress later unrelated errors.
 - If the platform exhausts retries for an error notice, keep the failed outbox diagnostic; do not generate a second error about the error notice.
 
 There is no transaction spanning gateway task state and Feishu acceptance. The guard checks immediately before handing the message to the sender, and cannot retract a message already accepted remotely or guarantee exactly-once delivery across an ambiguous network response. This is the existing platform/outbox limitation, not proof of a new receipt.
@@ -82,3 +82,8 @@ The release candidate repairs these and adds regressions, plus invalid wait
 timestamp/pending-error evidence and missing platform receipt checks. Parent
 review changes were made in an isolated worktree; no original defect reproduction
 was treated as a live incident or new authorization to replay messages.
+
+Authoritative final payloads with verified session/run identity bypass fuzzy
+overlap suppression; identical same-run payloads retain stable receipt evidence
+and are not resent. Expanded final details are delivered rather than discarded
+as a near-duplicate of a preamble. Uncorrelated content keeps its existing policy.
