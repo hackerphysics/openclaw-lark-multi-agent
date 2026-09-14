@@ -106,6 +106,18 @@ export class OpenClawClient {
   private mutedProactiveSessionCounts: Map<string, number> = new Map();
   /** Sessions force-aborted by /stop; collectReply should finish immediately instead of waiting for idle timeout. */
   private forceAbortedSessions: Set<string> = new Set();
+  /** Explicit-stop evidence is scoped to runs known active at the request, never
+   * to the persistent session flag used by the original collector. */
+  private observedActiveChatRuns = new Map<string, Set<string>>();
+  private explicitlyStoppedRuns = new Map<string, number>();
+  private isExplicitlyStoppedRun(sessionKey: string, runId?: string): boolean {
+    if (!runId) return false;
+    const key = JSON.stringify([this.canonicalSessionKey(sessionKey), runId]);
+    const at = this.explicitlyStoppedRuns.get(key);
+    if (at === undefined) return false;
+    if (Date.now() - at > 24 * 60 * 60_000) { this.explicitlyStoppedRuns.delete(key); return false; }
+    return true;
+  }
   /** Global limiter for chat.send RPC calls; large multi-bot fan-out can
    * saturate the Gateway before collectReply even starts. The slot is released
    * as soon as the chat.send RPC returns a runId; collectReply does not hold it.
@@ -648,7 +660,7 @@ export class OpenClawClient {
         sourceType: "run_error", runId,
         error: { sessionKey: this.canonicalSessionKey(rawKey), runId: runId || "", source: "session.message",
           state: "final", stopReason: msg.stopReason, detail: String(msg.errorMessage || ""),
-          ...(this.sessionKeyVariants(rawKey).some(key => this.forceAbortedSessions.has(key)) ? { userStop: true } : {}) },
+          ...(this.isExplicitlyStoppedRun(rawKey, runId) ? { userStop: true } : {}) },
       });
     }
     const allowVerboseTranscript = this.isVerboseTranscriptEnabled(rawKey);
@@ -1716,10 +1728,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     // chat.abort supports { sessionKey } with no runId to abort ALL active runs
     // for that session. Used by /stop to force-clear a stuck run.
     if (!runId) {
+      for (const activeRun of this.observedActiveChatRuns.get(key) || []) {
+        this.explicitlyStoppedRuns.set(JSON.stringify([key, activeRun]), Date.now());
+      }
+      for (const [identity, at] of this.explicitlyStoppedRuns) if (Date.now() - at > 24 * 60 * 60_000) this.explicitlyStoppedRuns.delete(identity);
       // Mark the session so any in-flight collectReply finishes immediately
       // instead of treating the cancelled lifecycle as a transient state.
-      this.forceAbortedSessions.add(key);
-      this.forceAbortedSessions.add(this.shortKey(key));
+      if (this.runStateChecks.has(key)) {
+        this.forceAbortedSessions.add(key);
+        this.forceAbortedSessions.add(this.shortKey(key));
+      }
     }
     const params: any = runId ? { sessionKey: key, runId } : { sessionKey: key };
     return this.rpc("chat.abort", params, 5000).catch(() => {});
@@ -1734,6 +1752,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (!sessionKey || sessionKey === "__default__") return;
     const keys = this.sessionKeyVariants(sessionKey);
     const runId = typeof payload?.runId === "string" ? payload.runId : "";
+    const canonicalKey = this.canonicalSessionKey(sessionKey);
+    if (runId && (state === "delta" || state === "status")) {
+      const active = this.observedActiveChatRuns.get(canonicalKey) || new Set<string>();
+      active.add(runId); this.observedActiveChatRuns.set(canonicalKey, active);
+    } else if (runId && ["final", "error", "aborted"].includes(state || "")) {
+      this.observedActiveChatRuns.get(canonicalKey)?.delete(runId);
+    }
     if (runId && this.ownedDeliveryRuns.has(runId)) {
       // collectReply owns this exact run. Do not suppress the whole session:
       // queueMode=steer may concurrently create another ordinary run that must
@@ -1751,7 +1776,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         sourceType: "run_error", runId,
         error: { sessionKey: this.canonicalSessionKey(sessionKey), runId, source: "chat", state: state || "final",
           ...(typeof stopReason === "string" ? { stopReason } : {}), detail,
-          ...(keys.some(key => this.forceAbortedSessions.has(key)) ? { userStop: true } : {}) },
+          ...(this.isExplicitlyStoppedRun(sessionKey, runId) ? { userStop: true } : {}) },
       });
       this.releaseSuppressedSessionKeysAfter(keys, 0);
     } else if (state === "delta") {
@@ -2183,6 +2208,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     this.pendingSteerTexts.clear();
     this.steerConsumedCallbacks.clear();
     this.ownedDeliveryRuns.clear();
+    this.observedActiveChatRuns.clear();
+    this.explicitlyStoppedRuns.clear();
     if (this.ws) {
       this.ws.close();
       this.ws = null;

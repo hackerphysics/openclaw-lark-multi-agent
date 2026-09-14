@@ -79,6 +79,8 @@ export interface PendingErrorNotice {
   createdAt: number;
   status: "pending" | "parked" | "terminal" | "suppressed" | "stopped";
   verdict?: ErrorVerdict;
+  hasObservedContinuingTask?: boolean;
+  recoveryProbeUsed?: boolean;
 }
 
 export class MessageStore {
@@ -141,6 +143,19 @@ export class MessageStore {
       .all(botName, chatId) as any[]).map(row => JSON.parse(row.record_json));
   }
 
+  /** A later exact final may be content-deduped against its own transcript.
+   * Upgrade only identical payloads with the same canonical session/run; never
+   * infer identity from text similarity or another run's successful answer. */
+  promoteExactRunFinal(botName: string, chatId: string, sessionKey: string, runId: string, contentHash: string, content: string, attachmentsJson: string): void {
+    this.db.prepare(`UPDATE delivery_outbox
+      SET delivery_meta_json=json_set(delivery_meta_json,'$.provenance.final',json('true'))
+      WHERE bot_name=? AND chat_id=? AND source_type='assistant_visible' AND content_hash=?
+      AND content=? AND attachments_json=?
+      AND json_valid(delivery_meta_json)
+      AND json_extract(delivery_meta_json,'$.provenance.sessionKey')=?
+      AND json_extract(delivery_meta_json,'$.provenance.runId')=?`).run(botName, chatId, contentHash, content, attachmentsJson, sessionKey, runId);
+  }
+
   hasRunFinalDelivery(botName: string, chatId: string, p: ErrorProvenance, confirmed: boolean): boolean {
     return Boolean(p.runId && this.db.prepare(`SELECT 1 FROM delivery_outbox
       WHERE bot_name=? AND chat_id=? AND source_type='assistant_visible'
@@ -160,7 +175,10 @@ export class MessageStore {
 
   /** Withdraw only an unsent error notice. Never claim it was delivered or touch a result row. */
   withdrawErrorDelivery(id: number): void {
-    this.db.prepare("UPDATE delivery_outbox SET status='failed', updated_at=? WHERE id=? AND source_type='run_error' AND text_delivered=0")
+    // claimDelivery reserves a send attempt before the asynchronous evidence
+    // guard. Withdrawing here means no platform send was attempted: refund only
+    // that current claim, never an earlier failed/ambiguous platform attempt.
+    this.db.prepare("UPDATE delivery_outbox SET status='failed', attempts=MAX(0,attempts-1), updated_at=? WHERE id=? AND source_type='run_error' AND status='delivering' AND text_delivered=0")
       .run(Date.now(), id);
   }
 

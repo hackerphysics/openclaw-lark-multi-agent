@@ -31,7 +31,7 @@ Therefore:
 | Exact completed child, delivery failed **and** terminalOutcome blocked | One notice that execution completed but result handoff is blocked/terminated and needs human handling |
 | Bare delivery failed, cancellation, incomplete metadata, unsupported form/RPC, lookup failure | Unknown; no final failure/success claim |
 | Ordinary gateway chat.error (or chat.final with error stopReason) | Preserve an accurate run-error notice, deduped by exact run |
-| Ordinary transcript error or bare abort | Require exact `agent.wait` error with terminal `endedAt`; short timeout/ok/no terminal metadata stays unknown |
+| Ordinary transcript error or bare abort | Require exact `agent.wait` error with finite positive ordered `endedAt`, not pending or yielded; short timeout/ok/no valid terminal metadata stays unknown |
 | Explicit bridge stop provenance | No error cascade; existing `/stop` response and collector behavior are unchanged |
 
 Gateway `deliveryStatus=delivered` confirms that task's gateway return path, **not a new Feishu receipt**. This is sufficient to suppress a stale attempt error, not to declare that LMA delivered the main result. Exact LMA final outbox records provide a separate local delivery proof; an enqueued but unsent exact-run final defers an error rather than pretending it was delivered.
@@ -49,13 +49,18 @@ Gateway `deliveryStatus=delivered` confirms that task's gateway return path, **n
 ## Bounded reconciliation and restart semantics
 
 - One lightweight unref'd timer and one in-flight check per chat; no background agent/model task.
-- Six scheduled read-only checks per observed run: immediate, then delays of 15s, 60s, 120s, 300s, and the existing `FOREGROUND_WAIT_MS` (10min). This is about 18m15s plus bounded RPC time, **not** a new foreground deadline. Existing 10-minute effective inactivity, yield freeze and collector ownership behavior are unchanged.
+- For never-confirmed/unknown observations, six scheduled read-only checks per observed run: immediate, then delays of 15s, 60s, 120s, 300s, and the existing `FOREGROUND_WAIT_MS` (10min). This is about 18m15s plus bounded RPC time, **not** a new foreground deadline. Existing 10-minute effective inactivity, yield freeze and collector ownership behavior are unchanged.
 - Each lookup is capped at two list pages plus one get, each with a 2s RPC deadline. Ordinary wait probes use `timeoutMs: 1`, 2s RPC deadline. No short wait is converted into a terminal timeout notice.
 - Check counts are persisted **before** awaiting RPC. Startup resumes pending observations with their remaining budget and due time, independently of message triggers. Disconnection produces unknown, not failure.
 - Duplicate/late observations do not renew the budget. One stronger gateway terminal envelope can upgrade a prior transcript/bare-abort observation and give it one final check if its budget was already exhausted; repeats of that stronger envelope cannot rearm it.
-- After the budget, retain the row as `parked`, with its last unknown reason and evidence. Do not send a failure, success, or speculative recovery notice. Do not poll it forever. New attempts are separately observed; no business request is automatically retried.
+- Once an exact task/delivery is verified queued or running, keep low-frequency checks (at most every five minutes after the initial checks), bounded at 300 checks / 24 hours. This spans the Gateway's 30-minute completion retry window; temporary lookup loss does not abandon a previously verified continuing task. It does not create model turns or retry model work.
+- A still-pending row at its reserved budget cap can indicate a crash before verdict/outbox completion. Permit one additional recovery probe, with its allowance persisted before awaiting, so repeated restarts cannot reset budgets. Re-read each due record after earlier async checks, retaining newer stop/provenance state.
+- After the applicable budget, retain the row as `parked`, with its last unknown reason and evidence. Do not send a failure, success, or speculative recovery notice. Do not poll it forever. New attempts are separately observed; no business request is automatically retried.
 - Parked diagnostics and dedupe records are intentionally retained. The repair does not add destructive expiry or automatically rescan historic transcripts/outbox.
 - Before every actual notice send (including existing bounded platform retries), re-read task finality and check durable exact-run finals again. A matching queued final, delivered final, changed task, stop, or unavailable lookup withdraws the unsent notice and retains the appropriate state. These send-time reads are additional to the six scheduled checks and bounded by existing outbox attempts.
+- Error notices use one plain-text platform operation per guarded outbox attempt, with no interactive→text fallback bypass; require a nonempty platform message ID. A pre-send withdrawal refunds only the current unsent claim, not a prior failed or ambiguous platform attempt.
+- A later exact successful final upgrades only an identical payload's existing outbox provenance for the same session/run before text deduplication, retaining successful receipt evidence without double-sending. Other run identities and merely overlapping text cannot qualify.
+- Explicit-stop error provenance is captured against exact observed active run IDs, not the collector's session-wide flag. An idle stop does not leave a force-stop flag for a future collector. No inference from a shared session is used to suppress later unrelated errors.
 - If the platform exhausts retries for an error notice, keep the failed outbox diagnostic; do not generate a second error about the error notice.
 
 There is no transaction spanning gateway task state and Feishu acceptance. The guard checks immediately before handing the message to the sender, and cannot retract a message already accepted remotely or guarantee exactly-once delivery across an ambiguous network response. This is the existing platform/outbox limitation, not proof of a new receipt.
@@ -67,3 +72,13 @@ There is no transaction spanning gateway task state and Feishu acceptance. The g
 Coverage includes captured announce forms, abort/retry/success, confirmed blocked delivery, separate failed/successful children, typed and exact-run-correlated late generic failures, normal identical text, ordinary terminal errors, explicit stop, query failure/timeout/unsupported responses, identity drift, bounded pagination, restart pending/receipt/dedupe, stable result key isolation, send-time final/unknown races, and platform retry revalidation. Existing routing/mention/Chairman/Free/Discuss/model/attachment/stop/insertion/collector/inactivity/yield tests remain in the full suite.
 
 No live bot test, deployment, restart, gateway/config/permission/model edit, push, tag or release is part of this change. Live Feishu acceptance requires a separately authorized deployment and validation.
+
+## Pre-release independent review follow-up
+
+The initial 672-test candidate was not accepted as sufficient. Independent
+review reproduced sender-fallback, unsent-attempt-budget, deduped-final-evidence,
+stop-scope, continuing-task parking, stale-snapshot and crash-recovery defects.
+The release candidate repairs these and adds regressions, plus invalid wait
+timestamp/pending-error evidence and missing platform receipt checks. Parent
+review changes were made in an isolated worktree; no original defect reproduction
+was treated as a live incident or new authorization to replay messages.

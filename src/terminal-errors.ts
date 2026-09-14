@@ -85,7 +85,12 @@ export async function inspectError(p: ErrorProvenance, rpc: ReadRPC): Promise<Er
     };
     try {
       const wait = await rpc("agent.wait", { runId: p.runId, timeoutMs: 1 }, 2000);
-      if (wait?.runId === p.runId && wait?.status === "error" && typeof wait.endedAt === "number") return {
+      const ended = wait?.endedAt;
+      const started = wait?.startedAt;
+      const terminalTime = typeof ended === "number" && Number.isFinite(ended) && ended > 0
+        && (started === undefined || (typeof started === "number" && Number.isFinite(started) && started >= 0 && ended >= started));
+      if (wait?.runId === p.runId && wait?.status === "error" && wait?.pendingError !== true
+        && wait?.yielded !== true && terminalTime) return {
         state: "terminal", reason: "exact_run_terminal_error", terminalKey: `run-error:${errorIdentity(p.sessionKey, p.runId)}`,
         text: "⚠️ 该次运行已终止，未能完成回复。",
       };

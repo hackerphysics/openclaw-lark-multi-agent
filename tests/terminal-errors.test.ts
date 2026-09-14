@@ -44,6 +44,7 @@ async function harness(tasks: TaskEvidence[] = [task()], dbPath?: string) {
   const bot: any = new FeishuBot({ name: "GPT", appId: "offline", appSecret: "test", model: "test-model" }, client, store);
   bot.readSessionStatus = vi.fn(async () => ({ status: "running" }));
   bot.sendFinalMessage = vi.fn(async () => {});
+  bot.sendErrorNotice = bot.sendFinalMessage;
   bot.replyFinalMessage = vi.fn(async () => {});
   bot.sendBridgeAttachment = vi.fn(async () => {});
   bot.cancelDelayedFailure = vi.fn();
@@ -179,7 +180,10 @@ describe("client → bot → persistent notice → guarded outbox", () => {
     expect(h.bot.sendFinalMessage).toHaveBeenCalledTimes(1); expect(h.bot.sendFinalMessage.mock.calls[0][1]).toBe(generic);
   });
   it("explicit stop metadata stays diagnostic and emits no abort cascade", async () => {
-    const h = await harness(); h.client.forceAbortedSessions.add(sessionKey);
+    const h = await harness();
+    h.client.trackChatEventSession(sessionKey, "status", { runId: "stopped-run" });
+    h.client.trackChatEventSession(sessionKey, "status", { runId: "stopped-run-2" });
+    await h.client.abortChat(sessionKey);
     await h.event("stopped-run"); await h.event("stopped-run-2");
     expect(h.bot.sendFinalMessage).not.toHaveBeenCalled(); expect(h.row("stopped-run")?.status).toBe("stopped");
   });
@@ -308,6 +312,148 @@ describe("client → bot → persistent notice → guarded outbox", () => {
     await h.event(directRun); await vi.advanceTimersByTimeAsync(60_000);
     expect(h.bot.sendFinalMessage).toHaveBeenCalledTimes(5);
     expect(h.bot.sendMessage).not.toHaveBeenCalled(); expect(h.bot.replyMessage).not.toHaveBeenCalled();
+  });
+
+  it("send-time evidence withdrawals do not consume the platform send retry budget", async () => {
+    const h = await harness([task({ deliveryStatus: "failed", terminalOutcome: "blocked" })]);
+    const base = memoryRPC(h.tasks); let gets = 0;
+    h.rpc.mockImplementation(async (method: string, params: any) => {
+      if (method === "tasks.get" && ++gets % 2 === 0 && gets <= 8) throw new Error("evidence briefly unavailable before send");
+      return base(method, params);
+    });
+    await h.event(directRun);
+    await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(h.bot.sendFinalMessage).toHaveBeenCalledTimes(1);
+    const record = h.row()!;
+    const delivery = h.store.getDeliveryByKey("GPT", "chat1", record.verdict!.terminalKey!);
+    expect(delivery?.status).toBe("delivered");
+    expect(delivery?.attempts).toBe(1);
+  });
+
+  it("keeps the real platform retry budget after multiple pre-send withdrawals", async () => {
+    const h = await harness([task({ deliveryStatus: "failed", terminalOutcome: "blocked" })]);
+    const base = memoryRPC(h.tasks); let gets = 0;
+    h.rpc.mockImplementation(async (method: string, params: any) => {
+      if (method === "tasks.get" && ++gets % 2 === 0 && gets <= 8) throw new Error("pre-send guard unavailable");
+      return base(method, params);
+    });
+    h.bot.sendFinalMessage.mockRejectedValueOnce(new Error("platform transient failure"));
+    await h.event(directRun); await vi.advanceTimersByTimeAsync(20 * 60_000);
+    expect(h.bot.sendFinalMessage).toHaveBeenCalledTimes(2);
+    const delivery = h.store.getDeliveryByKey("GPT", "chat1", h.row()!.verdict!.terminalKey!);
+    expect(delivery?.status).toBe("delivered"); expect(delivery?.attempts).toBe(2);
+  });
+
+  it.each([
+    { endedAt: 0 }, { endedAt: -1 }, { endedAt: Infinity },
+    { endedAt: Date.parse("2026-09-13T00:00:00Z"), startedAt: Date.parse("2026-09-14T00:00:00Z") },
+    { endedAt: Date.parse("2026-09-14T00:00:00Z"), pendingError: true },
+  ])("does not infer terminal failure from invalid/in-flight wait metadata %j", async metadata => {
+    const rpc = vi.fn(async () => ({ runId: "ordinary-abort", status: "error", ...metadata }));
+    expect((await inspectError(provenance("ordinary-abort"), rpc)).state).toBe("pending");
+  });
+
+  it("never performs an unguarded card-to-text fallback for an error notice", async () => {
+    const h = await harness([task({ deliveryStatus: "failed", terminalOutcome: "blocked" })]);
+    delete h.bot.sendErrorNotice;
+    const create = vi.fn(async (_request: any) => { h.tasks[0].deliveryStatus = "delivered"; h.tasks[0].terminalOutcome = "succeeded"; throw new Error("ambiguous platform failure"); });
+    h.bot.client.im.message.create = create;
+    await h.event(directRun);
+    expect(create).toHaveBeenCalledOnce(); expect(create.mock.calls[0][0].data.msg_type).toBe("text");
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(create).toHaveBeenCalledOnce(); expect(h.row()?.status).toBe("suppressed");
+  });
+
+  it("does not mark an error notice delivered without a platform message id", async () => {
+    const h = await harness([task({ deliveryStatus: "failed", terminalOutcome: "blocked" })]);
+    delete h.bot.sendErrorNotice;
+    h.bot.client.im.message.create = vi.fn(async () => ({ data: {} }));
+    await h.event(directRun);
+    const delivery = h.store.getDeliveryByKey("GPT", "chat1", h.row()!.verdict!.terminalKey!);
+    expect(delivery?.textDelivered).toBe(false); expect(delivery?.status).toBe("pending");
+  });
+
+  it("retains exact final evidence when the final text was already delivered as a transcript", async () => {
+    const h = await harness(); const run = "same-final-race";
+    await h.transcript(run, undefined, "actual answer");
+    await h.event(run, "final", { stopReason: "stop", message: { content: [{ type: "text", text: "actual answer" }] } });
+    expect(h.bot.sendFinalMessage).toHaveBeenCalledOnce();
+    expect(h.store.hasRunFinalDelivery("GPT", "chat1", provenance(run), true)).toBe(true);
+    await h.event(run, "error", { errorMessage: "stale error" });
+    expect(h.row(run)?.status).toBe("suppressed"); expect(h.bot.sendFinalMessage).toHaveBeenCalledOnce();
+  });
+
+  it("does not promote another run's identical text into final evidence", async () => {
+    const h = await harness();
+    await h.transcript("first", undefined, "same text");
+    await h.event("second", "final", { stopReason: "stop", message: { content: [{ type: "text", text: "same text" }] } });
+    expect(h.store.hasRunFinalDelivery("GPT", "chat1", provenance("first"), true)).toBe(false);
+    await h.event("first", "error", { errorMessage: "real first failure" });
+    expect(h.row("first")?.status).toBe("terminal");
+  });
+
+  it("an idle stop never suppresses a future unrelated run's true error", async () => {
+    const h = await harness(); await h.client.abortChat(sessionKey);
+    expect(h.client.forceAbortedSessions.size).toBe(0);
+    await h.event("future-unrelated", "error", { errorMessage: "real authentication failure" });
+    expect(h.row("future-unrelated")?.status).toBe("terminal");
+    expect(h.bot.sendErrorNotice).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes pending snapshots so an earlier RPC cannot erase a later record's stop", async () => {
+    const h = await harness();
+    h.store.observeRunError("GPT", "chat1", provenance("first", { state: "error" }));
+    h.store.observeRunError("GPT", "chat1", provenance("second", { state: "error" }));
+    const inspect = h.client.inspectRunError.bind(h.client); let stopped = false;
+    h.client.inspectRunError = async (p: ErrorProvenance) => {
+      if (p.runId === "first" && !stopped) { stopped = true; h.store.observeRunError("GPT", "chat1", provenance("second", { state: "error", userStop: true })); }
+      return inspect(p);
+    };
+    await h.bot.reconcileErrorNotices("chat1");
+    expect(h.row("second")?.status).toBe("stopped"); expect(h.row("second")?.provenance.userStop).toBe(true);
+    expect(h.bot.sendErrorNotice).toHaveBeenCalledOnce();
+  });
+
+  it("keeps known continuing tasks observed beyond the Gateway retry window", async () => {
+    const h = await harness([task({ deliveryStatus: "session_queued" })]);
+    await h.event(directRun); await vi.advanceTimersByTimeAsync(35 * 60_000);
+    expect(h.row()?.status).toBe("pending"); expect(h.bot.sendErrorNotice).not.toHaveBeenCalled();
+    h.tasks[0].deliveryStatus = "failed"; h.tasks[0].terminalOutcome = "blocked";
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(h.row()?.status).toBe("terminal"); expect(h.bot.sendErrorNotice).toHaveBeenCalledOnce();
+  });
+
+  it("recovers a crash after the last budget reservation without losing a true terminal error", async () => {
+    const h = await harness();
+    const record = h.store.observeRunError("GPT", "chat1", provenance("crashed-last-probe", { state: "error" }));
+    record.checks = 6; record.status = "pending";
+    h.store.saveErrorNotice(record); h.stop();
+    const next = await harness([], h.path); await next.bot.reconcileErrorNotices("chat1");
+    expect(next.row("crashed-last-probe")?.status).toBe("terminal");
+    expect(next.row("crashed-last-probe")?.recoveryProbeUsed).toBe(true);
+    expect(next.bot.sendErrorNotice).toHaveBeenCalledOnce();
+  });
+
+  it("persists the one recovery probe so repeated restarts cannot reset an unknown budget", async () => {
+    const h = await harness();
+    const record = h.store.observeRunError("GPT", "chat1", provenance());
+    record.checks = 6; record.status = "pending"; h.store.saveErrorNotice(record); h.stop();
+    const next = await harness([], h.path); next.rpc.mockRejectedValue(new Error("unavailable"));
+    await next.bot.reconcileErrorNotices("chat1");
+    expect(next.row()?.status).toBe("parked"); expect(next.rpc).toHaveBeenCalledTimes(1);
+    next.stop(); const again = await harness([], h.path); await again.bot.reconcileErrorNotices("chat1");
+    expect(again.rpc).not.toHaveBeenCalled(); expect(again.row()?.recoveryProbeUsed).toBe(true);
+  });
+
+  it("a temporary lookup loss after 35 minutes cannot abandon a previously confirmed continuing task", async () => {
+    const h = await harness([task({ deliveryStatus: "session_queued" })]);
+    await h.event(directRun); await vi.advanceTimersByTimeAsync(35 * 60_000);
+    h.rpc.mockRejectedValueOnce(new Error("temporary disconnect"));
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(h.row()?.status).toBe("pending");
+    h.tasks[0].deliveryStatus = "failed"; h.tasks[0].terminalOutcome = "blocked";
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    expect(h.row()?.status).toBe("terminal"); expect(h.bot.sendErrorNotice).toHaveBeenCalledOnce();
   });
 
   it("nested typed error provenance wins over a conflicting final-envelope stop reason", async () => {

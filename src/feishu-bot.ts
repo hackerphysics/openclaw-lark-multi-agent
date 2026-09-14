@@ -2349,6 +2349,9 @@ export class FeishuBot {
       ...(finalReplyModel?.trim() ? { model: finalReplyModel.trim() } : {}),
       ...(provenance ? { provenance } : {}), ...(errorNoticeId ? { errorNoticeId } : {}),
     });
+    if (sourceType === "assistant_visible" && provenance?.final && provenance.runId && provenance.sessionKey) {
+      this.store.promoteExactRunFinal(this.config.name, chatId, provenance.sessionKey, provenance.runId, contentHash, text, attachmentsJson);
+    }
     if (sourceType === "verbose_transcript") {
       if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
       if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
@@ -2519,8 +2522,14 @@ export class FeishuBot {
   private deferErrorNotice(record: PendingErrorNotice, verdict: ErrorVerdict): void {
     const delays = [15_000, 60_000, 120_000, 300_000, FOREGROUND_WAIT_MS];
     record.verdict = verdict;
-    record.status = record.checks >= 6 ? "parked" : "pending";
-    record.nextCheckAt = Date.now() + (delays[Math.max(0, record.checks - 1)] || FOREGROUND_WAIT_MS);
+    // Known-live task/delivery state is not an unknown diagnosis. Continue
+    // low-frequency checks across the Gateway's 30-minute retry window, bounded
+    // by the existing 24-hour observation horizon. Unknown evidence stays capped.
+    if (verdict.reason === "matching_task_or_delivery_continuing") record.hasObservedContinuingTask = true;
+    const continuing = record.hasObservedContinuingTask === true;
+    const budget = continuing ? 300 : 6;
+    record.status = record.checks >= budget || Date.now() - record.createdAt >= 24 * 60 * 60_000 ? "parked" : "pending";
+    record.nextCheckAt = Date.now() + (continuing && record.checks >= 4 ? 300_000 : (delays[Math.max(0, record.checks - 1)] || FOREGROUND_WAIT_MS));
     this.store.saveErrorNotice(record);
     this.scheduleErrorNoticeCheck(record.chatId);
   }
@@ -2539,7 +2548,7 @@ export class FeishuBot {
     this.errorNoticeTimers.set(chatId, timer);
   }
 
-  /** Six read-only checks per observed run, durable across restarts. No model polls. */
+  /** Bounded read-only diagnosis; known live tasks retain low-frequency observation. */
   private async reconcileErrorNotices(chatId: string): Promise<void> {
     const running = this.errorNoticeChecks.get(chatId);
     if (running) return running;
@@ -2547,9 +2556,18 @@ export class FeishuBot {
       const timer = this.errorNoticeTimers.get(chatId);
       if (timer) clearTimeout(timer);
       this.errorNoticeTimers.delete(chatId);
-      for (const record of this.store.listPendingErrorNotices(this.config.name, chatId)) {
+      for (const snapshot of this.store.listPendingErrorNotices(this.config.name, chatId)) {
+        // Earlier awaits may have observed a stop/stronger envelope for this row.
+        const record = this.store.getErrorNotice(this.config.name, chatId, snapshot.noticeId);
+        if (!record || record.status !== "pending") continue;
         if (record.nextCheckAt > Date.now()) continue;
-        if (record.checks >= 6) { this.deferErrorNotice(record, record.verdict || { state: "pending", reason: "budget_exhausted" }); continue; }
+        if (record.checks >= (record.hasObservedContinuingTask || record.verdict?.reason === "matching_task_or_delivery_continuing" ? 300 : 6)) {
+          // Normal exhausted checks are already parked. A still-pending row at
+          // the cap can be a crash after budget reservation / before verdict or
+          // outbox creation. Reserve one durable recovery probe, never per boot.
+          if (record.recoveryProbeUsed) { this.deferErrorNotice(record, record.verdict || { state: "pending", reason: "budget_exhausted" }); continue; }
+          record.recoveryProbeUsed = true;
+        }
         record.checks++;
         // Reserve the budget before awaiting RPC, including crash/disconnect.
         this.store.saveErrorNotice(record);
@@ -2638,7 +2656,11 @@ export class FeishuBot {
               record!.verdict = verdict;
               this.store.saveErrorNotice(record!);
             }
-            if (shouldReplyToSource) {
+            if (item.sourceType === "run_error") {
+              // Exactly one platform operation per guarded attempt. A card/text
+              // fallback must not bypass a fresh finality check.
+              await this.sendErrorNotice(chatId, item.content);
+            } else if (shouldReplyToSource) {
               try { await this.replyFinalMessage(replyTarget!, item.content, finalModel, finalStatus); }
               catch { await this.sendFinalMessage(chatId, item.content, finalModel, finalStatus); }
             } else {
@@ -3460,6 +3482,16 @@ export class FeishuBot {
   /**
    * Send a proactive message to a chat (not a reply).
    */
+  private async sendErrorNotice(chatId: string, text: string): Promise<string | undefined> {
+    const res = await this.client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: { receive_id: chatId, msg_type: "text", content: JSON.stringify({ text }) },
+    });
+    const id = (res as any)?.data?.message_id || (res as any)?.message_id;
+    if (!id) throw new Error("Error notice send returned no confirmed message id");
+    return id;
+  }
+
   private async sendFinalMessage(chatId: string, text: string, model?: string, status?: string): Promise<string | undefined> {
     if (!model?.trim()) return this.sendMessage(chatId, text);
     this.sendModelFooters.set(chatId, model.trim());
