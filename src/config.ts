@@ -8,6 +8,8 @@ export interface BotConfig {
   appSecret: string;
   model: string;
   locale?: Locale;
+  /** Optional per-bot thinking level (informational fallback for footers). */
+  thinking?: string;
 }
 
 export interface OpenClawConfig {

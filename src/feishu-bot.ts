@@ -1411,6 +1411,7 @@ export class FeishuBot {
             }, {
               botName: this.config.name,
               model: this.config.model,
+              thinkingLevel: await this.fetchThinkingLabel(sessionKey),
               locale: this.isEn(chatId) ? "en" : "zh",
             })
           : undefined;
@@ -1929,12 +1930,16 @@ export class FeishuBot {
     }
   }
 
-  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "model" | "locale">, emoji = "✅"): string {
+  private completionSummary(meta: Pick<LiveStatusFinalMeta, "toolCalls" | "elapsed" | "model" | "thinkingLevel" | "locale">, emoji = "✅"): string {
     const en = meta.locale === "en";
     const core = en
       ? `${emoji} ${meta.toolCalls} tool call${meta.toolCalls === 1 ? "" : "s"} · ⏱ ${meta.elapsed}`
       : `${emoji} 累计${meta.toolCalls} 次工具调用 · ⏱ 耗时${meta.elapsed}`;
-    return meta.model?.trim() ? `${core} · 🧠 ${this.escapeCardText(meta.model.trim())}` : core;
+    if (!meta.model?.trim()) return core;
+    const modelLabel = meta.thinkingLevel?.trim()
+      ? `${meta.model.trim()} · ${meta.thinkingLevel.trim()}`
+      : meta.model.trim();
+    return `${core} · 🧠 ${this.escapeCardText(modelLabel)}`;
   }
 
   /** Best-effort terminal cleanup for status-only rows and legacy v1.4.3
@@ -1945,6 +1950,7 @@ export class FeishuBot {
       lines: [],
       elapsed: meta.elapsed,
       model: meta.model,
+      thinkingLevel: meta.thinkingLevel,
       toolCalls: meta.toolCalls,
       noReply: Boolean(meta.noReply),
       state: "done",
@@ -2818,6 +2824,24 @@ export class FeishuBot {
     return bot ? this.asDiscussionParticipant(bot, chatId) : undefined;
   }
 
+  /** Resolve the session's current thinking label for the live-status footer.
+   * Prefers a live session override (set via //think / sessions.patch), falls
+   * back to the session's default, then the bot's config-level thinking. */
+  private async fetchThinkingLabel(sessionKey: string): Promise<string | undefined> {
+    try {
+      const info = await this.openclawClient.getSessionInfo(sessionKey);
+      const s = info?.session;
+      const label = (typeof s?.thinkingLevel === "string" && s.thinkingLevel.trim())
+        || (typeof s?.thinkingDefault === "string" && s.thinkingDefault.trim())
+        || (typeof this.config.thinking === "string" && this.config.thinking.trim())
+        || "";
+      return label || undefined;
+    } catch {
+      const cfg = typeof this.config.thinking === "string" ? this.config.thinking.trim() : "";
+      return cfg || undefined;
+    }
+  }
+
   private asDiscussionParticipant(bot: FeishuBot, chatId: string): DiscussionParticipant {
     return {
       name: bot.config.name,
@@ -2837,6 +2861,7 @@ export class FeishuBot {
         }, {
           botName: this.config.name,
           model: this.config.model,
+          thinkingLevel: await this.fetchThinkingLabel(sessionKey),
           locale: this.isEn(chatId) ? "en" : "zh",
         })
       : undefined;
@@ -2939,6 +2964,7 @@ export class FeishuBot {
         toolCalls: view.toolCalls,
         elapsed: view.elapsed,
         model: view.model,
+        thinkingLevel: view.thinkingLevel,
         locale: en ? "en" : "zh",
       }, statusEmoji);
       return {
@@ -2974,7 +3000,12 @@ export class FeishuBot {
     // Keep the active model visible while the run is in progress or failed.
     // The final reply also keeps model attribution so it remains self-contained.
     const footerBits = [en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`];
-    if (view.model?.trim()) footerBits.push(`🧠 ${this.escapeCardText(view.model.trim())}`);
+    if (view.model?.trim()) {
+      const modelBit = view.thinkingLevel?.trim()
+        ? `🧠 ${this.escapeCardText(view.model.trim())} · ${this.escapeCardText(view.thinkingLevel.trim())}`
+        : `🧠 ${this.escapeCardText(view.model.trim())}`;
+      footerBits.push(modelBit);
+    }
     elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
     const template = view.state === "failed" ? "orange" : "blue";
     return {

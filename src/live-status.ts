@@ -33,6 +33,8 @@ export type LiveStatusView = {
   elapsed: string;
   /** Footer: model name, e.g. "phgeek-gw/claude-opus-4.8". */
   model?: string;
+  /** Footer: current thinking level label, e.g. "high" / "adaptive". */
+  thinkingLevel?: string;
   /** Total tool calls in the run (for the compact finished summary). */
   toolCalls: number;
   /** True when finished via noReply(): the model produced no user-visible reply. */
@@ -47,6 +49,7 @@ export type LiveStatusFinalMeta = {
   toolCalls: number;
   elapsed: string;
   model?: string;
+  thinkingLevel?: string;
   locale: "zh" | "en";
   noReply?: boolean;
 };
@@ -66,6 +69,8 @@ export type LiveStatusOptions = {
   maxChars?: number;
   /** Model name shown in the footer. */
   model?: string;
+  /** Thinking level label shown after the model name in the footer. */
+  thinkingLevel?: string;
   /** Number of recent activity lines kept in the content area. */
   historySize?: number;
   /** Footer/auto-refresh cadence in ms. */
@@ -210,6 +215,7 @@ export class LiveStatusController {
       toolCalls: this.toolCallCount,
       elapsed: this.formatElapsed(),
       model: this.opts.model,
+      thinkingLevel: this.opts.thinkingLevel,
       locale: this.opts.locale === "en" ? "en" : "zh",
       noReply,
     };
@@ -434,6 +440,7 @@ export class LiveStatusController {
       lines,
       elapsed: this.formatElapsed(),
       model: this.opts.model,
+      thinkingLevel: this.opts.thinkingLevel,
       toolCalls: this.toolCallCount,
       noReply: this.noReplyResult,
       state: this.state,

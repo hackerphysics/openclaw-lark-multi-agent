@@ -2232,7 +2232,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("renders a minimal done card but keeps activity on failure for debugging", () => {
     const h = makeHarness("Claude");
     try {
-      const baseView = { title: "✅ Claude 已完成", lines: [], elapsed: "2:15", model: "phgeek-gw/claude-opus-4.8", toolCalls: 7, noReply: false };
+      const baseView = { title: "✅ Claude 已完成", lines: [], elapsed: "2:15", model: "phgeek-gw/claude-opus-4.8", thinkingLevel: "high", toolCalls: 7, noReply: false };
       // Done (clean): minimal single compact grey line, no header/footer.
       const doneCard = (h.bot as any).buildLiveStatusCard({ ...baseView, state: "done" }, "chat1");
       expect(doneCard.header).toBeUndefined();
@@ -2241,7 +2241,7 @@ describe("FeishuBot routing and queue behavior", () => {
       expect(doneText).toContain("✅");
       expect(doneText).toContain("累计7 次工具调用");
       expect(doneText).toContain("⏱ 耗时2:15");
-      expect(doneText).toContain("🧠 phgeek-gw/claude-opus-4.8");
+      expect(doneText).toContain("🧠 phgeek-gw/claude-opus-4.8 · high");
       expect(doneText).toContain("<font color='grey'>"); // unobtrusive grey, footer-like
 
       // The separate final answer remains self-contained with model attribution;
