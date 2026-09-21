@@ -528,6 +528,54 @@ describe("OpenClawClient collectReply", () => {
   });
 });
 
+describe("OpenClawClient archived-session auto-restore", () => {
+  it("detects archived-session RPC errors", () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    expect(client.isArchivedSessionError(new Error('RPC error: {"code":"INVALID_REQUEST","message":"Session \"agent:main:x\" is archived. Restore it before starting new work."}'))).toBe(true);
+    expect(client.isArchivedSessionError(new Error("RPC timeout: chat.send"))).toBe(false);
+    expect(client.isArchivedSessionError(new Error("something else"))).toBe(false);
+  });
+
+  it("unarchives via describe + patch with expectedSessionId", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const calls: Array<{ method: string; params: any }> = [];
+    (client as any).rpc = vi.fn(async (method: string, params: any) => {
+      calls.push({ method, params });
+      if (method === "sessions.describe") {
+        return { session: { sessionId: "sid-1", archived: true } };
+      }
+      if (method === "sessions.patch") return { ok: true };
+      throw new Error("unexpected method " + method);
+    });
+    const ok = await client.unarchiveSession("s1");
+    expect(ok).toBe(true);
+    expect(calls[0].method).toBe("sessions.describe");
+    expect(calls[1].method).toBe("sessions.patch");
+    expect(calls[1].params.expectedSessionId).toBe("sid-1");
+    expect(calls[1].params.archived).toBe(false);
+  });
+
+  it("compactSession restores an archived session once and retries", async () => {
+    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    let compactCalls = 0;
+    (client as any).rpc = vi.fn(async (method: string, params: any) => {
+      if (method === "sessions.compact") {
+        compactCalls++;
+        if (compactCalls === 1) {
+          throw new Error('RPC error: {"code":"INVALID_REQUEST","message":"Session \"agent:main:s1\" is archived. Restore it before starting new work."}');
+        }
+        return { ok: true, compacted: true, kept: 42 };
+      }
+      if (method === "sessions.describe") return { session: { sessionId: "sid-1", archived: true } };
+      if (method === "sessions.patch") return { ok: true };
+      throw new Error("unexpected method " + method);
+    });
+    const res = await client.compactSession("s1", { maxLines: 800 });
+    expect(res.compacted).toBe(true);
+    expect(compactCalls).toBe(2);
+  });
+});
+
 describe("OpenClawClient 2026.8 session model policy", () => {
   it("does not patch an already-correct canonical model", async () => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);

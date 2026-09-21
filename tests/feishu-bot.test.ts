@@ -3366,16 +3366,28 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("reports a no-op when semantic compaction and Gateway transcript trim both skip", async () => {
+    it("reports a no-op when the default transcript trim skips (single trim call)", async () => {
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
+        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        // Default mode is trim: exactly ONE call, no LLM summarization attempt.
+        expect(h.openclaw.compactSession).toHaveBeenCalledTimes(1);
+        expect(h.openclaw.compactSession).toHaveBeenCalledWith(expect.any(String), { maxLines: 800 });
+        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("未压缩"));
+      } finally { h.cleanup(); }
+    });
+
+    it("semantic mode falls back to Gateway transcript trim when summarization skips", async () => {
       const h = makeHarness("GPT");
       try {
         h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines
           ? ({ ok: true, compacted: false, reason: "transcript too small" })
           : ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
-        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
         expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(1, expect.any(String));
-        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 200 });
-        expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
+        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 800 });
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("未压缩"));
       } finally { h.cleanup(); }
     });
@@ -3386,10 +3398,20 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines
           ? ({ ok: true, compacted: true, kept: 137 })
           : ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
-        await (h.bot as any).handleCompactCommand("chat1", "m1");
-        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 200 });
+        await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
+        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 800 });
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("转录裁剪"));
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("137"));
+      } finally { h.cleanup(); }
+    });
+
+    it("honors an explicit maxLines argument", async () => {
+      const h = makeHarness("GPT");
+      try {
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: true, kept: 500 })) as any;
+        await (h.bot as any).handleCompactCommand("chat1", "m1", "maxLines=500");
+        expect(h.openclaw.compactSession).toHaveBeenCalledWith(expect.any(String), { maxLines: 500 });
+        expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
       } finally { h.cleanup(); }
     });
 
@@ -3400,7 +3422,7 @@ describe("FeishuBot routing and queue behavior", () => {
           if (options?.maxLines) throw new Error("trim rpc timeout");
           throw new Error("semantic rpc timeout");
         }) as any;
-        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("semantic rpc timeout"));
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("trim rpc timeout"));
       } finally { h.cleanup(); }

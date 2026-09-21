@@ -1457,6 +1457,37 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return this.rpc("sessions.patch", { ...params, key: this.canonicalSessionKey(params.key) }, 10000);
   }
 
+  /** True when an RPC error is the Gateway's "session is archived" refusal. */
+  isArchivedSessionError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err ?? "");
+    return /is archived[.,]|Restore it before starting new work/i.test(msg);
+  }
+
+  /**
+   * Restore an archived session (e.g. auto-archived by the Gateway's
+   * active-session-cap) so new work can start. sessions.patch requires
+   * expectedSessionId, so describe first, then patch archived=false.
+   */
+  async unarchiveSession(key: string): Promise<boolean> {
+    const canonical = this.canonicalSessionKey(key);
+    try {
+      const info = await this.rpc("sessions.describe", { key: canonical }, 15000);
+      const sessionId = info?.session?.sessionId;
+      if (!sessionId) return false;
+      if (info?.session?.archived !== true) return true; // already active
+      const res = await this.rpc(
+        "sessions.patch",
+        { key: canonical, expectedSessionId: sessionId, archived: false },
+        15000,
+      );
+      console.log(`[OpenClaw] unarchived session ${key}: ${res?.ok === true ? "ok" : "unexpected response"}`);
+      return res?.ok === true;
+    } catch (err) {
+      console.warn(`[OpenClaw] unarchive failed for ${key}:`, err instanceof Error ? err.message : err);
+      return false;
+    }
+  }
+
   async getSessionStatus(key: string): Promise<any> {
     return this.rpc("sessions.describe", { key: this.canonicalSessionKey(key) });
   }
@@ -1704,12 +1735,21 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     const maxLines = Number.isFinite(options.maxLines)
       ? Math.max(1, Math.floor(options.maxLines!))
       : undefined;
+    const sendCompact = () => this.rpc(
+      "sessions.compact",
+      { key: this.canonicalSessionKey(key), ...(maxLines !== undefined ? { maxLines } : {}) },
+      10 * 60 * 1000,
+    );
     try {
-      return await this.rpc(
-        "sessions.compact",
-        { key: this.canonicalSessionKey(key), ...(maxLines !== undefined ? { maxLines } : {}) },
-        10 * 60 * 1000,
-      );
+      try {
+        return await sendCompact();
+      } catch (err) {
+        if (!this.isArchivedSessionError(err)) throw err;
+        console.warn(`[OpenClaw] sessions.compact hit archived session for ${key}; restoring and retrying once`);
+        const restored = await this.unarchiveSession(key);
+        if (!restored) throw err;
+        return await sendCompact();
+      }
     } finally {
       const mode = maxLines === undefined ? "semantic" : `maxLines=${maxLines}`;
       console.log(`[OpenClaw] sessions.compact (${mode}) finished for ${key} in ${Date.now() - startedAt}ms`);
@@ -1966,13 +2006,25 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       const sendStartedAt = Date.now();
       try {
         await params.onSendAttempt?.();
-        result = await this.rpc("chat.send", {
+        const sendChat = () => this.rpc("chat.send", {
           sessionKey: this.canonicalSessionKey(sk),
           message: params.message,
           attachments: params.attachments,
           deliver: params.deliver ?? false,
           idempotencyKey: randomUUID(),
         });
+        try {
+          result = await sendChat();
+        } catch (err) {
+          // The Gateway auto-archives sessions past the active-session cap; an
+          // archived session refuses new work. Restore it once and retry — the
+          // user should never have to fix this by hand.
+          if (!this.isArchivedSessionError(err)) throw err;
+          console.warn(`[OpenClaw] chat.send hit archived session for ${sk}; restoring and retrying once`);
+          const restored = await this.unarchiveSession(sk);
+          if (!restored) throw err;
+          result = await sendChat();
+        }
       } finally {
         releaseChatSendSlot();
       }

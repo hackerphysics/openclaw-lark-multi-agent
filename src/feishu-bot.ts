@@ -47,12 +47,12 @@ function steerInjectionPrefix(en: boolean): string {
     || "[New message inserted by the user mid-task; please handle it together with the current task]";
   return en ? enText : zh;
 }
-// Emergency transcript trim used only when semantic compaction cannot run.
-// The Gateway owns the transcript store (JSONL before 2026.8, SQLite after it),
-// so LMA must use sessions.compact instead of mutating storage directly.
+// Default transcript-tail trim depth for /compact. Tool-heavy group sessions can
+// easily carry 300+ events of pure tool noise, so keep a generous tail: the
+// Gateway truncates to the last N transcript events. Env override stays.
 function compactFallbackMaxLines(): number {
-  const value = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_FALLBACK_MAX_LINES || 200);
-  return Number.isFinite(value) ? Math.max(20, Math.floor(value)) : 200;
+  const value = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_FALLBACK_MAX_LINES || 800);
+  return Number.isFinite(value) ? Math.max(20, Math.floor(value)) : 800;
 }
 // After a reply is delivered, if context usage reaches this percent, send the
 // user a one-time alert to compact. 0 disables the alert.
@@ -723,7 +723,7 @@ export class FeishuBot {
             `━━━━━━━━━━━━━━━━━━`,
             `桥接层命令（单斜杠，由 openclaw-lark-multi-agent 本地处理）`,
             `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
-            `🧹 /compact — 压缩当前 bot 的 OpenClaw session`,
+            `🧹 /compact [N|maxLines=N|semantic] — 裁剪转录尾部（默认，保留最近事件）；N 指定保留条数；semantic 走 LLM 总结`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
@@ -769,7 +769,8 @@ export class FeishuBot {
         }
         if (commandName === "/compact") {
           await this.ensureSession(chatId);
-          await this.handleCompactCommand(chatId, messageId);
+          const compactArgs = cleanText.trim().split(/\s+/).slice(1).join(" ").trim();
+          await this.handleCompactCommand(chatId, messageId, compactArgs);
           markCommandSynced();
           return;
         }
@@ -3061,7 +3062,9 @@ export class FeishuBot {
     // Running: phase line + ticking elapsed footer.
     const phaseLine = view.phase === "transcript-trim"
       ? (en ? "🧹 Semantic compaction unavailable — trimming transcript safely…" : "🧹 语义压缩不可用，正在安全裁剪转录…")
-      : (en ? "🧹 Compacting session…" : "🧹 正在压缩 session…");
+      : view.phase === "trim"
+        ? (en ? "🧹 Trimming transcript tail (keeping the most recent events)…" : "🧹 正在裁剪转录尾部（保留最近的事件）…")
+        : (en ? "🧹 Compacting session…" : "🧹 正在压缩 session…");
     const footer = en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`;
     return {
       schema: "2.0",
@@ -3836,24 +3839,47 @@ export class FeishuBot {
    * Handle /compact command: compress session context.
    */
   /**
-   * Compact a session with a Gateway-owned fallback chain:
-   *   1. Semantic compaction through `sessions.compact`.
-   *   2. If summarization cannot run, ask the same RPC to retain only a bounded
-   *      transcript tail via `maxLines`. This works with legacy JSONL and the
-   *      SQLite session store introduced in OpenClaw 2026.8.x, and preserves
-   *      OpenClaw's write locks, transcript invariants, and migration ownership.
+   * Compact a session via Gateway-owned RPCs. LMA deliberately never opens or
+   * rewrites OpenClaw transcript storage.
    *
-   * LMA deliberately never opens or rewrites OpenClaw transcript storage.
+   * Modes (kept strictly separate so the flows are never mixed):
+   *   - "trim" (default): `sessions.compact` with `maxLines` — permanently keeps
+   *     only the last N transcript events. Model-free, fast, never times out on
+   *     oversized sessions.
+   *   - "semantic": LLM summarization via the same RPC; on failure falls back to
+   *     a trim so the session is still reclaimed.
    */
   private async compactWithFallback(
     sessionKey: string,
-    onPhase?: (phase: "native" | "transcript-trim") => void,
+    onPhase?: (phase: "native" | "transcript-trim" | "trim") => void,
+    opts: { mode?: "trim" | "semantic"; maxLines?: number } = {},
   ): Promise<{
     compacted: boolean;
     method: "native" | "transcript-trim" | "none";
     reason?: string;
     detail?: string;
   }> {
+    const mode = opts.mode === "semantic" ? "semantic" : "trim";
+    const trimMaxLines = Number.isFinite(opts.maxLines) && (opts.maxLines as number) >= 20
+      ? Math.floor(opts.maxLines as number)
+      : compactFallbackMaxLines();
+
+    if (mode === "trim") {
+      onPhase?.("trim");
+      try {
+        const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines: trimMaxLines });
+        if (trimmed?.compacted === true) {
+          const kept = typeof trimmed?.kept === "number" ? trimmed.kept : trimMaxLines;
+          return { compacted: true, method: "transcript-trim", detail: `kept ${kept} transcript events` };
+        }
+        const trimReason = typeof trimmed?.reason === "string" ? trimmed.reason : undefined;
+        return { compacted: false, method: "none", reason: trimReason || "transcript trim made no change" };
+      } catch (err) {
+        return { compacted: false, method: "none", reason: (err as Error).message };
+      }
+    }
+
+    // semantic mode: LLM summarize first, trim as fallback.
     let nativeReason: string | undefined;
     try {
       const res = await this.openclawClient.compactSession(sessionKey);
@@ -3864,11 +3890,10 @@ export class FeishuBot {
     }
 
     onPhase?.("transcript-trim");
-    const maxLines = compactFallbackMaxLines();
     try {
-      const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines });
+      const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines: trimMaxLines });
       if (trimmed?.compacted === true) {
-        const kept = typeof trimmed?.kept === "number" ? trimmed.kept : maxLines;
+        const kept = typeof trimmed?.kept === "number" ? trimmed.kept : trimMaxLines;
         return {
           compacted: true,
           method: "transcript-trim",
@@ -3893,24 +3918,34 @@ export class FeishuBot {
     }
   }
 
-  private async handleCompactCommand(chatId: string, messageId: string): Promise<void> {
+  private async handleCompactCommand(chatId: string, messageId: string, args = ""): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     const en = this.isEn(chatId);
-    // Large sessions can take tens of seconds to compact (native compaction may
-    // even time out before the transcript-trim fallback kicks in). Show a ticking
-    // "compacting…" card so the user can SEE it is working instead of staring at
-    // nothing and assuming nothing is happening. The card is created lazily, so
-    // a fast compaction that finishes quickly never flashes a card at all.
+    // Argument parsing — modes are strictly separated:
+    //   /compact                 → transcript tail trim (default, model-free)
+    //   /compact semantic        → LLM summarization (trim fallback on failure)
+    //   /compact 500             → tail trim keeping the last 500 events
+    //   /compact maxLines=500    → same as above
+    const argTokens = args.split(/\s+/).filter(Boolean);
+    let mode: "trim" | "semantic" = "trim";
+    let maxLines: number | undefined;
+    for (const tok of argTokens) {
+      const semanticMatch = /^(semantic|summarize|llm)$/i.exec(tok);
+      if (semanticMatch) { mode = "semantic"; continue; }
+      const linesMatch = /^(?:maxlines|max_lines)[=:](\d{2,})$/i.exec(tok) || /^(\d{2,})$/.exec(tok);
+      if (linesMatch) { maxLines = Number(linesMatch[1] || linesMatch[2]); continue; }
+    }
     const progress = new CompactProgressController({
       create: (view) => this.sendOrdered(chatId, () => this.replyCompactCard(messageId, view, chatId)),
       edit: (id, view) => this.sendOrdered(chatId, () => this.patchCompactCard(id, view, chatId)),
       warn: (msg, err) => console.warn(`[${this.config.name}] ${msg}`, err instanceof Error ? err.message : err),
     }, { locale: en ? "en" : "zh" });
+    if (mode === "trim") progress.toTrim();
     progress.start();
     try {
       const r = await this.compactWithFallback(sessionKey, (phase) => {
         if (phase === "transcript-trim") void progress.toTranscriptTrim().catch(() => {});
-      });
+      }, { mode, maxLines });
       if (r.compacted) {
         // If a card was shown, patch it in place; otherwise (fast finish, no card)
         // fall back to a normal reply so the user still gets confirmation.
