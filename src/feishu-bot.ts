@@ -40,6 +40,37 @@ const AUTO_RETRY_DONE_PHRASE_EN = process.env.OPENCLAW_LARK_MULTI_AGENT_AUTO_RET
 // it is a NEW user message that arrived while it was still working, and should
 // be handled together with the current task. The live-status card and reactions
 // still key off the ORIGINAL text; only what OpenClaw receives is wrapped.
+/** Damerau-Levenshtein distance (insert/delete/substitute/transpose), bounded. */
+function damerauLevenshtein(a: string, b: string): number {
+  const la = a.length, lb = b.length;
+  if (Math.abs(la - lb) > 1) return 2; // fast reject for threshold-1 use
+  const d: number[][] = Array.from({ length: la + 1 }, () => new Array(lb + 1).fill(0));
+  for (let i = 0; i <= la; i++) d[i][0] = i;
+  for (let j = 0; j <= lb; j++) d[0][j] = j;
+  for (let i = 1; i <= la; i++) {
+    for (let j = 1; j <= lb; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost);
+      if (i > 1 && j > 1 && a[i - 1] === b[j - 2] && a[i - 2] === b[j - 1]) {
+        d[i][j] = Math.min(d[i][j], d[i - 2][j - 2] + 1);
+      }
+    }
+  }
+  return d[la][lb];
+}
+
+/** Find a bridge command within one edit of `name` (typo hint); undefined if none. */
+function findNearMissCommand(name: string, commands: Set<string>): string | undefined {
+  if (!name.startsWith("/") || name.length < 3) return undefined;
+  let best: string | undefined;
+  for (const cmd of commands) {
+    if (damerauLevenshtein(name, cmd) <= 1) {
+      if (best === undefined || cmd.length < best.length) best = cmd;
+    }
+  }
+  return best;
+}
+
 function steerInjectionPrefix(en: boolean): string {
   const zh = process.env.OPENCLAW_LARK_MULTI_AGENT_STEER_PREFIX
     || "【用户中途插入的新消息，请与当前任务一起处理】";
@@ -631,6 +662,28 @@ export class FeishuBot {
       const commandName = preliminaryCommandName;
       const bridgeCommands = preliminaryBridgeCommands;
       const isCommand = isBridgeCommand && bridgeCommands.has(commandName);
+      // Typo hint: a near-miss single-slash command (e.g. "/chiarman") must not
+      // silently fall through into the chairman/model chat path — that is how
+      // "I set the chairman but someone else keeps answering" confusion starts.
+      if (!isCommand && isBridgeCommand) {
+        const nearMiss = findNearMissCommand(commandName, bridgeCommands);
+        if (nearMiss) {
+          const groupBotCount = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store).length;
+          const shouldHint = chatType === "p2p"
+            || (routing.hasTargetedMention ? routing.isCurrentBotMentioned : (groupBotCount === 1 || this.isDiscussionCoordinator()));
+          if (shouldHint) {
+            const en = this.isEn(chatId);
+            await this.replyMessage(messageId, en
+              ? `❓ Unknown command \`${commandName}\`. Did you mean \`${nearMiss}\`?\nRe-send the correct command to execute it. Commands starting with // are passed to OpenClaw.`
+              : `❓ 未知命令 \`${commandName}\`，你是想输入 \`${nearMiss}\` 吗？\n重新发送正确命令即可执行；双斜杠 // 开头的命令会转交给 OpenClaw。`);
+            if (insertedId > 0) {
+              this.store.markSynced(this.config.name, chatId, insertedId);
+              this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
+            }
+            return;
+          }
+        }
+      }
       if (isCommand) {
         // In group chats, most bridge commands must be explicitly routed to this
         // bot or @all. /discuss is a group-level command, so an unmentioned
@@ -3192,6 +3245,15 @@ export class FeishuBot {
     const model = this.replyModelFooters.get(messageId);
     const status = this.replyStatusFooters.get(messageId);
     const card = this.buildMarkdownCard(text, model, status);
+    // Best-effort chat resolution for chunked/error paths: the reply target is
+    // normally a stored inbound message, so the store knows its chat.
+    const resolveChatId = (): string | undefined => {
+      try {
+        return this.store.getMessageByMessageId(messageId)?.chatId || undefined;
+      } catch {
+        return undefined;
+      }
+    };
     try {
       const res = await this.client.im.message.reply({
         path: { message_id: messageId },
@@ -3201,17 +3263,32 @@ export class FeishuBot {
         },
       });
       return (res as any)?.data?.message_id || (res as any)?.message_id;
-    } catch {
+    } catch (err) {
+      const chatId = resolveChatId();
+      if (this.isOutOfChatError(err) && chatId) this.markCurrentBotUnavailable(chatId, err);
+      // Content over Feishu's per-message limit: chunk and deliver instead of
+      // retrying the same oversized payload (retries would fail forever).
+      if (this.isContentTooLongError(err) && chatId) {
+        return await this.sendChunkedText(chatId, text, model, status, messageId);
+      }
       // Fallback to plain text if card fails; retain model attribution.
       const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · ${status}` : ""}` : text;
-      const res = await this.client.im.message.reply({
-        path: { message_id: messageId },
-        data: {
-          content: JSON.stringify({ text: fallbackText }),
-          msg_type: "text",
-        },
-      });
-      return (res as any)?.data?.message_id || (res as any)?.message_id;
+      try {
+        const res = await this.client.im.message.reply({
+          path: { message_id: messageId },
+          data: {
+            content: JSON.stringify({ text: fallbackText }),
+            msg_type: "text",
+          },
+        });
+        return (res as any)?.data?.message_id || (res as any)?.message_id;
+      } catch (fallbackErr) {
+        if (this.isOutOfChatError(fallbackErr) && chatId) this.markCurrentBotUnavailable(chatId, fallbackErr);
+        if (this.isContentTooLongError(fallbackErr) && chatId) {
+          return await this.sendChunkedText(chatId, text, model, status, messageId);
+        }
+        throw fallbackErr;
+      }
     }
   }
 
@@ -3542,6 +3619,55 @@ export class FeishuBot {
     }
   }
 
+  /** Feishu code 230025: message content over the per-message limit. */
+  private isContentTooLongError(err: unknown): boolean {
+    const e = err as any;
+    const code = e?.response?.data?.code ?? e?.data?.code ?? e?.code;
+    const msg = String(e?.response?.data?.msg ?? e?.data?.msg ?? e?.message ?? e?.msg ?? "");
+    return code === 230025 || msg.includes("230025") || /length of the message content/i.test(msg);
+  }
+
+  /** Split text into Feishu-safe chunks (default well under the 4000-char text limit).
+   * Prefers paragraph, then line boundaries; hard-cuts only when a single line
+   * is longer than the limit. Joining all chunks reproduces the original text. */
+  private splitIntoChunks(text: string, limit = 3200): string[] {
+    if (text.length <= limit) return [text];
+    const chunks: string[] = [];
+    let rest = text;
+    while (rest.length > limit) {
+      let cut = rest.lastIndexOf("\n\n", limit);
+      if (cut < limit * 0.5) cut = rest.lastIndexOf("\n", limit);
+      if (cut < limit * 0.5) cut = rest.lastIndexOf(" ", limit);
+      if (cut < limit * 0.5) cut = limit;
+      chunks.push(rest.slice(0, cut));
+      rest = rest.slice(cut).replace(/^\n+/, "");
+    }
+    if (rest.length > 0) chunks.push(rest);
+    return chunks;
+  }
+
+  /** Deliver oversized content as multiple plain-text messages (used on 230025).
+   * Keeps the model footer on the final chunk. Returns the first message id. */
+  private async sendChunkedText(chatId: string, text: string, model: string | undefined, status: string | undefined, replyTo?: string): Promise<string | undefined> {
+    const suffix = model?.trim() ? `\n\n🧠 ${model.trim()}${status ? ` · ${status}` : ""}` : "";
+    const chunks = this.splitIntoChunks(text);
+    if (suffix && chunks.length > 0) chunks[chunks.length - 1] += suffix;
+    let firstId: string | undefined;
+    for (let i = 0; i < chunks.length; i++) {
+      const payload: any = {
+        content: JSON.stringify({ text: chunks[i] }),
+        msg_type: "text",
+      };
+      const res = replyTo
+        ? await this.client.im.message.reply({ path: { message_id: replyTo }, data: payload })
+        : await this.client.im.message.create({ params: { receive_id_type: "chat_id" }, data: { receive_id: chatId, ...payload } });
+      const id = (res as any)?.data?.message_id || (res as any)?.message_id;
+      if (i === 0) firstId = id;
+    }
+    this.store.clearBotUnavailableInChat(this.config.name, chatId);
+    return firstId;
+  }
+
   private async sendMessage(chatId: string, text: string): Promise<string | undefined> {
     const model = this.sendModelFooters.get(chatId);
     const status = this.sendStatusFooters.get(chatId);
@@ -3560,6 +3686,16 @@ export class FeishuBot {
     } catch (err) {
       console.warn(`[${this.config.name}] sendMessage interactive failed:`, JSON.stringify((err as any)?.response?.data || (err as any)?.data || { message: (err as Error).message }));
       if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
+      // Content over Feishu's per-message limit: chunk and deliver instead of
+      // retrying the same oversized payload (retries would fail forever).
+      if (this.isContentTooLongError(err)) {
+        try {
+          return await this.sendChunkedText(chatId, text, model, status);
+        } catch (chunkErr) {
+          console.warn(`[${this.config.name}] sendMessage chunked delivery failed:`, (chunkErr as Error).message);
+          throw chunkErr;
+        }
+      }
       // Fallback to plain text; retain model attribution.
       try {
         const fallbackText = model?.trim() ? `${text}\n\n🧠 ${model.trim()}${status ? ` · ${status}` : ""}` : text;
@@ -3576,6 +3712,9 @@ export class FeishuBot {
       } catch (fallbackErr) {
         console.warn(`[${this.config.name}] sendMessage text failed:`, JSON.stringify((fallbackErr as any)?.response?.data || (fallbackErr as any)?.data || { message: (fallbackErr as Error).message }));
         if (this.isOutOfChatError(fallbackErr)) this.markCurrentBotUnavailable(chatId, fallbackErr);
+        if (this.isContentTooLongError(fallbackErr)) {
+          return await this.sendChunkedText(chatId, text, model, status);
+        }
         throw fallbackErr;
       }
     }

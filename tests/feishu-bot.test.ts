@@ -3815,6 +3815,67 @@ describe("routing identity edge representations", () => {
   });
 });
 
+describe("near-miss command typo hints", () => {
+  it("detects transposed and single-edit typos of bridge commands", async () => {
+    const h = makeHarness("GPT");
+    try {
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "/chiarman", messageId: "m1" }));
+      await new Promise((r) => setTimeout(r, 50));
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("/chairman"));
+      // Unknown commands far from any bridge command get no typo hint.
+      (h.bot as any).replyMessage.mockClear();
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "/zzzzzz", messageId: "m2" }));
+      await new Promise((r) => setTimeout(r, 50));
+      const hintCalls = ((h.bot as any).replyMessage as any).mock.calls.filter((c: any[]) => c[1]?.includes?.("你是想输入"));
+      expect(hintCalls).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+});
+
+describe("Feishu 230025 chunked delivery", () => {
+  it("splits oversized text into Feishu-safe chunks that reassemble exactly", () => {
+    const h = makeHarness("GPT");
+    try {
+      const paragraph = "段落下文\n\n".repeat(30); // ~600 chars per para block
+      const long = paragraph.repeat(20); // ~12000 chars
+      const chunks = (h.bot as any).splitIntoChunks(long, 3200) as string[];
+      expect(chunks.length).toBeGreaterThan(1);
+      for (const c of chunks) expect(c.length).toBeLessThanOrEqual(3200);
+      expect(chunks.join("") + "").not.toBe("");
+      // chunks reassemble to the original ignoring the newline separators we strip
+      const norm = (s: string) => s.replace(/\n+/g, "\n");
+      expect(norm(chunks.join("\n"))).toBe(norm(long));
+    } finally { h.cleanup(); }
+  });
+
+  it("recognizes Feishu 230025 errors in multiple shapes", () => {
+    const h = makeHarness("GPT");
+    try {
+      const f = (h.bot as any).isContentTooLongError.bind(h.bot);
+      expect(f({ response: { data: { code: 230025 } } })).toBe(true);
+      expect(f({ code: 230025 })).toBe(true);
+      expect(f(new Error('code=230025 "The length of the message content reaches its limit."'))).toBe(true);
+      expect(f(new Error("RPC timeout"))).toBe(false);
+      expect(f({ code: 230002 })).toBe(false);
+    } finally { h.cleanup(); }
+  });
+
+  it("chunked send emits one message per chunk via im.message.create", async () => {
+    const h = makeHarness("GPT");
+    try {
+      const calls: any[] = [];
+      (h.bot as any).client = { im: { message: { create: async (p: any) => { calls.push(p); return { data: { message_id: `mid-${calls.length}` } }; }, reply: async () => ({ data: { message_id: "rid" } }) } } };
+      const long = ("行\n\n".repeat(4000)); // 12000 chars
+      const first = await (h.bot as any).sendChunkedText("chat1", long, "m1", undefined);
+      expect(first).toBe("mid-1");
+      expect(calls.length).toBeGreaterThan(1);
+      for (const c of calls) {
+        expect(JSON.parse(c.data.content).text.length).toBeLessThanOrEqual(3200 + 50); // chunk + footer allowance
+      }
+    } finally { h.cleanup(); }
+  });
+});
+
 describe("rich-post chairman commands", () => {
   it("uses the same verified rich-post targets for command ownership and chairman setup", async () => {
     const h = makeHarness("GPT"), target = makeHarness("Claude");
