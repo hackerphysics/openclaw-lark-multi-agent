@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
@@ -165,6 +166,64 @@ export class FeishuBot {
   private replyStatusFooters = new Map<string, string>();
   private sendStatusFooters = new Map<string, string>();
   /** Go / Go-Checker supervision controller (per-bot instance). */
+  private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;stage:string;ordinals:Map<string,number>;blocked?:boolean}>();
+  private readonly goReceiptApis = new WeakSet<object>();
+  private installGoReceiptCapture(): void {
+    const docx=(this.client as any).docx;
+    const candidates=[
+      ...Array.from(new Set([this.client.im.message,(this.client.im as any).v1?.message].filter(Boolean))).map(api=>({api,operations:["create","reply"],visible:true})),
+      {api:this.client.im.file,operations:["create"],visible:false},
+      {api:this.client.im.image,operations:["create"],visible:false},
+      {api:docx?.document,operations:["create","convert"],visible:false},
+      {api:docx?.documentBlockDescendant,operations:["create"],visible:false},
+    ];
+    for (const {api,operations,visible} of candidates as Array<{api:any;operations:string[];visible:boolean}>) {
+    if(!api || this.goReceiptApis.has(api)) continue;
+    this.goReceiptApis.add(api);
+    for (const operation of operations) {
+      const original=api[operation]?.bind(api);
+      if(!original) continue;
+      api[operation]=async(params:any)=>{
+        const context=this.goDeliveryReceipts.getStore();
+        const ordinal=context?.ordinals.get(context.stage) ?? 0;
+        context?.ordinals.set(context.stage,ordinal+1);
+        const key=`outbox:${context?.outboxId}:${context?.stage}:${ordinal}`;
+        const previous=context?.goId ? this.store.getGoDeliveryOperation(context.goId,key) : null;
+        if(previous?.state==="rejected") {
+          const failure=JSON.parse(previous.response_json);
+          throw Object.assign(new Error(failure.message),{code:failure.code,response:{data:{code:failure.code,msg:failure.message}}});
+        }
+        if(context?.blocked || (previous && previous.state!=="accepted")) throw new Error("Go delivery outcome unknown; original operation cannot be replayed");
+        let result:any;
+        if(previous?.state==="accepted") result=JSON.parse(previous.response_json).result;
+        else {
+          if(context?.goId) this.store.recordGoDeliveryOperation(context.goId,key,"attempted");
+          try {result=await original(params);} catch(err) {
+            if(context?.goId) {
+              const error=err as any;
+              const code=error?.response?.data?.code ?? error?.data?.code ?? error?.code;
+              const status=error?.response?.status;
+              // A documented API rejection is not a lost response. Cache it so
+              // deterministic card/text fallback can proceed without repeating it.
+              if(Number.isFinite(Number(code)) && Number(code)>0 || Number.isInteger(status) && status>=400 && status<500) {
+                this.store.recordGoDeliveryOperation(context.goId,key,"rejected",{code,message:error?.response?.data?.msg ?? error?.message ?? "platform rejected"});
+              } else {this.store.recordGoDeliveryOperation(context.goId,key,"unknown");context.blocked=true;}
+            }
+            throw err;
+          }
+        }
+        const id=result?.data?.message_id ?? result?.message_id;
+        if(visible && context?.goId && !id) {this.store.recordGoDeliveryOperation(context.goId,key,"unknown");context.blocked=true;throw new Error("Missing actual Go platform message receipt");}
+        if(context?.goId) this.store.recordGoDeliveryOperation(context.goId,key,"accepted",{result,payload:visible ? params.data : undefined,operation});
+        if(visible && context && typeof id==="string" && id) {
+          context.receipts.push({messageId:id,operation:previous?.state==="accepted" ? JSON.parse(previous.response_json).operation : operation,payload:previous?.state==="accepted" ? JSON.parse(previous.response_json).payload : params.data});
+          context.onReceipt(); // Persist before the next chunk or attachment operation.
+        }
+        return result;
+      };
+    }
+    }
+  }
   private goController: GoController | null = null;
   /** Per-chat durable outbox retry timer. */
   private deliveryRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
@@ -212,6 +271,8 @@ export class FeishuBot {
       appType: lark.AppType.SelfBuild,
     });
 
+    this.installGoReceiptCapture();
+
     this.wsClient = new lark.WSClient({
       appId: config.appId,
       appSecret: config.appSecret,
@@ -246,8 +307,15 @@ export class FeishuBot {
         if (sessionId !== job.executorSessionId) continue;
         const sourceKey = `${channel}:${runId}:${event.message?.id ?? event.id ?? event.seq ?? "unidentified"}`;
         if (sourceKey.endsWith(":unidentified")) continue;
+        const message=event.message;
+        const text=message?.role==="assistant" && Array.isArray(message.content)
+          ? message.content.filter((part:any)=>part.type==="text").map((part:any)=>part.text ?? "").join("\n")
+          : event.stream==="assistant" ? (event.data?.text ?? event.data?.delta ?? "") : "";
+        const terminal=event.stream==="lifecycle" && ["end","error"].includes(event.data?.phase);
+        if(!text && !terminal && !event.attachments?.length) continue;
         this.store.recordGoVisibleEvidence(job.id, sourceKey, { sessionId, runId, kind: channel,
-          text: JSON.stringify(payload), attachments: event.attachments ?? event.message?.attachments ?? [] });
+          text, attachments: event.attachments ?? message?.attachments ?? [] });
+        if(terminal) this.goController?.notifyRunOutcome(job.chatId,"no_reply",sourceKey,"精确 run 终局状态更新；不等于投递/验收通过");
       }
     });
     this.store.onClose(() => unobserveGo?.());
@@ -1076,6 +1144,7 @@ export class FeishuBot {
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot, chatId, routing)) return;
       if (!isBot && insertedId > 0) {
+        this.goController?.onHumanInput(chatId);
         this.store.markPendingTrigger(this.config.name, chatId, insertedId);
       }
 
@@ -1491,6 +1560,8 @@ export class FeishuBot {
         }
       }
 
+      let foregroundRunId: string | undefined;
+      const foregroundSessionId = this.store.getActiveGoJob(this.config.name,chatId)?.executorSessionId;
       let runAcceptedByOpenClaw = false;
       let liveStatus: LiveStatusController | undefined;
       try {
@@ -1544,6 +1615,7 @@ export class FeishuBot {
               markSubmittedBatch("send-attempt");
             },
             onSubmitted: (runId: string) => {
+              foregroundRunId = runId;
               runAcceptedByOpenClaw = true;
               const target = this.activeDeliveryTargets.get(chatId);
               if (target?.triggerId === triggerId) {
@@ -1702,6 +1774,7 @@ export class FeishuBot {
                 lastHuman.messageId,
                 `trigger:${triggerId}`,
                 this.config.model,
+                foregroundRunId && foregroundSessionId ? {runId:foregroundRunId,sessionKey,sessionId:foregroundSessionId,final:true} as ProactiveMessageMeta : undefined,
               );
               await liveStatus?.complete();
               // Mark every merged trigger as delivered so retries/restarts do
@@ -1711,7 +1784,7 @@ export class FeishuBot {
               void this.maybeAlertHighContext(chatId);
               // Go supervision: record the delivered final reply as evidence and
               // arm a debounced checker round (busy gates apply inside).
-              this.goController?.notifyRunOutcome(chatId, "assistant_reply", `trigger:${triggerId}`, shouldReply ? visibleReply : "(仅附件回复)");
+              // Actual body/attachment receipts are recorded by dispatchPendingDeliveries.
             } catch (err) {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
@@ -2601,7 +2674,7 @@ export class FeishuBot {
           replyToMessageId: replyToMessageId || "",
           deliveryMode: "send",
           targetMessageId: "",
-          deliveryMetaJson: "{}",
+          deliveryMetaJson,
         });
       }
 
@@ -2735,15 +2808,26 @@ export class FeishuBot {
   }
 
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
+    this.installGoReceiptCapture();
     let retryScheduled = false;
     while (true) {
       const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
       if (pending.length === 0) break;
       for (const item of pending) {
-        await this.sendOrdered(chatId, async () => {
+        const receipts: Array<{messageId:string;operation:string;payload:unknown}> = [];
+        await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:this.store.getActiveGoJob(this.config.name,chatId)?.id,outboxId:item.id!,stage:"body",ordinals:new Map(),onReceipt:()=>{
+          const job=this.store.getActiveGoJob(this.config.name,chatId);
+          if(job) this.store.recordGoDeliveryReceipt(job.id,`outbox:${item.id}`,{messages:receipts,partial:true});
+        }}, async () => {
         if (!item.id || !this.store.claimDelivery(item.id)) return;
         let failureStage: "text" | "attachment" | "cleanup" = "text";
         try {
+          const job = this.store.getActiveGoJob(this.config.name, chatId);
+          const provenance = JSON.parse(item.deliveryMetaJson || "{}").provenance;
+          const goSource = `outbox:${item.id}`;
+          const eligible = job && ["assistant_visible","verbose_transcript","run_error","provider_error","delayed_error","proactive"].some(k=>item.sourceType.startsWith(k));
+          if (eligible) this.store.recordGoVisibleEvidence(job.id,goSource,{sessionId:provenance?.sessionId ?? "",
+            runId:provenance?.runId ?? "",kind:item.sourceType,text:item.content,attachments:JSON.parse(item.attachmentsJson || "[]")});
           const attachments = JSON.parse(item.attachmentsJson || "[]") as BridgeAttachment[];
 
           // Final text is always sent as a NEW message. Never patch it into the
@@ -2808,6 +2892,8 @@ export class FeishuBot {
           failureStage = "attachment";
           const cursor = Math.max(0, item.attachmentCursor || 0);
           for (let i = cursor; i < attachments.length; i++) {
+            const context=this.goDeliveryReceipts.getStore();
+            if(context) context.stage=`attachment:${i}`;
             await this.sendBridgeAttachment(chatId, attachments[i]);
             this.store.markDeliveryAttachmentCursor(item.id, i + 1);
           }
@@ -2824,8 +2910,17 @@ export class FeishuBot {
             this.store.markDeliveryCleanupPending(item.id, false);
           }
 
+          if (eligible && receipts.length) {
+            const previous = this.store.listGoVisibleEvidence(job.id).find(e=>e.sourceKey===goSource)?.receipt;
+            this.store.recordGoDeliveryReceipt(job.id,goSource,{messages:[...(previous?.messages ?? []),...receipts],outboxId:item.id});
+            if (provenance?.runId && provenance?.sessionId === job.executorSessionId) {
+              this.goController?.notifyRunOutcome(chatId,["run_error","provider_error","delayed_error"].some(k=>item.sourceType.startsWith(k)) ? "run_error" : "assistant_reply",goSource,JSON.stringify({text:item.content,attachments,receipt:receipts}));
+            }
+          }
           this.store.markDeliveryDelivered(item.id);
         } catch (err) {
+          const activeJob = this.store.getActiveGoJob(this.config.name,chatId);
+          if (activeJob && receipts.length) this.store.recordGoDeliveryReceipt(activeJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
           const willRetry = this.store.retryDelivery(item.id, DELIVERY_MAX_ATTEMPTS);
           if (willRetry) {
@@ -2859,7 +2954,7 @@ export class FeishuBot {
             console.warn(`[${this.config.name}] Failed to notify terminal delivery error:`, this.errorSummary(notifyErr));
           }
         }
-        });
+        }));
       }
       // Drain subsequent pages immediately after successful batches. If any row
       // was returned to pending, honor its backoff timer instead of hot-looping.

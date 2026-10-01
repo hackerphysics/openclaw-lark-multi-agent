@@ -45,3 +45,29 @@ describe("Go public integration isolated synthetic loop", () => {
     }finally{store.close();rmSync(dir,{recursive:true,force:true});}
   });
 });
+
+
+describe("Go public original-result reconciliation",()=>{
+ it("requires exact generation/run and committed terminalReply, not inferred session text",async()=>{
+  const client=Object.create(OpenClawClient.prototype) as any;
+  client.getSessionInfo=async()=>({session:{sessionId:"generation"}});
+  client.rpc=async()=>({runId:"original",status:"ok",endedAt:42,terminalReply:{disposition:"visible",text:"original verdict"}});
+  await expect(client.readGoRunResult({sessionKey:"checker",sessionId:"generation",runId:"original"})).resolves.toBe("original verdict");
+  await expect(client.readGoRunResult({sessionKey:"checker",sessionId:"new-generation",runId:"original"})).resolves.toBeNull();
+  await expect(client.readGoRunResult({sessionKey:"checker",sessionId:"generation",runId:"other"})).resolves.toBeNull();
+  client.rpc=async()=>({runId:"original",status:"ok",endedAt:42});
+  await expect(client.readGoRunResult({sessionKey:"checker",sessionId:"generation",runId:"original"})).resolves.toBeNull();
+ });
+});
+
+describe("Go exact admitted run collector",()=>{
+ it("never accepts another run's verdict via session-key fallback",async()=>{
+  const client=new OpenClawClient({baseUrl:"ws://localhost",token:"synthetic"} as any);
+  const key="agent:main:checker";const events:any[]=[];(client as any).agentEvents=new Map([[key,events]]);
+  (client as any).rpc=async()=>({runId:"owned",status:"running"});
+  const pending=client.collectGoRun({runId:"owned",sessionKey:key,timeoutMs:2000});
+  events.push({runId:"unowned",sessionKey:key,stream:"assistant",data:{delta:"forged COMPLETE"}}, {runId:"unowned",sessionKey:key,stream:"lifecycle",data:{phase:"end"}});
+  setTimeout(()=>events.push({runId:"owned",sessionKey:key,stream:"assistant",data:{delta:"owned WAIT"}},{runId:"owned",sessionKey:key,stream:"lifecycle",data:{phase:"end",livenessState:"working"}}),25);
+  await expect(pending).resolves.toBe("owned WAIT");
+ });
+});

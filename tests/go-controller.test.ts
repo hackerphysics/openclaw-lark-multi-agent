@@ -5,6 +5,7 @@ import { join } from "node:path";
 // Timers must never auto-fire during tests: cycles are driven manually.
 process.env.OPENCLAW_LARK_MULTI_AGENT_GO_CHECK_DELAY_MS = "3600000";
 import { MessageStore } from "../src/message-store.js";
+import { checkTool } from "../plugins/lma-go/src/policy.js";
 import { GoController, parseGoVerdict } from "../src/go-controller.js";
 
 type Harness = ReturnType<typeof makeHarness>;
@@ -18,21 +19,27 @@ function makeHarness(botName = "GPT") {
   const repliesToUser: Array<[string, string]> = [];
   const sessions = new Map<string, any>();
   let running = false;
+  const requests=new Map<string,string>();
   const client = {
     sessions, sent, checkerReplies,
-    async verifyGoSafety() { return { checkerToolsIsolated: true, exactTaskAndDeliveryGate: true, guardedSend: true }; },
+    async verifyGoSafety() { return {checkerToolsIsolated:Boolean(checkTool([{checkerSessionKey:"agent:main:checker",checkerSessionId:"checker-proof",executorSessionKey:"agent:main:executor",executorSessionId:"executor-proof",goalId:"goal"}],{toolName:"exec",params:{}},{sessionId:"checker-proof"})?.block),exactTaskAndDeliveryGate:typeof client.readGoRuntimeSnapshot==="function",guardedSend:typeof client.sendGoGuarded==="function"}; },
+    async initializeGoRuntime(p:any) { return {nativeGoalId:"goal",executorSessionId:p.executorSessionId,checkerSessionId:p.checkerSessionId,checkerRunId:"checker-root",executorRunIds:["executor-root"],goalUpdatedAt:1,goalRevision:1}; },
+    async completeGoNativeGoalCas(p:any) { if (p.expectedGoalRevision!==1) throw new Error("CAS conflict"); return {goalId:"goal",revision:2}; },
+    async readGoRuntimeSnapshot(sessionKey:string,sessionId:string) { return {sessionKey:sessionKey.startsWith("agent:") ? sessionKey : `agent:main:${sessionKey}`,sessionId,goalId:"goal",goalRevision:1,executorRunIds:store.getGoNativeIdentity(1)?.executorRunIds ?? ["executor-root"],checkerRunId:store.getGoNativeIdentity(1)?.checkerRunId ?? "checker-root",complete:true,archived:false,queuedInputs:0,recoverableInputs:0,pendingDeliveries:0,tasks:(store.getGoNativeIdentity(1)?.executorRunIds ?? ["executor-root"]).map((runId:string,i:number)=>({taskId:`root-${i}`,runId,parentTaskId:null,state:running?"running":"completed",deliveryState:"delivered"}))}; },
+    async sendGoGuarded(p:any) { requests.set(p.idempotencyKey,p.message); return {runId:p.idempotencyKey}; },
+    async collectGoRun(p:any) { const checker = p.sessionKey.includes("lma-go-"); return client.chatSendWithContext({sessionKey:p.sessionKey,currentMessage:requests.get(p.runId),unsyncedMessages:[],runId:p.runId}); },
     set running(v: boolean) { running = v; },
     get running() { return running; },
     async getSessionInfo(key: string) { return { session: sessions.get(key) || null }; },
     async getSessionRuntimeStatus(_key: string) { return { running }; },
-    async createSession(p: any) { sessions.set(p.key, { sessionId: `sid-${p.key}`, model: p.model }); return { ok: true }; },
+    async createSession(p: any) { sessions.set(p.key, { sessionId: `sid-${p.key}`, activeLeafEntryId:null, model: p.model }); return { ok: true }; },
     async chatSendWithContext(p: any) { sent.push(p); return checkerReplies.shift() ?? "OK"; },
     queueReply(r: string) { checkerReplies.push(r); },
   };
   const c = new GoController({
     botName, fallbackModel: "prov/base", store, client: client as any,
     executorSessionKeyFor: (chatId: string) => `lma-${botName.toLowerCase()}-${chatId}`,
-    notify: async (chatId, text) => { notifications.push(`${chatId}::${text}`); },
+    notify: async (chatId, text) => { notifications.push(`${chatId}::${text}`); return "synthetic-notification-id"; },
     reply: async (messageId, text) => { repliesToUser.push([messageId, text]); },
   });
   return {
@@ -42,7 +49,7 @@ function makeHarness(botName = "GPT") {
 }
 
 function primeExecutor(h: Harness, chatId = "chat1") {
-  h.client.sessions.set(`lma-gpt-${chatId}`, { sessionId: "exec-sid-1", model: "glm-5.3", modelProvider: "phgeek-gw" });
+  h.client.sessions.set(`lma-gpt-${chatId}`, { sessionId: "exec-sid-1", activeLeafEntryId:null, model: "glm-5.3", modelProvider: "phgeek-gw" });
 }
 
 async function startGo(h: Harness, goal = "完成测试目标", chatId = "chat1") {
@@ -53,6 +60,8 @@ async function startGo(h: Harness, goal = "完成测试目标", chatId = "chat1"
 }
 
 async function cycleWithEvidence(h: Harness, jobId: number, n: number, checkerReply: string, chatId = "chat1") {
+  h.store.recordGoVisibleEvidence(jobId,`src-${n}`,{sessionId:"exec-sid-1",runId:"executor-root",kind:"assistant_visible",text:"测试通过",attachments:[]});
+  h.store.recordGoDeliveryReceipt(jobId,`src-${n}`,{messageId:`fixture-${n}`});
   h.store.insertGoEvent(jobId, `src-${n}`, "assistant_reply", `第 ${n} 条结果证据：测试通过`);
   h.client.queueReply(checkerReply);
   await (h.c as any).runCheckCycle(chatId);
@@ -141,7 +150,7 @@ describe("GoController busy gates", () => {
       const job = await startGo(h);
       const sentBefore = h.sent.length;
       h.client.running = true;
-      await cycleWithEvidence(h, job.id, 1, '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}');
+      await cycleWithEvidence(h, job.id, 1, '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"],"criteria_evidence":{"C1":["E1"]}}');
       expect(h.sent.length).toBe(sentBefore); // no checker call
       expect(h.store.getGoJobById(job.id)!.state).toBe("WAITING_WORK");
     } finally { h.cleanup(); }
@@ -154,7 +163,7 @@ describe("GoController busy gates", () => {
       const rowId = h.store.insert({ chatId: "chat1", messageId: "human-1", senderType: "human", senderName: "u", content: "新指令", timestamp: Date.now(), triggerKind: "normal" });
       h.store.markPendingTrigger("GPT", "chat1", rowId);
       const sentBefore = h.sent.length;
-      await cycleWithEvidence(h, job.id, 1, '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}');
+      await cycleWithEvidence(h, job.id, 1, '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"],"criteria_evidence":{"C1":["E1"]}}');
       expect(h.sent.length).toBe(sentBefore);
       expect(h.store.getGoJobById(job.id)!.state).toBe("WAITING_WORK");
     } finally { h.cleanup(); }
@@ -225,7 +234,7 @@ describe("GoController verdicts", () => {
     const h = makeHarness();
     try {
       const job = await startGo(h);
-      const j = await cycleWithEvidence(h, job.id, 1, '{"action":"COMPLETE","summary":"全部达标","evidence_refs":["E1"]}');
+      const j = await cycleWithEvidence(h, job.id, 1, '{"action":"COMPLETE","summary":"全部达标","evidence_refs":["E1"],"criteria_evidence":{"C1":["E1"]}}');
       expect(j.state).toBe("COMPLETED");
       expect(h.notifications[0]).toContain("验收通过");
       expect(h.sent.some((p) => p.sessionKey === "lma-gpt-chat1" && p.currentMessage.includes("完成"))).toBe(false);
@@ -359,7 +368,7 @@ describe("Go safety regressions", () => {
       const cycle = (h.c as any).runCheckCycle("chat1");
       while (!finish) await Promise.resolve();
       await h.c.handleGoCommand("chat1", "m", command);
-      finish('{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}');
+      finish('{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"],"criteria_evidence":{"C1":["E1"]}}');
       await cycle;
       expect(h.store.getGoJobById(job.id)!.state).toBe(command === "stop" ? "STOPPED" : "PAUSED");
       expect(h.notifications).toHaveLength(0);
@@ -373,7 +382,7 @@ describe("Go safety regressions", () => {
       h.client.chatSendWithContext = async () => {
         const id = h.store.insert({ chatId: "chat1", messageId: "new", senderType: "human", senderName: "u", content: "new task", timestamp: Date.now(), triggerKind: "normal" });
         h.store.markPendingTrigger("GPT", "chat1", id);
-        return '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}';
+        return '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"],"criteria_evidence":{"C1":["E1"]}}';
       };
       await (h.c as any).runCheckCycle("chat1");
       expect(h.store.getGoJobById(job.id)!.state).toBe("WAITING_WORK");
@@ -385,7 +394,7 @@ describe("Go safety regressions", () => {
     try {
       const job = await startGo(h);
       h.store.insertGoEvent(job.id, "err", "run_error", "failed");
-      h.client.queueReply('{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}');
+      h.client.queueReply('{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"],"criteria_evidence":{"C1":["E1"]}}');
       await (h.c as any).runCheckCycle("chat1");
       expect(h.store.getGoJobById(job.id)!.state).toBe("PAUSED");
     } finally { h.cleanup(); }

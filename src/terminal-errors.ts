@@ -11,6 +11,7 @@ export interface ErrorProvenance {
   userStop?: boolean;
 }
 export interface ProactiveMessageMeta {
+  sessionId?: string;
   sourceType?: string;
   runId?: string;
   sessionKey?: string;

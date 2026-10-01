@@ -337,7 +337,7 @@ export class OpenClawClient {
               data: { deltaText: visibleAssistantText, delta: visibleAssistantText, replace: true },
             });
           }
-          this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId);
+          this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId, frame.payload.sessionId);
 
           // Tool calls in assistant messages — skip, using agent item events instead
           // (session.message toolCall events are batched, not real-time)
@@ -658,7 +658,7 @@ export class OpenClawClient {
     }
   }
 
-  private handleProactiveSessionMessage(rawKey: string, msg: any, runId?: string): boolean {
+  private handleProactiveSessionMessage(rawKey: string, msg: any, runId?: string, sessionId?: string): boolean {
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
 
     // Proactive assistant text messages. Cron/session-targeted runs often emit
@@ -692,7 +692,7 @@ export class OpenClawClient {
     }
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
     if (cb) {
-      if (runId) cb(proactiveText, { runId, sessionKey: this.canonicalSessionKey(rawKey), final: msg?.stopReason === "stop",
+      if (runId) cb(proactiveText, { runId, sessionId, sessionKey: this.canonicalSessionKey(rawKey), final: msg?.stopReason === "stop",
         ...(!msg?.stopReason && genericFailure(proactiveText) ? { genericErrorCandidate: true } : {}) });
       else cb(proactiveText);
     }
@@ -743,7 +743,7 @@ export class OpenClawClient {
    * reconcile the original run instead of aborting or treating a draft as final.
    * Explicit terminal/error/disconnect paths keep their existing behavior.
    */
-private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
+private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { exactRunIdentity?: boolean; emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
     let cleanupObservation = () => {};
     return new Promise<string>((resolveResult, rejectResult) => {
       // Whether we were connected when the run started. We only treat a later
@@ -1027,6 +1027,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             const eventSessionMatches = Boolean(sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey || ev.sessionKey === shortSessionKey));
             const matchesRun = evRunId ? activeRunIds.has(evRunId) : false;
 
+            if (options?.exactRunIdentity && !matchesRun) { i++; continue; }
+
             if (!sessionKey && ev.sessionKey) {
               shortSessionKey = String(ev.sessionKey).replace(/^agent:[^:]+:/, "");
               sessionKey = `agent:main:${shortSessionKey}`;
@@ -1075,7 +1077,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
 
             let matchesSession = false;
-            if (eventSessionMatches && anchorSeen) {
+            if (!options?.exactRunIdentity && eventSessionMatches && anchorSeen) {
               if (!expectedUserText) {
                 // Backward-compatible mode for tests/internal callers that do not
                 // provide an anchor: allow session-key matching as before.
@@ -2011,6 +2013,25 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       deliver: false, suppressCommandInterpretation: true });
     if (typeof result?.runId !== "string" || !result.runId) throw new Error("Unknown Go admission receipt");
     return { runId: result.runId, sessionId: p.sessionId, idempotencyKey: p.idempotencyKey, raw: result };
+  }
+  /** Collect only the admitted run; this path never performs another send. */
+  async collectGoRun(p: { runId: string; sessionKey: string; timeoutMs: number }) {
+    return this.collectReply(p.runId, p.timeoutMs, p.sessionKey, {exactRunIdentity:true});
+  }
+  async readGoRunResult(p: {sessionKey:string;sessionId:string;runId:string}) {
+    const info=await this.getSessionInfo(p.sessionKey);
+    if(info?.session?.sessionId!==p.sessionId || info.session.archived) return null;
+    const result=await this.rpc("agent.wait",{runId:p.runId,timeoutMs:1},2500);
+    if(result?.runId!==p.runId || result.status!=="ok" || !Number.isFinite(result.endedAt) || result.endedAt<=0 || result.yielded || result.pendingError) return null;
+    const reply=result.terminalReply;
+    return reply?.disposition==="visible" && typeof reply.text==="string" ? reply.text : reply?.disposition==="silent" ? "NO_REPLY" : null;
+  }
+  /** Public generation-pinned original input receipts; absence is unknown, not permission to resend. */
+  async reconcileGoSend(p: { sessionKey: string; sessionId: string; idempotencyKey: string }) {
+    const result = await this.rpc("chat.history", { sessionKey: this.canonicalSessionKey(p.sessionKey),
+      sessionId: p.sessionId, inputRunIds: [p.idempotencyKey], limit: 1 });
+    const receipt = result?.inputReceipts?.find((r: any) => r.runId === p.idempotencyKey);
+    return receipt ? { runId: receipt.runId, sessionId: p.sessionId, raw: receipt } : null;
   }
   async bindGoPolicy(binding: Record<string, string>) { return this.rpc("lma.go.bind", { binding }); }
   async readGoRuntimeSnapshot(sessionKey: string, sessionId: string) {

@@ -204,7 +204,7 @@ export class MessageStore {
       go_id INTEGER NOT NULL, source_key TEXT NOT NULL, payload_json TEXT NOT NULL,
       receipt_json TEXT NOT NULL DEFAULT '', PRIMARY KEY(go_id, source_key));`);
   }
-  bindGoNativeIdentity(goId: number, identity: { nativeGoalId: string; executorSessionId: string; checkerSessionId: string; checkerRunId?: string; executorRunIds: string[]; goalUpdatedAt: number; goalRevision: null }) {
+  bindGoNativeIdentity(goId: number, identity: { nativeGoalId: string; executorSessionId: string; checkerSessionId: string; checkerRunId?: string; executorRunIds: string[]; goalUpdatedAt: number; goalRevision: number | null }) {
     this.ensureGoIntegrationSchema();
     this.db.prepare('INSERT INTO go_native_bindings VALUES (?, ?)').run(goId, JSON.stringify(identity));
   }
@@ -212,6 +212,50 @@ export class MessageStore {
     this.ensureGoIntegrationSchema();
     const row = this.db.prepare('SELECT identity_json FROM go_native_bindings WHERE go_id=?').get(goId) as any;
     return row ? JSON.parse(row.identity_json) : null;
+  }
+  setGoCriteria(goId:number, criteria:Array<{id:string;text:string}>) {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_criteria(go_id INTEGER PRIMARY KEY,criteria_json TEXT NOT NULL)");
+    this.db.prepare("INSERT OR REPLACE INTO go_criteria VALUES (?,?)").run(goId,JSON.stringify(criteria));
+  }
+  getGoCriteria(goId:number): Array<{id:string;text:string}> {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_criteria(go_id INTEGER PRIMARY KEY,criteria_json TEXT NOT NULL)");
+    const row=this.db.prepare("SELECT criteria_json FROM go_criteria WHERE go_id=?").get(goId) as any;
+    return row ? JSON.parse(row.criteria_json) : [];
+  }
+  getGoDeliveryOperation(goId:number,key:string): any {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_delivery_operations(go_id INTEGER,operation_key TEXT,state TEXT,response_json TEXT,PRIMARY KEY(go_id,operation_key))");
+    return this.db.prepare("SELECT * FROM go_delivery_operations WHERE go_id=? AND operation_key=?").get(goId,key);
+  }
+  recordGoDeliveryOperation(goId:number,key:string,state:"attempted"|"accepted"|"unknown"|"rejected",response?:unknown) {
+    this.getGoDeliveryOperation(goId,key);
+    this.db.prepare("INSERT INTO go_delivery_operations VALUES (?,?,?,?) ON CONFLICT(go_id,operation_key) DO UPDATE SET state=excluded.state,response_json=excluded.response_json WHERE go_delivery_operations.state!='accepted'").run(goId,key,state,response===undefined?"":JSON.stringify(response));
+  }
+  recordGoRunResult(goId:number,actionKey:string,result:{state:"complete"|"unknown";text?:string;runId:string}) {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_run_results(go_id INTEGER,action_key TEXT,result_json TEXT,PRIMARY KEY(go_id,action_key))");
+    this.db.prepare("INSERT OR REPLACE INTO go_run_results VALUES (?,?,?)").run(goId,actionKey,JSON.stringify(result));
+  }
+  getGoRunResult(goId:number,actionKey:string) {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_run_results(go_id INTEGER,action_key TEXT,result_json TEXT,PRIMARY KEY(go_id,action_key))");
+    const row=this.db.prepare("SELECT result_json FROM go_run_results WHERE go_id=? AND action_key=?").get(goId,actionKey) as any;
+    return row ? JSON.parse(row.result_json) : null;
+  }
+  listUnknownGoRunResults(goId:number): Array<{actionKey:string;runId:string;sessionKey:string;sessionId:string}> {
+    this.getGoRunResult(goId,"");this.listUnresolvedGoSends(goId);
+    return (this.db.prepare("SELECT r.action_key,r.result_json,s.identity_json FROM go_run_results r JOIN go_send_identities s ON r.go_id=s.go_id AND r.action_key=s.action_key WHERE r.go_id=?").all(goId) as any[]).flatMap(r=>{
+      const result=JSON.parse(r.result_json);
+      return result.state==="unknown" ? [{actionKey:r.action_key,runId:result.runId,...JSON.parse(r.identity_json)}] : [];
+    });
+  }
+  hasUnknownGoRunResults(goId:number) {
+    this.getGoRunResult(goId,"");
+    return (this.db.prepare("SELECT result_json FROM go_run_results WHERE go_id=?").all(goId) as any[]).some(r=>JSON.parse(r.result_json).state==="unknown");
+  }
+  associateGoAdmittedRun(goId:number,runId:string,executor:boolean): void {
+    const identity=this.getGoNativeIdentity(goId);
+    if(!identity) throw new Error("Missing native identity");
+    if(executor) identity.executorRunIds=[...new Set([...identity.executorRunIds,runId])];
+    else identity.checkerRunId=runId;
+    this.db.prepare("UPDATE go_native_bindings SET identity_json=? WHERE go_id=?").run(JSON.stringify(identity),goId);
   }
   recordGoVisibleEvidence(goId: number, sourceKey: string, payload: { sessionId: string; runId: string; kind: string; text: string; attachments: unknown[] }) {
     this.ensureGoIntegrationSchema();
@@ -225,6 +269,14 @@ export class MessageStore {
     this.ensureGoIntegrationSchema();
     return (this.db.prepare('SELECT * FROM go_visible_evidence WHERE go_id=? ORDER BY rowid').all(goId) as any[])
       .map(r => ({ sourceKey: r.source_key, ...JSON.parse(r.payload_json), receipt: r.receipt_json ? JSON.parse(r.receipt_json) : null }));
+  }
+  bindGoSendIdentity(goId:number,actionKey:string,identity:{sessionKey:string;sessionId:string}) {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_send_identities(go_id INTEGER,action_key TEXT,identity_json TEXT,PRIMARY KEY(go_id,action_key))");
+    this.db.prepare("INSERT OR IGNORE INTO go_send_identities VALUES (?,?,?)").run(goId,actionKey,JSON.stringify(identity));
+  }
+  listUnresolvedGoSends(goId:number): Array<{actionKey:string;idempotencyKey:string;sessionKey:string;sessionId:string}> {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_send_identities(go_id INTEGER,action_key TEXT,identity_json TEXT,PRIMARY KEY(go_id,action_key))");
+    return (this.db.prepare("SELECT s.*,l.idempotency_key FROM go_send_identities s JOIN go_action_lifecycle l ON s.go_id=l.go_id AND s.action_key=l.action_key WHERE s.go_id=? AND l.state!='accepted'").all(goId) as any[]).map(r=>({actionKey:r.action_key,idempotencyKey:r.idempotency_key,...JSON.parse(r.identity_json)}));
   }
   recordGoActionAttempt(goId: number, actionKey: string) {
     this.ensureGoIntegrationSchema();
@@ -1543,7 +1595,7 @@ export class MessageStore {
   }
 
   hasUnresolvedGoActions(goId: number): boolean {
-    return !!this.db.prepare(`SELECT 1 FROM go_actions WHERE go_id=? AND done=0 LIMIT 1`).get(goId);
+    return !!this.db.prepare(`SELECT 1 FROM go_actions WHERE go_id=? AND done=0 LIMIT 1`).get(goId) || this.listUnresolvedGoSends(goId).length>0 || this.hasUnknownGoRunResults(goId);
   }
 
   completeGoAction(goId: number, actionKey: string, receipt: string): void {
