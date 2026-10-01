@@ -12,13 +12,18 @@ export default definePluginEntry({
       try { registry.bind(params.binding); respond(true, { persisted: true, binding: params.binding }); }
       catch (e) { respond(false, undefined, { code: "INVALID_REQUEST", message: (e as Error).message }); }
     }, { scope: "operator.admin" });
+    api.registerGatewayMethod("lma.go.capabilities", ({ respond }) => {
+      respond(true, { mode: "independent", checkerToolsIsolated: true, taskQuery: true,
+        atomicSnapshot: false, nativeGoalAuthority: false });
+    }, { scope: "operator.read" });
     api.registerGatewayMethod("lma.go.snapshot", ({ params, respond }) => {
       if (typeof params.sessionKey !== "string" || typeof params.sessionId !== "string") {
         respond(false, undefined, { code: "INVALID_REQUEST", message: "exact session identity required" }); return;
       }
       const tasks = api.runtime.tasks.runs.bindSession({ sessionKey: params.sessionKey }).list();
       respond(true, { sessionKey: params.sessionKey, requestedSessionId: params.sessionId, tasks,
-        complete: false, boundaries: ["task list scoped to session key, not generation", "no consistent queue/recoverable/delivery snapshot", "no native goal revision CAS"] });
+        queryAvailable: true, atomicSnapshot: false,
+        boundaries: ["tasks scoped to canonical key; adapter pins generation and run ids", "LMA checks its own queue and delivery ledger"] });
     }, { scope: "operator.read" });
   },
 });

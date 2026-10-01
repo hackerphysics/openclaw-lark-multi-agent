@@ -13,8 +13,8 @@ describe("Go runtime tool enforcement", () => {
   it("does not affect prefix-similar unrelated sessions", () => {
     expect(checkTool([b],{toolName:"exec",params:{}},{sessionKey:b.checkerSessionKey+"other",sessionId:"other"})).toBeUndefined();
   });
-  it("blocks managed executor goal mutation, not normal work", () => {
-    expect(checkTool([b],{toolName:"update_goal",params:{status:"complete"}},{sessionId:"es"})?.block).toBe(true);
+  it("does not interfere with executor native goals or normal work", () => {
+    expect(checkTool([b],{toolName:"update_goal",params:{status:"complete"}},{sessionId:"es"})).toBeUndefined();
     expect(checkTool([b],{toolName:"exec",params:{}},{sessionId:"es"})).toBeUndefined();
   });
   it("rejects ambiguous and noncanonical bindings", () => {

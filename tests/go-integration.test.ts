@@ -71,3 +71,23 @@ describe("Go exact admitted run collector",()=>{
   await expect(pending).resolves.toBe("owned WAIT");
  });
 });
+
+describe("independent production adapter",()=>{
+ it("binds restrictions without native Goal and reads public leaf, queue, exact tasks",async()=>{
+  const client=Object.create(OpenClawClient.prototype) as any;const calls:any[]=[];
+  client.rpc=async(method:string,p:any)=>{calls.push({method,p});
+   if(method==="lma.go.capabilities")return {mode:"independent",checkerToolsIsolated:true,taskQuery:true,atomicSnapshot:false};
+   if(method==="lma.go.bind")return {persisted:true,binding:p.binding};
+   if(method==="chat.history")return {sessionInfo:{sessionId:"es",activeLeafEntryId:"leaf",hasActiveRun:false},pendingInputs:{total:0}};
+   if(method==="lma.go.snapshot")return {sessionKey:p.sessionKey,requestedSessionId:p.sessionId,queryAvailable:true,tasks:[{id:"task",runId:"run",status:"succeeded",deliveryStatus:"delivered"}]};
+   throw new Error(method);
+  };
+  expect(await client.verifyGoSafety("executor")).toEqual({checkerToolsIsolated:true,exactTaskAndDeliveryGate:true,guardedSend:true});
+  const identity=await client.initializeGoRuntime({goId:1,goal:"independent",executorSessionKey:"executor",executorSessionId:"es",checkerSessionKey:"checker",checkerSessionId:"cs"});
+  expect(identity.nativeGoalId).toBeUndefined();expect(identity.executorRunIds).toEqual([]);
+  const snapshot=await client.readGoRuntimeSnapshot("executor","es");
+  expect(snapshot).toMatchObject({independent:true,atomicSnapshot:false,complete:false,queryAvailable:true,queuedInputs:0,running:false});
+  expect(snapshot.tasks[0]).toMatchObject({taskId:"task",runId:"run",state:"completed",deliveryState:"delivered"});
+  expect(calls.some(c=>c.method.includes("goal"))).toBe(false);
+ });
+});

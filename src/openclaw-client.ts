@@ -2034,8 +2034,38 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return receipt ? { runId: receipt.runId, sessionId: p.sessionId, raw: receipt } : null;
   }
   async bindGoPolicy(binding: Record<string, string>) { return this.rpc("lma.go.bind", { binding }); }
+  /** History publicly projects active leaf/run/recovery; describe alone does not. */
+  async getGoSessionInfo(sessionKey:string) {
+    const history = await this.rpc("chat.history", {sessionKey:this.canonicalSessionKey(sessionKey),limit:1});
+    return {session:history?.sessionInfo};
+  }
+  async verifyGoSafety(_executorKey: string) {
+    const capability = await this.rpc("lma.go.capabilities", {});
+    return { checkerToolsIsolated: capability?.mode === "independent" && capability.checkerToolsIsolated === true,
+      exactTaskAndDeliveryGate: capability?.taskQuery === true, guardedSend: true };
+  }
+  async initializeGoRuntime(p: {goId:number;goal:string;executorSessionKey:string;executorSessionId:string;checkerSessionKey:string;checkerSessionId:string}) {
+    const binding = { checkerSessionKey:this.canonicalSessionKey(p.checkerSessionKey), checkerSessionId:p.checkerSessionId,
+      executorSessionKey:this.canonicalSessionKey(p.executorSessionKey), executorSessionId:p.executorSessionId };
+    const result = await this.bindGoPolicy(binding);
+    if (result?.persisted !== true || JSON.stringify(result.binding) !== JSON.stringify(binding)) throw new Error("Checker restriction binding not confirmed");
+    return {executorSessionId:p.executorSessionId,checkerSessionId:p.checkerSessionId,checkerRunId:"",executorRunIds:[]};
+  }
   async readGoRuntimeSnapshot(sessionKey: string, sessionId: string) {
-    return this.rpc("lma.go.snapshot", { sessionKey: this.canonicalSessionKey(sessionKey), sessionId });
+    const key = this.canonicalSessionKey(sessionKey);
+    const before = await this.getGoSessionInfo(key);
+    const query = await this.rpc("lma.go.snapshot", {sessionKey:key,sessionId});
+    const history = await this.rpc("chat.history", {sessionKey:key,sessionId,limit:1});
+    const live = history?.sessionInfo;
+    const after = await this.getGoSessionInfo(key);
+    return { sessionKey:key,sessionId,archived:after?.session?.archived===true,
+      complete: false, independent:true, atomicSnapshot:false,
+      queryAvailable:query?.queryAvailable===true && query.sessionKey===key && query.requestedSessionId===sessionId && live?.sessionId===sessionId && before?.session?.sessionId===sessionId && after?.session?.sessionId===sessionId &&
+        before.session.activeLeafEntryId===after.session.activeLeafEntryId && typeof live?.hasActiveRun==="boolean",
+      running:history?.inFlightRun ? true : live?.hasActiveRun, activeRunIds:live?.activeRunIds,
+      queuedInputs:history?.pendingInputs?.total,
+      tasks:(query?.tasks ?? []).map((t:any)=>({taskId:t.id,runId:t.runId ?? "",parentTaskId:t.parentTaskId ?? null,
+        state:t.status==="succeeded" ? "completed" : t.status,deliveryState:t.deliveryStatus==="not_applicable" ? "not_required" : t.deliveryStatus})) };
   }
 
   async chatSend(params: {

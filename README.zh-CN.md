@@ -530,3 +530,11 @@ MIT
 steer V2 与问答适配器。
 
 计时、API 参数及限制详见 [前台静默计时说明](docs/foreground-idle-2026-09-11.md)。
+
+### 独立 Go Checker
+
+`/go <目标>` 创建专用验收 Checker；`/go status`、`/go pause|resume|stop`、
+`/go model <provider/model>` 控制监督。目标、验收条件、revision 和完成权由 LMA
+MessageStore 管理，不依赖或修改原生 Goal。需由操作者启用随仓库提供的 `lma-go`
+插件；动态绑定后真实禁止 Checker 全部工具。详见
+[能力边界和本机激活步骤](docs/go-integration-boundaries.md)。

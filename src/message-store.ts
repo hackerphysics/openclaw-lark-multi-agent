@@ -204,7 +204,7 @@ export class MessageStore {
       go_id INTEGER NOT NULL, source_key TEXT NOT NULL, payload_json TEXT NOT NULL,
       receipt_json TEXT NOT NULL DEFAULT '', PRIMARY KEY(go_id, source_key));`);
   }
-  bindGoNativeIdentity(goId: number, identity: { nativeGoalId: string; executorSessionId: string; checkerSessionId: string; checkerRunId?: string; executorRunIds: string[]; goalUpdatedAt: number; goalRevision: number | null }) {
+  bindGoNativeIdentity(goId: number, identity: { nativeGoalId?: string; executorSessionId: string; checkerSessionId: string; checkerRunId?: string; executorRunIds: string[]; goalUpdatedAt?: number; goalRevision?: number | null }) {
     this.ensureGoIntegrationSchema();
     this.db.prepare('INSERT INTO go_native_bindings VALUES (?, ?)').run(goId, JSON.stringify(identity));
   }
@@ -252,7 +252,7 @@ export class MessageStore {
   }
   associateGoAdmittedRun(goId:number,runId:string,executor:boolean): void {
     const identity=this.getGoNativeIdentity(goId);
-    if(!identity) throw new Error("Missing native identity");
+    if(!identity) throw new Error("Missing independent identity");
     if(executor) identity.executorRunIds=[...new Set([...identity.executorRunIds,runId])];
     else identity.checkerRunId=runId;
     this.db.prepare("UPDATE go_native_bindings SET identity_json=? WHERE go_id=?").run(JSON.stringify(identity),goId);

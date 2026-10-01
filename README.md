@@ -626,3 +626,11 @@ This does not shorten the Gateway's execution limit. Unverified steer V2 and
 question adapters are not included in this release.
 
 Timing/API parameters and limitations: [foreground idle semantics](docs/foreground-idle-2026-09-11.md).
+
+### Independent Go Checker
+
+`/go <objective>` starts a dedicated, tool-denied acceptance Checker; `/go status`,
+`/go pause|resume|stop`, `/go model <provider/model>` control it. LMA's MessageStore
+owns objective, criteria, revision and completion, independent of native Goal APIs.
+Enable the included `lma-go` plugin first (operator-owned). Dynamic Checker binding
+is enforced before model admission. See [integration boundaries and local activation](docs/go-integration-boundaries.md).

@@ -17,7 +17,7 @@ function runtime() {
  const admissions=new Map<string,any>(); const sends:any[]=[];const outputs:string[]=["initialized"];const notices:string[]=[];
  let revision=1, busy="completed",delivery="delivered",queued=0,recoverable=0,pending=0,complete=true,child=false,lost=false;
  const client=Object.create(OpenClawClient.prototype) as any;client.goEvidenceObservers=new Set();client.onToolEvent=()=>{};
- client.getSessionInfo=async(key:string)=>({session:sessions.get(key)});
+ client.getSessionInfo=async(key:string)=>({session:sessions.get(key)});client.getGoSessionInfo=client.getSessionInfo;
  client.createSession=async(p:any)=>sessions.set(p.key,{sessionId:"checker-generation",model:p.model,activeLeafEntryId:null});
  const snapshot=(key:string,sid:string)=>({sessionKey:key.startsWith("agent:") ? key : `agent:main:${key}`,sessionId:sid,goalId:"native",goalRevision:revision,executorRunIds:store.getGoNativeIdentity(1)?.executorRunIds ?? ["executor-root"],checkerRunId:store.getGoNativeIdentity(1)?.checkerRunId ?? "checker-root",complete,archived:false,queuedInputs:queued,recoverableInputs:recoverable,pendingDeliveries:pending,tasks:[...(store.getGoNativeIdentity(1)?.executorRunIds ?? ["executor-root"]).map((runId:string,i:number)=>({taskId:i?`followup-${i}`:"root",runId,parentTaskId:null,state:busy,deliveryState:delivery})),...(child?[{taskId:"child",runId:"child-run",parentTaskId:"root",state:"running",deliveryState:"pending"}]:[])]});
  client.rpc=async(method:string,p:any)=>{
@@ -33,7 +33,6 @@ function runtime() {
  client.getSessionRuntimeStatus=async()=>({running:busy==="running"});
  client.initializeGoRuntime=async(p:any)=>{policy.bind({checkerSessionKey:`agent:main:${p.checkerSessionKey}`,checkerSessionId:p.checkerSessionId,executorSessionKey:`agent:main:${p.executorSessionKey}`,executorSessionId:p.executorSessionId,goalId:"native"});return {nativeGoalId:"native",executorSessionId:p.executorSessionId,checkerSessionId:p.checkerSessionId,checkerRunId:"checker-root",executorRunIds:["executor-root"],goalUpdatedAt:1,goalRevision:revision};};
  client.readGoRuntimeSnapshot=async(key:string,sid:string)=>snapshot(key,sid);
- client.completeGoNativeGoalCas=async(p:any)=>{if(p.expectedGoalRevision!==revision || p.goalId!=="native" || p.expectedLeafEntryId!==sessions.get("lma-synthetic-chat").activeLeafEntryId)throw new Error("goal CAS conflict");revision++;return {goalId:"native",revision};};
  client.verifyGoSafety=async()=>({checkerToolsIsolated: Boolean(checkTool(policy.list().length ? policy.list() : [{checkerSessionKey:"synthetic-checker",checkerSessionId:"checker-generation",executorSessionKey:"lma-synthetic-chat",executorSessionId:"executor-generation",goalId:"native"}],{toolName:"exec",params:{}},{sessionId:"checker-generation"})?.block),exactTaskAndDeliveryGate:typeof client.readGoRuntimeSnapshot==="function",guardedSend:typeof client.sendGoGuarded==="function"});
  const make=()=>new GoController({botName:"synthetic",fallbackModel:"synthetic/model",store,client,executorSessionKeyFor:()=>"lma-synthetic-chat",notify:async(_chat,text)=>{notices.push(text);return "synthetic-notice";},reply:async()=>"synthetic-reply"});
  let controller=make();
@@ -43,7 +42,7 @@ function runtime() {
  return {dir,store,client,policy,sends,outputs,notices,start,evidence,cycle,get controller(){return controller;},restart:async()=>{controller.dispose();controller=make();await controller.recoverOnStartup();},set:(p:any)=>{if(p.revision!==undefined)revision=p.revision;if(p.busy!==undefined)busy=p.busy;if(p.delivery!==undefined)delivery=p.delivery;if(p.queued!==undefined)queued=p.queued;if(p.recoverable!==undefined)recoverable=p.recoverable;if(p.pending!==undefined)pending=p.pending;if(p.complete!==undefined)complete=p.complete;if(p.child!==undefined)child=p.child;if(p.lost!==undefined)lost=p.lost;},cleanup:()=>{controller.dispose();store.close();FeishuBot.getAllBots().clear();rmSync(dir,{recursive:true,force:true});}};
 }
 
-describe("fully isolated Controller/public-admission/native-CAS synthetic runtime",()=>{
+describe("Controller/public-admission conservative legacy observation fixtures",()=>{
  it("WAIT → CONTINUE → guarded execution → actual evidence receipts → COMPLETE, no replay on restart",async()=>{
   const h=runtime();try {const job=await h.start();expect(job.state).toBe("WAITING_WORK");expect(checkTool(h.policy.list(),{toolName:"tool_call",params:{id:"exec"}},{sessionId:"checker-generation"})?.block).toBe(true);
    h.evidence(job.id,"first");h.outputs.push('{"action":"WAIT","summary":"report pending"}');await h.cycle();expect(h.store.getGoJobById(job.id)?.lastVerdict).toBe("WAIT");
@@ -99,4 +98,31 @@ describe("fully isolated Controller/public-admission/native-CAS synthetic runtim
   } finally {h.cleanup();}
  });
 
+});
+
+describe("independent Controller with real production adapter and public local runtime fixture",()=>{
+ it("starts, WAIT, CONTINUE, completes and recovers without any native Goal dependency",async()=>{
+  const h=runtime();try{
+   // Keep model/platform outputs synthetic; exercise the actual production binding/query adapters.
+   for(const name of ["verifyGoSafety","initializeGoRuntime","readGoRuntimeSnapshot","getGoSessionInfo"])
+    h.client[name]=(OpenClawClient.prototype as any)[name];
+   delete h.client.completeGoNativeGoalCas;
+   const original=h.client.rpc.bind(h.client);const calls:string[]=[];let pending=0;
+   h.client.rpc=async(method:string,p:any)=>{calls.push(method);
+    if(method==="lma.go.capabilities")return {mode:"independent",checkerToolsIsolated:true,taskQuery:true,atomicSnapshot:false};
+    if(method==="lma.go.bind"){h.policy.bind(p.binding);return {persisted:true,binding:p.binding};}
+    if(method==="lma.go.snapshot")return {sessionKey:p.sessionKey,requestedSessionId:p.sessionId,queryAvailable:true,tasks:[]};
+    if(method==="chat.history" && !p.inputRunIds){const session=(await h.client.getSessionInfo(p.sessionKey.replace(/^agent:main:/,""))).session;return {sessionInfo:{...session,hasActiveRun:false},pendingInputs:{total:pending}};}
+    return original(method,p);
+   };
+   const job=await h.start();expect(job.state).toBe("WAITING_WORK");expect(h.store.getGoNativeIdentity(job.id).nativeGoalId).toBeUndefined();
+   h.evidence(job.id,"one");pending=1;const count=h.sends.length;await h.cycle();expect(h.sends).toHaveLength(count);pending=0;
+   h.outputs.push('{"action":"WAIT","summary":"waiting"}');await h.cycle();expect(h.store.getGoJobById(job.id)?.lastVerdict).toBe("WAIT");
+   h.evidence(job.id,"two");h.outputs.push('{"action":"CONTINUE","summary":"missing","missing":["report"]}',"executor result");await h.cycle();expect(h.store.getGoJobById(job.id)?.continueCount).toBe(1);
+   h.evidence(job.id,"three");h.outputs.push('{"action":"COMPLETE","summary":"done","evidence_refs":["E3"],"criteria_evidence":{"C1":["E3"]}}');await h.cycle();expect(h.store.getGoJobById(job.id)?.state).toBe("COMPLETED");
+   await h.restart();expect(calls.some(m=>m.includes("goal"))).toBe(false);
+   expect(checkTool(h.policy.list(),{toolName:"tool_call",params:{}},{sessionId:"checker-generation"})?.block).toBe(true);
+   expect(checkTool(h.policy.list(),{toolName:"update_goal",params:{}},{sessionId:"executor-generation"})).toBeUndefined();
+  }finally{h.cleanup();}
+ });
 });

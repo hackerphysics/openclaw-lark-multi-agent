@@ -1,27 +1,18 @@
-/**
- * Native-Goal-backed Go supervision. Admission and collection are separate,
- * generation/leaf pinned, with durable original receipts and no replay of
- * unknown actions. Activation requires host-authoritative scope/policy/CAS.
- * The installed production host does not meet that contract: ordinary chat
- * remains unchanged and Go remains closed. Isolated synthetic-host acceptance
- * exercises the same Controller, store, public send adapter and delivery code.
- */
+/** Independent LMA supervision. MessageStore owns objective, criteria and completion. */
 import { goSnapshotBlocked, type GoRuntimeSnapshot } from "./go-runtime-gate.js";
 import type { GoJobRow } from "./message-store.js";
 
 export type GoClient = {
-  /** Must be backed by enforced runtime policy, never a prompt or config assertion.
-   * Production client deliberately does not implement this until the public
-   * runtime capability prototype has verified all design gates. */
+  /** Backed by plugin enforced runtime policy, never a prompt assertion. */
   verifyGoSafety?(executorKey: string): Promise<{ checkerToolsIsolated: boolean; exactTaskAndDeliveryGate: boolean; guardedSend: boolean }>;
   sendGoGuarded?(p: { sessionKey: string; sessionId: string; expectedLeafEntryId: string | null; message: string; idempotencyKey: string }): Promise<{runId:string}>;
   collectGoRun?(p: {runId:string;sessionKey:string;timeoutMs:number}): Promise<string>;
   readGoRunResult?(p:{sessionKey:string;sessionId:string;runId:string}): Promise<string|null>;
   reconcileGoSend?(p: {sessionKey:string;sessionId:string;idempotencyKey:string}): Promise<{runId:string}|null>;
-  initializeGoRuntime?(p: {goId:number;goal:string;executorSessionKey:string;executorSessionId:string;checkerSessionKey:string;checkerSessionId:string}): Promise<{nativeGoalId:string;executorSessionId:string;checkerSessionId:string;checkerRunId:string;executorRunIds:string[];goalUpdatedAt:number;goalRevision:number}>;
+  initializeGoRuntime?(p: {goId:number;goal:string;executorSessionKey:string;executorSessionId:string;checkerSessionKey:string;checkerSessionId:string}): Promise<{nativeGoalId?:string;executorSessionId:string;checkerSessionId:string;checkerRunId:string;executorRunIds:string[];goalUpdatedAt?:number;goalRevision?:number}>;
   readGoRuntimeSnapshot?(sessionKey:string,sessionId:string): Promise<GoRuntimeSnapshot>;
-  completeGoNativeGoalCas?(p: {goId:number;sessionKey:string;sessionId:string;goalId:string;expectedGoalRevision:number;expectedLeafEntryId:string|null;operationId:string}): Promise<unknown>;
   getSessionInfo(key: string): Promise<any>;
+  getGoSessionInfo?(key:string): Promise<any>;
   getSessionRuntimeStatus(key: string): Promise<any>;
   createSession(params: { key: string; model: string; label?: string }): Promise<any>;
 
@@ -121,7 +112,7 @@ export class GoController {
   private async guardedRequest(jobId: number, actionKey: string, sessionKey: string, message: string): Promise<string> {
     const client = this.d.client;
     if (!client.sendGoGuarded || !client.collectGoRun) throw new Error("Guarded admission/run collection unavailable");
-    const info = await client.getSessionInfo(sessionKey);
+    const info = await (client.getGoSessionInfo?.bind(client) ?? client.getSessionInfo.bind(client))(sessionKey);
     if (!info?.session?.sessionId || info.session.archived) throw new Error("Missing generation or archived session");
     const job = this.d.store.getGoJobById(jobId);
     if (!job || ["PAUSED","BLOCKED","STOPPED","COMPLETED"].includes(job.state) || this.cancelledStarts.has(this.jobKey(job.chatId))) throw new Error("Go action invalidated before admission");
@@ -195,7 +186,7 @@ export class GoController {
   private async safetyUnavailable(executorKey: string): Promise<boolean> {
     try {
       const proof = await this.d.client.verifyGoSafety?.(executorKey);
-      return !this.d.client.sendGoGuarded || !this.d.client.collectGoRun || !this.d.client.initializeGoRuntime || !this.d.client.readGoRuntimeSnapshot || !this.d.client.completeGoNativeGoalCas || !proof?.checkerToolsIsolated || !proof.exactTaskAndDeliveryGate || !proof.guardedSend;
+      return !this.d.client.sendGoGuarded || !this.d.client.collectGoRun || !this.d.client.initializeGoRuntime || !this.d.client.readGoRuntimeSnapshot || !proof?.checkerToolsIsolated || !proof.exactTaskAndDeliveryGate || !proof.guardedSend;
     } catch { return true; }
   }
 
@@ -216,12 +207,12 @@ export class GoController {
     }
     const executorKey = this.d.executorSessionKeyFor(chatId);
     if (await this.safetyUnavailable(executorKey)) {
-      await this.d.reply(messageId, "❌ Go 未启动：当前运行时尚未验证 Checker 工具隔离、精确子孙任务/投递门禁及条件发送。不能仅凭提示词安全开启自动监督。原生 Goal 联动也未实现；普通聊天不受影响。");
+      await this.d.reply(messageId, "❌ Go 未启动：当前运行时尚未验证 Checker 工具隔离、精确子孙任务/投递门禁及条件发送。不能仅凭提示词安全开启自动监督。独立模式无需原生 Goal；普通聊天不受影响。");
       return;
     }
     if (this.cancelledStarts.has(this.jobKey(chatId))) return;
     let info: any;
-    try { info = await this.d.client.getSessionInfo(executorKey); } catch { info = null; }
+    try { info = await (this.d.client.getGoSessionInfo?.bind(this.d.client) ?? this.d.client.getSessionInfo.bind(this.d.client))(executorKey); } catch { info = null; }
     const session = info?.session;
     if (!session?.sessionId) {
       await this.d.reply(messageId, "❌ Go 未启动：无法读取执行会话状态（会话不存在或网关不可达）。请先与该 Bot 对话一次再试。");
@@ -240,7 +231,7 @@ export class GoController {
       await this.d.reply(messageId, `❌ Go 未启动：Checker 会话创建失败（${(err as Error).message}）。未开始监督。`);
       return;
     }
-    const created = await this.d.client.getSessionInfo(checkerKey).catch(() => null);
+    const created = await (this.d.client.getGoSessionInfo?.bind(this.d.client) ?? this.d.client.getSessionInfo.bind(this.d.client))(checkerKey).catch(() => null);
     if (!created?.session?.sessionId) {
       await this.d.reply(messageId, "❌ Go 未启动：Checker 会话创建后无法确认。未开始监督。");
       return;
@@ -254,14 +245,14 @@ export class GoController {
     try {
       const identity = await this.d.client.initializeGoRuntime!({goId:id,goal,executorSessionKey:executorKey,
         executorSessionId:session.sessionId,checkerSessionKey:checkerKey,checkerSessionId:created.session.sessionId});
-      if (!identity.nativeGoalId || identity.executorSessionId!==session.sessionId || identity.checkerSessionId!==created.session.sessionId ||
-        !Number.isSafeInteger(identity.goalRevision) || identity.goalRevision<1 || !identity.checkerRunId || !identity.executorRunIds.length ||
-        identity.executorRunIds.some(r=>!r || r===identity.checkerRunId)) throw new Error("Invalid authoritative native scope");
+      if (identity.executorSessionId!==session.sessionId || identity.checkerSessionId!==created.session.sessionId ||
+        !identity.checkerSessionId ||
+        identity.executorRunIds.some(r=>!r || r===identity.checkerRunId)) throw new Error("Invalid independent policy binding");
       this.d.store.bindGoNativeIdentity(id, identity);
       this.d.store.setGoCriteria(id, [{id:"C1",text:goal}]);
     } catch (err) {
-      this.d.store.updateGoJobCas(id, 1, {state:"PAUSED",pauseReason:`Native Goal/policy initialization failed: ${String(err)}`});
-      return this.d.reply(messageId,"❌ Go 未启动：原生目标/隔离绑定未确认；不会发送模型请求。");
+      this.d.store.updateGoJobCas(id, 1, {state:"PAUSED",pauseReason:`Independent policy initialization failed: ${String(err)}`});
+      return this.d.reply(messageId,"❌ Go 未启动：Checker 隔离绑定未确认；不会发送模型请求。");
     }
     const initializationCheckId = `go:${id}:initialization`;
     this.d.store.insertGoCheck(id, initializationCheckId, 0);
@@ -321,7 +312,7 @@ export class GoController {
     if (!this.d.client.reconcileGoSend) return;
     for (const send of this.d.store.listUnresolvedGoSends(job.id)) {
       try {
-        const info=await this.d.client.getSessionInfo(send.sessionKey);
+        const info=await (this.d.client.getGoSessionInfo?.bind(this.d.client) ?? this.d.client.getSessionInfo.bind(this.d.client))(send.sessionKey);
         if(info?.session?.sessionId!==send.sessionId || info.session.archived) continue;
         const receipt=await this.d.client.reconcileGoSend(send);
         if(receipt) {
@@ -427,15 +418,15 @@ export class GoController {
   private async executorBusy(chatId: string, job: GoJobRow): Promise<string | null> {
     try {
       if (await this.safetyUnavailable(job.executorSessionKey)) return "运行时安全能力未验证";
-      const info = await this.d.client.getSessionInfo(job.executorSessionKey);
+      const info = await (this.d.client.getGoSessionInfo?.bind(this.d.client) ?? this.d.client.getSessionInfo.bind(this.d.client))(job.executorSessionKey);
       if (info?.session?.sessionId !== job.executorSessionId || info?.session?.archived) return "执行会话代际已改变或归档";
       const identity = this.d.store.getGoNativeIdentity(job.id);
-      if (!identity || !Number.isSafeInteger(identity.goalRevision)) return "Native Goal revision CAS unavailable";
+      if (!identity) return "Missing independent run binding";
       const snapshot = await this.d.client.readGoRuntimeSnapshot!(job.executorSessionKey, job.executorSessionId);
       const blocked = goSnapshotBlocked(snapshot, {sessionKey:job.executorSessionKey.startsWith("agent:") ? job.executorSessionKey : `agent:main:${job.executorSessionKey}`,sessionId:job.executorSessionId,
         goalId:identity.nativeGoalId,goalRevision:identity.goalRevision,executorRunIds:identity.executorRunIds});
       if (blocked) {
-        if(blocked==="identity/version changed") this.d.store.updateGoJobCas(job.id,job.revision,{state:"PAUSED",pauseReason:"Native Goal/session version changed; no automatic migration"});
+        if(blocked==="identity/version changed") this.d.store.updateGoJobCas(job.id,job.revision,{state:"PAUSED",pauseReason:"Session generation changed; no automatic migration"});
         return blocked;
       }
       if (this.d.store.listGoVisibleEvidence(job.id).some(e=>e.sourceKey.startsWith("outbox:") && (!e.receipt || e.receipt.partial))) return "pending visible delivery";
@@ -625,21 +616,9 @@ export class GoController {
       this.d.store.updateGoJobCas(job.id,job.revision,{state:"PAUSED",pauseReason:"Incomplete structured criteria/evidence coverage"});
       return;
     }
-    const completionInfo=await this.d.client.getSessionInfo(job.executorSessionKey);
+    const completionInfo=await (this.d.client.getGoSessionInfo?.bind(this.d.client) ?? this.d.client.getSessionInfo.bind(this.d.client))(job.executorSessionKey);
     const completionJob=this.d.store.getGoJobById(job.id);
     if(!completionJob || completionJob.revision!==job.revision || completionJob.state!=="CHECKING" || completionInfo?.session?.sessionId!==job.executorSessionId || completionInfo.session.activeLeafEntryId===undefined) return;
-    const identity = this.d.store.getGoNativeIdentity(job.id);
-    const completeKey = `go:${job.id}:native-complete`;
-    if (!this.d.store.claimGoAction(job.id,completeKey,"native_complete",JSON.stringify(identity))) return;
-    try {
-      const receipt = await this.d.client.completeGoNativeGoalCas!({goId:job.id,sessionKey:job.executorSessionKey,
-        sessionId:job.executorSessionId,goalId:identity.nativeGoalId,expectedGoalRevision:identity.goalRevision,expectedLeafEntryId:completionInfo.session.activeLeafEntryId,operationId:completeKey});
-      this.d.store.completeGoAction(job.id,completeKey,JSON.stringify(receipt));
-    } catch (err) {
-      this.d.store.recordGoActionOutcome(job.id,completeKey,"unknown");
-      this.d.store.updateGoJobCas(job.id,job.revision,{state:"PAUSED",pauseReason:`Native completion rejected/unknown: ${String(err)}`});
-      return;
-    }
     if (!this.d.store.updateGoJobCas(job.id, job.revision, { state: "COMPLETING", lastVerdict: "COMPLETE", lastVerdictSummary: parsed.summary, waitStreak: 0 })) return;
     const noticeKey = `go:${job.id}:complete-notice`;
     if (this.d.store.claimGoAction(job.id, noticeKey, "complete_notice", JSON.stringify({ summary: parsed.summary }))) {
@@ -680,7 +659,7 @@ export class GoController {
         continue;
       }
       let info: any = null;
-      try { info = await this.d.client.getSessionInfo(job.executorSessionKey); } catch { /* treat as changed */ }
+      try { info = await (this.d.client.getGoSessionInfo?.bind(this.d.client) ?? this.d.client.getSessionInfo.bind(this.d.client))(job.executorSessionKey); } catch { /* treat as changed */ }
       const sid = info?.session?.sessionId;
       if (!sid || sid !== job.executorSessionId || info?.session?.archived === true) {
         if (this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "重启后执行会话代际不匹配或已归档" })) {
@@ -693,9 +672,8 @@ export class GoController {
         this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "持久化操作结果未知，禁止自动重发" });
         continue;
       }
-      // Both durable native mutation and actual notification acceptance survived:
-      // settle only local state, without another Goal mutation/model/message.
-      if(job.state==="COMPLETING" && this.d.store.getGoActionLifecycle(job.id,`go:${job.id}:native-complete`)?.state==="accepted" &&
+      // Actual notification acceptance survived; settle local state only.
+      if(job.state==="COMPLETING" &&
         this.d.store.getGoActionLifecycle(job.id,`go:${job.id}:complete-notice`)?.state==="accepted") {
         this.d.store.updateGoJobCas(job.id,job.revision,{state:"COMPLETED"});
         continue;

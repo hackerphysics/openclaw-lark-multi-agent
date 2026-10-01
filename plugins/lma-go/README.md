@@ -1,19 +1,22 @@
-# LMA Go runtime enforcement component
+# LMA Go independent runtime enforcement
 
-Independent from lma-steer; compiled with `npm run build:go-plugin`.
+Build with `npm run build:go-plugin`. Enable plugin id `lma-go` through the host's
+supported plugin installation/configuration workflow (operator-owned).
 
-This is a **fixture-ready component, not enabled production Go integration**.
-It registers the public SDK `before_tool_call` hook. Explicit bindings use
-canonical executor/checker session keys, generations and native goal IDs.
-Message-review checkers have **zero tools**, including reads and generic dispatch
-wrappers. No prompt-based permission claims. Missing/replaced checker generations
-remain denied on the exact key. Unrelated sessions are unchanged.
+The real before_tool_call hook denies **all** tools for explicitly bound dedicated
+Checkers. Exact canonical keys/generations are persisted under the host state dir;
+missing/replaced Checker generations remain denied on the bound key. Executor
+native Goal tools and unrelated sessions are not restricted.
 
-Managed executors' direct `create_goal` / `update_goal` calls are vetoed. This does
-not control external Goal mutations, generic nested dispatch on executor tools,
-or establish Goal CAS; these require the host integration described in the
-artifact report. Bindings are configuration-supplied in isolated fixtures only;
-there is no exposed unauthenticated binding RPC and no dynamic binding handshake.
-Production `verifyGoSafety` remains unavailable rather than claiming enforcement
-coverage from plugin presence. Do not load this into the business Gateway until
-host capability proof and lifecycle integration are complete.
+Public operator RPCs:
+- `lma.go.capabilities` (operator.read): independent policy/task query capability;
+  explicitly no atomic snapshot and no native Goal authority.
+- `lma.go.bind` (operator.admin): persistent idempotent dynamic Checker binding;
+  identity conflicts reject. Called before the first Checker admission.
+- `lma.go.snapshot` (operator.read): canonical-key task views, explicit query
+  boundaries; the production client separately checks session generation, public
+  input/recovery/live-run state and LMA's durable queue/delivery ledger.
+
+No static bindings or nativeGoalId are required. The bridge's independent SQLite
+Go state owns objective, criteria, revision and completion. No Host changes needed.
+See ../../docs/go-integration-boundaries.md for limits and activation procedure.
