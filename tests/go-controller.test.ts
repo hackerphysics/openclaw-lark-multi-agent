@@ -20,6 +20,7 @@ function makeHarness(botName = "GPT") {
   let running = false;
   const client = {
     sessions, sent, checkerReplies,
+    async verifyGoSafety() { return { checkerToolsIsolated: true, exactTaskAndDeliveryGate: true, guardedSend: true }; },
     set running(v: boolean) { running = v; },
     get running() { return running; },
     async getSessionInfo(key: string) { return { session: sessions.get(key) || null }; },
@@ -61,7 +62,7 @@ async function cycleWithEvidence(h: Harness, jobId: number, n: number, checkerRe
 describe("parseGoVerdict", () => {
   it("accepts the three valid verdict shapes", () => {
     expect(parseGoVerdict('{"action":"WAIT","summary":"证据不足"}')).toMatchObject({ action: "WAIT" });
-    expect(parseGoVerdict('前缀噪音 {"action":"CONTINUE","summary":"缺测试","missing":["单测"]} 后缀')).toMatchObject({ action: "CONTINUE", missing: ["单测"] });
+    expect(parseGoVerdict('{"action":"CONTINUE","summary":"缺测试","missing":["单测"]}')).toMatchObject({ action: "CONTINUE", missing: ["单测"] });
     expect(parseGoVerdict('{"action":"COMPLETE","summary":"达标","evidence_refs":["E1","E2"]}')).toMatchObject({ action: "COMPLETE", evidenceRefs: ["E1", "E2"] });
   });
   it("rejects malformed or non-conforming output", () => {
@@ -86,6 +87,7 @@ describe("GoController commands", () => {
       expect(h.client.sessions.has("lma-go-gpt-chat1")).toBe(true);
       const initMsg = h.sent.find((p) => p.sessionKey === "lma-go-gpt-chat1");
       expect(initMsg.currentMessage).toContain("Go Checker");
+      expect(initMsg.unsyncedMessages).toEqual([]);
       expect(h.repliesToUser[0][1]).toContain("已启动");
     } finally { h.cleanup(); }
   });
@@ -310,7 +312,7 @@ describe("GoController isolation and recovery", () => {
       h2.store.insertGoEvent(job.id, "post-crash", "assistant_reply", "崩溃后到达的结果");
       await h2.c.recoverOnStartup();
       const j = h2.store.getGoJobById(job.id)!;
-      expect(j.state).toBe("WAITING_WORK");
+      expect(j.state).toBe("PAUSED");
     } finally { h2.cleanup(); }
   });
 });
@@ -326,6 +328,83 @@ describe("Go store primitives", () => {
       expect(s2).toBe(-1);
       expect(h.store.claimGoAction(job.id, "go:1:check:x:continue", "continue", "{}")).toBe(true);
       expect(h.store.claimGoAction(job.id, "go:1:check:x:continue", "continue", "{}")).toBe(false);
+    } finally { h.cleanup(); }
+  });
+});
+
+describe("Go safety regressions", () => {
+  it("rejects prose, multiple objects, unknown fields and invalid array members", () => {
+    for (const raw of ['prefix {"action":"WAIT","summary":"x"}', '{"action":"WAIT","summary":"x"} {}', '{"action":"WAIT","summary":"x","route":"other"}', '{"action":"COMPLETE","summary":"x","evidence_refs":[1,"E1"]}']) {
+      expect("error" in parseGoVerdict(raw)).toBe(true);
+    }
+  });
+  it("refuses start before session creation without enforced safety capabilities", async () => {
+    const h = makeHarness();
+    try {
+      primeExecutor(h);
+      (h.client as any).verifyGoSafety = undefined;
+      await h.c.handleGoCommand("chat1", "m", "目标");
+      expect(h.sent).toHaveLength(0);
+      expect(h.store.getActiveGoJob("GPT", "chat1")).toBeNull();
+      expect(h.repliesToUser[0][1]).toContain("Go 未启动");
+    } finally { h.cleanup(); }
+  });
+  it.each(["stop", "pause"])("discards late COMPLETE after %s", async (command) => {
+    const h = makeHarness();
+    try {
+      const job = await startGo(h);
+      h.store.insertGoEvent(job.id, "e", "assistant_reply", "测试通过");
+      let finish!: (raw: string) => void;
+      h.client.chatSendWithContext = async () => new Promise<string>((r) => { finish = r; });
+      const cycle = (h.c as any).runCheckCycle("chat1");
+      while (!finish) await Promise.resolve();
+      await h.c.handleGoCommand("chat1", "m", command);
+      finish('{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}');
+      await cycle;
+      expect(h.store.getGoJobById(job.id)!.state).toBe(command === "stop" ? "STOPPED" : "PAUSED");
+      expect(h.notifications).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+  it("does not complete when a new human trigger arrives during checking", async () => {
+    const h = makeHarness();
+    try {
+      const job = await startGo(h);
+      h.store.insertGoEvent(job.id, "e", "assistant_reply", "测试通过");
+      h.client.chatSendWithContext = async () => {
+        const id = h.store.insert({ chatId: "chat1", messageId: "new", senderType: "human", senderName: "u", content: "new task", timestamp: Date.now(), triggerKind: "normal" });
+        h.store.markPendingTrigger("GPT", "chat1", id);
+        return '{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}';
+      };
+      await (h.c as any).runCheckCycle("chat1");
+      expect(h.store.getGoJobById(job.id)!.state).toBe("WAITING_WORK");
+      expect(h.notifications).toHaveLength(0);
+    } finally { h.cleanup(); }
+  });
+  it("refuses error-only completion evidence", async () => {
+    const h = makeHarness();
+    try {
+      const job = await startGo(h);
+      h.store.insertGoEvent(job.id, "err", "run_error", "failed");
+      h.client.queueReply('{"action":"COMPLETE","summary":"ok","evidence_refs":["E1"]}');
+      await (h.c as any).runCheckCycle("chat1");
+      expect(h.store.getGoJobById(job.id)!.state).toBe("PAUSED");
+    } finally { h.cleanup(); }
+  });
+  it("preserves unknown followup claims and refuses automatic resume", async () => {
+    const h = makeHarness();
+    try {
+      const job = await startGo(h);
+      h.store.insertGoEvent(job.id, "e", "assistant_reply", "test missing");
+      h.client.chatSendWithContext = async (p) => {
+        if (p.sessionKey === job.executorSessionKey) throw new Error("connection lost after acceptance");
+        return '{"action":"CONTINUE","summary":"missing","missing":["test"]}';
+      };
+      await (h.c as any).runCheckCycle("chat1");
+      expect(h.store.hasUnresolvedGoActions(job.id)).toBe(true);
+      expect(h.store.getGoJobById(job.id)!.state).toBe("PAUSED");
+      await h.c.handleGoCommand("chat1", "m", "resume");
+      expect(h.store.getGoJobById(job.id)!.state).toBe("PAUSED");
+      expect(h.repliesToUser.at(-1)![1]).toContain("结果未知");
     } finally { h.cleanup(); }
   });
 });

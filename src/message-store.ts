@@ -1493,6 +1493,10 @@ export class MessageStore {
       .run(goId, actionKey, kind, payload, Date.now()).changes === 1;
   }
 
+  hasUnresolvedGoActions(goId: number): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM go_actions WHERE go_id=? AND done=0 LIMIT 1`).get(goId);
+  }
+
   completeGoAction(goId: number, actionKey: string, receipt: string): void {
     this.db.prepare(`UPDATE go_actions SET done=1, receipt=? WHERE go_id=? AND action_key=?`).run(receipt.slice(0, 500), goId, actionKey);
   }

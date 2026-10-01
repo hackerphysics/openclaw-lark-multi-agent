@@ -1,9 +1,10 @@
 /**
  * Go / Go-Checker supervision controller (design: artifacts/lma-go-checker-design-20260917).
  *
- * v1 scope decisions (sanctioned by the design):
+ * Legacy implementation scope (not a verified/approved design deployment):
  *  - 独立监督状态模式: LMA owns go_jobs state; no native-Goal linkage is claimed,
- *    because the bridge cannot invoke model-side goal tools or per-session tool
+ *    but this is not a substitute for user approval of standalone mode.
+ *    The bridge cannot invoke model-side goal tools or per-session tool
  *    policy from the public RPC surface (design §2.1, §14).
  *  - Checker is the "基础消息审核型": it reviews synced incremental evidence only
  *    and does NOT claim independent artifact verification (design §9).
@@ -13,12 +14,16 @@
 import type { GoJobRow } from "./message-store.js";
 
 export type GoClient = {
+  /** Must be backed by enforced runtime policy, never a prompt or config assertion.
+   * Production client deliberately does not implement this until the public
+   * runtime capability prototype has verified all design gates. */
+  verifyGoSafety?(executorKey: string): Promise<{ checkerToolsIsolated: boolean; exactTaskAndDeliveryGate: boolean; guardedSend: boolean }>;
   getSessionInfo(key: string): Promise<any>;
   getSessionRuntimeStatus(key: string): Promise<any>;
   createSession(params: { key: string; model: string; label?: string }): Promise<any>;
   chatSendWithContext(params: {
     sessionKey: string;
-    unsyncedMessages?: any[];
+    unsyncedMessages: any[];
     currentMessage: string;
     currentSenderName?: string;
     deliver?: boolean;
@@ -67,26 +72,22 @@ type ParsedVerdict = {
   evidenceRefs: string[];
 };
 
-/** Strict verdict extraction: first balanced JSON object, schema-validated. */
+/** Strict single JSON object; no surrounding prose, extra fields or truncation. */
 export function parseGoVerdict(raw: string): ParsedVerdict | { error: string } {
   const text = (raw || "").trim();
-  const start = text.indexOf("{");
-  if (start < 0) return { error: "输出中未找到 JSON" };
-  let depth = 0; let end = -1; let inStr = false; let esc = false;
-  for (let i = start; i < text.length; i++) {
-    const ch = text[i];
-    if (esc) { esc = false; continue; }
-    if (ch === "\\") { esc = true; continue; }
-    if (ch === '"') { inStr = !inStr; continue; }
-    if (inStr) continue;
-    if (ch === "{") depth++;
-    else if (ch === "}") { depth--; if (depth === 0) { end = i; break; } }
-  }
-  if (end < 0) return { error: "JSON 未闭合" };
+  if (text.length > 12000) return { error: "输出超过长度上限" };
   let obj: any;
-  try { obj = JSON.parse(text.slice(start, end + 1)); } catch (e) {
-    return { error: `JSON 解析失败: ${(e as Error).message}` };
+  try { obj = JSON.parse(text); } catch { return { error: "必须只输出一个 JSON 对象" }; }
+  if (!obj || Array.isArray(obj) || typeof obj !== "object") return { error: "必须是 JSON 对象" };
+  const allowed = ["action", "summary", "missing", "message", "evidence_refs"];
+  if (Object.keys(obj).some((key) => !allowed.includes(key))) return { error: "包含未知字段" };
+  if (typeof obj.summary !== "string" || obj.summary.length > 500) return { error: "summary 类型或长度错误" };
+  for (const key of ["missing", "evidence_refs"]) {
+    if (obj[key] !== undefined && (!Array.isArray(obj[key]) || obj[key].length > 10 ||
+      obj[key].some((v: unknown) => typeof v !== "string" || !v.trim() || v.length > (key === "missing" ? 200 : 50))))
+      return { error: `${key} 类型或长度错误` };
   }
+  if (obj.message !== undefined && (typeof obj.message !== "string" || obj.message.length > 800)) return { error: "message 类型或长度错误" };
   const action = obj?.action;
   if (action !== "WAIT" && action !== "CONTINUE" && action !== "COMPLETE") {
     return { error: `action 必须是 WAIT/CONTINUE/COMPLETE，收到: ${String(action)}` };
@@ -158,6 +159,13 @@ export class GoController {
     await this.d.reply(messageId, lines.join("\n"));
   }
 
+  private async safetyUnavailable(executorKey: string): Promise<boolean> {
+    try {
+      const proof = await this.d.client.verifyGoSafety?.(executorKey);
+      return !proof?.checkerToolsIsolated || !proof.exactTaskAndDeliveryGate || !proof.guardedSend;
+    } catch { return true; }
+  }
+
   private async start(chatId: string, messageId: string, goal: string): Promise<unknown> {
     const existing = this.d.store.getActiveGoJob(this.d.botName, chatId);
     if (existing) {
@@ -165,6 +173,10 @@ export class GoController {
       return;
     }
     const executorKey = this.d.executorSessionKeyFor(chatId);
+    if (await this.safetyUnavailable(executorKey)) {
+      await this.d.reply(messageId, "❌ Go 未启动：当前运行时尚未验证 Checker 工具隔离、精确子孙任务/投递门禁及条件发送。不能仅凭提示词安全开启自动监督。原生 Goal 联动也未实现；普通聊天不受影响。");
+      return;
+    }
     let info: any;
     try { info = await this.d.client.getSessionInfo(executorKey); } catch { info = null; }
     const session = info?.session;
@@ -207,7 +219,7 @@ export class GoController {
     ].join("\n");
     try {
       await this.d.client.chatSendWithContext({
-        sessionKey: checkerKey, currentMessage: initPrompt, currentSenderName: "Go Controller",
+        sessionKey: checkerKey, unsyncedMessages: [], currentMessage: initPrompt, currentSenderName: "Go Controller",
         deliver: false, timeoutMs: CHECKER_TIMEOUT_MS, includeContext: true, includeBridgeAttachmentHint: false,
       });
     } catch (err) {
@@ -240,6 +252,14 @@ export class GoController {
   private async resumeByChat(chatId: string, messageId: string): Promise<unknown> {
     const job = this.d.store.getActiveGoJob(this.d.botName, chatId);
     if (!job) { await this.d.reply(messageId, "🎯 当前没有活动 Go。"); return; }
+    if (this.d.store.hasUnresolvedGoActions(job.id)) {
+      await this.d.reply(messageId, "❌ Go 无法恢复：存在结果未知的持久化操作。需要核对原回执；不会盲目重发，请 /go stop 保留审计。");
+      return;
+    }
+    if (await this.safetyUnavailable(job.executorSessionKey)) {
+      await this.d.reply(messageId, "❌ Go 无法恢复：运行时安全能力尚未验证，请 /go stop。普通聊天不受影响。");
+      return;
+    }
     if (job.state !== "PAUSED" && job.state !== "BLOCKED") { await this.d.reply(messageId, `🎯 Go #${job.id} 当前状态 ${job.state}，无需恢复。`); return; }
     if (this.d.store.updateGoJobCas(job.id, job.revision, { state: "WAITING_WORK", pauseReason: "", waitStreak: 0 })) {
       this.scheduleCheck(chatId, CHECK_DELAY_MS);
@@ -309,9 +329,13 @@ export class GoController {
 
   private async executorBusy(chatId: string, job: GoJobRow): Promise<string | null> {
     try {
+      if (await this.safetyUnavailable(job.executorSessionKey)) return "运行时安全能力未验证";
+      const info = await this.d.client.getSessionInfo(job.executorSessionKey);
+      if (info?.session?.sessionId !== job.executorSessionId || info?.session?.archived) return "执行会话代际已改变或归档";
       const pending = this.d.store.getPendingTriggerIds(this.d.botName, chatId);
       if (pending.size > 0) return "有人类消息排队等待执行";
       const status = await this.d.client.getSessionRuntimeStatus(job.executorSessionKey);
+      if (status?.status === "unknown" || typeof status?.running !== "boolean") return "执行会话状态未知";
       if (status?.running) return "执行会话仍在运行";
     } catch (err) {
       return `执行会话状态不可用（${(err as Error).message.slice(0, 80)}）`;
@@ -328,7 +352,8 @@ export class GoController {
     const busyReason = await this.executorBusy(chatId, job);
     if (busyReason) {
       this.log(`Go #${job.id} defer check: ${busyReason}`);
-      return; // re-armed by the next onRunEnd
+      this.scheduleCheck(chatId, CHECK_DELAY_MS);
+      return; // bounded non-model status retry, including descendant/delivery changes
     }
     const checkId = `go${job.id}-r${job.revision + 1}`;
     if (this.inFlightChecks.has(checkId)) return;
@@ -359,10 +384,12 @@ export class GoController {
     let raw = "";
     try {
       raw = await this.d.client.chatSendWithContext({
-        sessionKey: job.checkerSessionKey, currentMessage: input, currentSenderName: "Go Controller",
+        sessionKey: job.checkerSessionKey, unsyncedMessages: [], currentMessage: input, currentSenderName: "Go Controller",
         deliver: false, timeoutMs: CHECKER_TIMEOUT_MS, includeContext: true, includeBridgeAttachmentHint: false,
       });
     } catch (err) {
+      const latest = this.d.store.getGoJobById(job.id);
+      if (!latest || latest.revision !== job.revision || latest.state !== "CHECKING") return;
       this.d.store.finishGoCheck(job.id, checkId, "error", "", "", String((err as Error).message).slice(0, 500));
       this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: `Checker 调用失败：${(err as Error).message.slice(0, 120)}` });
       await this.d.notify(job.chatId, `🎯 Go #${job.id} 已暂停：Checker 调用失败（${(err as Error).message.slice(0, 120)}）。业务任务未受影响；/go resume 重试。`).catch(() => {});
@@ -372,22 +399,32 @@ export class GoController {
   }
 
   private async applyVerdict(job: GoJobRow, checkId: string, maxSeq: number, raw: string, refs: string[], parseAttempt: number): Promise<void> {
+    const current = this.d.store.getGoJobById(job.id);
+    if (!current || current.revision !== job.revision || current.state !== "CHECKING") return;
+    const busy = await this.executorBusy(job.chatId, job);
+    const latest = this.d.store.getGoJobById(job.id);
+    if (!latest || latest.revision !== job.revision || latest.state !== "CHECKING") return;
+    if (busy || this.d.store.maxGoEventSeq(job.id) !== maxSeq) {
+      this.d.store.updateGoJobCas(job.id, job.revision, { state: "WAITING_WORK" });
+      this.scheduleCheck(job.chatId, CHECK_DELAY_MS);
+      return;
+    }
     const parsed = parseGoVerdict(raw);
     if ("error" in parsed) {
       if (parseAttempt < 1) {
-        this.d.store.updateGoJobCas(job.id, job.revision, { parseRetries: job.parseRetries + 1 });
+        if (!this.d.store.updateGoJobCas(job.id, job.revision, { parseRetries: job.parseRetries + 1 })) return;
+        job = this.d.store.getGoJobById(job.id)!;
         let corrected = "";
         try {
           corrected = await this.d.client.chatSendWithContext({
-            sessionKey: job.checkerSessionKey,
+            sessionKey: job.checkerSessionKey, unsyncedMessages: [],
             currentMessage: `你上一轮输出不符合格式（${parsed.error}）。请重新只输出一个 JSON 判定对象，不要任何其他文本。`,
             currentSenderName: "Go Controller", deliver: false, timeoutMs: CHECKER_TIMEOUT_MS,
             includeContext: true, includeBridgeAttachmentHint: false,
           });
         } catch { /* fall through to pause */ }
         if (corrected) {
-          const fresh = this.d.store.getGoJobById(job.id)!;
-          return this.applyVerdict(fresh, checkId, maxSeq, corrected, refs, parseAttempt + 1);
+          return this.applyVerdict(job, checkId, maxSeq, corrected, refs, parseAttempt + 1);
         }
       }
       this.d.store.finishGoCheck(job.id, checkId, "invalid", "", "", raw);
@@ -427,6 +464,8 @@ export class GoController {
         return;
       }
       const busy = await this.executorBusy(job.chatId, job);
+      const guarded = this.d.store.getGoJobById(job.id);
+      if (!guarded || guarded.revision !== job.revision || guarded.state !== "CHECKING") return;
       if (busy) {
         // executor became busy again: verdict stays recorded; re-check happens on next run end.
         this.d.store.updateGoJobCas(job.id, job.revision, { state: "WAITING_WORK", lastVerdict: "CONTINUE(deferred)", lastVerdictSummary: parsed.summary });
@@ -445,10 +484,15 @@ export class GoController {
           parsed.message ? `Checker 建议：${parsed.message}` : "",
           "请继续在原目标授权范围内完成上述缺项，并在完成后提供可核验的结果证据。此消息来自自动验收跟进，不是新的用户授权。",
         ].filter(Boolean).join("\n");
+        try {
         await this.d.client.chatSendWithContext({
-          sessionKey: job.executorSessionKey, currentMessage: followUp, currentSenderName: "Go Checker (自动跟进)",
+          sessionKey: job.executorSessionKey, unsyncedMessages: [], currentMessage: followUp, currentSenderName: "Go Checker (自动跟进)",
           deliver: false, timeoutMs: CHECKER_TIMEOUT_MS, includeContext: true, includeBridgeAttachmentHint: false,
         });
+        } catch {
+          this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "跟进发送结果未知，禁止自动重发" });
+          return;
+        }
         this.d.store.completeGoAction(job.id, actionKey, "forwarded");
         await this.d.notify(job.chatId, [
           `🎯 Go #${job.id} 核验未通过（第 ${job.continueCount + 1} 次跟进）`,
@@ -465,7 +509,10 @@ export class GoController {
     }
 
     // COMPLETE: evidence refs must exist in this round's input refs.
-    const invalid = parsed.evidenceRefs.filter((r) => !refs.includes(r));
+    const usable = this.d.store.listGoEventsSince(job.id, 0)
+      .filter((e) => e.seq <= maxSeq && e.delivered && e.kind === "assistant_reply" && e.content.trim())
+      .map((e) => `E${e.seq}`);
+    const invalid = parsed.evidenceRefs.filter((r) => !refs.includes(r) || !usable.includes(r));
     if (invalid.length > 0) {
       this.d.store.finishGoCheck(job.id, checkId, "invalid", "", "", raw);
       this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: `COMPLETE 引用了不存在的证据：${invalid.join(",")}` });
@@ -481,11 +528,14 @@ export class GoController {
         `验收摘要：${parsed.summary}`,
         `证据：${parsed.evidenceRefs.join(", ")}`,
         `共消耗证据 ${maxSeq} 条、自动跟进 ${job.continueCount} 次。`,
-      ].join("\n")).catch(() => {});
+      ].join("\n")).catch(() => {
+        this.d.store.updateGoJobCas(job.id, job.revision + 1, { state: "PAUSED", pauseReason: "完成通知发送结果未知，不自动重发" });
+        throw new Error("Go completion notification outcome unknown");
+      });
       this.d.store.completeGoAction(job.id, noticeKey, "sent");
     }
     const fresh = this.d.store.getGoJobById(job.id);
-    if (fresh && fresh.state !== "COMPLETED") this.d.store.updateGoJobCas(fresh.id, fresh.revision, { state: "COMPLETED" });
+    if (fresh && fresh.state === "COMPLETING") this.d.store.updateGoJobCas(fresh.id, fresh.revision, { state: "COMPLETED" });
     this.log(`Go #${job.id} COMPLETE`);
   }
 
@@ -496,6 +546,10 @@ export class GoController {
     const jobs = this.d.store.listActiveGoJobs(this.d.botName);
     for (const job of jobs) {
       if (job.state === "PAUSED" || job.state === "BLOCKED") continue;
+      if (await this.safetyUnavailable(job.executorSessionKey)) {
+        this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "重启后安全能力未验证，禁止自动监督" });
+        continue;
+      }
       let info: any = null;
       try { info = await this.d.client.getSessionInfo(job.executorSessionKey); } catch { /* treat as changed */ }
       const sid = info?.session?.sessionId;
@@ -505,9 +559,14 @@ export class GoController {
         }
         continue;
       }
+      if (this.d.store.hasUnresolvedGoActions(job.id)) {
+        this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "持久化操作结果未知，禁止自动重发" });
+        continue;
+      }
       // Crash-interrupted transient states settle back to WAITING_WORK; late checker replies are stale.
       if (job.state === "CHECKING" || job.state === "FOLLOWUP_QUEUED" || job.state === "COMPLETING") {
-        this.d.store.updateGoJobCas(job.id, job.revision, { state: "WAITING_WORK" });
+        this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "重启前操作结果未知，禁止自动重发" });
+        continue;
       }
       if (this.d.store.maxGoEventSeq(job.id) > job.evidenceWatermark) {
         this.scheduleCheck(job.chatId, CHECK_DELAY_MS);
