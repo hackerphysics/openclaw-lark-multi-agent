@@ -83,6 +83,31 @@ export interface PendingErrorNotice {
   recoveryProbeUsed?: boolean;
 }
 
+export type GoJobRow = {
+  id: number;
+  botName: string;
+  chatId: string;
+  goal: string;
+  acceptance: string;
+  state: "STARTING" | "WAITING_WORK" | "CHECKING" | "FOLLOWUP_QUEUED" | "COMPLETING" | "COMPLETED" | "PAUSED" | "BLOCKED" | "STOPPED";
+  executorSessionKey: string;
+  executorSessionId: string;
+  checkerSessionKey: string;
+  checkerModel: string;
+  revision: number;
+  continueCount: number;
+  waitStreak: number;
+  stagnantCount: number;
+  parseRetries: number;
+  evidenceWatermark: number;
+  lastMissingJson: string;
+  lastVerdict: string;
+  lastVerdictSummary: string;
+  pauseReason: string;
+  createdAt: number;
+  updatedAt: number;
+};
+
 export class MessageStore {
   private db: Database.Database;
 
@@ -94,6 +119,78 @@ export class MessageStore {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.init();
+    this.initGoTables();
+  }
+
+  /** Go / Go-Checker supervision state (design: artifacts/lma-go-checker-design-20260917 §10). */
+  private initGoTables() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS go_jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        acceptance TEXT NOT NULL DEFAULT '',
+        state TEXT NOT NULL DEFAULT 'WAITING_WORK',
+        executor_session_key TEXT NOT NULL,
+        executor_session_id TEXT NOT NULL DEFAULT '',
+        checker_session_key TEXT NOT NULL,
+        checker_model TEXT NOT NULL,
+        revision INTEGER NOT NULL DEFAULT 1,
+        continue_count INTEGER NOT NULL DEFAULT 0,
+        wait_streak INTEGER NOT NULL DEFAULT 0,
+        stagnant_count INTEGER NOT NULL DEFAULT 0,
+        parse_retries INTEGER NOT NULL DEFAULT 0,
+        evidence_watermark INTEGER NOT NULL DEFAULT 0,
+        last_missing_json TEXT NOT NULL DEFAULT '[]',
+        last_verdict TEXT NOT NULL DEFAULT '',
+        last_verdict_summary TEXT NOT NULL DEFAULT '',
+        pause_reason TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_go_jobs_active ON go_jobs(bot_name, chat_id, state);
+      CREATE TABLE IF NOT EXISTS go_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        go_id INTEGER NOT NULL,
+        source_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        content TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        UNIQUE(go_id, source_key)
+      );
+      CREATE TABLE IF NOT EXISTS go_checks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        go_id INTEGER NOT NULL,
+        check_id TEXT NOT NULL,
+        evidence_max_seq INTEGER NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending',
+        action TEXT NOT NULL DEFAULT '',
+        summary TEXT NOT NULL DEFAULT '',
+        raw TEXT NOT NULL DEFAULT '',
+        created_at INTEGER NOT NULL,
+        UNIQUE(go_id, check_id)
+      );
+      CREATE TABLE IF NOT EXISTS go_actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        go_id INTEGER NOT NULL,
+        action_key TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        payload TEXT NOT NULL DEFAULT '',
+        receipt TEXT NOT NULL DEFAULT '',
+        done INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        UNIQUE(go_id, action_key)
+      );
+      CREATE TABLE IF NOT EXISTS go_model_prefs (
+        bot_name TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        model TEXT,
+        updated_at INTEGER NOT NULL,
+        PRIMARY KEY(bot_name, chat_id)
+      );
+    `);
   }
 
   observeRunError(botName: string, chatId: string, provenance: ErrorProvenance): PendingErrorNotice {
@@ -1293,6 +1390,122 @@ export class MessageStore {
   tryMarkBotProcessed(botName: string, messageId: string): boolean {
     const result = this.db.prepare(`INSERT OR IGNORE INTO processed_events (bot_name, message_id) VALUES (?, ?)`).run(botName, messageId);
     return result.changes === 1;
+  }
+
+  // --- Go / Go-Checker supervision (DESIGN.md §10) ---
+
+  createGoJob(j: {
+    botName: string; chatId: string; goal: string; acceptance: string;
+    executorSessionKey: string; executorSessionId: string;
+    checkerSessionKey: string; checkerModel: string;
+  }): number {
+    const now = Date.now();
+    const r = this.db.prepare(`INSERT INTO go_jobs
+      (bot_name, chat_id, goal, acceptance, state, executor_session_key, executor_session_id, checker_session_key, checker_model, revision, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'WAITING_WORK', ?, ?, ?, ?, 1, ?, ?)`)
+      .run(j.botName, j.chatId, j.goal, j.acceptance, j.executorSessionKey, j.executorSessionId, j.checkerSessionKey, j.checkerModel, now, now);
+    return Number(r.lastInsertRowid);
+  }
+
+  private rowToGoJob(row: any): GoJobRow {
+    return {
+      id: row.id, botName: row.bot_name, chatId: row.chat_id, goal: row.goal, acceptance: row.acceptance,
+      state: row.state, executorSessionKey: row.executor_session_key, executorSessionId: row.executor_session_id,
+      checkerSessionKey: row.checker_session_key, checkerModel: row.checker_model, revision: row.revision,
+      continueCount: row.continue_count, waitStreak: row.wait_streak, stagnantCount: row.stagnant_count,
+      parseRetries: row.parse_retries, evidenceWatermark: row.evidence_watermark,
+      lastMissingJson: row.last_missing_json, lastVerdict: row.last_verdict, lastVerdictSummary: row.last_verdict_summary,
+      pauseReason: row.pause_reason, createdAt: row.created_at, updatedAt: row.updated_at,
+    };
+  }
+
+  getActiveGoJob(botName: string, chatId: string): GoJobRow | null {
+    const row = this.db.prepare(`SELECT * FROM go_jobs WHERE bot_name=? AND chat_id=? AND state NOT IN ('COMPLETED','STOPPED') ORDER BY id DESC LIMIT 1`).get(botName, chatId) as any;
+    return row ? this.rowToGoJob(row) : null;
+  }
+
+  getGoJobById(id: number): GoJobRow | null {
+    const row = this.db.prepare(`SELECT * FROM go_jobs WHERE id=?`).get(id) as any;
+    return row ? this.rowToGoJob(row) : null;
+  }
+
+  listActiveGoJobs(botName?: string): GoJobRow[] {
+    const rows = botName
+      ? this.db.prepare(`SELECT * FROM go_jobs WHERE bot_name=? AND state NOT IN ('COMPLETED','STOPPED')`).all(botName)
+      : this.db.prepare(`SELECT * FROM go_jobs WHERE state NOT IN ('COMPLETED','STOPPED')`).all();
+    return (rows as any[]).map((r) => this.rowToGoJob(r));
+  }
+
+  /** CAS update: only applies when the current revision matches. Returns success. */
+  updateGoJobCas(id: number, expectedRevision: number, patch: Partial<Record<"state" | "pauseReason" | "continueCount" | "waitStreak" | "stagnantCount" | "parseRetries" | "evidenceWatermark" | "lastMissingJson" | "lastVerdict" | "lastVerdictSummary" | "executorSessionId", unknown>>): boolean {
+    const sets: string[] = [];
+    const vals: any[] = [];
+    const colMap: Record<string, string> = {
+      state: "state", pauseReason: "pause_reason", continueCount: "continue_count", waitStreak: "wait_streak",
+      stagnantCount: "stagnant_count", parseRetries: "parse_retries", evidenceWatermark: "evidence_watermark",
+      lastMissingJson: "last_missing_json", lastVerdict: "last_verdict", lastVerdictSummary: "last_verdict_summary",
+      executorSessionId: "executor_session_id",
+    };
+    for (const [k, v] of Object.entries(patch)) {
+      const col = colMap[k];
+      if (!col) continue;
+      sets.push(`${col}=?`);
+      vals.push(v as any);
+    }
+    if (sets.length === 0) return false;
+    sets.push("revision=revision+1", "updated_at=?");
+    vals.push(Date.now());
+    const r = this.db.prepare(`UPDATE go_jobs SET ${sets.join(", ")} WHERE id=? AND revision=?`).run(...vals, id, expectedRevision);
+    return r.changes === 1;
+  }
+
+  /** Insert evidence; returns the new event seq, or -1 when deduplicated. */
+  insertGoEvent(goId: number, sourceKey: string, kind: string, content: string): number {
+    const r = this.db.prepare(`INSERT OR IGNORE INTO go_events (go_id, source_key, kind, content, delivered, created_at) VALUES (?, ?, ?, ?, 1, ?)`)
+      .run(goId, sourceKey, kind, content, Date.now());
+    if (r.changes === 0) return -1;
+    return Number(r.lastInsertRowid);
+  }
+
+  listGoEventsSince(goId: number, afterSeq: number): Array<{ seq: number; kind: string; sourceKey: string; content: string; delivered: number }> {
+    const rows = this.db.prepare(`SELECT id, kind, source_key, content, delivered FROM go_events WHERE go_id=? AND id>? ORDER BY id`).all(goId, afterSeq) as any[];
+    return rows.map((r) => ({ seq: r.id, kind: r.kind, sourceKey: r.source_key, content: r.content, delivered: r.delivered }));
+  }
+
+  maxGoEventSeq(goId: number): number {
+    const r = this.db.prepare(`SELECT MAX(id) AS m FROM go_events WHERE go_id=?`).get(goId) as any;
+    return r?.m || 0;
+  }
+
+  insertGoCheck(goId: number, checkId: string, evidenceMaxSeq: number): boolean {
+    return this.db.prepare(`INSERT OR IGNORE INTO go_checks (go_id, check_id, evidence_max_seq, state, created_at) VALUES (?, ?, ?, 'pending', ?)`)
+      .run(goId, checkId, evidenceMaxSeq, Date.now()).changes === 1;
+  }
+
+  finishGoCheck(goId: number, checkId: string, state: string, action: string, summary: string, raw: string): void {
+    this.db.prepare(`UPDATE go_checks SET state=?, action=?, summary=?, raw=? WHERE go_id=? AND check_id=?`)
+      .run(state, action, summary, raw.slice(0, 4000), goId, checkId);
+  }
+
+  /** Idempotent action claim: returns true when newly claimed (caller performs the action), false when it already existed. */
+  claimGoAction(goId: number, actionKey: string, kind: string, payload: string): boolean {
+    return this.db.prepare(`INSERT OR IGNORE INTO go_actions (go_id, action_key, kind, payload, done, created_at) VALUES (?, ?, ?, ?, 0, ?)`)
+      .run(goId, actionKey, kind, payload, Date.now()).changes === 1;
+  }
+
+  completeGoAction(goId: number, actionKey: string, receipt: string): void {
+    this.db.prepare(`UPDATE go_actions SET done=1, receipt=? WHERE go_id=? AND action_key=?`).run(receipt.slice(0, 500), goId, actionKey);
+  }
+
+  setGoModelPref(botName: string, chatId: string, model: string | null): void {
+    this.db.prepare(`INSERT INTO go_model_prefs (bot_name, chat_id, model, updated_at) VALUES (?, ?, ?, ?)
+      ON CONFLICT(bot_name, chat_id) DO UPDATE SET model=excluded.model, updated_at=excluded.updated_at`)
+      .run(botName, chatId, model, Date.now());
+  }
+
+  getGoModelPref(botName: string, chatId: string): string | null {
+    const r = this.db.prepare(`SELECT model FROM go_model_prefs WHERE bot_name=? AND chat_id=?`).get(botName, chatId) as any;
+    return r?.model ?? null;
   }
 
   close() {

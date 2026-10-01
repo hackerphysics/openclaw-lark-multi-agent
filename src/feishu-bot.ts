@@ -6,6 +6,7 @@ import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
+import { GoController } from "./go-controller.js";
 import { MessageStore, type PendingErrorNotice } from "./message-store.js";
 import { errorIdentity, type ErrorVerdict, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -163,6 +164,8 @@ export class FeishuBot {
   private sendModelFooters: Map<string, string> = new Map();
   private replyStatusFooters = new Map<string, string>();
   private sendStatusFooters = new Map<string, string>();
+  /** Go / Go-Checker supervision controller (per-bot instance). */
+  private goController: GoController | null = null;
   /** Per-chat durable outbox retry timer. */
   private deliveryRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
@@ -219,6 +222,25 @@ export class FeishuBot {
       "im.message.receive_v1": this.handleMessage.bind(this),
       "im.message.recalled_v1": this.handleMessageRecalled.bind(this),
     });
+
+    // Go / Go-Checker supervision (design: lma-go-checker-design-20260917).
+    this.goController = new GoController({
+      botName: config.name,
+      fallbackModel: config.model,
+      store,
+      client: openclawClient as any,
+      executorSessionKeyFor: (chatId: string) => this.getSessionKey(chatId),
+      notify: (chatId, text) => this.sendOrdered(chatId, () => this.sendMessage(chatId, text)),
+      reply: (messageId, text) => this.replyMessage(messageId, text),
+      log: (msg) => console.log(msg),
+    });
+    // Recovery runs shortly after boot: verify executor session generations
+    // for active Go jobs and re-arm pending checks.
+    const recoverTimer = setTimeout(() => {
+      void this.goController?.recoverOnStartup().catch((err) =>
+        console.warn(`[${config.name}] Go recovery failed:`, (err as Error).message));
+    }, 5000);
+    recoverTimer.unref?.();
   }
 
   private async handleMessageRecalled(data: any) {
@@ -626,7 +648,7 @@ export class FeishuBot {
       }
 
       const preliminaryCommandName = cleanText.trim().split(/\s+/)[0]?.toLowerCase() || "";
-      const preliminaryBridgeCommands = new Set(["/help", "/status", "/compact", "/reset", "/stop", "/verbose", "/livestatus", "/free", "/mute", "/mode", "/model", "/models", "/discuss", "/chairman", "/locale"]);
+      const preliminaryBridgeCommands = new Set(["/help", "/status", "/compact", "/reset", "/stop", "/verbose", "/livestatus", "/free", "/mute", "/mode", "/model", "/models", "/discuss", "/chairman", "/locale", "/go"]);
       const isPreliminaryBridgeCommand = !isNativeOpenClawCommand && preliminaryBridgeCommands.has(preliminaryCommandName);
 
       // --- Record to local store (ALL messages, before command/response checks) ---
@@ -787,6 +809,7 @@ export class FeishuBot {
             `🤖 /model [id] — 查看/切换当前 bot 绑定模型（持久化）`,
             `💬 /discuss on|off|status|stop|rounds N — 群级多 bot 连续讨论（所有非 mute bot + Chairman 参与，忽略 free）`,
             `👑 /chairman @Bot|off — 设置/清除本群唯一 Chairman（状态见 /status）`,
+            `🎯 /go <目标>|status|pause|resume|stop — 独立 Go Checker 验收监督（执行 Agent 自称完成不等于验收通过）`,
             `🌐 /locale zh|en — 设置/查看当前群语言`,
             `❓ /help    — 显示此帮助信息`,
             ``,
@@ -837,6 +860,19 @@ export class FeishuBot {
           await this.handleStopCommand(chatId, messageId);
           markCommandSynced();
           return;
+        }
+        if (commandName === "/go") {
+          // Go supervision targets one bot's executor session: groups require an
+          // explicit mention (single-bot group is the implicit target), p2p always.
+          const groupBotCount = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store).length;
+          const goRoutedForMe = chatType === "p2p"
+            || (routing.hasTargetedMention ? routing.isCurrentBotMentioned : groupBotCount === 1);
+          if (goRoutedForMe) {
+            const goArgs = cleanText.trim().split(/\s+/).slice(1).join(" ").trim();
+            await this.goController?.handleGoCommand(chatId, messageId, goArgs);
+            markCommandSynced();
+            return;
+          }
         }
         if (rejectModelAll) {
           await this.replyMessage(messageId, "❌ /model 是单 bot 设置，不能 @所有人。请明确 @ 一个 bot，例如：@Claude /model provider/model-id");
@@ -1655,6 +1691,9 @@ export class FeishuBot {
               for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
               // After a successful reply, warn the user once if context is high.
               void this.maybeAlertHighContext(chatId);
+              // Go supervision: record the delivered final reply as evidence and
+              // arm a debounced checker round (busy gates apply inside).
+              this.goController?.notifyRunOutcome(chatId, "assistant_reply", `trigger:${triggerId}`, shouldReply ? visibleReply : "(仅附件回复)");
             } catch (err) {
               // enqueueAndDispatchDelivery already sent a user-visible delivery
               // failure. Do not fall through to the generic provider-error path;
@@ -1667,6 +1706,8 @@ export class FeishuBot {
         if (isRuntimeFailure && lastHuman.messageId) {
           await liveStatus?.fail().catch(() => {});
           this.scheduleDelayedFailure(chatId, lastHuman.messageId, visibleReply, triggerId);
+          // Go supervision: terminal runtime failure is still checkable evidence.
+          this.goController?.notifyRunOutcome(chatId, "run_error", `trigger:${triggerId}`, visibleReply || "(运行失败，无用户可见正文)");
         } else if (!shouldReply && !hasAttachments) {
           // A proactive session.message may already own this trigger and carry
           // the real answer while collectReply returns empty/NO_REPLY. Never
@@ -1703,6 +1744,9 @@ export class FeishuBot {
               await liveStatus?.noReply().catch(() => {});
             }
           }
+          // Go supervision: an explicit NO_REPLY round is still a terminal
+          // outcome the checker may need to see (e.g. executor stayed silent).
+          this.goController?.notifyRunOutcome(chatId, "no_reply", `trigger:${triggerId}`, "(本轮无用户可见回复 NO_REPLY)");
         }
         console.log(`[${this.config.name}] [${new Date().toISOString()}] ${shouldReply || hasAttachments ? 'Replied' : 'Skipped (empty/NO_REPLY)'} (${reply.length} chars, attachments=${parsedReply.attachments.length})`);
 
@@ -2063,7 +2107,7 @@ export class FeishuBot {
   private isLegacyBridgeControlMessage(text: string): boolean {
     const t = text.trim();
     if (!t) return false;
-    return /^\/(help|status|compact|reset|stop|verbose|livestatus|free|mute|mode|model|models|discuss|chairman|locale)(\s|$)/i.test(t)
+    return /^\/(help|status|compact|reset|stop|verbose|livestatus|free|mute|mode|model|models|discuss|chairman|locale|go)(\s|$)/i.test(t)
       || this.isBridgeControlReply(t);
   }
 
@@ -3228,10 +3272,21 @@ export class FeishuBot {
     await this.client.im.v1.message.delete({ path: { message_id: messageId } });
   }
 
+  /** Resolve the Go supervision footer marker for a reply target via the store. */
+  private goFooterForReply(messageId: string): string | null {
+    try {
+      const chatId = this.store.getMessageByMessageId(messageId)?.chatId;
+      return chatId ? this.goController?.footerMarker(chatId) ?? null : null;
+    } catch {
+      return null;
+    }
+  }
+
   private async replyFinalMessage(messageId: string, text: string, model?: string, status?: string): Promise<string | undefined> {
     if (!model?.trim()) return this.replyMessage(messageId, text);
     this.replyModelFooters.set(messageId, model.trim());
-    if (status) this.replyStatusFooters.set(messageId, status);
+    const effStatus = [status?.trim(), this.goFooterForReply(messageId)].filter(Boolean).join(" · ") || undefined;
+    if (effStatus) this.replyStatusFooters.set(messageId, effStatus);
     try {
       return await this.replyMessage(messageId, text);
     } finally {
@@ -3610,7 +3665,8 @@ export class FeishuBot {
   private async sendFinalMessage(chatId: string, text: string, model?: string, status?: string): Promise<string | undefined> {
     if (!model?.trim()) return this.sendMessage(chatId, text);
     this.sendModelFooters.set(chatId, model.trim());
-    if (status) this.sendStatusFooters.set(chatId, status);
+    const effStatus = [status?.trim(), this.goController?.footerMarker(chatId) ?? null].filter(Boolean).join(" · ") || undefined;
+    if (effStatus) this.sendStatusFooters.set(chatId, effStatus);
     try {
       return await this.sendMessage(chatId, text);
     } finally {
@@ -4161,6 +4217,9 @@ export class FeishuBot {
   private async handleResetCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     try {
+      // Go supervision: a reset replaces the executor session generation; pause
+      // supervision instead of letting the checker judge a wiped transcript.
+      void this.goController?.onExecutorSessionChanged(chatId, "执行会话被 /reset");
       // Fire reset (no response expected)
       this.openclawClient.resetSession(sessionKey).catch(() => {});
       // Wait a moment for it to take effect
@@ -4181,6 +4240,9 @@ export class FeishuBot {
    */
   private async handleStopCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
+    // Go supervision: a user stop must also pause related Go, so the checker
+    // cannot wake the just-stopped task back up with a follow-up.
+    void this.goController?.pauseSilently(chatId, "用户执行了 /stop");
     try {
       // Bump the stop generation FIRST so any in-flight auto-retry loop sees the
       // cancellation on its next iteration and stops retrying immediately.
