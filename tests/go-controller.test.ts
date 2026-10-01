@@ -83,9 +83,9 @@ describe("GoController commands", () => {
       expect(job).toBeTruthy();
       expect(job.goal).toBe("完成测试目标");
       expect(job.checkerModel).toBe("phgeek-gw/glm-5.3");
-      expect(job.checkerSessionKey).toBe("lma-go-gpt-chat1");
-      expect(h.client.sessions.has("lma-go-gpt-chat1")).toBe(true);
-      const initMsg = h.sent.find((p) => p.sessionKey === "lma-go-gpt-chat1");
+      expect(job.checkerSessionKey).toMatch(/^lma-go-gpt-chat1-[0-9a-f-]+$/);
+      expect(h.client.sessions.has(job.checkerSessionKey)).toBe(true);
+      const initMsg = h.sent.find((p) => p.sessionKey === job.checkerSessionKey);
       expect(initMsg.currentMessage).toContain("Go Checker");
       expect(initMsg.unsyncedMessages).toEqual([]);
       expect(h.repliesToUser[0][1]).toContain("已启动");
@@ -406,5 +406,36 @@ describe("Go safety regressions", () => {
       expect(h.store.getGoJobById(job.id)!.state).toBe("PAUSED");
       expect(h.repliesToUser.at(-1)![1]).toContain("结果未知");
     } finally { h.cleanup(); }
+  });
+});
+
+describe("Go initialization lifecycle faults", () => {
+  it("stop during checker initialization cannot announce started or revive the job", async () => {
+    const h = makeHarness();
+    try {
+      primeExecutor(h);
+      let release!: (value:string)=>void;
+      h.client.chatSendWithContext = async (p:any) => { h.sent.push(p); return new Promise<string>(r => {release=r;}); };
+      const pending = h.c.handleGoCommand("chat1","start","goal");
+      while (!release) await new Promise(r => setTimeout(r,0));
+      expect(h.store.getActiveGoJob("GPT","chat1")?.state).toBe("STARTING");
+      await h.c.handleGoCommand("chat1","stop","stop");
+      release("OK"); await pending;
+      expect(h.store.getActiveGoJob("GPT","chat1")).toBeNull();
+      expect(h.repliesToUser.some(([,text])=>text.includes("已启动，开始监督"))).toBe(false);
+    } finally {h.cleanup();}
+  });
+  it("concurrent starts reserve one initialization and paused evidence retains full body", async () => {
+    const h = makeHarness();
+    try {
+      primeExecutor(h);
+      const [a,b] = await Promise.all([h.c.handleGoCommand("chat1","a","goal"),h.c.handleGoCommand("chat1","b","goal")]);
+      expect(h.sent.length).toBe(1);
+      const job=h.store.getActiveGoJob("GPT","chat1")!;
+      await h.c.handleGoCommand("chat1","p","pause");
+      const body="e".repeat(12000);
+      h.c.notifyRunOutcome("chat1","assistant_reply","large",body);
+      expect(h.store.listGoEventsSince(job.id,0)[0].content).toBe(body);
+    } finally {h.cleanup();}
   });
 });

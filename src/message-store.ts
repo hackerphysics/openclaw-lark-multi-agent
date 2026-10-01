@@ -1397,13 +1397,13 @@ export class MessageStore {
   createGoJob(j: {
     botName: string; chatId: string; goal: string; acceptance: string;
     executorSessionKey: string; executorSessionId: string;
-    checkerSessionKey: string; checkerModel: string;
+    checkerSessionKey: string; checkerModel: string; state?: "STARTING" | "WAITING_WORK";
   }): number {
     const now = Date.now();
     const r = this.db.prepare(`INSERT INTO go_jobs
       (bot_name, chat_id, goal, acceptance, state, executor_session_key, executor_session_id, checker_session_key, checker_model, revision, created_at, updated_at)
-      VALUES (?, ?, ?, ?, 'WAITING_WORK', ?, ?, ?, ?, 1, ?, ?)`)
-      .run(j.botName, j.chatId, j.goal, j.acceptance, j.executorSessionKey, j.executorSessionId, j.checkerSessionKey, j.checkerModel, now, now);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`)
+      .run(j.botName, j.chatId, j.goal, j.acceptance, j.state || "WAITING_WORK", j.executorSessionKey, j.executorSessionId, j.checkerSessionKey, j.checkerModel, now, now);
     return Number(r.lastInsertRowid);
   }
 
