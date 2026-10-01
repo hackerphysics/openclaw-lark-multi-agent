@@ -193,6 +193,54 @@ export class MessageStore {
     `);
   }
 
+  private ensureGoIntegrationSchema() {
+    this.db.exec(`CREATE TABLE IF NOT EXISTS go_native_bindings (
+      go_id INTEGER PRIMARY KEY, identity_json TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS go_action_lifecycle (
+      go_id INTEGER NOT NULL, action_key TEXT NOT NULL, state TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL, receipt_json TEXT NOT NULL DEFAULT '',
+      PRIMARY KEY(go_id, action_key));
+      CREATE TABLE IF NOT EXISTS go_visible_evidence (
+      go_id INTEGER NOT NULL, source_key TEXT NOT NULL, payload_json TEXT NOT NULL,
+      receipt_json TEXT NOT NULL DEFAULT '', PRIMARY KEY(go_id, source_key));`);
+  }
+  bindGoNativeIdentity(goId: number, identity: { nativeGoalId: string; executorSessionId: string; checkerSessionId: string; checkerRunId?: string; executorRunIds: string[]; goalUpdatedAt: number; goalRevision: null }) {
+    this.ensureGoIntegrationSchema();
+    this.db.prepare('INSERT INTO go_native_bindings VALUES (?, ?)').run(goId, JSON.stringify(identity));
+  }
+  getGoNativeIdentity(goId: number) {
+    this.ensureGoIntegrationSchema();
+    const row = this.db.prepare('SELECT identity_json FROM go_native_bindings WHERE go_id=?').get(goId) as any;
+    return row ? JSON.parse(row.identity_json) : null;
+  }
+  recordGoVisibleEvidence(goId: number, sourceKey: string, payload: { sessionId: string; runId: string; kind: string; text: string; attachments: unknown[] }) {
+    this.ensureGoIntegrationSchema();
+    return this.db.prepare('INSERT OR IGNORE INTO go_visible_evidence (go_id,source_key,payload_json) VALUES (?,?,?)').run(goId, sourceKey, JSON.stringify(payload)).changes === 1;
+  }
+  recordGoDeliveryReceipt(goId: number, sourceKey: string, receipt: unknown) {
+    this.ensureGoIntegrationSchema();
+    this.db.prepare('UPDATE go_visible_evidence SET receipt_json=? WHERE go_id=? AND source_key=?').run(JSON.stringify(receipt), goId, sourceKey);
+  }
+  listGoVisibleEvidence(goId: number) {
+    this.ensureGoIntegrationSchema();
+    return (this.db.prepare('SELECT * FROM go_visible_evidence WHERE go_id=? ORDER BY rowid').all(goId) as any[])
+      .map(r => ({ sourceKey: r.source_key, ...JSON.parse(r.payload_json), receipt: r.receipt_json ? JSON.parse(r.receipt_json) : null }));
+  }
+  recordGoActionAttempt(goId: number, actionKey: string) {
+    this.ensureGoIntegrationSchema();
+    const idempotencyKey = `lma-go:${goId}:${actionKey}`;
+    this.db.prepare("INSERT OR IGNORE INTO go_action_lifecycle (go_id,action_key,state,idempotency_key) VALUES (?,?,'attempted',?)").run(goId, actionKey, idempotencyKey);
+    return this.getGoActionLifecycle(goId, actionKey);
+  }
+  getGoActionLifecycle(goId: number, actionKey: string) {
+    this.ensureGoIntegrationSchema();
+    return this.db.prepare('SELECT * FROM go_action_lifecycle WHERE go_id=? AND action_key=?').get(goId, actionKey) as {state:string;idempotency_key:string;receipt_json:string} | undefined;
+  }
+  recordGoActionOutcome(goId: number, actionKey: string, state: 'accepted' | 'unknown', receipt?: unknown) {
+    this.ensureGoIntegrationSchema();
+    this.db.prepare('UPDATE go_action_lifecycle SET state=?,receipt_json=? WHERE go_id=? AND action_key=? AND state!=?').run(state, receipt === undefined ? '' : JSON.stringify(receipt), goId, actionKey, 'accepted');
+  }
+
   observeRunError(botName: string, chatId: string, provenance: ErrorProvenance): PendingErrorNotice {
     const noticeId = errorIdentity(provenance.sessionKey, provenance.runId);
     const previous = this.getErrorNotice(botName, chatId, noticeId);
@@ -1489,6 +1537,7 @@ export class MessageStore {
 
   /** Idempotent action claim: returns true when newly claimed (caller performs the action), false when it already existed. */
   claimGoAction(goId: number, actionKey: string, kind: string, payload: string): boolean {
+    this.recordGoActionAttempt(goId, actionKey);
     return this.db.prepare(`INSERT OR IGNORE INTO go_actions (go_id, action_key, kind, payload, done, created_at) VALUES (?, ?, ?, ?, 0, ?)`)
       .run(goId, actionKey, kind, payload, Date.now()).changes === 1;
   }
@@ -1498,6 +1547,7 @@ export class MessageStore {
   }
 
   completeGoAction(goId: number, actionKey: string, receipt: string): void {
+    this.recordGoActionOutcome(goId, actionKey, "accepted", receipt);
     this.db.prepare(`UPDATE go_actions SET done=1, receipt=? WHERE go_id=? AND action_key=?`).run(receipt.slice(0, 500), goId, actionKey);
   }
 
@@ -1512,7 +1562,12 @@ export class MessageStore {
     return r?.model ?? null;
   }
 
+  private closeObservers = new Set<() => void>();
+  onClose(callback: () => void) { this.closeObservers.add(callback); return () => this.closeObservers.delete(callback); }
+
   close() {
+    for (const observer of this.closeObservers) observer();
+    this.closeObservers.clear();
     this.db.close();
   }
 }

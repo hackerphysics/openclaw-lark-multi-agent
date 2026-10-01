@@ -62,6 +62,12 @@ type PendingReq = {
  * Full agent pipeline — tools, memory, skills, context management by OpenClaw.
  */
 export class OpenClawClient {
+  private goEvidenceObservers = new Set<(event: { channel: string; payload: unknown }) => void>();
+  /** Raw full event observer. Observation is NOT a Feishu delivery receipt. */
+  observeGoEvidence(callback: (event: { channel: string; payload: unknown }) => void): () => void {
+    this.goEvidenceObservers.add(callback);
+    return () => { this.goEvidenceObservers.delete(callback); };
+  }
   private config: OpenClawConfig;
   private ws: WebSocket | null = null;
   private pending: Map<string, PendingReq> = new Map();
@@ -289,6 +295,12 @@ export class OpenClawClient {
           }
         }
 
+        if (frame.type === "event" && ["agent", "chat", "session.message"].includes(frame.event)) {
+          for (const observer of this.goEvidenceObservers) {
+            try { observer({ channel: frame.event, payload: frame.payload }); }
+            catch (error) { console.warn("[OpenClaw] Go evidence observer failed:", (error as Error).message); }
+          }
+        }
         // Log all events for debugging
         if (frame.type === "event" && frame.event !== "tick") {
           console.log(`[OpenClaw] Event: ${frame.event}`, JSON.stringify(frame.payload || {}).substring(0, 200));
@@ -1973,6 +1985,36 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     this.activeMaintenanceRpcs = Math.max(0, this.activeMaintenanceRpcs - 1);
     const next = this.maintenanceWaiters.shift();
     if (next) next();
+  }
+
+  /** Public native Goal protocol. Completion deliberately unavailable without host revision CAS. */
+  async createGoNativeGoal(p: { sessionKey: string; sessionId: string; objective: string; operationId: string; issuedAtMs: number }) {
+    return this.rpc("chat.send", { sessionKey: this.canonicalSessionKey(p.sessionKey), sessionId: p.sessionId,
+      message: p.objective, idempotencyKey: p.operationId, deliver: false,
+      intent: { kind: "session-goal-start", version: 1, issuedAtMs: p.issuedAtMs } });
+  }
+  async readGoNativeGoal(sessionKey: string, sessionId: string) {
+    const info = await this.getSessionInfo(sessionKey);
+    if (info?.session?.sessionId !== sessionId || info?.session?.archived) throw new Error("Go session generation changed or archived");
+    return { session: info.session, goal: info.session.goal ?? null, revisionCAS: "unsupported" as const };
+  }
+  async updateGoNativeGoal(p: { sessionKey: string; sessionId: string; goalId: string; operationId: string; issuedAtMs: number; action: "edit" | "pause" | "resume" | "block"; objective?: string; note?: string }) {
+    if (!( ["edit", "pause", "resume", "block"] as string[]).includes(p.action)) throw new Error("Native Goal completion CAS unsupported");
+    const { objective, note, ...identity } = p;
+    return this.rpc("sessions.goal.update", { ...identity, sessionKey: this.canonicalSessionKey(p.sessionKey),
+      ...(p.action === "edit" ? { objective } : note === undefined ? {} : { note }) });
+  }
+  /** Admission receipt, not delivery. No restore, random retry key, or generation fallback. */
+  async sendGoGuarded(p: { sessionKey: string; sessionId: string; expectedLeafEntryId: string | null; message: string; idempotencyKey: string }) {
+    if (!p.sessionId || !p.idempotencyKey || p.expectedLeafEntryId === undefined) throw new Error("Missing Go send guards");
+    const result = await this.rpc("chat.send", { ...p, sessionKey: this.canonicalSessionKey(p.sessionKey),
+      deliver: false, suppressCommandInterpretation: true });
+    if (typeof result?.runId !== "string" || !result.runId) throw new Error("Unknown Go admission receipt");
+    return { runId: result.runId, sessionId: p.sessionId, idempotencyKey: p.idempotencyKey, raw: result };
+  }
+  async bindGoPolicy(binding: Record<string, string>) { return this.rpc("lma.go.bind", { binding }); }
+  async readGoRuntimeSnapshot(sessionKey: string, sessionId: string) {
+    return this.rpc("lma.go.snapshot", { sessionKey: this.canonicalSessionKey(sessionKey), sessionId });
   }
 
   async chatSend(params: {

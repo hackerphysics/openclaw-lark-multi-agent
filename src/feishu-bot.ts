@@ -234,6 +234,23 @@ export class FeishuBot {
       reply: (messageId, text) => this.replyMessage(messageId, text),
       log: (msg) => console.log(msg),
     });
+    const unobserveGo = this.openclawClient.observeGoEvidence?.(({ channel, payload }) => {
+      const event = payload as any;
+      const exactKey = event?.sessionKey;
+      const sessionId = event?.sessionId;
+      const runId = event?.runId;
+      // Never infer generation or run identity from a prefix or current-session lookup.
+      if (typeof exactKey !== "string" || typeof sessionId !== "string" || typeof runId !== "string") return;
+      for (const job of this.store.listActiveGoJobs(this.config.name)) {
+        if (exactKey !== job.executorSessionKey && exactKey !== `agent:main:${job.executorSessionKey}`) continue;
+        if (sessionId !== job.executorSessionId) continue;
+        const sourceKey = `${channel}:${runId}:${event.message?.id ?? event.id ?? event.seq ?? "unidentified"}`;
+        if (sourceKey.endsWith(":unidentified")) continue;
+        this.store.recordGoVisibleEvidence(job.id, sourceKey, { sessionId, runId, kind: channel,
+          text: JSON.stringify(payload), attachments: event.attachments ?? event.message?.attachments ?? [] });
+      }
+    });
+    this.store.onClose(() => unobserveGo?.());
     // Recovery runs shortly after boot: verify executor session generations
     // for active Go jobs and re-arm pending checks.
     const recoverTimer = setTimeout(() => {
@@ -241,6 +258,7 @@ export class FeishuBot {
         console.warn(`[${config.name}] Go recovery failed:`, (err as Error).message));
     }, 5000);
     recoverTimer.unref?.();
+    this.store.onClose(() => { clearTimeout(recoverTimer); this.goController?.dispose(); });
   }
 
   private async handleMessageRecalled(data: any) {

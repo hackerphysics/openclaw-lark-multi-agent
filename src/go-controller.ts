@@ -104,6 +104,7 @@ export function parseGoVerdict(raw: string): ParsedVerdict | { error: string } {
 }
 
 export class GoController {
+  private disposed = false;
   private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly cancelledStarts = new Set<string>();
   private readonly starting = new Set<string>();
@@ -215,10 +216,12 @@ export class GoController {
     }
     if (this.cancelledStarts.has(this.jobKey(chatId))) return;
     const id = this.d.store.createGoJob({
-      botName: this.d.botName, chatId, goal, acceptance: "", state: "STARTING",
+      botName: this.d.botName, chatId, goal, acceptance: goal, state: "STARTING",
       executorSessionKey: executorKey, executorSessionId: session.sessionId,
       checkerSessionKey: checkerKey, checkerModel: resolvedModel,
     });
+    const initializationCheckId = `go:${id}:initialization`;
+    this.d.store.insertGoCheck(id, initializationCheckId, 0);
     const initPrompt = [
       "你是独立的 Go Checker（验收员）。你的唯一职责：对照固定目标，审核执行会话的增量结果证据，并只输出一个 JSON 判定。",
       "",
@@ -236,10 +239,12 @@ export class GoController {
         deliver: false, timeoutMs: CHECKER_TIMEOUT_MS, includeContext: true, includeBridgeAttachmentHint: false,
       });
     } catch (err) {
+      this.d.store.finishGoCheck(id, initializationCheckId, "failed", "", "初始化失败", (err as Error).message);
       this.d.store.updateGoJobCas(id, 1, { state: "PAUSED", pauseReason: "Checker 初始化失败" });
       await this.d.reply(messageId, `❌ Go 未启动成功：Checker 初始化消息发送失败（${(err as Error).message}），已暂停，需 /go stop 后重建。`);
       return;
     }
+    this.d.store.finishGoCheck(id, initializationCheckId, "initialized", "", "角色初始化已回传；不等于验收通过", "");
     // Stop/pause/session replacement during initialization invalidates this result.
     if (!this.d.store.updateGoJobCas(id, 1, { state: "WAITING_WORK" })) return;
     await this.d.reply(messageId, [
@@ -332,7 +337,7 @@ export class GoController {
 
   private scheduleCheck(chatId: string, delayMs: number) {
     const key = this.jobKey(chatId);
-    if (this.timers.has(key)) return; // coalesce bursts
+    if (this.disposed || this.timers.has(key)) return; // coalesce bursts
     const t = setTimeout(() => {
       this.timers.delete(key);
       void this.runCheckCycle(chatId).catch((err) => this.log(`check cycle error: ${(err as Error).message}`));
@@ -382,7 +387,7 @@ export class GoController {
   }
 
   private async runCheck(job: GoJobRow, checkId: string, maxSeq: number): Promise<void> {
-    const events = this.d.store.listGoEventsSince(job.id, job.evidenceWatermark);
+    const events = this.d.store.listGoEventsSince(job.id, 0).filter(e => e.seq <= maxSeq);
     if (events.length === 0) return;
     const evidenceLines = events.map((e) => `E${e.seq} [${e.kind}${e.delivered ? "/已投递" : "/未投递"}] ${e.content}`);
     const refs = events.map((e) => `E${e.seq}`);
@@ -506,6 +511,7 @@ export class GoController {
           deliver: false, timeoutMs: CHECKER_TIMEOUT_MS, includeContext: true, includeBridgeAttachmentHint: false,
         });
         } catch {
+          this.d.store.recordGoActionOutcome(job.id, actionKey, "unknown");
           this.d.store.updateGoJobCas(job.id, job.revision, { state: "PAUSED", pauseReason: "跟进发送结果未知，禁止自动重发" });
           return;
         }
@@ -545,6 +551,7 @@ export class GoController {
         `证据：${parsed.evidenceRefs.join(", ")}`,
         `共消耗证据 ${maxSeq} 条、自动跟进 ${job.continueCount} 次。`,
       ].join("\n")).catch(() => {
+        this.d.store.recordGoActionOutcome(job.id, noticeKey, "unknown");
         this.d.store.updateGoJobCas(job.id, job.revision + 1, { state: "PAUSED", pauseReason: "完成通知发送结果未知，不自动重发" });
         throw new Error("Go completion notification outcome unknown");
       });
@@ -559,6 +566,7 @@ export class GoController {
 
   /** Re-verify active jobs after a process restart; pause on executor generation mismatch. */
   async recoverOnStartup(): Promise<void> {
+    if (this.disposed) return;
     const jobs = this.d.store.listActiveGoJobs(this.d.botName);
     for (const job of jobs) {
       if (job.state === "PAUSED" || job.state === "BLOCKED") continue;
@@ -591,6 +599,7 @@ export class GoController {
   }
 
   dispose(): void {
+    this.disposed = true;
     for (const t of this.timers.values()) clearTimeout(t);
     this.timers.clear();
   }
