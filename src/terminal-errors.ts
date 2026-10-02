@@ -11,6 +11,8 @@ export interface ErrorProvenance {
   userStop?: boolean;
 }
 export interface ProactiveMessageMeta {
+  /** Bridge-local Go result owner; never derived from an untrusted model body. */
+  goJobId?: number;
   sessionId?: string;
   sourceType?: string;
   runId?: string;

@@ -629,7 +629,10 @@ Timing/API parameters and limitations: [foreground idle semantics](docs/foregrou
 
 ### Independent Go Checker
 
-`/go <objective>` starts a dedicated, tool-denied acceptance Checker; `/go status`,
+`/go <objective>` sets the goal, starts a dedicated tool-denied acceptance Checker,
+and submits the original objective once at a safely observed idle boundary. Initial
+and follow-up executor results use LMA’s durable body/attachment outbox with actual
+platform receipts; no extra execution message is required. `/go status`,
 `/go pause|resume|stop`, `/go model <provider/model>` control it. LMA's MessageStore
 owns objective, criteria, revision and completion, independent of native Goal APIs.
 Enable the included `lma-go` plugin first (operator-owned). Dynamic Checker binding

@@ -1,3 +1,4 @@
+import type { GoExecutorResult } from "./go-execution.js";
 import WebSocket from "ws";
 import { inspectError, genericFailure, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
@@ -2009,22 +2010,58 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   /** Admission receipt, not delivery. No restore, random retry key, or generation fallback. */
   async sendGoGuarded(p: { sessionKey: string; sessionId: string; expectedLeafEntryId: string | null; message: string; idempotencyKey: string }) {
     if (!p.sessionId || !p.idempotencyKey || p.expectedLeafEntryId === undefined) throw new Error("Missing Go send guards");
-    const result = await this.rpc("chat.send", { ...p, sessionKey: this.canonicalSessionKey(p.sessionKey),
-      deliver: false, suppressCommandInterpretation: true });
-    if (typeof result?.runId !== "string" || !result.runId) throw new Error("Unknown Go admission receipt");
-    return { runId: result.runId, sessionId: p.sessionId, idempotencyKey: p.idempotencyKey, raw: result };
+    // Own delivery before admission: events can beat the RPC response. Mute only
+    // this brief admission window; afterwards exact run ownership avoids hiding
+    // unrelated proactive work. A lost receipt retains the conservative fence.
+    const release = this.muteProactiveDelivery(p.sessionKey);
+    this.ownDeliveryRun(p.idempotencyKey);
+    try {
+      const result = await this.rpc("chat.send", { ...p, message:p.message + this.bridgeAttachmentHint(p.message),
+        sessionKey: this.canonicalSessionKey(p.sessionKey), deliver: false, suppressCommandInterpretation: true });
+      if (typeof result?.runId !== "string" || !result.runId) throw new Error("Unknown Go admission receipt");
+      this.ownDeliveryRun(result.runId);
+      return { runId: result.runId, sessionId: p.sessionId, idempotencyKey: p.idempotencyKey, raw: result };
+    } finally { release(); }
   }
-  /** Collect only the admitted run; this path never performs another send. */
-  async collectGoRun(p: { runId: string; sessionKey: string; timeoutMs: number }) {
-    return this.collectReply(p.runId, p.timeoutMs, p.sessionKey, {exactRunIdentity:true});
+  /** Checker collection accepts only the admitted run, never a session-key fallback. */
+  async collectGoRun(p: { runId: string; sessionKey: string; sessionId?:string; timeoutMs: number }) {
+    if (p.sessionId && (await this.getGoSessionInfo(p.sessionKey))?.session?.sessionId!==p.sessionId) throw new Error("Go result generation changed");
+    const text=await this.collectReply(p.runId, p.timeoutMs, p.sessionKey, {exactRunIdentity:true});
+    if (p.sessionId && (await this.getGoSessionInfo(p.sessionKey))?.session?.sessionId!==p.sessionId) throw new Error("Go result generation changed");
+    return text;
+  }
+  /** Public committed terminalReply is the authority, including explicit empty
+   * and terminal error. Stream prefaces, lifecycle end alone and timeout are not. */
+  async readGoExecutorRunResult(p:{sessionKey:string;sessionId:string;runId:string}, waitMs=1): Promise<GoExecutorResult|null> {
+    const before=await this.getGoSessionInfo(p.sessionKey);
+    if(before?.session?.sessionId!==p.sessionId || before.session.archived) return null;
+    this.ownDeliveryRun(p.runId);
+    const result=await this.rpc("agent.wait",{runId:p.runId,timeoutMs:waitMs},Math.max(2500,waitMs+1500));
+    const after=await this.getGoSessionInfo(p.sessionKey);
+    if(after?.session?.sessionId!==p.sessionId || after.session.archived || result?.runId!==p.runId ||
+      (result.sessionId!==undefined && result.sessionId!==p.sessionId) || !Number.isFinite(result.endedAt) || result.endedAt<=0 ||
+      (Number.isFinite(result.startedAt) && result.endedAt<result.startedAt) || result.yielded || result.pendingError) return null;
+    const identity={sessionKey:this.canonicalSessionKey(p.sessionKey),sessionId:p.sessionId,runId:p.runId};
+    if(result.status==="error" || result.status==="timeout") return {...identity,disposition:"error",text:"",error:String(result.error || `Run ended: ${result.status}`)};
+    if(result.status!=="ok") return null;
+    const reply=result.terminalReply;
+    if(reply?.disposition==="silent") return {...identity,disposition:"silent",text:""};
+    if(reply?.disposition==="empty") return {...identity,disposition:"empty",text:""};
+    if(reply?.disposition!=="visible" || typeof reply.text!=="string") return null;
+    return {...identity,disposition:reply.text.trim()==="NO_REPLY" ? "silent" : reply.text.trim() ? "visible" : "empty",text:reply.text};
+  }
+  async collectGoExecutorRun(p:{sessionKey:string;sessionId:string;runId:string;timeoutMs:number}): Promise<GoExecutorResult> {
+    const deadline=Date.now()+p.timeoutMs;
+    do {
+      const result=await this.readGoExecutorRunResult(p,Math.min(1500,Math.max(1,deadline-Date.now())));
+      if(result) return result;
+      if(Date.now()<deadline) await new Promise(r=>setTimeout(r,250));
+    } while(Date.now()<deadline);
+    throw new Error("Exact Go executor terminal result unknown; no replay");
   }
   async readGoRunResult(p: {sessionKey:string;sessionId:string;runId:string}) {
-    const info=await this.getSessionInfo(p.sessionKey);
-    if(info?.session?.sessionId!==p.sessionId || info.session.archived) return null;
-    const result=await this.rpc("agent.wait",{runId:p.runId,timeoutMs:1},2500);
-    if(result?.runId!==p.runId || result.status!=="ok" || !Number.isFinite(result.endedAt) || result.endedAt<=0 || result.yielded || result.pendingError) return null;
-    const reply=result.terminalReply;
-    return reply?.disposition==="visible" && typeof reply.text==="string" ? reply.text : reply?.disposition==="silent" ? "NO_REPLY" : null;
+    const result=await this.readGoExecutorRunResult(p);
+    return !result || result.disposition==="error" || result.disposition==="empty" ? null : result.disposition==="silent" ? "NO_REPLY" : result.text;
   }
   /** Public generation-pinned original input receipts; absence is unknown, not permission to resend. */
   async reconcileGoSend(p: { sessionKey: string; sessionId: string; idempotencyKey: string }) {

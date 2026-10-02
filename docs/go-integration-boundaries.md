@@ -21,6 +21,45 @@ before_tool_call hook denies every Checker tool, including generic wrappers and
 reads, across missing/replaced generations. Executor/unrelated tools are unchanged.
 Bindings survive restart and are intentionally not auto-removed on stop.
 
+## Goal execution and delivery contract
+
+`/go <objective>` means **set the objective and begin executing it**, not merely
+watch for a later user execution message. The command initializes the isolated
+Checker, replies, clears only its own bridge pending row, and arms a cycle.
+A durable `go_bootstrap` intent submits the original authorized objective once at
+an observed idle boundary; existing main work, queues, descendants, task returns,
+unknown runtime state and pending outbox receipts defer admission. Human input,
+pause, stop and generation changes invalidate stale cycles through revision CAS.
+An unsubmitted bootstrap superseded by new human work is paused rather than
+silently replaying the old objective.
+
+- `sendGoGuarded`: public `chat.send` with exact `sessionId`, `expectedLeafEntryId`,
+  stable `idempotencyKey`, `deliver:false`, `suppressCommandInterpretation:true`.
+  A bridge attachment capability hint changes transport instructions, not scope.
+- `collectGoExecutorRun` / `readGoExecutorRunResult`: public `agent.wait` for the
+  original run, bounded by before/after generation checks. Committed `terminalReply`
+  distinguishes visible, silent/NO_REPLY and true empty; committed terminal error
+  becomes error evidence and pauses. Missing terminalReply, yielded runs, pending
+  errors and mismatched run/generation remain unknown, not invented completion.
+- `deliverExecutorResult(chatId, result, goId)`: the real FeishuBot callback parses
+  body and attachment markers into the existing outbox. Body chunks, attachment
+  payloads and captions retain their actual platform `message_id` receipts.
+  A late result remains attached to its original Go even after stop/new Go.
+- Exact Go run ownership suppresses competing proactive delivery before admission
+  and persists across restart/completion. Results do not depend on a host proactive
+  send. Unknown platform operations also fence fallback card/text sends after restart.
+- Initial execution and CONTINUE share send/result/delivery ledgers. Recovery reads
+  original admission and terminal receipts and can deliver an already-proven result;
+  it never replays the model/business request. Unconfirmed results remain paused.
+
+`tests/go-execution-loop.test.ts` drives the real Controller, production runtime
+adapters, FeishuBot command/callback/outbox and SQLite from only `/go <objective>`
+through initial execution, platform receipts, CONTINUE execution/delivery and
+COMPLETE, without manually inserting executor evidence. Host/model/platform
+transports are synthetic and all real network sockets are forbidden in tests.
+Legacy verdict-unit fixtures explicitly disable bootstrap to isolate supervision;
+they are not represented as end-to-end execution proof.
+
 ## Guarantees and limitations
 
 - Public queries are observations, **not a globally atomic snapshot**. Neither

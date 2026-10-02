@@ -230,7 +230,28 @@ export class MessageStore {
     this.getGoDeliveryOperation(goId,key);
     this.db.prepare("INSERT INTO go_delivery_operations VALUES (?,?,?,?) ON CONFLICT(go_id,operation_key) DO UPDATE SET state=excluded.state,response_json=excluded.response_json WHERE go_delivery_operations.state!='accepted'").run(goId,key,state,response===undefined?"":JSON.stringify(response));
   }
-  recordGoRunResult(goId:number,actionKey:string,result:{state:"complete"|"unknown";text?:string;runId:string}) {
+  /** Durable initial-execution intent, separate from the at-most-once send ledger. */
+  createGoBootstrap(goId:number): void {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_bootstrap(go_id INTEGER PRIMARY KEY,state TEXT NOT NULL)");
+    this.db.prepare("INSERT OR IGNORE INTO go_bootstrap VALUES (?,'pending')").run(goId);
+  }
+  getGoBootstrap(goId:number): string | null {
+    this.db.exec("CREATE TABLE IF NOT EXISTS go_bootstrap(go_id INTEGER PRIMARY KEY,state TEXT NOT NULL)");
+    return (this.db.prepare("SELECT state FROM go_bootstrap WHERE go_id=?").get(goId) as any)?.state ?? null;
+  }
+  finishGoBootstrap(goId:number,state:"done"|"superseded"): void {
+    this.getGoBootstrap(goId);
+    this.db.prepare("UPDATE go_bootstrap SET state=? WHERE go_id=?").run(state,goId);
+  }
+  isGoActionComplete(goId:number,actionKey:string): boolean {
+    return (this.db.prepare("SELECT done FROM go_actions WHERE go_id=? AND action_key=?").get(goId,actionKey) as any)?.done===1;
+  }
+  listGoSends(goId:number): Array<{actionKey:string;idempotencyKey:string;sessionKey:string;sessionId:string}> {
+    this.listUnresolvedGoSends(goId);
+    return (this.db.prepare("SELECT s.*,l.idempotency_key FROM go_send_identities s JOIN go_action_lifecycle l ON s.go_id=l.go_id AND s.action_key=l.action_key WHERE s.go_id=?").all(goId) as any[])
+      .map(r=>({actionKey:r.action_key,idempotencyKey:r.idempotency_key,...JSON.parse(r.identity_json)}));
+  }
+  recordGoRunResult(goId:number,actionKey:string,result:{state:"complete"|"unknown";text?:string;runId:string;executorResult?:import("./go-execution.js").GoExecutorResult}) {
     this.db.exec("CREATE TABLE IF NOT EXISTS go_run_results(go_id INTEGER,action_key TEXT,result_json TEXT,PRIMARY KEY(go_id,action_key))");
     this.db.prepare("INSERT OR REPLACE INTO go_run_results VALUES (?,?,?)").run(goId,actionKey,JSON.stringify(result));
   }
@@ -256,6 +277,12 @@ export class MessageStore {
     if(executor) identity.executorRunIds=[...new Set([...identity.executorRunIds,runId])];
     else identity.checkerRunId=runId;
     this.db.prepare("UPDATE go_native_bindings SET identity_json=? WHERE go_id=?").run(JSON.stringify(identity),goId);
+  }
+  /** Durable delivery ownership includes completed/stopped jobs, not only active ones. */
+  ownsGoExecutorRun(botName:string,chatId:string,sessionKey:string,sessionId:string,runId:string): boolean {
+    this.ensureGoIntegrationSchema();
+    return (this.db.prepare("SELECT j.executor_session_key,j.executor_session_id,b.identity_json FROM go_jobs j JOIN go_native_bindings b ON j.id=b.go_id WHERE j.bot_name=? AND j.chat_id=? AND j.executor_session_id=?").all(botName,chatId,sessionId) as any[])
+      .some(row=>[row.executor_session_key,`agent:main:${row.executor_session_key}`].includes(sessionKey) && JSON.parse(row.identity_json).executorRunIds.includes(runId));
   }
   recordGoVisibleEvidence(goId: number, sourceKey: string, payload: { sessionId: string; runId: string; kind: string; text: string; attachments: unknown[] }) {
     this.ensureGoIntegrationSchema();

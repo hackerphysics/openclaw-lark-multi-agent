@@ -17,7 +17,7 @@ describe("Go public integration isolated synthetic loop", () => {
     } finally {rmSync(dir,{recursive:true,force:true});}
   });
   it("uses public guarded admission and native goal shape; no archive restore or unsafe completion", async () => {
-    const client=Object.create(OpenClawClient.prototype) as any; const calls:any[]=[];
+    const client=new OpenClawClient({baseUrl:"ws://localhost",token:"synthetic"} as any) as any; const calls:any[]=[];
     client.rpc=async(method:string,params:any)=>{calls.push({method,params});return {runId:"checker-run"};};
     const p={sessionKey:binding.checkerSessionKey,sessionId:binding.checkerSessionId,expectedLeafEntryId:null,message:"/stop is evidence",idempotencyKey:"stable"};
     expect((await client.sendGoGuarded(p)).runId).toBe("checker-run");
@@ -49,8 +49,8 @@ describe("Go public integration isolated synthetic loop", () => {
 
 describe("Go public original-result reconciliation",()=>{
  it("requires exact generation/run and committed terminalReply, not inferred session text",async()=>{
-  const client=Object.create(OpenClawClient.prototype) as any;
-  client.getSessionInfo=async()=>({session:{sessionId:"generation"}});
+  const client=new OpenClawClient({baseUrl:"ws://localhost",token:"synthetic"} as any) as any;
+  client.getGoSessionInfo=async()=>({session:{sessionId:"generation"}});
   client.rpc=async()=>({runId:"original",status:"ok",endedAt:42,terminalReply:{disposition:"visible",text:"original verdict"}});
   await expect(client.readGoRunResult({sessionKey:"checker",sessionId:"generation",runId:"original"})).resolves.toBe("original verdict");
   await expect(client.readGoRunResult({sessionKey:"checker",sessionId:"new-generation",runId:"original"})).resolves.toBeNull();
@@ -74,7 +74,7 @@ describe("Go exact admitted run collector",()=>{
 
 describe("independent production adapter",()=>{
  it("binds restrictions without native Goal and reads public leaf, queue, exact tasks",async()=>{
-  const client=Object.create(OpenClawClient.prototype) as any;const calls:any[]=[];
+  const client=new OpenClawClient({baseUrl:"ws://localhost",token:"synthetic"} as any) as any;const calls:any[]=[];
   client.rpc=async(method:string,p:any)=>{calls.push({method,p});
    if(method==="lma.go.capabilities")return {mode:"independent",checkerToolsIsolated:true,taskQuery:true,atomicSnapshot:false};
    if(method==="lma.go.bind")return {persisted:true,binding:p.binding};
@@ -89,5 +89,28 @@ describe("independent production adapter",()=>{
   expect(snapshot).toMatchObject({independent:true,atomicSnapshot:false,complete:false,queryAvailable:true,queuedInputs:0,running:false});
   expect(snapshot.tasks[0]).toMatchObject({taskId:"task",runId:"run",state:"completed",deliveryState:"delivered"});
   expect(calls.some(c=>c.method.includes("goal"))).toBe(false);
+ });
+});
+
+
+describe("Go executor committed-result contract",()=>{
+ it("pins generation and run, distinguishes silent/empty/error, and never guesses missing terminalReply",async()=>{
+  const client=new OpenClawClient({baseUrl:"ws://localhost",token:"synthetic"} as any) as any;
+  const p={sessionKey:"executor",sessionId:"generation",runId:"owned"};
+  client.getGoSessionInfo=async()=>({session:{sessionId:"generation"}});
+  let snapshot:any={runId:"owned",sessionId:"generation",status:"ok",endedAt:42};
+  client.rpc=async()=>snapshot;
+  try {
+   await expect(client.readGoExecutorRunResult(p)).resolves.toBeNull();
+   snapshot.terminalReply={disposition:"empty"};await expect(client.readGoExecutorRunResult(p)).resolves.toMatchObject({...p,sessionKey:"agent:main:executor",disposition:"empty",text:""});
+   snapshot.terminalReply={disposition:"silent"};await expect(client.readGoExecutorRunResult(p)).resolves.toMatchObject({disposition:"silent"});
+   snapshot.terminalReply={disposition:"visible",text:"NO_REPLY"};await expect(client.readGoExecutorRunResult(p)).resolves.toMatchObject({disposition:"silent"});
+   snapshot.status="error";snapshot.error="terminal provider error";await expect(client.readGoExecutorRunResult(p)).resolves.toMatchObject({disposition:"error",error:"terminal provider error"});
+   snapshot.pendingError=true;await expect(client.readGoExecutorRunResult(p)).resolves.toBeNull();delete snapshot.pendingError;
+   snapshot.runId="unowned";await expect(client.readGoExecutorRunResult(p)).resolves.toBeNull();snapshot.runId="owned";
+   snapshot.sessionId="wrong-generation";await expect(client.readGoExecutorRunResult(p)).resolves.toBeNull();snapshot.sessionId="generation";
+   let lookup=0;client.getGoSessionInfo=async()=>({session:{sessionId:++lookup===1 ? "generation" : "replacement"}});
+   await expect(client.readGoExecutorRunResult(p)).resolves.toBeNull();
+  } finally {await client.disconnect();}
  });
 });

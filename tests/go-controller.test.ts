@@ -27,6 +27,10 @@ function makeHarness(botName = "GPT") {
     async readGoRuntimeSnapshot(sessionKey:string,sessionId:string) { return {sessionKey:sessionKey.startsWith("agent:") ? sessionKey : `agent:main:${sessionKey}`,sessionId,goalId:"goal",goalRevision:1,executorRunIds:store.getGoNativeIdentity(1)?.executorRunIds ?? ["executor-root"],checkerRunId:store.getGoNativeIdentity(1)?.checkerRunId ?? "checker-root",complete:true,archived:false,queuedInputs:0,recoverableInputs:0,pendingDeliveries:0,tasks:(store.getGoNativeIdentity(1)?.executorRunIds ?? ["executor-root"]).map((runId:string,i:number)=>({taskId:`root-${i}`,runId,parentTaskId:null,state:running?"running":"completed",deliveryState:"delivered"}))}; },
     async sendGoGuarded(p:any) { requests.set(p.idempotencyKey,p.message); return {runId:p.idempotencyKey}; },
     async collectGoRun(p:any) { const checker = p.sessionKey.includes("lma-go-"); return client.chatSendWithContext({sessionKey:p.sessionKey,currentMessage:requests.get(p.runId),unsyncedMessages:[],runId:p.runId}); },
+    async collectGoExecutorRun(p:any) {
+      const text=await client.collectGoRun(p);
+      return {sessionKey:p.sessionKey,sessionId:p.sessionId,runId:p.runId,disposition:text.trim()==="NO_REPLY" ? "silent" : "visible",text};
+    },
     set running(v: boolean) { running = v; },
     get running() { return running; },
     async getSessionInfo(key: string) { return { session: sessions.get(key) || null }; },
@@ -39,6 +43,8 @@ function makeHarness(botName = "GPT") {
     botName, fallbackModel: "prov/base", store, client: client as any,
     executorSessionKeyFor: (chatId: string) => `lma-${botName.toLowerCase()}-${chatId}`,
     notify: async (chatId, text) => { notifications.push(`${chatId}::${text}`); return "synthetic-notification-id"; },
+    // Supervisor unit fixtures isolate delivery; the real callback loop is covered separately.
+    deliverExecutorResult: async () => {},
     reply: async (messageId, text) => { repliesToUser.push([messageId, text]); },
   });
   return {
@@ -55,7 +61,10 @@ async function startGo(h: Harness, goal = "完成测试目标", chatId = "chat1"
   primeExecutor(h, chatId);
   h.client.queueReply("OK");
   await h.c.handleGoCommand(chatId, "msg1", goal);
-  return h.store.getActiveGoJob("GPT", chatId)!;
+  const job=h.store.getActiveGoJob("GPT", chatId)!;
+  // Explicit legacy-observation mode for verdict unit tests, not an execution fixture.
+  h.store.finishGoBootstrap(job.id,"done");
+  return job;
 }
 
 async function cycleWithEvidence(h: Harness, jobId: number, n: number, checkerReply: string, chatId = "chat1") {

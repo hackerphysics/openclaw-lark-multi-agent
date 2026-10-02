@@ -1,3 +1,4 @@
+import type { GoExecutorResult } from "./go-execution.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
@@ -193,7 +194,12 @@ export class FeishuBot {
           const failure=JSON.parse(previous.response_json);
           throw Object.assign(new Error(failure.message),{code:failure.code,response:{data:{code:failure.code,msg:failure.message}}});
         }
-        if(context?.blocked || (previous && previous.state!=="accepted")) throw new Error("Go delivery outcome unknown; original operation cannot be replayed");
+        if(context?.blocked || (previous && previous.state!=="accepted")) {
+          // Carry a durable unknown fence across *all* fallback operations after
+          // restart too, not merely the original failed card/attachment ordinal.
+          if(context) context.blocked=true;
+          throw new Error("Go delivery outcome unknown; original operation cannot be replayed");
+        }
         let result:any;
         if(previous?.state==="accepted") result=JSON.parse(previous.response_json).result;
         else {
@@ -216,7 +222,7 @@ export class FeishuBot {
         if(visible && context?.goId && !id) {this.store.recordGoDeliveryOperation(context.goId,key,"unknown");context.blocked=true;throw new Error("Missing actual Go platform message receipt");}
         if(context?.goId) this.store.recordGoDeliveryOperation(context.goId,key,"accepted",{result,payload:visible ? params.data : undefined,operation});
         if(visible && context && typeof id==="string" && id) {
-          context.receipts.push({messageId:id,operation:previous?.state==="accepted" ? JSON.parse(previous.response_json).operation : operation,payload:previous?.state==="accepted" ? JSON.parse(previous.response_json).payload : params.data});
+          if(!context.receipts.some(r=>r.messageId===id)) context.receipts.push({messageId:id,operation:previous?.state==="accepted" ? JSON.parse(previous.response_json).operation : operation,payload:previous?.state==="accepted" ? JSON.parse(previous.response_json).payload : params.data});
           context.onReceipt(); // Persist before the next chunk or attachment operation.
         }
         return result;
@@ -293,6 +299,7 @@ export class FeishuBot {
       executorSessionKeyFor: (chatId: string) => this.getSessionKey(chatId),
       notify: (chatId, text) => this.sendOrdered(chatId, () => this.sendMessage(chatId, text)),
       reply: (messageId, text) => this.replyMessage(messageId, text),
+      deliverExecutorResult: (chatId,result,goId) => this.deliverGoExecutorResult(chatId,result,goId),
       log: (msg) => console.log(msg),
     });
     const unobserveGo = this.openclawClient.observeGoEvidence?.(({ channel, payload }) => {
@@ -439,6 +446,11 @@ export class FeishuBot {
     this.openclawClient.setVerboseTranscriptDelivery(sessionKey, this.store.getBotVerbose(this.config.name, chatId));
     await this.openclawClient.subscribeSession(sessionKey, async (text, meta) => {
       try {
+        // The Controller owns exact Go executor finals. Streams/proactive callbacks
+        // can race collection (including after a bridge restart); never let that
+        // second path create a second body/attachment outbox owner.
+        if(meta?.runId && meta?.sessionId && this.store.ownsGoExecutorRun(this.config.name,chatId,
+          meta.sessionKey || "",meta.sessionId,meta.runId)) return;
         let provenance = meta?.error;
         if (!provenance && meta?.genericErrorCandidate && meta.runId && meta.sessionKey) {
           provenance = this.store.getErrorNotice(this.config.name, chatId, errorIdentity(meta.sessionKey, meta.runId))?.provenance;
@@ -955,8 +967,15 @@ export class FeishuBot {
             || (routing.hasTargetedMention ? routing.isCurrentBotMentioned : groupBotCount === 1);
           if (goRoutedForMe) {
             const goArgs = cleanText.trim().split(/\s+/).slice(1).join(" ").trim();
-            await this.goController?.handleGoCommand(chatId, messageId, goArgs);
-            markCommandSynced();
+            try {
+              const control=/^(?:status|pause|resume|stop|model)(?:\s|$)/i.test(goArgs) || !goArgs;
+              if(!control) await this.ensureSession(chatId);
+              await this.goController?.handleGoCommand(chatId, messageId, goArgs);
+            }
+            finally {
+              markCommandSynced();
+              this.goController?.onCommandSettled(chatId);
+            }
             return;
           }
         }
@@ -2807,6 +2826,29 @@ export class FeishuBot {
     this.deliveryRetryTimers.set(chatId, timer);
   }
 
+  /** Both initial and CONTINUE results enter the same ordinary LMA outbox.
+   * No host proactive-send assumption, no fake platform receipt. */
+  private async deliverGoExecutorResult(chatId:string,result:GoExecutorResult,goId:number): Promise<void> {
+    const source=`go-run:${result.sessionId}:${result.runId}`;
+    if(result.disposition==="silent" || result.disposition==="empty") {
+      this.goController?.notifyExactRunOutcome(goId,"no_reply",source,
+        result.disposition==="silent" ? "精确执行 run 已终局：NO_REPLY（无用户可见正文）" : "精确执行 run 已终局：terminalReply.empty（真无正文，非未确认）",result.sessionId,result.runId);
+      return;
+    }
+    const failure=result.disposition==="error";
+    const parsed=this.extractBridgeAttachments(failure ? `⚠️ Go 执行运行已确认终局错误\n原因：${result.error || "unknown"}` : result.text);
+    if(parsed.text.trim()==="NO_REPLY") parsed.text="";
+    if(!parsed.text.trim() && !parsed.attachments.length) {
+      this.goController?.notifyExactRunOutcome(goId,"no_reply",source,"精确执行 run 已终局，但解析后无正文/附件",result.sessionId,result.runId);return;
+    }
+    await this.enqueueAndDispatchDelivery(chatId,failure ? "go_executor_error" : "assistant_visible",source,
+      parsed.text.trim(),parsed.attachments,undefined,source,this.config.model,
+      {sessionKey:result.sessionKey,sessionId:result.sessionId,runId:result.runId,final:true,goJobId:goId});
+    // Pending/rejected/unknown platform responses must not be mistaken for
+    // visible evidence. The outbox retains its own safe receipt recovery path.
+    if(this.store.getDeliveryByKey(this.config.name,chatId,source)?.status!=="delivered") throw new Error("Go executor outbox delivery pending/unconfirmed");
+  }
+
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
     this.installGoReceiptCapture();
     let retryScheduled = false;
@@ -2814,18 +2856,21 @@ export class FeishuBot {
       const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
       if (pending.length === 0) break;
       for (const item of pending) {
-        const receipts: Array<{messageId:string;operation:string;payload:unknown}> = [];
-        await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:this.store.getActiveGoJob(this.config.name,chatId)?.id,outboxId:item.id!,stage:"body",ordinals:new Map(),onReceipt:()=>{
-          const job=this.store.getActiveGoJob(this.config.name,chatId);
-          if(job) this.store.recordGoDeliveryReceipt(job.id,`outbox:${item.id}`,{messages:receipts,partial:true});
+        const ownerId=JSON.parse(item.deliveryMetaJson || "{}").provenance?.goJobId;
+        const deliveryJob=ownerId ? this.store.getGoJobById(ownerId) : this.store.getActiveGoJob(this.config.name,chatId);
+        const receipts: Array<{messageId:string;operation:string;payload:unknown}> = [
+          ...(deliveryJob ? this.store.listGoVisibleEvidence(deliveryJob.id).find(e=>e.sourceKey===`outbox:${item.id}`)?.receipt?.messages ?? [] : []),
+        ];
+        await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,stage:"body",ordinals:new Map(),onReceipt:()=>{
+          if(deliveryJob) this.store.recordGoDeliveryReceipt(deliveryJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
         }}, async () => {
         if (!item.id || !this.store.claimDelivery(item.id)) return;
         let failureStage: "text" | "attachment" | "cleanup" = "text";
         try {
-          const job = this.store.getActiveGoJob(this.config.name, chatId);
+          const job = deliveryJob;
           const provenance = JSON.parse(item.deliveryMetaJson || "{}").provenance;
           const goSource = `outbox:${item.id}`;
-          const eligible = job && ["assistant_visible","verbose_transcript","run_error","provider_error","delayed_error","proactive"].some(k=>item.sourceType.startsWith(k));
+          const eligible = job && ["assistant_visible","verbose_transcript","run_error","provider_error","delayed_error","proactive","go_executor_error"].some(k=>item.sourceType.startsWith(k));
           if (eligible) this.store.recordGoVisibleEvidence(job.id,goSource,{sessionId:provenance?.sessionId ?? "",
             runId:provenance?.runId ?? "",kind:item.sourceType,text:item.content,attachments:JSON.parse(item.attachmentsJson || "[]")});
           const attachments = JSON.parse(item.attachmentsJson || "[]") as BridgeAttachment[];
@@ -2911,15 +2956,17 @@ export class FeishuBot {
           }
 
           if (eligible && receipts.length) {
-            const previous = this.store.listGoVisibleEvidence(job.id).find(e=>e.sourceKey===goSource)?.receipt;
-            this.store.recordGoDeliveryReceipt(job.id,goSource,{messages:[...(previous?.messages ?? []),...receipts],outboxId:item.id});
+            this.store.recordGoDeliveryReceipt(job.id,goSource,{messages:receipts,outboxId:item.id});
             if (provenance?.runId && provenance?.sessionId === job.executorSessionId) {
-              this.goController?.notifyRunOutcome(chatId,["run_error","provider_error","delayed_error"].some(k=>item.sourceType.startsWith(k)) ? "run_error" : "assistant_reply",goSource,JSON.stringify({text:item.content,attachments,receipt:receipts}));
+              const kind=["run_error","provider_error","delayed_error","go_executor_error"].some(k=>item.sourceType.startsWith(k)) ? "run_error" : "assistant_reply";
+              const evidence=JSON.stringify({text:item.content,attachments,receipt:receipts});
+              if(ownerId) this.goController?.notifyExactRunOutcome(job.id,kind,goSource,evidence,provenance.sessionId,provenance.runId);
+              else this.goController?.notifyRunOutcome(chatId,kind,goSource,evidence);
             }
           }
           this.store.markDeliveryDelivered(item.id);
         } catch (err) {
-          const activeJob = this.store.getActiveGoJob(this.config.name,chatId);
+          const activeJob = deliveryJob;
           if (activeJob && receipts.length) this.store.recordGoDeliveryReceipt(activeJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
           const willRetry = this.store.retryDelivery(item.id, DELIVERY_MAX_ATTEMPTS);

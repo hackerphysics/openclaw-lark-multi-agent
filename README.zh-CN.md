@@ -533,7 +533,9 @@ steer V2 与问答适配器。
 
 ### 独立 Go Checker
 
-`/go <目标>` 创建专用验收 Checker；`/go status`、`/go pause|resume|stop`、
+`/go <目标>` 设定目标、创建专用验收 Checker，并在安全空闲边界首次提交原目标，
+无需再发一条执行消息。首次与自动跟进的执行结果统一通过 LMA 正文/附件持久化 outbox
+投递，实际飞书消息回执才成为验收证据；`/go status`、`/go pause|resume|stop`、
 `/go model <provider/model>` 控制监督。目标、验收条件、revision 和完成权由 LMA
 MessageStore 管理，不依赖或修改原生 Goal。需由操作者启用随仓库提供的 `lma-go`
 插件；动态绑定后真实禁止 Checker 全部工具。详见
