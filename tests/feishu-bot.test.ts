@@ -2246,6 +2246,29 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { logged.mockRestore(); h.cleanup(); }
   });
 
+  it.each(["zh", "en"] as const)("delivers the real Go disabled-model error through the %s outbox without model/retry/policy changes", async locale => {
+    const h = makeHarness("Gemini");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      h.store.setChairmanBot("chat1", "Gemini"); h.store.setBotMode("Gemini", "chat1", "free"); h.store.setChatLocale("chat1", locale);
+      (h.bot as any).config.model = "x/gemini-3.8-flash";
+      (h.openclaw as any).chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params); params.onSendAttempt?.();
+        throw new Error(`Agent error: 503 ${JSON.stringify("model 'gemini-3.8-flash' is disabled")}`);
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "offline fixture", messageId: "disabled-model" }));
+      const rowId = h.store.getMessageId("disabled-model")!;
+      const delivery = h.store.getDeliveryByKey("Gemini", "chat1", `trigger:${rowId}:provider-error`)!;
+      expect(delivery.content).toContain(locale === "en" ? "selected model is paused" : "所选模型已暂停");
+      expect(delivery.content).toContain("x/gemini-3.8-flash"); expect(delivery.content).toContain("HTTP 503");
+      expect(delivery.content).not.toContain("原因尚未分类"); expect(delivery.content).not.toContain("JSON Schema");
+      expect(h.openclaw.chatCalls).toHaveLength(1); expect((h.bot as any).config.model).toBe("x/gemini-3.8-flash");
+      expect(h.openclaw.patchSession).not.toHaveBeenCalled(); expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      expect(h.store.getPendingTriggerIds("Gemini", "chat1").has(rowId)).toBe(false);
+      expect(h.store.getDeliveryByKey("Gemini", "chat1", `trigger:${rowId}`)).toBeNull();
+    } finally { logged.mockRestore(); h.cleanup(); }
+  });
+
   it("does not replay accepted truly empty replies", async () => {
     const h = makeHarness("GLM");
     try {

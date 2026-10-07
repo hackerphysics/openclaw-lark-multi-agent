@@ -1,6 +1,6 @@
 import type { Locale } from "./i18n.js";
 
-export type ErrorCategory = "cancelled" | "model" | "model_policy" | "tools" | "context" | "quota" | "rate_limit" | "auth" | "network" | "ttft_timeout" | "total_timeout" | "collector_timeout" | "timeout" | "unknown";
+export type ErrorCategory = "cancelled" | "model" | "model_unavailable" | "model_policy" | "tools" | "context" | "quota" | "rate_limit" | "auth" | "network" | "ttft_timeout" | "total_timeout" | "collector_timeout" | "timeout" | "unknown";
 export interface SafeProviderError {
   category: ErrorCategory;
   status?: number;
@@ -16,7 +16,7 @@ export interface SafeProviderError {
 const ENVELOPE_FIELDS = ["response", "data", "body", "error", "cause", "message", "msg", "errorMessage", "details"] as const;
 const MAX_TEXT = 16_384;
 const CODES = new Set([
-  "model_not_supported", "invalid_model", "model_not_found", "unsupported_model", "incompatible_api",
+  "model_not_supported", "invalid_model", "model_not_found", "unsupported_model", "incompatible_api", "model_disabled", "model_unavailable",
   "invalid_request_error", "invalid_request", "bad_request", "invalid_argument", "schema_rejected", "schema_validation_error", "validation_error", "malformed_request",
   "context_length_exceeded", "context_window_exceeded", "prompt_too_long", "input_too_long",
   "insufficient_quota", "quota_exceeded", "usage_limit_exceeded", "credits_exhausted", "rate_limit_exceeded", "too_many_requests", "rate_limit_error",
@@ -25,7 +25,16 @@ const CODES = new Set([
   "ttft_timeout", "first_token_timeout", "response_header_timeout", "und_err_headers_timeout", "total_timeout", "execution_timeout", "request_deadline_exceeded",
   "server_error", "internal_error", "internal_server_error", "api_error", "service_unavailable", "overloaded_error", "timeout_error", "abort_err",
 ]);
-const TYPES = new Set([...CODES, "error", "request_error", "invalid_argument_error", "permission_error", "not_found_error", "invalid_response_error"]);
+const TYPES = new Set([...CODES, "error", "request_error", "invalid_argument_error", "permission_error", "not_found_error", "invalid_response_error", "gateway_error"]);
+// A known model identifier is classification evidence, not public provider prose.
+// Reject URLs and credential-shaped IDs; even a valid captured ID is never echoed.
+const isSafeModelId = (value: string): boolean => /^[a-z0-9_./:-]{1,128}$/i.test(value)
+  && !value.includes("://") && !/(?:^|[/:._-])(?:sk-|gh[pousr]_|eyJ)|secret|private_|password|credential|api[_-]?key|access[_-]?token/i.test(value)
+  && !/^[a-f0-9]{24,}$/i.test(value) && !/^[a-z0-9_+-]{48,}$/i.test(value);
+const isDisabledModelBody = (value: string): boolean => {
+  const id = value.match(/^model '([a-z0-9_./:-]{1,128})' is disabled$/)?.[1];
+  return id !== undefined && isSafeModelId(id);
+};
 const diagnostic = (value: unknown, values: Set<string>): string | undefined => typeof value === "string"
   && values.has(value.toLowerCase()) ? value : undefined;
 /** Classify by a validated root; expose only known structural path segments.
@@ -63,30 +72,38 @@ const SAFE_MESSAGES = [
  * and nested JSON errors. Deeper structured provider fields beat wrapper fields.
  * Message text is used for classification, never returned verbatim. */
 export function classifyProviderError(error: unknown): SafeProviderError {
-  type Candidate = Partial<SafeProviderError> & { score: number };
+  type Candidate = Partial<SafeProviderError> & { score: number; disabledModelBody?: boolean };
   const candidates: Candidate[] = [];
   const texts: string[] = [];
   const seen = new Set<object>();
   let nodes = 0;
   let cancelled = false;
   let abortSignal = false;
-  function visit(value: unknown, depth = 0, rank = 0): void {
+  function visit(value: unknown, depth = 0, rank = 0, envelopeStatus?: number): void {
     if (depth > 8 || ++nodes > 64) return;
     if (typeof value === "string") {
       const text = value.slice(0, MAX_TEXT).trim();
       texts.push(text);
       const unwrapped = text.replace(/^(?:(?:Agent error|RPC error|Error|HTTP(?: error)?)\s*:\s*)+/i, "");
       const statusPrefix = unwrapped.match(/^(?:HTTP\s*)?([45]\d{2})\b\s*:?\s*/i);
-      if (statusPrefix) candidates.push({ score: rank + depth, status: httpStatus(statusPrefix[1]) });
+      const localStatus = statusPrefix ? httpStatus(statusPrefix[1]) : envelopeStatus;
+      if (statusPrefix) candidates.push({ score: rank + depth, status: localStatus });
       if (/<(?:!doctype|html|body)\b/i.test(text)) return;
       const body = statusPrefix ? unwrapped.slice(statusPrefix[0].length) : unwrapped;
       // Only a complete JSON value in an explicit SDK/HTTP envelope. Never
       // search arbitrary prose (which may contain prompt echoes) for JSON or
       // code/type/request_id assignments.
-      if (/^[{"]/.test(body)) {
-        try { const parsed: unknown = JSON.parse(body); if (parsed !== value) visit(parsed, depth + 1, rank); } catch { /* not JSON */ }
+      if (value.length <= MAX_TEXT && /^[{"]/.test(body)) {
+        try { const parsed: unknown = JSON.parse(body); if (parsed !== value) visit(parsed, depth + 1, rank, localStatus); } catch { /* not JSON */ }
       }
       const plain = body.trim();
+      // Mark only a complete known sentence, never a "disabled" substring.
+      // Classification below additionally requires the enclosing HTTP503 and
+      // compatible diagnostic provenance, including sibling response.status.
+      // Do not classify a truncated long body as a complete known sentence.
+      if (value.length <= MAX_TEXT && isDisabledModelBody(plain)) {
+        candidates.push({ score: rank + depth, disabledModelBody: true });
+      }
       if (SAFE_MESSAGES.some(message => message.toLowerCase() === plain.toLowerCase())) {
         candidates.push({ score: rank + depth, safeMessage: plain });
       }
@@ -103,7 +120,10 @@ export function classifyProviderError(error: unknown): SafeProviderError {
     }
     const candidate: Candidate = { score: rank + depth,
       code: diagnostic(obj.code, CODES), type: diagnostic(obj.type, TYPES), param: parameter(obj.param),
-      status: httpStatus(obj.status) ?? httpStatus(obj.statusCode) ?? httpStatus(obj.httpStatus),
+      status: httpStatus(obj.status) ?? httpStatus(obj.statusCode) ?? httpStatus(obj.httpStatus)
+        // Go writeErr's closed envelope uses a numeric HTTP code, not a string
+        // provider code. Accept it only with its known gateway_error type.
+        ?? (obj.type === "gateway_error" ? httpStatus(obj.code) : undefined),
       requestId: requestId(obj.request_id) ?? requestId(obj.req_id) ?? requestId(obj.requestId) };
     candidates.push(candidate);
     for (const field of ENVELOPE_FIELDS) {
@@ -111,7 +131,7 @@ export function classifyProviderError(error: unknown): SafeProviderError {
       // regardless of iteration order. Keep code/type/param as one envelope.
       const weight = field === "error" ? 100 : field === "response" ? 80 : field === "data" ? 20
         : field === "body" || field === "cause" || field === "details" ? 10 : 0;
-      visit(obj[field], depth + 1, rank + weight);
+      visit(obj[field], depth + 1, rank + weight, candidate.status ?? envelopeStatus);
     }
   }
   visit(error);
@@ -132,7 +152,15 @@ export function classifyProviderError(error: unknown): SafeProviderError {
   const type = (result.type || "").toLowerCase();
   const param = (result.param || "").toLowerCase();
   const tags = `${code} ${type}`;
+  const disabledBody = candidates.find(c => c.disabledModelBody);
+  const neutralCode = /^(?:server_error|internal_error|internal_server_error|api_error|service_unavailable|invalid_request_error|bad_request)$/.test(code);
+  const knownDisabledBody = result.status === 503 && disabledBody !== undefined
+    && disabledBody.score >= (chosen?.score ?? -Infinity) && (!param || param === "model")
+    && (!code || neutralCode)
+    && (!type || /^(?:error|request_error|gateway_error|api_error|server_error|invalid_request_error|service_unavailable)$/.test(type));
   if (cancelled) result.category = "cancelled";
+  else if (/^(?:model_disabled|model_unavailable)$/.test(code)
+    || ((!code || neutralCode) && /^(?:model_disabled|model_unavailable)$/.test(type)) || knownDisabledBody) result.category = "model_unavailable";
   else if (/\b(?:model_not_supported|invalid_model|model_not_found|unsupported_model|incompatible_api)\b/.test(tags) || param === "model") result.category = "model";
   else if (/^(?:tools|functions|tool_choice)(?:\b|[.\[])/.test(param)
     && (/^(?:invalid_argument|invalid_request_error|invalid_request|bad_request|schema_rejected|schema_validation_error|validation_error|malformed_request|invalid_argument_error)$/.test(code)
@@ -175,6 +203,7 @@ export function formatProviderError(error: unknown, botName: string, model: stri
   const reasons: Record<ErrorCategory, [string, string]> = {
     cancelled: ["本次运行收到停止或取消信号；不据此认定供应商故障。", "A stop/cancel signal was reported; provider failure is not established."],
     model: ["当前模型不受供应商支持、不可用，或与所用 API 不兼容；供应商支持尚未恢复。", "The current model is unsupported, unavailable or incompatible with this API; provider support has not been restored."],
+    model_unavailable: ["所选模型已暂停或当前没有可用上游；这不是工具参数错误。", "The selected model is paused or currently has no usable upstream; this is not a tool-argument error."],
     model_policy: ["当前模型被 OpenClaw 模型策略拒绝（modelPolicy.allow）；没有自动切换模型。", "The current model was rejected by OpenClaw modelPolicy.allow; no automatic model switch occurred."],
     tools: ["供应商明确拒绝了 tools/functions 的参数或 JSON Schema。", "The provider explicitly rejected tools/functions arguments or JSON Schema."],
     context: ["请求超过模型上下文或输入长度限制；这不是供应商额度耗尽。", "The request exceeded the model context/input limit; this is not quota exhaustion."],
@@ -192,7 +221,7 @@ export function formatProviderError(error: unknown, botName: string, model: stri
     e.param && `param=${e.param}`, e.requestId && `request_id=${e.requestId}`].filter(Boolean).join(" · ");
   // Names come from bridge configuration, not provider prose. Validate them too.
   const safeName = /^[\p{L}\p{N} _.-]{1,64}$/u.test(botName) ? botName : "Agent";
-  const safeModel = /^[a-z0-9_./:-]{1,128}$/i.test(model) && !model.includes("://") ? model : "unknown";
+  const safeModel = isSafeModelId(model) ? model : "unknown";
   const title = e.category === "cancelled" ? (en ? "run cancelled" : "本次运行已取消") : (en ? "did not finish this reply" : "这次没有完成回复");
   return `${e.category === "cancelled" ? "⏹️" : "⚠️"} ${safeName} ${title}${en ? "." : "。"}\n${en ? "Model: " : "模型："}${safeModel}\n${en ? "Reason: " : "原因："}${reasons[e.category][en ? 1 : 0]}${e.safeMessage ? `\n${e.safeMessage}` : ""}${metadata ? `\n${metadata}` : ""}`;
 }
