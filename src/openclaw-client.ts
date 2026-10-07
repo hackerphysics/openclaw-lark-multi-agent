@@ -1,5 +1,6 @@
 import type { GoExecutorResult } from "./go-execution.js";
 import WebSocket from "ws";
+import { safeErrorSummary } from "./provider-errors.js";
 import { inspectError, genericFailure, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { createHash, randomUUID } from "crypto";
@@ -435,7 +436,7 @@ export class OpenClawClient {
 
       this.ws.on("error", (err) => {
         if (!handshakeDone) reject(err);
-        else console.error("[OpenClaw] WS error:", err.message);
+        else console.error("[OpenClaw] WS error:", safeErrorSummary(err));
       });
 
       this.ws.on("close", () => {
@@ -710,7 +711,7 @@ export class OpenClawClient {
         this.reconnectDelay = 1000; // reset on success
         console.log("[OpenClaw] Reconnected successfully");
       } catch (err) {
-        console.error("[OpenClaw] Reconnect failed:", (err as Error).message);
+        console.error("[OpenClaw] Reconnect failed:", safeErrorSummary(err));
         if (this.shouldReconnect) this.scheduleReconnect();
       }
     }, delay);
@@ -1180,7 +1181,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                   const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
                   // Never abort a yielded original run, nor an empty final.
                   if (!foregroundYielded && latestFinalText) this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
-                    console.warn(`[OpenClaw] abort after chatFinal fallback failed:`, (err as Error).message);
+                    console.warn(`[OpenClaw] abort after chatFinal fallback failed:`, safeErrorSummary(err));
                   });
                   if (latestFinalText) {
                     finish(latestFinalText);
@@ -1271,8 +1272,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               // real final wins; if the run truly stalls, the idle timeout falls
               // back to this text.
               if (this.isRecoverableAgentError(errText)) {
-                pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
-                console.warn(`[OpenClaw] recoverable lifecycle error for runId=${evRunId || runId}; deferring (agent may auto-recover): ${errText.slice(0, 120)}`);
+                pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${safeErrorSummary(errText)}`;
+                console.warn(`[OpenClaw] recoverable lifecycle error for runId=${evRunId || runId}; deferring (agent may auto-recover): ${safeErrorSummary(errText)}`);
                 return;
               }
               if (isWaitTimeout(errText)) {
@@ -1320,8 +1321,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 continue;
               }
               if (this.isRecoverableAgentError(errText)) {
-                pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${errText}`;
-                console.warn(`[OpenClaw] recoverable chat error for runId=${evRunId || runId}; deferring: ${errText.slice(0, 120)}`);
+                pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${safeErrorSummary(errText)}`;
+                console.warn(`[OpenClaw] recoverable chat error for runId=${evRunId || runId}; deferring: ${safeErrorSummary(errText)}`);
                 bucket.splice(i, 1);
                 continue;
               }
@@ -1342,7 +1343,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               // reject, so an auto-retry probe does not race a zombie run on the
               // same session. Idempotent/best-effort.
               this.abortChat(targetSessionKey || sessionKey, evRunId || runId).catch((abortErr) => {
-                console.warn(`[OpenClaw] abort after chat error failed:`, (abortErr as Error).message);
+                console.warn(`[OpenClaw] abort after chat error failed:`, safeErrorSummary(abortErr));
               });
               reject(new Error(`Agent error: ${errText}`));
               return;

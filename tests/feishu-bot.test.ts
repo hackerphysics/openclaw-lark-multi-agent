@@ -2214,6 +2214,38 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it.each(["zh", "en"] as const)("classifies model-not-supported safely in the %s group outbox without replay or model fallback", async locale => {
+    const h = makeHarness("Gemini");
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      h.store.setChairmanBot("chat1", "Gemini");
+      h.store.setBotMode("Gemini", "chat1", "free");
+      h.store.setChatLocale("chat1", locale);
+      const originalModel = (h.bot as any).config.model;
+      (h.openclaw as any).chatSendWithContext = vi.fn(async (params: any) => {
+        h.openclaw.chatCalls.push(params);
+        params.onSendAttempt?.();
+        throw new Error(`Agent error: 400 ${JSON.stringify({ request_id: "gw-72f76eeee916f7fa", error: { code: "model_not_supported", type: "invalid_request_error", param: "model", message: "PRIVATE_PROMPT schema rejected https://private.invalid/?key=PRIVATE_KEY" } })}`);
+      });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "offline fixture", messageId: "model-error" }));
+      const rowId = h.store.getMessageId("model-error")!;
+      const delivery = h.store.getDeliveryByKey("Gemini", "chat1", `trigger:${rowId}:provider-error`)!;
+      expect(delivery.content).toContain("code=model_not_supported");
+      expect(delivery.content).toContain("param=model");
+      expect(delivery.content).toContain("HTTP 400");
+      expect(delivery.content).toContain("request_id=gw-72f76eeee916f7fa");
+      expect(delivery.content).toContain(locale === "en" ? "provider support has not been restored" : "供应商支持尚未恢复");
+      expect(delivery.content).toContain(originalModel);
+      expect(delivery.content).not.toContain("JSON Schema");
+      expect(delivery.content + JSON.stringify(logged.mock.calls)).not.toContain("PRIVATE_");
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect((h.bot as any).config.model).toBe(originalModel);
+      expect(h.openclaw.patchSession).not.toHaveBeenCalled();
+      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
+      expect(h.store.getPendingTriggerIds("Gemini", "chat1").has(rowId)).toBe(false);
+    } finally { logged.mockRestore(); h.cleanup(); }
+  });
+
   it("does not replay accepted truly empty replies", async () => {
     const h = makeHarness("GLM");
     try {

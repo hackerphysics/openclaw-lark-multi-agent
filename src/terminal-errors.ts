@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { safeErrorSummary } from "./provider-errors.js";
 
 /** Only gateway envelopes / committed assistant metadata populate this record. */
 export interface ErrorProvenance {
@@ -84,7 +85,7 @@ export async function inspectError(p: ErrorProvenance, rpc: ReadRPC): Promise<Er
     // grace). Do not rewrite normal collector/auth/parameter/tool-error handling.
     if (p.source === "chat" && (p.state === "error" || (p.state === "final" && p.stopReason === "error"))) return {
       state: "terminal", reason: "ordinary_gateway_error", terminalKey: `run-error:${errorIdentity(p.sessionKey, p.runId)}`,
-      text: `⚠️ Agent run failed${p.detail ? `: ${p.detail}` : ""}`,
+      text: `⚠️ Agent run failed${p.detail ? `: ${safeErrorSummary(p.detail)}` : ""}`,
     };
     try {
       const wait = await rpc("agent.wait", { runId: p.runId, timeoutMs: 1 }, 2000);

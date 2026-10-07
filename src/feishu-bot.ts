@@ -11,6 +11,7 @@ import { CompactProgressController, type CompactProgressView } from "./compact-p
 import { GoController } from "./go-controller.js";
 import { MessageStore, type PendingErrorNotice } from "./message-store.js";
 import { errorIdentity, type ErrorVerdict, type ProactiveMessageMeta } from "./terminal-errors.js";
+import { formatProviderError, safeErrorSummary } from "./provider-errors.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve } from "path";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
@@ -436,7 +437,7 @@ export class FeishuBot {
     } catch (err) {
       // Session/model setup is authoritative. Propagate policy/capability errors
       // so the queue can notify the user and never continue on the wrong model.
-      console.warn(`[${this.config.name}] ensureSession error:`, (err as Error).message);
+      console.warn(`[${this.config.name}] ensureSession error:`, safeErrorSummary(err));
       throw err;
     }
 
@@ -1266,7 +1267,7 @@ export class FeishuBot {
       this.pendingAckMessages.set(chatId, pending);
       await this.processQueue(chatId);
     } catch (err) {
-      console.error(`[${this.config.name}] Error:`, err);
+      console.error(`[${this.config.name}] Error:`, safeErrorSummary(err));
     }
   }
 
@@ -1545,7 +1546,7 @@ export class FeishuBot {
         // busy marker, report the actionable error, and retire only this batch
         // so the chat cannot remain wedged indefinitely.
         this.busyChats.set(chatId, 0);
-        const errorText = this.formatUserVisibleError(err);
+        const errorText = this.formatUserVisibleError(err, chatId);
         if (lastHuman.messageId) {
           await this.enqueueAndDispatchDelivery(
             chatId,
@@ -1912,8 +1913,8 @@ export class FeishuBot {
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
           break;
         }
-        console.error(`[${this.config.name}] processQueue error:`, err);
-        const errorText = this.formatUserVisibleError(err);
+        console.error(`[${this.config.name}] processQueue error:`, safeErrorSummary(err));
+        const errorText = this.formatUserVisibleError(err, chatId);
         if (lastHuman.messageId) {
           // Error message goes through the normal delivery path; the live status
           // is a separate message that we mark interrupted afterwards.
@@ -2176,21 +2177,9 @@ export class FeishuBot {
     await this.enqueueAndDispatchDelivery(chatId, "wait_paused", key, notice.message, [], messageId, key, this.config.model);
   }
 
-  private formatUserVisibleError(err: unknown): string {
+  private formatUserVisibleError(err: unknown, chatId?: string): string {
     if (err instanceof SessionWaitPaused) return err.message;
-    const raw = err instanceof Error ? err.message : String(err);
-    let reason = raw.replace(/\s+/g, " ").trim();
-    if (/quota/i.test(reason) || /exceeded/i.test(reason)) {
-      const reset = reason.match(/reset at ([^.;]+)/i)?.[1];
-      reason = reset ? `模型/供应商额度已用尽，重置时间：${reset}` : "模型/供应商额度已用尽，请稍后重试或切换模型";
-    } else if (/timeout/i.test(reason)) {
-      reason = "模型响应超时，请稍后重试";
-    } else if (/schema|tool payload|rejected/i.test(reason)) {
-      reason = "模型供应商拒绝了请求格式或工具参数，需要调整模型/工具调用";
-    } else if (reason.length > 220) {
-      reason = reason.slice(0, 220) + "...";
-    }
-    return `⚠️ ${this.config.name} 这次没有完成回复。\n原因：${reason}`;
+    return formatProviderError(err, this.config.name, this.config.model, this.chatLocale(chatId));
   }
 
   private isBridgeControlReply(text: string): boolean {
@@ -2717,6 +2706,11 @@ export class FeishuBot {
     let verdict: ErrorVerdict;
     try { verdict = await this.openclawClient.inspectRunError(record.provenance); }
     catch { verdict = { state: "pending", reason: "inspection_unavailable" }; }
+    // Presentation only: leave exact-run finality, stop suppression and durable
+    // outbox keys owned by the existing verdict; no retry/model fallback here.
+    if (verdict.state === "terminal" && verdict.reason === "ordinary_gateway_error") {
+      verdict = { ...verdict, text: this.formatUserVisibleError(record.provenance.detail, record.chatId) };
+    }
     // A stop or final may have arrived during the read-only lookup.
     const latest = this.store.getErrorNotice(this.config.name, record.chatId, record.noticeId);
     if (latest?.provenance.userStop) {
