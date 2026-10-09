@@ -2789,13 +2789,14 @@ describe("FeishuBot routing and queue behavior", () => {
         expect.stringContaining("中途插入的话"),
         "中途插入的话",
       );
-      // Before consumption: reaction is "Typing" (awaiting insertion), NOT "Get".
+      // Admission transfers custody (OpenClaw 2026.9.9 no longer mirrors
+      // injected messages, so waiting for a transcript confirmation would
+      // duplicate the message after the run ends): Typing flips to Get and
+      // the durable fallback is cleared immediately.
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
-      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("busy-2", "Get");
-      // RPC acceptance is provisional: retain the durable fallback until the
-      // canonical transcript confirms commitment/consumption.
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
       const secondRow = h.store.getMessageId("busy-2")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(true);
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
 
       // A confirmed plugin steer belongs to the existing run; it must not replace
       // that run's original final-reply target with the inserted message.
@@ -2811,6 +2812,69 @@ describe("FeishuBot routing and queue behavior", () => {
       releaseFirst("first reply");
       await first;
       // No second chatSendWithContext run for the steered message.
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+
+  it("restores the steered fallback when the owning run fails, but not after /stop", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setChairmanBot("chat1", "GLM");
+      h.store.setBotMode("GLM", "chat1", "free");
+      delete (h.bot as any).ensureSession;
+      let rejectFirst!: (err: Error) => void;
+      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
+        h.openclaw.chatCalls.push(params);
+        if (h.openclaw.chatCalls.length === 1) {
+          return new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
+        }
+        return Promise.resolve("fallback reply");
+      });
+
+      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "主任务", messageId: "fail-1" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入", messageId: "fail-2" }));
+      expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("中途插入"), "中途插入");
+      const row = h.store.getMessageId("fail-2")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(row)).toBe(false);
+
+      // Owning run fails: the steered input must come back as the durable fallback.
+      rejectFirst(new Error("run failed"));
+      await first;
+      await vi.waitUntil(() => h.store.getPendingTriggerIds("GLM", "chat1").has(row), { timeout: 1000 });
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
+      expect(h.openclaw.chatCalls[1].currentMessage).toContain("中途插入");
+    } finally { h.cleanup(); }
+  });
+
+  it("does not resurrect a steered message after the user stops the run", async () => {
+    const h = makeHarness("GLM");
+    try {
+      h.store.setChairmanBot("chat1", "GLM");
+      h.store.setBotMode("GLM", "chat1", "free");
+      delete (h.bot as any).ensureSession;
+      let rejectFirst!: (err: Error) => void;
+      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
+        h.openclaw.chatCalls.push(params);
+        if (h.openclaw.chatCalls.length === 1) {
+          return new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
+        }
+        return Promise.resolve("should-not-happen");
+      });
+
+      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "主任务", messageId: "stop-1" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入", messageId: "stop-2" }));
+      const row = h.store.getMessageId("stop-2")!;
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(row)).toBe(false);
+
+      // User stops the run, then the run fails: the steered input must NOT be
+      // resurrected (that would restart stopped work).
+      await (h.bot as any).handleStopCommand("chat1", "stop-msg");
+      rejectFirst(new Error("aborted"));
+      await first;
+      await new Promise((r) => setTimeout(r, 300));
+      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(row)).toBe(false);
       expect(h.openclaw.chatCalls).toHaveLength(1);
     } finally { h.cleanup(); }
   });

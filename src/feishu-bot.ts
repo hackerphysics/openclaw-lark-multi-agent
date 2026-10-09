@@ -167,6 +167,10 @@ export class FeishuBot {
   private sendModelFooters: Map<string, string> = new Map();
   private replyStatusFooters = new Map<string, string>();
   private sendStatusFooters = new Map<string, string>();
+  /** Batch-scoped run-failure observers: steered inputs whose owning batch
+   * fails restore their durable fallback. Fired in processQueueInner's
+   * failure arms; dropped at each new batch top and on queue exit. */
+  private runFailureObservers: Map<string, Array<() => void>> = new Map();
   /** Go / Go-Checker supervision controller (per-bot instance). */
   private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;stage:string;ordinals:Map<string,number>;blocked?:boolean}>();
   private readonly goReceiptApis = new WeakSet<object>();
@@ -1226,17 +1230,53 @@ export class FeishuBot {
         });
         const steer = await this.openclawClient.steer(sessionKeyForSteer, steerWrapped, cleanText).catch(() => ({ status: "unavailable" as const }));
         if (steer.status === "steered") {
+          // OpenClaw 2026.9.9 no longer mirrors plugin-injected user messages as
+          // session.message events, so the transcript-consumption observer may
+          // never fire. Custody transfers to the active run at admission: clear
+          // the durable trigger now (prevents the duplicate re-send after this
+          // run ends) and arm an abnormal-end fallback that restores it.
           if (insertedId > 0 && !consumedBeforeAck) {
+            const steerStopEpoch = this.stopEpoch.get(chatId) || 0;
+            this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
             this.pendingSteerCleanups.set(insertedId, () => {
               stopWatchingConsumption();
               if ("cancelPending" in steer) steer.cancelPending?.();
             });
+            // The owning batch's failure restores the durable fallback. The
+            // queue promise itself never rejects (processQueueInner isolates
+            // errors), so failures are observed via runFailureObservers.
+            const observers = this.runFailureObservers.get(chatId) || [];
+            observers.push(() => {
+              if (consumedBeforeAck) return;
+              // A /stop during the run must not resurrect stopped input.
+              if ((this.stopEpoch.get(chatId) || 0) !== steerStopEpoch) return;
+              this.store.markPendingTrigger(this.config.name, chatId, insertedId);
+              console.log(`[${this.config.name}] steer fallback restored after failed run for ${chatId.slice(-8)}: "${cleanText.substring(0, 40)}..."`);
+              // Deferred: the current queue run is still active here; a fresh
+              // drain must start after its finally releases the chat.
+              setTimeout(() => { void this.processQueue(chatId).catch(() => {}); }, 0).unref?.();
+            });
+            this.runFailureObservers.set(chatId, observers);
+            const owner = this.queueRuns.get(chatId);
+            if (owner) {
+              void owner.then(() => {
+                // Queue ended without a batch failure: the steered input was
+                // admitted into its batch; release the provisional correlation.
+                stopWatchingConsumption();
+                this.pendingSteerCleanups.delete(insertedId);
+              }).catch(() => {});
+            }
           }
+          // Custody transferred: acknowledge on Feishu immediately.
+          void this.removeReaction(messageId, "Typing").catch(() => {});
+          void this.addReaction(messageId, "Get").catch(() => {});
+          const acks = this.pendingAckMessages.get(chatId) || [];
+          for (const a of acks) if (a.messageId === messageId) a.emoji = "Get";
+          this.pendingAckMessages.set(chatId, acks);
           // The plugin confirmed queueing into the existing embedded run. Keep
-          // that run's original delivery target and retain the durable trigger
-          // until session.message proves this specific input was consumed.
+          // that run's original delivery target.
           console.log(
-            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, plugin steer accepted (awaiting transcript consumption): "${cleanText.substring(0, 50)}..."`
+            `[${this.config.name}] Agent busy for ${chatId.slice(-8)}, plugin steer accepted (custody transferred to active run): "${cleanText.substring(0, 50)}..."`
           );
           return;
         }
@@ -1373,6 +1413,16 @@ export class FeishuBot {
    * Process queued messages for a chat: batch all unsynced messages and send to OpenClaw.
    * Loops until no more unsynced human messages remain.
    */
+  /** Fire and clear run-failure observers for a chat (isolated callbacks). */
+  private fireRunFailureObservers(chatId: string): void {
+    const obs = this.runFailureObservers.get(chatId);
+    if (!obs || obs.length === 0) return;
+    this.runFailureObservers.delete(chatId);
+    for (const cb of obs) {
+      try { cb(); } catch { /* observer failures are isolated */ }
+    }
+  }
+
   private async processQueue(chatId: string): Promise<void> {
     const existing = this.queueRuns.get(chatId);
     if (existing) {
@@ -1381,6 +1431,7 @@ export class FeishuBot {
     }
     const run = this.processQueueInner(chatId).finally(() => {
       this.queueRuns.delete(chatId);
+      this.runFailureObservers.delete(chatId);
     });
     this.queueRuns.set(chatId, run);
     return run;
@@ -1388,6 +1439,9 @@ export class FeishuBot {
 
   private async processQueueInner(chatId: string): Promise<void> {
     while (true) {
+      // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
+      // completed with it (consumed or not); their failure observers are stale.
+      this.runFailureObservers.delete(chatId);
       const pendingMessages = this.store.getPendingTriggerMessages(this.config.name, chatId);
       const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chatId);
       // Only proceed if there are pending human messages that should actively trigger this bot.
@@ -1896,6 +1950,7 @@ export class FeishuBot {
           break;
         }
         if (err instanceof InactiveRunObservation) {
+          this.fireRunFailureObservers(chatId);
           await liveStatus?.pauseForUnconfirmedResult(err.message).catch(() => {});
           if (!liveStatus?.id && lastHuman.messageId) await this.replyMessage(lastHuman.messageId, `ℹ️ ${err.message}`).catch(() => {});
           const acks = this.pendingAckMessages.get(chatId) || [];
@@ -1906,6 +1961,7 @@ export class FeishuBot {
           break;
         }
         if (err instanceof UnhealthySessionError) {
+          this.fireRunFailureObservers(chatId);
           // stopForUnhealthySession already warned the user; mark the live
           // status as interrupted. The user can send another message to retry
           // without being forced through /reset.
@@ -1914,6 +1970,7 @@ export class FeishuBot {
           break;
         }
         console.error(`[${this.config.name}] processQueue error:`, safeErrorSummary(err));
+        this.fireRunFailureObservers(chatId);
         const errorText = this.formatUserVisibleError(err, chatId);
         if (lastHuman.messageId) {
           // Error message goes through the normal delivery path; the live status

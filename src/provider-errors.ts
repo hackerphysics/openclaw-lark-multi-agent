@@ -1,6 +1,6 @@
 import type { Locale } from "./i18n.js";
 
-export type ErrorCategory = "cancelled" | "model" | "model_unavailable" | "model_policy" | "tools" | "context" | "quota" | "rate_limit" | "auth" | "network" | "ttft_timeout" | "total_timeout" | "collector_timeout" | "timeout" | "unknown";
+export type ErrorCategory = "cancelled" | "model" | "model_unavailable" | "model_policy" | "tools" | "context" | "compaction_failed" | "quota" | "rate_limit" | "auth" | "network" | "ttft_timeout" | "total_timeout" | "collector_timeout" | "timeout" | "unknown";
 export interface SafeProviderError {
   category: ErrorCategory;
   status?: number;
@@ -40,6 +40,9 @@ const isUnknownModelBody = (value: string): boolean => {
   const id = value.match(/^Unknown model: ([a-z0-9][a-z0-9_.-]{0,63}\/([a-z0-9][a-z0-9_./-]{0,127}))$/i)?.[1];
   return id !== undefined && isSafeModelId(id) && id.split("/").every(part => part.length > 0);
 };
+// Exact observed Core copy, not a substring/context heuristic. No arbitrary
+// reason suffix, model ID or provider prose is accepted or shown to the chat.
+const CORE_COMPACTION_FAILURE = "⚠️ Context is too large and auto-compaction could not recover this turn. Try again, use /compact, or use /new to start a fresh session.";
 const diagnostic = (value: unknown, values: Set<string>): string | undefined => typeof value === "string"
   && values.has(value.toLowerCase()) ? value : undefined;
 /** Classify by a validated root; expose only known structural path segments.
@@ -77,14 +80,14 @@ const SAFE_MESSAGES = [
  * and nested JSON errors. Deeper structured provider fields beat wrapper fields.
  * Message text is used for classification, never returned verbatim. */
 export function classifyProviderError(error: unknown): SafeProviderError {
-  type Candidate = Partial<SafeProviderError> & { score: number; disabledModelBody?: boolean; unknownModelBody?: boolean };
+  type Candidate = Partial<SafeProviderError> & { score: number; disabledModelBody?: boolean; unknownModelBody?: boolean; compactionFailedBody?: boolean };
   const candidates: Candidate[] = [];
   const texts: string[] = [];
   const seen = new Set<object>();
   let nodes = 0;
   let cancelled = false;
   let abortSignal = false;
-  function visit(value: unknown, depth = 0, rank = 0, envelopeStatus?: number, rootDiagnostic = true): void {
+  function visit(value: unknown, depth = 0, rank = 0, envelopeStatus?: number, rootDiagnostic = true, compactionDiagnostic = true): void {
     if (depth > 8 || ++nodes > 64) return;
     if (typeof value === "string") {
       const text = value.slice(0, MAX_TEXT).trim();
@@ -99,9 +102,13 @@ export function classifyProviderError(error: unknown): SafeProviderError {
       // search arbitrary prose (which may contain prompt echoes) for JSON or
       // code/type/request_id assignments.
       if (value.length <= MAX_TEXT && /^[{"]/.test(body)) {
-        try { const parsed: unknown = JSON.parse(body); if (parsed !== value) visit(parsed, depth + 1, rank, localStatus, rootDiagnostic); } catch { /* not JSON */ }
+        try { const parsed: unknown = JSON.parse(body); if (parsed !== value) visit(parsed, depth + 1, rank, localStatus, rootDiagnostic,
+          compactionDiagnostic && typeof parsed === "string" && /^(?:Agent error|RPC error|Error)\s*:/i.test(text)); } catch { /* not JSON */ }
       }
       const plain = body.trim();
+      if (rootDiagnostic && compactionDiagnostic && value.length <= MAX_TEXT && plain === CORE_COMPACTION_FAILURE) {
+        candidates.push({ score: rank + depth, compactionFailedBody: true });
+      }
       // Mark only a complete known sentence, never a "disabled" substring.
       // Classification below additionally requires the enclosing HTTP503 and
       // compatible diagnostic provenance, including sibling response.status.
@@ -142,7 +149,7 @@ export function classifyProviderError(error: unknown): SafeProviderError {
       const weight = field === "error" ? 100 : field === "response" ? 80 : field === "data" ? 20
         : field === "body" || field === "cause" || field === "details" ? 10 : 0;
       visit(obj[field], depth + 1, rank + weight, candidate.status ?? envelopeStatus,
-        rootDiagnostic && ["error", "message", "msg", "errorMessage"].includes(field));
+        rootDiagnostic && ["error", "message", "msg", "errorMessage"].includes(field), compactionDiagnostic);
     }
   }
   visit(error);
@@ -195,6 +202,9 @@ export function classifyProviderError(error: unknown): SafeProviderError {
   else if (/\b(?:ttft_timeout|first_token_timeout|response_header_timeout|und_err_headers_timeout)\b/.test(tags)) result.category = "ttft_timeout";
   else if (/\b(?:total_timeout|execution_timeout|request_deadline_exceeded)\b/.test(tags)) result.category = "total_timeout";
   else if (abortSignal || code === "abort_err") result.category = "cancelled";
+  else if (candidates.some(c => c.compactionFailedBody && c.score >= (chosen?.score ?? -Infinity))
+    && ![401, 403, 429].includes(result.status ?? 0) && (!code || neutralCode) && !param
+    && (!type || /^(?:error|request_error|gateway_error|api_error|server_error|invalid_request_error|service_unavailable)$/.test(type))) result.category = "compaction_failed";
   // Fallback prose is classification evidence only. It cannot overwrite the
   // concrete structural category above and is never serialized to audiences.
   else if (/model not allowed by agents\.defaults\.modelpolicy\.allow/.test(text)) result.category = "model_policy";
@@ -228,6 +238,7 @@ export function formatProviderError(error: unknown, botName: string, model: stri
     model_policy: ["当前模型被 OpenClaw 模型策略拒绝（modelPolicy.allow）；没有自动切换模型。", "The current model was rejected by OpenClaw modelPolicy.allow; no automatic model switch occurred."],
     tools: ["供应商明确拒绝了 tools/functions 的参数或 JSON Schema。", "The provider explicitly rejected tools/functions arguments or JSON Schema."],
     context: ["请求超过模型上下文或输入长度限制；这不是供应商额度耗尽。", "The request exceeded the model context/input limit; this is not quota exhaustion."],
+    compaction_failed: ["整理/压缩未完成，本轮尚未生成回复；请检查摘要辅助模型或后台状态。", "Context preparation/compaction did not complete and this turn has not produced a reply; check the summarization helper model or background status."],
     quota: ["模型/供应商额度已用尽。", "The model/provider quota is exhausted."],
     rate_limit: ["供应商返回限流或额度限制（429）；未能确认额度已耗尽。", "The provider reported a rate/quota limit (429); quota exhaustion is not confirmed."],
     auth: ["供应商认证失败或当前账号无权访问。", "Provider authentication failed or the current account lacks access."],
