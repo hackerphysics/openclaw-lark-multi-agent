@@ -171,6 +171,10 @@ export class FeishuBot {
    * fails restore their durable fallback. Fired in processQueueInner's
    * failure arms; dropped at each new batch top and on queue exit. */
   private runFailureObservers: Map<string, Array<() => void>> = new Map();
+  /** Steered messages admitted into the CURRENT batch (per chat). Flipped to
+   * DONE when that batch completes successfully; cleared (unflipped) when the
+   * batch scope ends any other way. */
+  private admittedSteerAcks: Map<string, Array<{ messageId: string; insertedId: number }>> = new Map();
   /** Go / Go-Checker supervision controller (per-bot instance). */
   private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;stage:string;ordinals:Map<string,number>;blocked?:boolean}>();
   private readonly goReceiptApis = new WeakSet<object>();
@@ -1242,6 +1246,9 @@ export class FeishuBot {
               stopWatchingConsumption();
               if ("cancelPending" in steer) steer.cancelPending?.();
             });
+            const steerAckList = this.admittedSteerAcks.get(chatId) || [];
+            steerAckList.push({ messageId, insertedId });
+            this.admittedSteerAcks.set(chatId, steerAckList);
             // The owning batch's failure restores the durable fallback. The
             // queue promise itself never rejects (processQueueInner isolates
             // errors), so failures are observed via runFailureObservers.
@@ -1251,6 +1258,9 @@ export class FeishuBot {
               // A /stop during the run must not resurrect stopped input.
               if ((this.stopEpoch.get(chatId) || 0) !== steerStopEpoch) return;
               this.store.markPendingTrigger(this.config.name, chatId, insertedId);
+              // The restored input takes the ordinary queue path: drop its
+              // admitted-steer ack so only the new batch's DONE applies.
+              this.admittedSteerAcks.set(chatId, (this.admittedSteerAcks.get(chatId) || []).filter((a) => a.insertedId !== insertedId));
               console.log(`[${this.config.name}] steer fallback restored after failed run for ${chatId.slice(-8)}: "${cleanText.substring(0, 40)}..."`);
               // Deferred: the current queue run is still active here; a fresh
               // drain must start after its finally releases the chat.
@@ -1432,6 +1442,7 @@ export class FeishuBot {
     const run = this.processQueueInner(chatId).finally(() => {
       this.queueRuns.delete(chatId);
       this.runFailureObservers.delete(chatId);
+      this.admittedSteerAcks.delete(chatId);
     });
     this.queueRuns.set(chatId, run);
     return run;
@@ -1442,6 +1453,7 @@ export class FeishuBot {
       // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
       // completed with it (consumed or not); their failure observers are stale.
       this.runFailureObservers.delete(chatId);
+      this.admittedSteerAcks.delete(chatId);
       const pendingMessages = this.store.getPendingTriggerMessages(this.config.name, chatId);
       const pendingTriggerIds = this.store.getPendingTriggerIds(this.config.name, chatId);
       // Only proceed if there are pending human messages that should actively trigger this bot.
@@ -1929,6 +1941,18 @@ export class FeishuBot {
           }
         }
         this.pendingAckMessages.set(chatId, remainingAcks);
+        // Steered messages admitted into THIS batch were consumed with it:
+        // flip their Get → DONE alongside the batch's own triggers.
+        const admittedSteers = this.admittedSteerAcks.get(chatId) || [];
+        if (admittedSteers.length > 0) {
+          this.admittedSteerAcks.delete(chatId);
+          for (const s of admittedSteers) {
+            await this.removeReaction(s.messageId, "Get").catch(() => {});
+            await this.addReaction(s.messageId, "DONE").catch(() => {});
+          }
+          const acksAfter = this.pendingAckMessages.get(chatId) || [];
+          this.pendingAckMessages.set(chatId, acksAfter.filter((a) => !admittedSteers.some((s) => a.messageId === s.messageId)));
+        }
       } catch (err) {
         let pause = err instanceof SessionWaitPaused ? err : undefined;
         if (!pause && isWaitTimeout(err instanceof Error ? err.message : String(err))) {

@@ -2811,6 +2811,9 @@ describe("FeishuBot routing and queue behavior", () => {
 
       releaseFirst("first reply");
       await first;
+      // The owning run completed: the steered message flips Get -> DONE.
+      expect((h.bot as any).removeReaction).toHaveBeenCalledWith("busy-2", "Get");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "DONE");
       // No second chatSendWithContext run for the steered message.
       expect(h.openclaw.chatCalls).toHaveLength(1);
     } finally { h.cleanup(); }
