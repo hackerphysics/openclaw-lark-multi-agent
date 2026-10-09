@@ -77,7 +77,9 @@ describe("Go disabled-model HTTP503 (the C false-negative regression)", () => {
     expect(classifyProviderError(error).category).toBe("unknown");
     const output = show(error) + safeErrorSummary(error);
     expect(output).not.toContain("PRIVATE_");
-    expect(output).not.toContain(sentence);
+    // Transparency directive (2026-10-09): unclassified plain server prose MAY
+    // now echo through the sanitized 原始错误 excerpt line; safety screens
+    // (PRIVATE/credentials/echo markers/JSON/HTML) are still enforced above.
     expect(output).not.toContain("<html");
   });
   it.each([

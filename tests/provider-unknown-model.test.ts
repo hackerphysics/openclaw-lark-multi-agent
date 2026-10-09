@@ -45,7 +45,9 @@ describe("r4b exact root Core/SDK unknown-custom-model regression", () => {
   ])("does not upgrade ambiguous prose, HTML, JSON substrings, truncation or arbitrary data/tool trees", error => {
     expect(classifyProviderError(error).category).toBe("unknown");
     expect(show(error) + safeErrorSummary(error)).not.toContain("PRIVATE_");
-    expect(show(error)).not.toContain(sentence);
+    // Transparency directive (2026-10-09): unclassified plain server prose MAY
+    // now echo via the sanitized 原始错误 excerpt; PRIVATE/credential/echo/
+    // JSON/HTML screens above still block everything dangerous.
   });
   it.each([
     "x/https://private.invalid/key", "x/sk-abc…6789", "x/ghp_ab…6789", "x/eyJhbGciOiJPRIVATE", "x/api_key", "x/secret-id",

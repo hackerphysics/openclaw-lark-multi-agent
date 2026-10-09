@@ -1239,6 +1239,14 @@ export class FeishuBot {
           // never fire. Custody transfers to the active run at admission: clear
           // the durable trigger now (prevents the duplicate re-send after this
           // run ends) and arm an abnormal-end fallback that restores it.
+          if (insertedId > 0) {
+            // Consumption can land before admission returns (fast mirror) or
+            // never (2026.9.9 removed mirrors); either way the message belongs
+            // to this batch for the Get -> DONE flip.
+            const steerAckList = this.admittedSteerAcks.get(chatId) || [];
+            steerAckList.push({ messageId, insertedId });
+            this.admittedSteerAcks.set(chatId, steerAckList);
+          }
           if (insertedId > 0 && !consumedBeforeAck) {
             const steerStopEpoch = this.stopEpoch.get(chatId) || 0;
             this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
@@ -1246,9 +1254,6 @@ export class FeishuBot {
               stopWatchingConsumption();
               if ("cancelPending" in steer) steer.cancelPending?.();
             });
-            const steerAckList = this.admittedSteerAcks.get(chatId) || [];
-            steerAckList.push({ messageId, insertedId });
-            this.admittedSteerAcks.set(chatId, steerAckList);
             // The owning batch's failure restores the durable fallback. The
             // queue promise itself never rejects (processQueueInner isolates
             // errors), so failures are observed via runFailureObservers.

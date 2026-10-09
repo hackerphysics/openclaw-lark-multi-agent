@@ -222,6 +222,60 @@ export function classifyProviderError(error: unknown): SafeProviderError {
   return result;
 }
 
+/** Transparency (user directive 2026-10-09): the visible notice must always
+ *  carry the original diagnostic so "unclassified" is still actionable. The
+ *  excerpt is extracted from the error's diagnostic envelope fields and
+ *  sanitized (no HTML, no URLs, no keys/tokens, capped) — never verbatim
+ *  arbitrary provider prose. Kept out of classifyProviderError so the
+ *  classification shape stays stable. */
+export function rawErrorExcerpt(error: unknown): string | undefined {
+  const texts: string[] = [];
+  const seen = new Set<object>();
+  const visit = (value: unknown, depth = 0): void => {
+    if (depth > 3 || texts.length > 16) return;
+    if (typeof value === "string") {
+      if (value.length <= MAX_TEXT) texts.push(value);
+      return;
+    }
+    if (!value || typeof value !== "object" || seen.has(value)) return;
+    seen.add(value);
+    const obj = value as Record<string, unknown>;
+    for (const field of ENVELOPE_FIELDS) {
+      if (obj[field] !== undefined) visit(obj[field], depth + 1);
+    }
+  };
+  visit(error);
+  // Safety screen (the curated anti-echo contract keeps applying): prompt
+  // echoes, tool outputs, JSON/HTML bodies, PRIVATE-like markers and known
+  // compaction-copy fragments are attacker- or prompt-controlled content and
+  // are never eligible for the transparency excerpt. Real server diagnostics
+  // (status lines, provider error prose) pass through sanitized below.
+  const isEcho = (t: string) => /\b(?:user|your)\s+prompt\b|\btool\s+outputs?\b|\btool\s+results?\b|\bdocs\s+quote\b/i.test(t);
+  const containsCoreCopyFragment = /context is too large|auto-compaction could not|use \/compact|start a fresh session/i;
+  // Credential-shaped or malformed-ID content is never eligible for echo.
+  // Applied AFTER URL pre-redaction so URL-bearing diagnostics still show as
+  // "[url]" instead of being dropped entirely.
+  const credentialish = (t: string) => /api[_-]?key|secret|credential|password|passcode|ghp_[a-z0-9]|eyJ[a-z0-9]|sk-[a-z0-9]|private|\/\/|[{"]/i.test(t);
+  const preRedact = (t: string) => t.replace(/\s+/g, " ").replace(/https?:\/\/\S+/gi, "[url]");
+  const isUnsafeForEcho = (t: string) =>
+    isEcho(t) || credentialish(t) || containsCoreCopyFragment.test(t)
+    || /^\s*[{\["]/.test(t) || /<(?:!doctype|html|body)\b/i.test(t);
+  const diagnosticTexts = texts.map(preRedact).filter(t => t && !isUnsafeForEcho(t));
+  const excerptSource =
+    diagnosticTexts.filter(t => /(?:error|fail|exceed|disabled|timeout|filter|quota|unsupported|invalid|refused|terminated|abort|prohibited|denied|limit|not found|unknown)/i.test(t))
+      .sort((a, b) => b.length - a.length)[0]
+    || [...diagnosticTexts].sort((a, b) => b.length - a.length)[0]
+    || "";
+  if (!excerptSource) return undefined;
+  const sanitized = excerptSource
+    .replace(/\b(?:sk|pk|rk)-[A-Za-z0-9_-]{8,}/g, "[key]")
+    .replace(/\b(?:bearer|authorization)\s+[A-Za-z0-9._-]{8,}/gi, "[auth]")
+    .replace(/[A-Za-z0-9+/]{32,}={0,2}/g, "[token]")
+    .trim()
+    .slice(0, 200);
+  return sanitized || undefined;
+}
+
 export function safeErrorSummary(error: unknown): string {
   const e = classifyProviderError(error);
   return [e.category, e.safeMessage, e.status && `HTTP ${e.status}`, e.code && `code=${e.code}`,
@@ -230,6 +284,11 @@ export function safeErrorSummary(error: unknown): string {
 
 export function formatProviderError(error: unknown, botName: string, model: string, locale: Locale): string {
   const e = classifyProviderError(error);
+  // Transparency for the unclassified gap (user directive 2026-10-09): when
+  // no category explains the failure, carry the sanitized original text.
+  // Categorized errors keep their curated prose (anti-echo hardening) unless
+  // an exact safe message was allowlisted.
+  const rawExcerpt = e.category === "unknown" ? rawErrorExcerpt(error) : undefined;
   const en = locale === "en";
   const reasons: Record<ErrorCategory, [string, string]> = {
     cancelled: ["本次运行收到停止或取消信号；不据此认定供应商故障。", "A stop/cancel signal was reported; provider failure is not established."],
@@ -260,5 +319,5 @@ export function formatProviderError(error: unknown, botName: string, model: stri
   const safeName = /^[\p{L}\p{N} _.-]{1,64}$/u.test(botName) ? botName : "Agent";
   const safeModel = isSafeModelId(model) ? model : "unknown";
   const title = e.category === "cancelled" ? (en ? "run cancelled" : "本次运行已取消") : (en ? "did not finish this reply" : "这次没有完成回复");
-  return `${e.category === "cancelled" ? "⏹️" : "⚠️"} ${safeName} ${title}${en ? "." : "。"}\n${en ? "Model: " : "模型："}${safeModel}\n${en ? "Reason: " : "原因："}${reason}${e.safeMessage && !registration ? `\n${e.safeMessage}` : ""}${metadata ? `\n${metadata}` : ""}`;
+  return `${e.category === "cancelled" ? "⏹️" : "⚠️"} ${safeName} ${title}${en ? "." : "。"}\n${en ? "Model: " : "模型："}${safeModel}\n${en ? "Reason: " : "原因："}${reason}${e.safeMessage && !registration ? `\n${e.safeMessage}` : ""}${rawExcerpt && rawExcerpt !== e.safeMessage ? `\n${en ? "Raw error (excerpt): " : "原始错误（节选）："}${rawExcerpt}` : ""}${metadata ? `\n${metadata}` : ""}`;
 }

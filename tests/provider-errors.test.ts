@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyProviderError, formatProviderError, safeErrorSummary, type ErrorCategory } from "../src/provider-errors.js";
+import { classifyProviderError, formatProviderError, rawErrorExcerpt, safeErrorSummary, type ErrorCategory } from "../src/provider-errors.js";
 import { FeishuBot } from "../src/feishu-bot.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus } from "../src/session-status.js";
 
@@ -172,5 +172,58 @@ describe("structured provider-error classification and safe presentation", () =>
       const notice = new SessionWaitPaused(normalizeSessionRuntimeStatus({ session: { status: "running" } }), true, reason);
       expect(bot.formatUserVisibleError(notice, "english-chat")).toBe(notice.message);
     }
+  });
+});
+
+describe("provider error transparency (raw excerpt, directive 2026-10-09)", () => {
+  it("carries a sanitized raw excerpt for unclassified errors", () => {
+    const err = new Error("400 unsupported registered MiniMax M3.1 operation");
+    expect(classifyProviderError(err).category).toBe("unknown");
+    expect(rawErrorExcerpt(err)).toContain("unsupported registered MiniMax M3.1 operation");
+    const text = formatProviderError(err, "Minimax", "x/minimax-m3.1-flash", "zh");
+    expect(text).toContain("原始错误（节选）");
+    expect(text).toContain("unsupported registered MiniMax M3.1 operation");
+  });
+
+  it("categorized errors keep curated prose without the raw excerpt", () => {
+    const err = new Error("429 You have exceeded the monthly usage quota. It will reset at 2026-10-09 23:59:59 +0800 CST.");
+    expect(classifyProviderError(err).category).toBe("quota");
+    const text = formatProviderError(err, "Gemini", "phgeek-gw/gemini-3.8-flash", "zh");
+    expect(text).toContain("额度已用尽");
+    expect(text).toContain("HTTP 429");
+    expect(text).not.toContain("原始错误（节选）");
+  });
+
+  it("redacts URLs and long tokens in the excerpt", () => {
+    const err = new Error("500 upstream failed https://evil.example/path?a=1 " + "A".repeat(64) + "\nline2");
+    const excerpt = rawErrorExcerpt(err);
+    expect(excerpt).toContain("[url]");
+    expect(excerpt).not.toContain("evil.example");
+    expect(excerpt).not.toContain("AAAA");
+    expect(excerpt!.length).toBeLessThanOrEqual(200);
+  });
+
+  it("credential-shaped, echo-marked, JSON/HTML and core-copy texts are never echoed", () => {
+    expect(rawErrorExcerpt(new Error("500 upstream failed key sk-AbCdEf123456789012345678 token ghp_ab12cd34"))).toBeUndefined();
+    expect(rawErrorExcerpt(new Error("400 bad request for api_key rotation"))).toBeUndefined();
+    expect(rawErrorExcerpt(new Error("Request rejected. User prompt: do things"))).toBeUndefined();
+    expect(rawErrorExcerpt(new Error('Prefix {"message":"boom"}'))).toBeUndefined();
+    expect(rawErrorExcerpt(new Error("<!doctype html><html>err</html>"))).toBeUndefined();
+    expect(rawErrorExcerpt(new Error("⚠️ Context is too large and auto-compaction could not recover this turn."))).toBeUndefined();
+  });
+
+  it("content-filter rejections surface their raw reason", () => {
+    const err = new Error("Provider finish_reason: content_filter: PROHIBITED_CONTENT");
+    const text = formatProviderError(err, "Gemini", "phgeek-gw/gemini-3.8-flash", "zh");
+    expect(text).toContain("content_filter: PROHIBITED_CONTENT");
+  });
+
+  it("the exact disabled-model copy classifies with curated prose (no excerpt needed)", () => {
+    const err = new Error("503 model 'gemini-3.8-flash' is disabled");
+    expect(classifyProviderError(err).category).toBe("model_unavailable");
+    const text = formatProviderError(err, "Gemini", "phgeek-gw/gemini-3.8-flash", "zh");
+    expect(text).toContain("所选模型已暂停");
+    expect(text).toContain("HTTP 503");
+    expect(text).not.toContain("原始错误（节选）");
   });
 });
