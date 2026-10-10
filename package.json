@@ -4,7 +4,7 @@
   "description": "Multi-bot Lark/Feishu bridge for OpenClaw, with per-bot model routing and isolated sessions",
   "type": "module",
   "scripts": {
-    "build": "tsc && npm run build:steer-plugin && npm run build:go-plugin",
+    "build": "tsc && npm run build:steer-plugin && npm run build:go-plugin && npm run build:core-plugin",
     "build:steer-plugin": "tsc -p plugins/lma-steer/tsconfig.json",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
@@ -12,7 +12,8 @@
     "test:coverage": "vitest run --config tests/normal-flow-offline.config.ts --coverage",
     "prepack": "npm run build",
     "prepublishOnly": "npm test && npm pack --dry-run",
-    "build:go-plugin": "tsc -p plugins/lma-go/tsconfig.json"
+    "build:go-plugin": "tsc -p plugins/lma-go/tsconfig.json",
+    "build:core-plugin": "tsc -p plugins/lma-core/tsconfig.json"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.73.3",

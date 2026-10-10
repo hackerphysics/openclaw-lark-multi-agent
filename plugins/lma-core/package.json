@@ -1,0 +1,13 @@
+{
+  "name": "@hackerphysics/lma-core",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Consolidated LMA gateway plugin: steer injection, Go checker tool enforcement, custom compaction R&D.",
+  "openclaw": {
+    "extensions": ["./dist/index.js"],
+    "compat": {
+      "pluginApi": ">=2026.3.0"
+    }
+  }
+}
