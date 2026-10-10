@@ -3483,17 +3483,17 @@ describe("FeishuBot routing and queue behavior", () => {
       const h = makeHarness("GPT");
       try {
         h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: true })) as any;
-        await (h.bot as any).handleCompactCommand("chat1", "m1");
+        await (h.bot as any).handleCompactCommand("chat1", "m1", "trim");
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
       } finally { h.cleanup(); }
     });
 
-    it("reports a no-op when the default transcript trim skips (single trim call)", async () => {
+    it("reports a no-op when the explicit transcript trim skips (single trim call)", async () => {
       const h = makeHarness("GPT");
       try {
         h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
-        await (h.bot as any).handleCompactCommand("chat1", "m1");
-        // Default mode is trim: exactly ONE call, no LLM summarization attempt.
+        await (h.bot as any).handleCompactCommand("chat1", "m1", "trim");
+        // Explicit trim mode: exactly ONE call, no LLM summarization attempt.
         expect(h.openclaw.compactSession).toHaveBeenCalledTimes(1);
         expect(h.openclaw.compactSession).toHaveBeenCalledWith(expect.any(String), { maxLines: 800 });
         expect((h.bot as any).replyMessage).not.toHaveBeenCalledWith("m1", expect.stringContaining("已压缩"));
@@ -3508,9 +3508,14 @@ describe("FeishuBot routing and queue behavior", () => {
       await (h.bot as any).handleCompactCommand("chat1", "m1", "tooltrim");
       expect(h.openclaw.toolTrimCompact).toHaveBeenCalledWith(expect.any(String), 10);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("ToolTrim"));
-      // semantic/trim modes must NOT invoke tooltrim.
+      // Bare /compact defaults to tooltrim (user directive 2026-10-10).
       (h.openclaw.toolTrimCompact as any).mockClear();
       await (h.bot as any).handleCompactCommand("chat1", "m2", "");
+      expect(h.openclaw.toolTrimCompact).toHaveBeenCalledWith(expect.any(String), 10);
+      // Explicit trim must NOT invoke tooltrim.
+      (h.openclaw.toolTrimCompact as any).mockClear();
+      h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "skip" })) as any;
+      await (h.bot as any).handleCompactCommand("chat1", "m3", "trim");
       expect(h.openclaw.toolTrimCompact).not.toHaveBeenCalled();
     } finally { h.cleanup(); }
   });
@@ -3518,12 +3523,11 @@ describe("FeishuBot routing and queue behavior", () => {
   it("semantic mode falls back to Gateway transcript trim when summarization skips", async () => {
       const h = makeHarness("GPT");
       try {
-        h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines
-          ? ({ ok: true, compacted: false, reason: "transcript too small" })
-          : ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
+        h.openclaw.semanticCompact = vi.fn(async () => ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
-        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(1, expect.any(String));
-        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 800 });
+        expect(h.openclaw.semanticCompact).toHaveBeenCalledWith(expect.any(String));
+        expect(h.openclaw.compactSession).toHaveBeenCalledWith(expect.any(String), { maxLines: 800 });
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("未压缩"));
       } finally { h.cleanup(); }
     });
@@ -3531,11 +3535,10 @@ describe("FeishuBot routing and queue behavior", () => {
     it("falls back to Gateway-owned transcript trim for SQLite-compatible compaction", async () => {
       const h = makeHarness("GPT");
       try {
-        h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines
-          ? ({ ok: true, compacted: true, kept: 137 })
-          : ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
+        h.openclaw.semanticCompact = vi.fn(async () => ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
+        h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: true, kept: 137 })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
-        expect(h.openclaw.compactSession).toHaveBeenNthCalledWith(2, expect.any(String), { maxLines: 800 });
+        expect(h.openclaw.compactSession).toHaveBeenCalledWith(expect.any(String), { maxLines: 800 });
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("转录裁剪"));
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("137"));
       } finally { h.cleanup(); }
@@ -3554,10 +3557,8 @@ describe("FeishuBot routing and queue behavior", () => {
     it("reports both failures when semantic compaction and transcript trim throw", async () => {
       const h = makeHarness("GPT");
       try {
-        h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => {
-          if (options?.maxLines) throw new Error("trim rpc timeout");
-          throw new Error("semantic rpc timeout");
-        }) as any;
+        h.openclaw.semanticCompact = vi.fn(async () => { throw new Error("semantic rpc timeout"); }) as any;
+        h.openclaw.compactSession = vi.fn(async () => { throw new Error("trim rpc timeout"); }) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("semantic rpc timeout"));
         expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("trim rpc timeout"));

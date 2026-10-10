@@ -1772,18 +1772,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if (typeof hash !== "string" || !cfg || typeof cfg !== "object") {
         return { compacted: false, reason: "无法读取网关配置（config.get）" };
       }
-      const originalRaw = typeof full?.raw === "string" ? full.raw : JSON.stringify(cfg);
-      // 2. Toggle the provider; the restore payload is the untouched original.
-      const agentsNode = ((cfg as any).agents ??= {});
-      const defaultsNode = (agentsNode.defaults ??= {});
-      const comp = (defaultsNode.compaction ??= {});
-      comp.provider = PROVIDER;
-      const setRes = await this.rpc("config.set", { raw: JSON.stringify(cfg), baseHash: hash }, 30000);
-      if (setRes?.ok !== true || typeof setRes?.hash !== "string") {
-        return { compacted: false, reason: `config.set 失败: ${JSON.stringify(setRes).slice(0, 160)}` };
+      const compNode0 = (cfg as any)?.agents?.defaults?.compaction;
+      if (compNode0?.provider !== PROVIDER) {
+        // Provider is not the persistent default: toggle it on for this run and
+        // restore afterwards (portable path for hosts without the default set).
+        const originalRaw = typeof full?.raw === "string" ? full.raw : JSON.stringify(cfg);
+        const agentsNode = ((cfg as any).agents ??= {});
+        const defaultsNode = (agentsNode.defaults ??= {});
+        const comp = (defaultsNode.compaction ??= {});
+        comp.provider = PROVIDER;
+        const setRes = await this.rpc("config.set", { raw: JSON.stringify(cfg), baseHash: hash }, 30000);
+        if (setRes?.ok !== true || typeof setRes?.hash !== "string") {
+          return { compacted: false, reason: `config.set 失败: ${JSON.stringify(setRes).slice(0, 160)}` };
+        }
+        restoreInfo = { raw: originalRaw, baseHash: setRes.hash };
       }
-      restoreInfo = { raw: originalRaw, baseHash: setRes.hash };
-      // 3. Native semantic compaction now routes through our provider.
+      // 2. Native semantic compaction now routes through our provider.
       const result = await this.rpc("sessions.compact", { key: this.canonicalSessionKey(key) }, 10 * 60 * 1000);
       await restoreProvider();
       const ok = result?.compacted === true;
@@ -1800,6 +1804,48 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       return { compacted: false, method: "tooltrim", reason: (err as Error).message };
     } finally {
       console.log(`[OpenClaw] tooltrim finished for ${key} in ${Date.now() - startedAt}ms`);
+      release();
+    }
+  }
+
+  /** Explicit LLM-summarize compaction (/compact semantic). Since lma-tooltrim
+   *  is the persistent default provider, temporarily unset it so the built-in
+   *  summarization pipeline runs, then restore the original config (always). */
+  async semanticCompact(key: string): Promise<any> {
+    const release = await this.acquireMaintenanceSlot("semantic");
+    const PROVIDER = "lma-tooltrim";
+    let restoreInfo: { raw: string; baseHash: string } | null = null;
+    const restoreProvider = async () => {
+      if (!restoreInfo) return;
+      try {
+        await this.rpc("config.set", { raw: restoreInfo.raw, baseHash: restoreInfo.baseHash }, 30000);
+        console.log(`[OpenClaw] semantic: compaction provider config restored`);
+      } catch (err) {
+        console.warn(`[OpenClaw] semantic: config restore failed:`, (err as Error).message);
+      }
+    };
+    try {
+      const full = await this.rpc("config.get", {}, 30000);
+      const hash = full?.hash;
+      const cfg = full?.config ?? full?.parsed;
+      const comp = cfg && typeof cfg === "object" ? (cfg as any)?.agents?.defaults?.compaction : undefined;
+      if (typeof hash === "string" && cfg && typeof cfg === "object" && comp?.provider) {
+        const originalRaw = typeof full?.raw === "string" ? full.raw : JSON.stringify(cfg);
+        delete comp.provider;
+        const setRes = await this.rpc("config.set", { raw: JSON.stringify(cfg), baseHash: hash }, 30000);
+        if (setRes?.ok === true && typeof setRes?.hash === "string") {
+          restoreInfo = { raw: originalRaw, baseHash: setRes.hash };
+        }
+        // If the toggle failed we still compact below: routing through the
+        // default provider is a degraded-but-useful outcome vs not compacting.
+      }
+      const result = await this.rpc("sessions.compact", { key: this.canonicalSessionKey(key) }, 10 * 60 * 1000);
+      await restoreProvider();
+      return result;
+    } catch (err) {
+      await restoreProvider();
+      throw err;
+    } finally {
       release();
     }
   }

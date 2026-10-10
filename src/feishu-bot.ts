@@ -905,7 +905,7 @@ export class FeishuBot {
             `━━━━━━━━━━━━━━━━━━`,
             `桥接层命令（单斜杠，由 openclaw-lark-multi-agent 本地处理）`,
             `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
-            `🧹 /compact [N|maxLines=N|semantic|tooltrim] — 裁剪转录尾部（默认）；semantic 走 LLM 总结；tooltrim 保文本过滤工具`,
+            `🧹 /compact — 默认 ToolTrim：保文本、过滤工具载荷（保留最近 10 条）；/compact semantic 走 LLM 总结；/compact trim 或 N 裁剪转录尾部`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
@@ -4327,7 +4327,7 @@ export class FeishuBot {
     reason?: string;
     detail?: string;
   }> {
-    const mode = opts.mode === "semantic" ? "semantic" : opts.mode === "tooltrim" ? "tooltrim" : "trim";
+    const mode = opts.mode === "trim" ? "trim" : opts.mode === "semantic" ? "semantic" : "tooltrim";
     if (mode === "tooltrim") {
       onPhase?.("tooltrim");
       try {
@@ -4368,7 +4368,7 @@ export class FeishuBot {
     // semantic mode: LLM summarize first, trim as fallback.
     let nativeReason: string | undefined;
     try {
-      const res = await this.openclawClient.compactSession(sessionKey);
+      const res = await this.openclawClient.semanticCompact(sessionKey);
       if (res?.compacted === true) return { compacted: true, method: "native" };
       nativeReason = typeof res?.reason === "string" ? res.reason : undefined;
     } catch (err) {
@@ -4413,15 +4413,20 @@ export class FeishuBot {
     //   /compact 500             → tail trim keeping the last 500 events
     //   /compact maxLines=500    → same as above
     const argTokens = args.split(/\s+/).filter(Boolean);
-    let mode: "trim" | "semantic" | "tooltrim" = "trim";
+    // toolTrim is the default (user directive 2026-10-10): bare /compact keeps
+    // text and filters tool payload. Explicit tokens: semantic (LLM summarize),
+    // trim/tail or a bare number N (mechanical tail trim keeping N events).
+    let mode: "trim" | "semantic" | "tooltrim" = "tooltrim";
     let maxLines: number | undefined;
     for (const tok of argTokens) {
       const semanticMatch = /^(semantic|summarize|llm)$/i.exec(tok);
       if (semanticMatch) { mode = "semantic"; continue; }
       const toolTrimMatch = /^(tooltrim|tool_trim|tool-trim)$/i.exec(tok);
       if (toolTrimMatch) { mode = "tooltrim"; continue; }
+      const trimMatch = /^(trim|tail)$/i.exec(tok);
+      if (trimMatch) { mode = "trim"; continue; }
       const linesMatch = /^(?:maxlines|max_lines)[=:](\d{2,})$/i.exec(tok) || /^(\d{2,})$/.exec(tok);
-      if (linesMatch) { maxLines = Number(linesMatch[1] || linesMatch[2]); continue; }
+      if (linesMatch) { maxLines = Number(linesMatch[1] || linesMatch[2]); mode = "trim"; continue; }
     }
     const progress = new CompactProgressController({
       create: (view) => this.sendOrdered(chatId, () => this.replyCompactCard(messageId, view, chatId)),
