@@ -1745,6 +1745,65 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return this.rpc("sessions.reset", { key: this.canonicalSessionKey(key) }, 5000).catch(() => {});
   }
 
+  /** One-shot ToolTrim compaction: route the native semantic compaction
+   *  through the lma-core plugin's lma-tooltrim provider (keep text, keep only
+   *  the 10 most recent tool calls, drop the rest of the tool payload).
+   *  Orchestration (validated E2E 2026-10-10): config.set {raw, baseHash} →
+   *  sessions.compact → restore the original config (always). */
+  async toolTrimCompact(key: string, keepRecentToolCalls = 10): Promise<any> {
+    const release = await this.acquireMaintenanceSlot("tooltrim");
+    const startedAt = Date.now();
+    const PROVIDER = "lma-tooltrim";
+    let restoreInfo: { raw: string; baseHash: string } | null = null;
+    const restoreProvider = async () => {
+      if (!restoreInfo) return;
+      try {
+        await this.rpc("config.set", { raw: restoreInfo.raw, baseHash: restoreInfo.baseHash }, 30000);
+        console.log(`[OpenClaw] tooltrim: compaction provider config restored`);
+      } catch (err) {
+        console.warn(`[OpenClaw] tooltrim: config restore failed:`, (err as Error).message);
+      }
+    };
+    try {
+      // 1. Read the full config + its base hash (optimistic-concurrency token).
+      const full = await this.rpc("config.get", {}, 30000);
+      const hash = full?.hash;
+      const cfg = full?.config ?? full?.parsed;
+      if (typeof hash !== "string" || !cfg || typeof cfg !== "object") {
+        return { compacted: false, reason: "无法读取网关配置（config.get）" };
+      }
+      const originalRaw = typeof full?.raw === "string" ? full.raw : JSON.stringify(cfg);
+      // 2. Toggle the provider; the restore payload is the untouched original.
+      const agentsNode = ((cfg as any).agents ??= {});
+      const defaultsNode = (agentsNode.defaults ??= {});
+      const comp = (defaultsNode.compaction ??= {});
+      comp.provider = PROVIDER;
+      const setRes = await this.rpc("config.set", { raw: JSON.stringify(cfg), baseHash: hash }, 30000);
+      if (setRes?.ok !== true || typeof setRes?.hash !== "string") {
+        return { compacted: false, reason: `config.set 失败: ${JSON.stringify(setRes).slice(0, 160)}` };
+      }
+      restoreInfo = { raw: originalRaw, baseHash: setRes.hash };
+      // 3. Native semantic compaction now routes through our provider.
+      const result = await this.rpc("sessions.compact", { key: this.canonicalSessionKey(key) }, 10 * 60 * 1000);
+      await restoreProvider();
+      const ok = result?.compacted === true;
+      return {
+        compacted: ok,
+        method: "tooltrim",
+        detail: ok
+          ? `文本保留；工具载荷已过滤（保留最近 ${keepRecentToolCalls} 条工具调用）`
+          : (typeof result?.reason === "string" ? result.reason : "网关未执行压缩（会话可能正在运行或不需压缩）"),
+        tokensBefore: result?.result?.tokensBefore,
+      };
+    } catch (err) {
+      await restoreProvider();
+      return { compacted: false, method: "tooltrim", reason: (err as Error).message };
+    } finally {
+      console.log(`[OpenClaw] tooltrim finished for ${key} in ${Date.now() - startedAt}ms`);
+      release();
+    }
+  }
+
   async compactSession(key: string, options: { maxLines?: number } = {}): Promise<any> {
     const release = await this.acquireMaintenanceSlot("sessions.compact");
     const startedAt = Date.now();

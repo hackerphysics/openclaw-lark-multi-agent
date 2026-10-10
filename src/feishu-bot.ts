@@ -905,7 +905,7 @@ export class FeishuBot {
             `━━━━━━━━━━━━━━━━━━`,
             `桥接层命令（单斜杠，由 openclaw-lark-multi-agent 本地处理）`,
             `📊 /status  — 查看当前模型、Token 用量、Session 状态`,
-            `🧹 /compact [N|maxLines=N|semantic] — 裁剪转录尾部（默认，保留最近事件）；N 指定保留条数；semantic 走 LLM 总结`,
+            `🧹 /compact [N|maxLines=N|semantic|tooltrim] — 裁剪转录尾部（默认）；semantic 走 LLM 总结；tooltrim 保文本过滤工具`,
             `🔄 /reset   — 重置当前 bot 的 OpenClaw session`,
             `⏹️ /stop    — 强制停止当前 bot 在本聊天的卡死 run，解锁队列`,
             `🔊 /verbose — 开关当前聊天里的 Tool Call 显示`,
@@ -3430,6 +3430,8 @@ export class FeishuBot {
     // Running: phase line + ticking elapsed footer.
     const phaseLine = view.phase === "transcript-trim"
       ? (en ? "🧹 Semantic compaction unavailable — trimming transcript safely…" : "🧹 语义压缩不可用，正在安全裁剪转录…")
+      : view.phase === "tooltrim"
+        ? (en ? "🧹 ToolTrim: keeping text, filtering tool payload (last 10 tool calls kept)…" : "🧹 ToolTrim 压缩：保留文本，过滤工具载荷（保留最近 10 条工具调用）…")
       : view.phase === "trim"
         ? (en ? "🧹 Trimming transcript tail (keeping the most recent events)…" : "🧹 正在裁剪转录尾部（保留最近的事件）…")
         : (en ? "🧹 Compacting session…" : "🧹 正在压缩 session…");
@@ -4317,15 +4319,33 @@ export class FeishuBot {
    */
   private async compactWithFallback(
     sessionKey: string,
-    onPhase?: (phase: "native" | "transcript-trim" | "trim") => void,
-    opts: { mode?: "trim" | "semantic"; maxLines?: number } = {},
+    onPhase?: (phase: "native" | "transcript-trim" | "trim" | "tooltrim") => void,
+    opts: { mode?: "trim" | "semantic" | "tooltrim"; maxLines?: number } = {},
   ): Promise<{
     compacted: boolean;
-    method: "native" | "transcript-trim" | "none";
+    method: "native" | "transcript-trim" | "tooltrim" | "none";
     reason?: string;
     detail?: string;
   }> {
-    const mode = opts.mode === "semantic" ? "semantic" : "trim";
+    const mode = opts.mode === "semantic" ? "semantic" : opts.mode === "tooltrim" ? "tooltrim" : "trim";
+    if (mode === "tooltrim") {
+      onPhase?.("tooltrim");
+      try {
+        const res = await this.openclawClient.toolTrimCompact(sessionKey, 10);
+        if (res?.compacted === true) {
+          return {
+            compacted: true,
+            method: "tooltrim",
+            detail: typeof res?.detail === "string" ? res.detail : "文本保留；仅保留最近 10 条工具调用",
+          };
+        }
+        const reason = typeof res?.detail === "string" ? res.detail : typeof res?.reason === "string" ? res.reason : undefined;
+        return { compacted: false, method: "none", reason: reason || "tooltrim made no change" };
+      } catch (err) {
+        return { compacted: false, method: "none", reason: (err as Error).message };
+      }
+    }
+
     const trimMaxLines = Number.isFinite(opts.maxLines) && (opts.maxLines as number) >= 20
       ? Math.floor(opts.maxLines as number)
       : compactFallbackMaxLines();
@@ -4393,11 +4413,13 @@ export class FeishuBot {
     //   /compact 500             → tail trim keeping the last 500 events
     //   /compact maxLines=500    → same as above
     const argTokens = args.split(/\s+/).filter(Boolean);
-    let mode: "trim" | "semantic" = "trim";
+    let mode: "trim" | "semantic" | "tooltrim" = "trim";
     let maxLines: number | undefined;
     for (const tok of argTokens) {
       const semanticMatch = /^(semantic|summarize|llm)$/i.exec(tok);
       if (semanticMatch) { mode = "semantic"; continue; }
+      const toolTrimMatch = /^(tooltrim|tool_trim|tool-trim)$/i.exec(tok);
+      if (toolTrimMatch) { mode = "tooltrim"; continue; }
       const linesMatch = /^(?:maxlines|max_lines)[=:](\d{2,})$/i.exec(tok) || /^(\d{2,})$/.exec(tok);
       if (linesMatch) { maxLines = Number(linesMatch[1] || linesMatch[2]); continue; }
     }
@@ -4407,6 +4429,7 @@ export class FeishuBot {
       warn: (msg, err) => console.warn(`[${this.config.name}] ${msg}`, err instanceof Error ? err.message : err),
     }, { locale: en ? "en" : "zh" });
     if (mode === "trim") progress.toTrim();
+    else if (mode === "tooltrim") progress.toToolTrim();
     progress.start();
     try {
       const r = await this.compactWithFallback(sessionKey, (phase) => {
@@ -4418,16 +4441,22 @@ export class FeishuBot {
         const localizedTrimDetail = r.detail
           ?.replace("kept ", en ? "kept " : "保留最近 ")
           .replace(" transcript events", en ? " transcript events" : " 条转录事件");
-        const detail = r.method === "transcript-trim" && localizedTrimDetail
-          ? (en ? `transcript trim: ${localizedTrimDetail}` : `转录裁剪：${localizedTrimDetail}`)
-          : (en ? "native" : "原生压缩");
+        const detail = r.method === "tooltrim"
+          ? (en ? `tooltrim: ${r.detail || "text kept; tool payload filtered"}` : `ToolTrim：${r.detail || "文本保留，工具载荷已过滤"}`)
+          : r.method === "transcript-trim" && localizedTrimDetail
+            ? (en ? `transcript trim: ${localizedTrimDetail}` : `转录裁剪：${localizedTrimDetail}`)
+            : (en ? "native" : "原生压缩");
         await progress.done(detail);
         if (!progress.id) {
-          await this.replyMessage(messageId, r.method === "transcript-trim"
+          await this.replyMessage(messageId, r.method === "tooltrim"
             ? (en
-              ? `✅ Session compacted (transcript trim${localizedTrimDetail ? ": " + localizedTrimDetail : ""})`
-              : `✅ Session 已压缩（转录裁剪${localizedTrimDetail ? "：" + localizedTrimDetail : ""}）`)
-            : (en ? `✅ Session compacted` : `✅ Session 已压缩`));
+              ? `✅ Session compacted (tooltrim${r.detail ? `: ${r.detail}` : ""})`
+              : `✅ Session 已压缩（ToolTrim${r.detail ? `：${r.detail}` : ""}）`)
+            : r.method === "transcript-trim"
+              ? (en
+                ? `✅ Session compacted (transcript trim${localizedTrimDetail ? ": " + localizedTrimDetail : ""})`
+                : `✅ Session 已压缩（转录裁剪${localizedTrimDetail ? "：" + localizedTrimDetail : ""}）`)
+              : (en ? `✅ Session compacted` : `✅ Session 已压缩`));
         }
       } else {
         const reason = r.reason || (en ? "nothing to compact" : "无需压缩");

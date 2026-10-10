@@ -3501,7 +3501,21 @@ describe("FeishuBot routing and queue behavior", () => {
       } finally { h.cleanup(); }
     });
 
-    it("semantic mode falls back to Gateway transcript trim when summarization skips", async () => {
+    it("tooltrim mode calls the plugin method and reports success", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.openclaw.toolTrimCompact = vi.fn(async () => ({ compacted: true, method: "tooltrim", detail: "文本保留；仅保留最近 10 条工具调用" })) as any;
+      await (h.bot as any).handleCompactCommand("chat1", "m1", "tooltrim");
+      expect(h.openclaw.toolTrimCompact).toHaveBeenCalledWith(expect.any(String), 10);
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("ToolTrim"));
+      // semantic/trim modes must NOT invoke tooltrim.
+      (h.openclaw.toolTrimCompact as any).mockClear();
+      await (h.bot as any).handleCompactCommand("chat1", "m2", "");
+      expect(h.openclaw.toolTrimCompact).not.toHaveBeenCalled();
+    } finally { h.cleanup(); }
+  });
+
+  it("semantic mode falls back to Gateway transcript trim when summarization skips", async () => {
       const h = makeHarness("GPT");
       try {
         h.openclaw.compactSession = vi.fn(async (_key: string, options?: { maxLines?: number }) => options?.maxLines

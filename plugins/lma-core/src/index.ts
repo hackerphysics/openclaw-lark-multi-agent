@@ -2,6 +2,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { registerSteer } from "./steer.js";
 import { registerGo } from "./go.js";
 import { registerCompaction } from "./compaction.js";
+import { registerToolTrim } from "./tooltrim.js";
 
 /**
  * lma-core — the single consolidated LMA gateway plugin
@@ -23,6 +24,7 @@ export default definePluginEntry({
     registerSteer(api);
     registerGo(api);
     registerCompaction(api);
-    console.log("[lma-core] registered: steer (lma.steer), go (lma.go.*), compaction (lma.core.capabilities)");
+    registerToolTrim(api);
+    console.log("[lma-core] registered: steer (lma.steer), go (lma.go.*), compaction (lma.core.*), tooltrim (lma.core.compact.tooltrim)");
   },
 });

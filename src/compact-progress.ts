@@ -12,7 +12,7 @@ const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_ST
 const DEFAULT_TICK_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_COMPACT_STATUS_TICK_MS || 1000);
 
 /** Coarse phase of the compaction flow, drives the card's primary line. */
-export type CompactPhase = "native" | "transcript-trim" | "trim";
+export type CompactPhase = "native" | "transcript-trim" | "trim" | "tooltrim";
 
 /** Terminal outcome used by the renderer to pick color/emoji. */
 export type CompactState = "running" | "done" | "failed" | "noop";
@@ -83,8 +83,14 @@ export class CompactProgressController {
 
   /** Switch straight into explicit transcript-trim mode (user-requested trim). */
   toTrim(): void {
-    if (this.finalized || this.phase === "trim" || this.phase === "transcript-trim") return;
+    if (this.finalized || this.phase === "trim" || this.phase === "transcript-trim" || this.phase === "tooltrim") return;
     this.phase = "trim";
+  }
+
+  /** Switch into ToolTrim mode (keep text, filter tool payload). */
+  toToolTrim(): void {
+    if (this.finalized || this.phase === "tooltrim" || this.phase === "transcript-trim") return;
+    this.phase = "tooltrim";
   }
 
   /** Native compaction gave up; switch to Gateway-owned transcript-tail trim. */

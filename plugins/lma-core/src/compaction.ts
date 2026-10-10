@@ -26,6 +26,29 @@ export function registerCompaction(api: any): void {
       console.warn(`[lma-core] compaction probe failed:`, (err as Error).message);
     }
   }
+  api.registerGatewayMethod("lma.core.probe", ({ respond }: any) => {
+    // Phase-2 R&D: dump the live plugin api + runtime surface (names only,
+    // no values — nothing sensitive) so toolTrim targets real methods.
+    const surface = (obj: unknown, depth = 0): unknown => {
+      if (!obj || typeof obj !== "object" || depth > 2) return typeof obj;
+      const out: Record<string, unknown> = {};
+      let keys: string[] = [];
+      try { keys = Object.keys(obj); } catch { return "inaccessible"; }
+      try {
+        const proto = Object.getPrototypeOf(obj);
+        if (proto && proto !== Object.prototype) {
+          keys = Array.from(new Set([...Object.getOwnPropertyNames(proto), ...keys]));
+        }
+      } catch { /* ignore */ }
+      for (const k of keys.slice(0, 120)) {
+        let v: unknown;
+        try { v = (obj as Record<string, unknown>)[k]; } catch { out[k] = "getter-threw"; continue; }
+        out[k] = typeof v === "function" ? "fn" : surface(v, depth + 1);
+      }
+      return out;
+    };
+    respond(true, { api: surface(api), version: "0.1.0" });
+  }, { scope: "operator.read" });
   api.registerGatewayMethod("lma.core.capabilities", ({ respond }: any) => {
     respond(true, {
       plugin: "lma-core",
