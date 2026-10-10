@@ -128,6 +128,21 @@ export function toolTrimProvider() {
  * -> sessions.compact -> restore). This method only reports provider status.
  */
 export function registerToolTrim(api: any): void {
+  if (typeof api?.registerCompactionProvider !== "function") {
+    // Older gateways (e.g. 2026.9.6) may lack this API — degrade gracefully so
+    // steer/go modules of this plugin still register and run.
+    console.warn(`[lma-core] tooltrim: registerCompactionProvider unavailable on this gateway — provider not registered (steer/go unaffected)`);
+    api.registerGatewayMethod("lma.core.compact.tooltrim", ({ respond }: any) => {
+      respond(true, {
+        provider: TOOLTRIM_PROVIDER_ID,
+        registered: false,
+        reason: "gateway lacks registerCompactionProvider (upgrade gateway to use tooltrim)",
+        orchestration: "bridge",
+        keepRecentToolCalls: 10,
+      });
+    }, { scope: "operator.read" });
+    return;
+  }
   api.registerCompactionProvider(toolTrimProvider());
 
   api.registerGatewayMethod("lma.core.compact.tooltrim", ({ respond }: any) => {
