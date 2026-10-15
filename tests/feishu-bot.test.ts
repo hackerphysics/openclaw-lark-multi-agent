@@ -2691,6 +2691,34 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("force-expires a zombie queue owner when the gateway reports the session idle", async () => {
+    const h = makeHarness("GPT");
+    try {
+      // First run never settles: a zombie owner holding chat custody forever
+      // (the 2026-10-15 guangzi incident — completion routed via proactive path).
+      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
+        h.openclaw.chatCalls.push(p);
+        if (h.openclaw.chatCalls.length === 1) return new Promise<string>(() => {});
+        return Promise.resolve("new answer");
+      });
+      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "old task", messageId: "zombie-first" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect((h.bot as any).queueRuns.has("chat1")).toBe(true);
+      // Gateway authoritatively idle; steer confirms no active run.
+      h.openclaw.steer = vi.fn(async () => ({ status: "no_active_run" as const }));
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ running: false, status: "done" }));
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "new task", messageId: "zombie-second" }));
+      // The zombie owner was force-expired and the new input processed now.
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
+      expect(h.openclaw.chatCalls[1]?.currentMessage).toContain("new task");
+      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("zombie-second", "new answer");
+      // The still-pending zombie promise settling later must not delete the new owner.
+      await ((h.bot as any).queueRuns.get("chat1") || Promise.resolve());
+      // NOTE: `first` (the zombie batch) is intentionally never awaited — it
+      // stays pending forever, simulating the real incident's dead collector.
+    } finally { h.cleanup(); }
+  });
+
   it("retains no stale cleanup when the inserted message is consumed before the RPC ack", async () => {
     const h = makeHarness("GPT");
     try {

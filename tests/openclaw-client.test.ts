@@ -614,10 +614,12 @@ describe("OpenClawClient plugin steering", () => {
     expect(consumed).toHaveBeenCalledWith("wrapped input");
   });
 
-  it.each(["no_active_run", "rejected"])("does not claim plugin status %s as inserted", async (status) => {
+  it.each(["no_active_run", "rejected"].map(s => [s]))("does not claim plugin status %s as inserted", async (status) => {
     const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
     (client as any).rpc = vi.fn(async () => ({ status }));
-    await expect(client.steer("s1", "input")).resolves.toEqual({ status: "unavailable" });
+    // no_active_run passes through (zombie-owner detection); rejected stays unavailable.
+    const expected = status === "no_active_run" ? { status: "no_active_run" } : { status: "unavailable" };
+    await expect(client.steer("s1", "input")).resolves.toEqual(expected);
     expect((client as any).handleSteerConsumption("s1", "input")).toBe(false);
     expect((client as any).rpc).not.toHaveBeenCalledWith("chat.send", expect.anything(), expect.anything());
   });

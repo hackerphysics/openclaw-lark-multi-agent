@@ -1300,9 +1300,41 @@ export class FeishuBot {
         // in-run insertion.
         stopWatchingConsumption();
         if ("cancelPending" in steer) steer.cancelPending?.();
-        console.log(
-          `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}), queuing: "${cleanText.substring(0, 50)}..."`
-        );
+        // Zombie-owner detection (2026-10-15 guangzi incident): steer found no
+        // active run while our in-memory owner still holds the chat. Ask the
+        // gateway for the authoritative session status: if it is idle, the owner
+        // is a zombie (its completion event was routed through the proactive
+        // path and it will never settle). Force-expire it and process this input
+        // NOW instead of queueing behind a dead promise forever.
+        if (steer.status === "no_active_run" && this.queueRuns.has(chatId)) {
+          const live = await this.openclawClient.getSessionRuntimeStatus(sessionKeyForSteer).catch(() => null);
+          if (live && !live.running) {
+            console.warn(
+              `[${this.config.name}] gateway reports session idle while queue owner exists for ${chatId.slice(-8)} — expiring zombie owner (status=${live.status})`
+            );
+            this.forceExpireQueueOwner(chatId, `gateway idle (steer=${steer.status}, session=${live.status})`);
+            // Fall through to the normal send path below; the durable trigger
+            // for this input is still set, so the fresh processQueue drains it.
+          } else {
+            console.log(
+              `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}, session running=${live?.running}), queuing: "${cleanText.substring(0, 50)}..."`
+            );
+          }
+        } else {
+          console.log(
+            `[${this.config.name}] Agent busy for ${chatId.slice(-8)} (steer=${steer.status}), queuing: "${cleanText.substring(0, 50)}..."`
+          );
+        }
+        if (!this.queueRuns.has(chatId)) {
+          // Owner gone (force-expired or settled during the steer RPC): send now.
+          await this.removeReaction(messageId, "Typing").catch(() => {});
+          await this.addReaction(messageId, "Get").catch(() => {});
+          const acksNow = this.pendingAckMessages.get(chatId) || [];
+          for (const a of acksNow) if (a.messageId === messageId) a.emoji = "Get";
+          this.pendingAckMessages.set(chatId, acksNow);
+          await this.processQueue(chatId);
+          return;
+        }
         // Reconciliation may have finished the old owner during the steer RPC.
         // Ensure this new, still-pending input is drained even when that owner
         // exited through an error path. Already-consumed input is never replayed.
@@ -1445,12 +1477,35 @@ export class FeishuBot {
       return existing;
     }
     const run = this.processQueueInner(chatId).finally(() => {
-      this.queueRuns.delete(chatId);
-      this.runFailureObservers.delete(chatId);
-      this.admittedSteerAcks.delete(chatId);
+      // Ownership token guard: only the CURRENT owner may release the slot. A
+      // zombie owner that settles after forceExpireQueueOwner must not delete
+      // the replacement owner's entry (that would open a concurrent-run window).
+      if (this.queueRuns.get(chatId) === run) {
+        this.queueRuns.delete(chatId);
+        this.runFailureObservers.delete(chatId);
+        this.admittedSteerAcks.delete(chatId);
+      }
     });
     this.queueRuns.set(chatId, run);
     return run;
+  }
+
+  /**
+   * Force-release a stuck queue owner after the gateway authoritatively
+   * reported the session idle (no active run). The zombie owner's deep waits
+   * can otherwise hold chat custody forever: completion events routed through
+   * the proactive path are invisible to them. Steer-fallback triggers are
+   * restored via the failure observers so their input drains normally.
+   */
+  private forceExpireQueueOwner(chatId: string, reason: string): boolean {
+    const owner = this.queueRuns.get(chatId);
+    if (!owner) return false;
+    console.warn(`[${this.config.name}] force-expiring zombie queue owner for ${chatId.slice(-8)}: ${reason}`);
+    this.queueRuns.delete(chatId);
+    this.fireRunFailureObservers(chatId);
+    this.runFailureObservers.delete(chatId);
+    this.admittedSteerAcks.delete(chatId);
+    return true;
   }
 
   private async processQueueInner(chatId: string): Promise<void> {

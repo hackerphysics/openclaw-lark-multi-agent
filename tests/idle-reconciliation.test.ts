@@ -53,7 +53,7 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
   it("reconciles a no-active-run steer against the original terminal without waiting 30 minutes", async () => {
     const run = start();
     snapshot = { runId: "r", status: "ok", endedAt: Date.now(), terminalReply: { disposition: "visible", text: "recovered original reply" } };
-    expect(await c.steer("s1", "new input")).toEqual({ status: "unavailable" });
+    expect(await c.steer("s1", "new input")).toEqual({ status: "no_active_run" });
     expect(await run.result).toEqual({ text: "recovered original reply" });
     expect(calls).toEqual(["lma.steer", "agent.wait"]);
     expect(c.runStateChecks.size).toBe(0);

@@ -1527,7 +1527,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    * the ambiguous public admission as a realtime-insertion success signal.
    */
   async steer(sessionKey: string, text: string, displayText?: string): Promise<{
-    status: "steered" | "unavailable";
+    status: "steered" | "unavailable" | "no_active_run";
     runId?: string;
     /** Cancel provisional transcript correlation when LMA falls back to a normal run. */
     cancelPending?: () => void;
@@ -1545,6 +1545,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           console.warn(`[OpenClaw] lma.steer ${res.status} for ${key.slice(-8)}`);
         }
         cancelPending();
+        // Pass the gateway's authoritative "no active run" verdict through: the
+        // caller uses it to detect a zombie queue owner (2026-10-15 incident).
+        if (res?.status === "no_active_run") return { status: "no_active_run" };
         return { status: "unavailable" };
       }
       return { status: "steered", cancelPending };
