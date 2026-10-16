@@ -865,11 +865,12 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
       let replayInvalidTimer: ReturnType<typeof setTimeout> | null = null;
       let genericChatErrorTimer: ReturnType<typeof setTimeout> | null = null;
-      // A channel message-tool send marked terminate=true is the turn's intended
-      // user-visible output (2026-10-16 incident: it bypassed the bridge and the
-      // collector waited forever). Capture its text and settle on a short grace.
-      let terminatingSendText = "";
-      let terminatingSendTimer: ReturnType<typeof setTimeout> | null = null;
+      // A terminating message-tool send schedules ONE deferred exact-run
+      // reconciliation. The timer carries no settlement or delivery authority
+      // of its own; checkRunState still requires the gateway to confirm the
+      // root's recorded terminal state (all tools settled, no error, no async
+      // pending) before anything resolves.
+      let terminatingReconcileTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingRuntimeFailureText = "";
       let lastActivitySummary = "";
       let lastActivityAt = 0;
@@ -1103,7 +1104,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
         if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
-        if (terminatingSendTimer) clearTimeout(terminatingSendTimer);
+        if (terminatingReconcileTimer) clearTimeout(terminatingReconcileTimer);
         resolve(finalText);
       };
 
@@ -1230,30 +1231,21 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
             if (hasEffectiveActivity(ev)) resetIdleTimer();
             rememberActivity(ev);
-            // Terminating channel-send detection: a message-tool result carrying
-            // terminate=true ends the turn with that send as its user-visible
-            // output. The bridge is the delivery channel for LMA sessions, so
-            // waiting for a further final would hang forever (2026-10-16 frozen
-            // card incident). Capture the sent text at tool start; settle on a
-            // short grace unless a real final arrives first.
+            // Terminating channel-send detection (2026-10-16 frozen-card
+            // incident, remediated per independent review): a message-tool
+            // result carrying a top-level terminate=true is a batch-control
+            // hint — NOT a delivery receipt and NOT settlement authority for
+            // this collector. It only nudges the exact-run reconciliation:
+            // checkRunState requires a recorded terminal time, all tools
+            // settled, no error and no async pending before resolving; a run
+            // that is still executing keeps waiting normally. No tool input is
+            // ever re-delivered to the source chat by this path.
             {
               const tdata = ev.data || {};
               if (ev.stream === "tool" || (ev.stream === "item" && tdata.kind === "tool")) {
                 const toolName = String(tdata.name || tdata.toolName || "");
                 const tphase = tdata.phase === "result" ? (tdata.isError || tdata.error ? "error" : "end") : tdata.phase;
-                if (toolName === "message" && tphase === "start") {
-                  const raw = tdata.input ?? tdata.args ?? tdata.meta ?? null;
-                  if (raw !== null) {
-                    try {
-                      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
-                      if (parsed && typeof parsed.message === "string" && parsed.message.trim()) terminatingSendText = parsed.message;
-                    } catch { /* non-JSON tool input */ }
-                  }
-                } else if (toolName === "message" && (tphase === "end" || tphase === "error")) {
-                  // Top-level check ONLY: a read/reaction result whose content
-                  // merely mentions "terminate=true" (e.g. quoting this very
-                  // bug report in chat) must never be mistaken for a
-                  // terminating send.
+                if (toolName === "message" && (tphase === "end" || tphase === "error")) {
                   const rawOut = tdata.output ?? tdata.result ?? tdata.error ?? null;
                   let terminating = false;
                   try {
@@ -1266,14 +1258,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                       } else terminating = /^terminate\s*=\s*true$/i.test(trimmed);
                     }
                   } catch { /* unparseable output is not evidence */ }
-                  if (terminating && !terminatingSendTimer) {
-                    terminatingSendTimer = setTimeout(() => {
-                      terminatingSendTimer = null;
+                  if (terminating && !terminatingReconcileTimer) {
+                    terminatingReconcileTimer = setTimeout(() => {
+                      terminatingReconcileTimer = null;
                       if (observationClosed) return;
-                      const best = (chatFinalText.trim() || text.trim() || terminatingSendText || "").trim();
-                      finish(best || "NO_REPLY");
+                      void checkRunState(() => true, true);
                     }, 10_000);
-                    terminatingSendTimer.unref?.();
+                    terminatingReconcileTimer.unref?.();
                   }
                 }
               }
@@ -1508,6 +1499,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               if (chatFinalTimer) clearTimeout(chatFinalTimer);
               if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
               if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
+        if (terminatingReconcileTimer) clearTimeout(terminatingReconcileTimer);
               // Abort the (possibly still-running) backgrounded run before we
               // reject, so an auto-retry probe does not race a zombie run on the
               // same session. Idempotent/best-effort.
@@ -1556,7 +1548,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
         if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
-        if (terminatingSendTimer) clearTimeout(terminatingSendTimer);
+        if (terminatingReconcileTimer) clearTimeout(terminatingReconcileTimer);
         if (observationKey && this.runStateChecks.get(observationKey) === checkAfterNoActiveRun) this.runStateChecks.delete(observationKey);
       };
       // Fence registration: a newer batch on this session must be able to end

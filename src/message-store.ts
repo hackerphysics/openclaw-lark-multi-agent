@@ -262,6 +262,13 @@ export class MessageStore {
       ON CONFLICT(bot_name,chat_id,message_row_id) DO UPDATE SET state=excluded.state,record_json=excluded.record_json,next_check_at=excluded.next_check_at
       WHERE insertion_custody.state NOT IN ('stopped','committed')`).run(bot,chat,row,id,JSON.stringify(record),state,next);
   }
+  /** Purge still-pending insertion status notices once the insertion resolves
+   *  (accepted/ordinary): a stale "unknown" notice must not fire after Get. */
+  deletePendingInsertionNotices(bot: string, chat: string, insertionId: string): number {
+    const r = this.db.prepare(`DELETE FROM delivery_outbox WHERE bot_name=? AND chat_id=? AND delivery_key LIKE ? AND status='pending'`)
+      .run(bot, chat, `insertion:${insertionId}:%`);
+    return r.changes;
+  }
   claimInsertionAttempt(bot:string,chat:string,row:number):boolean {
     return this.db.prepare(`UPDATE insertion_custody SET state='dispatching',record_json=json_set(record_json,'$.attempted',json('true'))
       WHERE bot_name=? AND chat_id=? AND message_row_id=? AND state='pending'`).run(bot,chat,row).changes===1;

@@ -27,13 +27,37 @@ beforeEach(() => {
 afterEach(async () => { await c.disconnect(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe("terminating message-tool send never waits forever (2026-10-16 incident)", () => {
-  it("settles on a short grace and delivers the captured send text", async () => {
+  it("a terminating send triggers exact-run reconciliation and settles with the gateway terminal reply, never the tool input", async () => {
+    c.rpc = vi.fn(async (method: string) => {
+      if (method === "agent.wait") return { runId: "r", status: "ok", endedAt: Date.now(), yielded: false,
+        terminalReply: { disposition: "visible", text: "gateway terminal reply" } };
+      return { session: { status: "running" } };
+    });
     const run = start();
-    emit("tool", { name: "message", toolCallId: "tm1", phase: "start", input: { action: "send", message: "答复内容ABC" } });
+    emit("tool", { name: "message", toolCallId: "tm1", phase: "start", input: { action: "send", message: "tool input text" } });
     emit("tool", { name: "message", toolCallId: "tm1", phase: "result", output: { terminate: true } });
-    // No lifecycle end, no chatFinal — the old code waited forever here.
+    // The deferred reconcile (10s, per the reviewed contract) settles with the
+    // gateway-confirmed terminalReply — never the tool input.
     await vi.advanceTimersByTimeAsync(10_500);
-    await expect(run).resolves.toBe("答复内容ABC");
+    await expect(run).resolves.toBe("gateway terminal reply");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a terminating send with the root still executing does NOT settle early", async () => {
+    c.rpc = vi.fn(async (method: string) => {
+      if (method === "agent.wait") return { runId: "r", status: "pending", pendingError: false };
+      return { session: { hasActiveRun: true, status: "running" } };
+    });
+    let settled: string | undefined;
+    const run = start().then(t => { settled = t; return t; });
+    emit("tool", { name: "message", toolCallId: "tm2", phase: "result", output: { terminate: true } });
+    await vi.advanceTimersByTimeAsync(15_000);
+    // Still executing: the single tool hint grants no settlement authority.
+    expect(settled).toBeUndefined();
+    emit("chatFinal", { text: "real final" });
+    emit("lifecycle", { phase: "end", livenessState: "working" });
+    await vi.advanceTimersByTimeAsync(50);
+    await expect(run).resolves.toBe("real final");
     expect(vi.getTimerCount()).toBe(0);
   });
 

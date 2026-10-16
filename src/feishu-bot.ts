@@ -1431,14 +1431,15 @@ export class FeishuBot {
         // 息都发个这个"). Stay silent until it persists through several
         // re-checks (~45s), then notify exactly once.
         const unknownChecks = state === 'unknown' ? (Number(item.unknownChecks) || 0) + 1 : 0;
-        const unknownNotified = Boolean(item.unknownNotified) || (state === 'unknown' && unknownChecks >= 3);
-        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks,unknownNotified};
+        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks};
         this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,state,record,Date.now()+(state==='unknown'?15_000:5000));
         if(state==='ordinary') {
+          this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
           void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:ordinary`,
             'ℹ️ 原 run 已明确结束，且这条消息确定未被插入；现已交回普通队列，只执行一次。',[],item.messageId,`insertion:${item.insertionId}:ordinary`).catch(()=>{});
           void this.processQueue(chatId).catch(()=>{});
         } else if(state==='accepted') {
+          this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
           this.store.clearPendingTrigger(this.config.name,chatId,item.rowId);
           // Durable acceptance drives Get, including after bridge restart when
           // its ephemeral pendingAckMessages array no longer exists.
@@ -1455,10 +1456,19 @@ export class FeishuBot {
           if(item.state!==state) void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:${state}`,
             `ℹ️ 这条插入消息的状态为 ${state}，仍保留本地记录，未确认接收前不会显示 Get，也不会自动重复执行。${receipt.reason || ''}`,
             [],item.messageId,`insertion:${item.insertionId}:${state}`).catch(()=>{});
-        } else if(state==='unknown' && unknownNotified && !item.unknownNotified) {
+        } else if(state==='unknown' && unknownChecks >= 4 && !item.unknownNotified) {
+          // ~45s (attempt + 3 re-checks). Mark unknownNotified ONLY after the
+          // outbox insert succeeds, so a failed enqueue retries next check
+          // instead of silencing the notice forever.
           void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:unknown-prolonged`,
             `ℹ️ 这条插入消息约 45 秒仍未确认接收：本地记录保留中，不会自动重复执行；确认后会自动显示 Get。`,
-            [],item.messageId,`insertion:${item.insertionId}:unknown-prolonged`).catch(()=>{});
+            [],item.messageId,`insertion:${item.insertionId}:unknown-prolonged`)
+            .then(() => {
+              const cur = this.store.getInsertion(this.config.name, chatId, item.rowId);
+              const curRecord = (cur && cur.record) || record;
+              this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,(cur && cur.state) || state,{...curRecord,unknownNotified:true},Date.now()+15_000);
+            })
+            .catch(() => { /* enqueue failed: retry on next check */ });
         }
       }
     } finally {this.insertionChecks.delete(chatId);}
