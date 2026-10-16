@@ -422,3 +422,14 @@ describe('persistent local custody and explicit no-send reconciliation controls'
   }finally{if(r){clearTimers(r.bot);r.store.close();}h.cleanup();}
  });
 });
+
+it('legacy unknown body without captured transport payload can be settled only by independently verified exact message identity, with no sending',async()=>{
+ const h=makeHarness('Kimi');const w=uniqueWire(h.bot);
+ try{
+  const id=h.store.enqueueDelivery({sessionKey:'lma-kimi-chat1',chatId:'chat1',botName:'Kimi',sourceType:'assistant_visible',sourceId:'legacy-unknown',deliveryKey:'legacy-unknown',contentHash:'exact',content:'independently verified original answer',attachmentsJson:'[]',replyToMessageId:''})!;
+  h.store.saveDeliveryOperation(id,`outbox:${id}:body:0`,'unknown',{});
+  expect(()=>h.store.registerHistoricalDeliveryContext(id,'Other','chat1',['actual-proof'])).toThrow();
+  h.store.registerHistoricalDeliveryContext(id,'Kimi','chat1',['actual-proof']);await (h.bot as any).dispatchPendingDeliveries('chat1');
+  expect(w.calls).toHaveLength(0);expect(rows(h)).toHaveLength(1);expect(h.store.getDeliveryByKey('Kimi','chat1','legacy-unknown')?.status).toBe('delivered');
+ }finally{h.cleanup();}
+});

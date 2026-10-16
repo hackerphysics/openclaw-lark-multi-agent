@@ -391,10 +391,11 @@ export class MessageStore {
     // Match every supplied message to exactly one unresolved visible operation.
     const unknown=(this.db.prepare("SELECT * FROM delivery_operations WHERE outbox_id=? AND state IN ('attempted','unknown') ORDER BY operation_key").all(id) as any[])
       .map(r=>({...r,record:JSON.parse(r.record_json)}));
-    if(unknown.length!==messageIds.length || unknown.some(r=>!r.record.visible || !r.record.payload || this.getDeliveryOperation(id,r.operation_key)?.state==='accepted')) throw new Error('Exact visible unknown operations and independent receipts required');
+    const legacyBody=(r:any)=>r.record.visible===undefined && r.operation_key.split(':').slice(2,-1).join(':')==='body';
+    if(unknown.length!==messageIds.length || unknown.some(r=>(!r.record.visible || !r.record.payload) && !legacyBody(r) || this.getDeliveryOperation(id,r.operation_key)?.state==='accepted')) throw new Error('Exact visible unknown operations and independent receipts required');
     this.db.transaction(()=>{
       unknown.forEach((r,i)=>{
-        const record={...r.record,result:{code:0,data:{message_id:messageIds[i],chat_id:chat}},reconciliation:{independentlyVerified:true,at:Date.now(),bot,chat}};
+        const record={...r.record,visible:true,result:{code:0,data:{message_id:messageIds[i],chat_id:chat}},reconciliation:{independentlyVerified:true,at:Date.now(),bot,chat}};
         this.rememberKnownDeliveryReceipt(id,r.operation_key,record);
         this.saveDeliveryOperation(id,r.operation_key,'accepted',record);
       });
