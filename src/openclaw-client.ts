@@ -184,9 +184,11 @@ export class OpenClawClient {
     this.recoveryChecking=true;
     try {
       for(const item of this.recoveryStore.listRunObservations(undefined,Date.now(),20)) {
+        // Advance every selected row, including temporarily unsubscribed/owned
+        // ones, so a due page cannot starve recoverable runs behind it.
+        this.recoveryStore.saveRunObservation(item.sessionKey,item.runId,item,Date.now()+60_000);
         if(!this.sessionMessageCallbacks.has(item.sessionKey) && !this.sessionMessageCallbacks.has(this.shortKey(item.sessionKey))) continue;
         if(this.ownedDeliveryRuns.has(item.runId)) continue;
-        this.recoveryStore.saveRunObservation(item.sessionKey,item.runId,item,Date.now()+60_000);
         try {
           const snapshot=item.terminalObserved ? {runId:item.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:item.terminalText}} : await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
           if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError) continue;
@@ -884,8 +886,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         }
         reject(error);
       };
-      const checkRunState = async (idleStillCurrent = () => true) => {
-        if (observationClosed || checkingState || Date.now() - lastStateCheckAt < 60_000) return;
+      const checkRunState = async (idleStillCurrent = () => true, force = false) => {
+        if (observationClosed || checkingState || !force && Date.now() - lastStateCheckAt < 60_000) return;
         checkingState = true;
         lastStateCheckAt = Date.now();
         try {
@@ -1082,7 +1084,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           return;
         }
         const bucketsToScan = sessionKey
-          ? Array.from(new Set([sessionKey, shortSessionKey].filter(Boolean)))
+          ? Array.from(new Set([sessionKey,shortSessionKey,...[...this.agentEvents.keys()].filter(k=>this.shortKey(k)===shortSessionKey && this.agentEvents.get(k)?.some(ev=>activeRunIds.has(ev.runId)))].filter(Boolean)))
           : Array.from(this.agentEvents.keys());
 
         for (const bucketKey of bucketsToScan) {
@@ -1094,7 +1096,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             const ev = bucket[i];
 
             const evRunId = typeof ev.runId === "string" ? ev.runId : "";
-            const eventSessionMatches = Boolean(sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey || ev.sessionKey === shortSessionKey));
+            const eventSessionMatches = Boolean(sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey || ev.sessionKey === shortSessionKey || activeRunIds.has(evRunId) && this.shortKey(ev.sessionKey || '')===shortSessionKey));
             const matchesRun = evRunId ? activeRunIds.has(evRunId) : false;
 
             if (options?.exactRunIdentity && !matchesRun) { i++; continue; }
@@ -1179,6 +1181,14 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
 
             bucket.splice(i, 1);
+            // Continuation progress is valid, but only the admitted root's
+            // committed terminalReply can authorize another run's final text.
+            if(evRunId && evRunId!==runId && (ev.stream==='chatFinal' || ev.stream==='chatError' || ev.stream==='lifecycle' && ['end','error'].includes(ev.data?.phase))) {
+              if(ev.stream==='chatFinal' && ev.data?.gatewayYielded===true) continue;
+              if(ev.stream==='lifecycle' && ev.data?.phase==='end' && !text.trim() && !chatDeltaText.trim() && !transcriptAssistantText.trim()) continue;
+              void checkRunState(()=>true,true);
+              continue;
+            }
             if (hasEffectiveActivity(ev)) resetIdleTimer();
             rememberActivity(ev);
             // If more events arrive after a replay-invalid lifecycle end, that lifecycle
@@ -2031,6 +2041,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if (result?.aborted === true && Array.isArray(result.runIds)) {
         for (const stopped of result.runIds) if (typeof stopped === "string" && stopped) {
           this.explicitlyStoppedRuns.set(JSON.stringify([key, stopped]), Date.now());
+          this.recoveryStore?.stopExactRun(key,stopped);
         }
       }
       return result;

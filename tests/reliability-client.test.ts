@@ -85,6 +85,17 @@ describe('exact-run collector and admission custody correctness',()=>{
   await replacement.recoverExactRuns();expect(proactive).toHaveBeenCalledWith('restart result',expect.objectContaining({runId:'r1',final:true}));
   expect(replacement.rpc.mock.calls.map(([m]:any)=>m)).toEqual(['agent.wait']);expect(store.listRunObservations()).toHaveLength(0);await replacement.disconnect();
  });
+ it('raw agent alias for the exact root still extends activity and returns its own final',async()=>{
+  const notice=vi.fn();const old=await send('old',{onWaitPaused:notice});await vi.advanceTimersByTimeAsync(595000);
+  wire('agent',{sessionKey:'agent:other:regression',runId:'r1',stream:'tool',data:{phase:'result',name:'read',toolCallId:'alias-tool'}});
+  await vi.advanceTimersByTimeAsync(6000);expect(notice).not.toHaveBeenCalled();final('r1');await vi.advanceTimersByTimeAsync(50);expect(await old.promise).toEqual({text:'old exact final'});
+ });
+ it('a different run terminal without authoritative lineage cannot settle the old root',async()=>{
+  const old=await send('old');wire('session.message',{runId:'r1',message:{role:'user',content:[{type:'text',text:'old'}]}});
+  wire('agent',{runId:'foreign',stream:'lifecycle',data:{phase:'start'}});final('foreign','foreign answer');
+  let settled=false;void old.promise.then(()=>settled=true);await vi.advanceTimersByTimeAsync(100);expect(settled).toBe(false);
+  final('r1','own exact answer');await vi.advanceTimersByTimeAsync(50);expect(await old.promise).toEqual({text:'own exact answer'});
+ });
  it.each([undefined,'future-disposition'])('unknown terminal metadata %s cannot promote an interim draft',async(disposition)=>{
   const old=await send('old');wire('agent',{runId:'r1',stream:'assistant',data:{delta:'unverified draft.'}});
   c.rpc=vi.fn(async()=>({runId:'r1',status:'ok',endedAt:Date.now(),terminalReply:disposition?{disposition}:undefined}));

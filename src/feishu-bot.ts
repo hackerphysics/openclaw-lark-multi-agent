@@ -603,6 +603,7 @@ export class FeishuBot {
    */
   private async drainOnStartup(): Promise<void> {
     try {
+      this.store.recoverUnsentReservations(this.config.name);
       const restoredDeliveries = this.store.resetDeliveringOnStartup(this.config.name);
       if (restoredDeliveries > 0) {
         console.warn(`[${this.config.name}] Startup delivery recovery: restored=${restoredDeliveries}`);
@@ -1306,7 +1307,14 @@ export class FeishuBot {
         if(this.stopGeneration(chatId)!==item.stopEpoch) {this.store.stopInsertions(this.config.name,chatId);continue;}
         const owner=this.queueOwners.get(chatId);
         if(!item.expectedRunId && owner?.id===item.ownerId && owner?.batchId===item.batchId && owner?.runId) item.expectedRunId=owner.runId;
-        if(!item.expectedRunId) continue; // pre-admission: never target a later run silently
+        if(!item.expectedRunId) {
+          const stillOriginal=owner?.id===item.ownerId && owner?.batchId===item.batchId;
+          this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,stillOriginal?'pending':'target_changed',
+            {...item,reason:stillOriginal?'original admission not identified yet':'original admission target unavailable; no retargeting'},Date.now()+5000);
+          if(!stillOriginal) void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:target-unidentified`,
+            'ℹ️ 原插入目标未能确认，消息仍保留，未发送到其他 run，也不会自动重放。',[],item.messageId,`insertion:${item.insertionId}:target-unidentified`).catch(()=>{});
+          continue;
+        }
         if(item.state==='accepted') {
           if(await this.openclawClient.exactRunSettled?.(item.expectedRunId)) {
             this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'committed',item);
@@ -1774,7 +1782,7 @@ export class FeishuBot {
             onSendAttempt: (submissionId:string) => {
               guard();
               if(submissionId && lastHuman.messageId) {
-                this.store.bindDeliveryRun(this.config.name,chatId,submissionId,{triggerId,messageId:lastHuman.messageId,runId:submissionId});
+                this.store.bindDeliveryRun(this.config.name,chatId,submissionId,{triggerId,triggerIds:mergedTriggerIds,messageId:lastHuman.messageId,runId:submissionId,stopGeneration:this.stopGeneration(chatId)});
                 for(const ack of this.pendingAckMessages.get(chatId)||[]) if(mergedTriggerIdSet.has(ack.rowId)) void this.receiptReaction(chatId,ack.rowId,ack.messageId,'Typing',submissionId).catch(()=>{});
               }
               // At-most-once: as soon as we begin issuing chat.send, do not let

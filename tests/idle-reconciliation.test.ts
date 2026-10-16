@@ -106,6 +106,7 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
   it("retains existing user-anchored continuation and live-status callback behavior", async () => {
     const progress = vi.fn(); c.progressCallbacks.set("s1", progress);
     const p = c.collectReply("r", 30 * 60_000, "s1", { expectedUserText: "original" });
+    snapshot={runId:'r',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'continued reply'}};
     emit("sessionUser", { text: "original" });
     emit("lifecycle", { phase: "start" }, "continuation");
     emit("assistant", { delta: "continued reply" }, "continuation");

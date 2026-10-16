@@ -177,11 +177,32 @@ export class MessageStore {
     const row=this.db.prepare('SELECT record_json FROM run_delivery_targets WHERE bot_name=? AND chat_id=? AND run_id=?').get(bot,chat,runId) as any;
     return row ? JSON.parse(row.record_json) : null;
   }
+  /** Reserved is persisted before the send-attempt callback; dispatching is
+   * persisted before the RPC. Only reserved + unchanged stop generation proves
+   * no business effect and may be restored on startup. Unknown never replays. */
+  recoverUnsentReservations(bot:string):number {
+    return this.db.transaction(()=>{
+      let restored=0;
+      const rows=this.db.prepare(`SELECT a.submission_id,t.chat_id,t.record_json FROM admission_custody a
+        JOIN run_delivery_targets t ON t.run_id=a.submission_id WHERE t.bot_name=? AND a.state='reserved' LIMIT 100`).all(bot) as any[];
+      for(const row of rows) {
+        const r=JSON.parse(row.record_json);
+        if(r.stopGeneration!==this.getStopGeneration(bot,row.chat_id)) continue;
+        for(const id of r.triggerIds || []) {this.markPendingTrigger(bot,row.chat_id,id);restored++;}
+        this.db.prepare("UPDATE admission_custody SET state='restored-unsubmitted' WHERE submission_id=? AND state='reserved'").run(row.submission_id);
+      }
+      return restored;
+    })();
+  }
   saveAdmission(sessionKey:string,submissionId:string,state:string,record:object):void {
     this.db.prepare(`INSERT INTO admission_custody VALUES(?,?,?,?) ON CONFLICT(submission_id) DO UPDATE SET state=excluded.state,record_json=excluded.record_json`).run(sessionKey,submissionId,state,JSON.stringify(record));
   }
   listAdmissions(sessionKey:string):any[] {
     return (this.db.prepare('SELECT * FROM admission_custody WHERE session_key=? ORDER BY rowid DESC LIMIT 100').all(sessionKey) as any[]).map(r=>({...JSON.parse(r.record_json),submissionId:r.submission_id,state:r.state}));
+  }
+  stopExactRun(sessionKey:string,runId:string):void {
+    this.db.prepare(`INSERT INTO run_observations VALUES(?,?,'{}','stopped',0)
+      ON CONFLICT(session_key,run_id) DO UPDATE SET state='stopped'`).run(sessionKey,runId);
   }
   isStoppedObservation(sessionKey:string,runId:string):boolean {
     return !!this.db.prepare("SELECT 1 FROM run_observations WHERE session_key=? AND run_id=? AND state='stopped'").get(sessionKey,runId);
@@ -266,6 +287,10 @@ export class MessageStore {
         let row: number | null=null;
         if(worthy && content.trim() && content.trim().toUpperCase()!=='NO_REPLY') {
           const existing=receipts.map(r=>this.getMessageId(r.messageId)).find(Boolean);
+          if(existing) {
+            const source=this.db.prepare('SELECT chat_id,sender_type,sender_name FROM messages WHERE id=?').get(existing) as any;
+            if(source?.chat_id!==item.chat_id || source?.sender_type!=='bot' || source?.sender_name!==item.bot_name) throw new Error('Platform receipt identity conflicts with existing message origin');
+          }
           const identity=JSON.parse(item.delivery_meta_json || '{}').botIdentity || item.bot_name;
           const messageId=`lma:${JSON.stringify([identity,item.bot_name,item.chat_id,item.delivery_key,stage])}`;
           row=existing ?? this.insert({chatId:item.chat_id,messageId,

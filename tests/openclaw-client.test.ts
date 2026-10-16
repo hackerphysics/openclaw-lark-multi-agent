@@ -41,6 +41,7 @@ describe("OpenClawClient collectReply", () => {
     const key = "agent:main:s1";
     events.set(key, []);
 
+    (client as any).rpc=vi.fn(async()=>({runId:'chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'real reply'}}));
     const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
     events.get(key)!.push({
       runId: "other-runtime-run",
@@ -213,6 +214,7 @@ describe("OpenClawClient collectReply", () => {
     const key = "agent:main:s1";
     events.set(key, []);
 
+    (client as any).rpc=vi.fn(async()=>({runId:'chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'later text'}}));
     const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
     events.get(key)!.push({
       runId: "other-runtime-run",
@@ -245,6 +247,7 @@ describe("OpenClawClient collectReply", () => {
     const key = "agent:main:s1";
     events.set(key, []);
 
+    (client as any).rpc=vi.fn(async()=>({runId:'current-chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'current answer'}}));
     const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
     events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
     events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "sessionUser", data: { text: "Continue the OpenClaw runtime event." } });
@@ -282,6 +285,7 @@ describe("OpenClawClient collectReply", () => {
     const key = "agent:main:s1";
     events.set(key, []);
 
+    (client as any).rpc=vi.fn(async()=>({runId:'current-chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'anchored answer'}}));
     const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
     events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
     events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "sessionUser", data: { text: "current question" } });

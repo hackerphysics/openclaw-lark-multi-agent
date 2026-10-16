@@ -264,6 +264,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     agent("item", { kind: "tool", phase: "end", name: "exec", itemId: "tool:1" }, "continuation");
     chat({ yielded: true }, "continuation"); await vi.advanceTimersByTimeAsync(6000);
     expect(run.settled()).toBe(false); expect(notice).toHaveBeenCalledOnce();
+    const rpc=c.rpc;c.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait'?{runId:'r',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'discussion continuation result'}}:rpc(m,p));
     chat({ message: message("discussion continuation result") }, "continuation");
     agent("lifecycle", { phase: "end", livenessState: "working" }, "continuation");
     await vi.advanceTimersByTimeAsync(100);
