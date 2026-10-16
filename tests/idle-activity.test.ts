@@ -37,6 +37,20 @@ describe("terminating message-tool send never waits forever (2026-10-16 incident
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("a message-tool READ whose content mentions terminate=true is not mistaken for a terminating send", async () => {
+    let settledText: string | undefined;
+    const run = start().then(t => { settledText = t; return t; });
+    emit("tool", { name: "message", toolCallId: "tr1", phase: "start", input: { action: "read", target: "oc_x" } });
+    emit("tool", { name: "message", toolCallId: "tr1", phase: "result", output: { ok: false, messages: [{ text: "bug report mentioning terminate=true inline" }] } });
+    await vi.advanceTimersByTimeAsync(10_500);
+    expect(settledText).toBeUndefined();
+    emit("chatFinal", { text: "real final" });
+    emit("lifecycle", { phase: "end", livenessState: "working" });
+    await vi.advanceTimersByTimeAsync(50);
+    await expect(run).resolves.toBe("real final");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("does not settle early for a message-tool send without terminate", async () => {
     let settledText: string | undefined;
     const run = start().then(t => { settledText = t; return t; });

@@ -1250,8 +1250,23 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                     } catch { /* non-JSON tool input */ }
                   }
                 } else if (toolName === "message" && (tphase === "end" || tphase === "error")) {
-                  const out = String(JSON.stringify(tdata.output ?? tdata.result ?? tdata.error ?? ""));
-                  if (/"?terminate"?\s*[:=]\s*true/i.test(out) && !terminatingSendTimer) {
+                  // Top-level check ONLY: a read/reaction result whose content
+                  // merely mentions "terminate=true" (e.g. quoting this very
+                  // bug report in chat) must never be mistaken for a
+                  // terminating send.
+                  const rawOut = tdata.output ?? tdata.result ?? tdata.error ?? null;
+                  let terminating = false;
+                  try {
+                    if (rawOut && typeof rawOut === "object") terminating = (rawOut as any).terminate === true;
+                    else if (typeof rawOut === "string") {
+                      const trimmed = rawOut.trim();
+                      if (trimmed.startsWith("{")) {
+                        const parsed = JSON.parse(trimmed);
+                        terminating = parsed && typeof parsed === "object" && parsed.terminate === true;
+                      } else terminating = /^terminate\s*=\s*true$/i.test(trimmed);
+                    }
+                  } catch { /* unparseable output is not evidence */ }
+                  if (terminating && !terminatingSendTimer) {
                     terminatingSendTimer = setTimeout(() => {
                       terminatingSendTimer = null;
                       if (observationClosed) return;
