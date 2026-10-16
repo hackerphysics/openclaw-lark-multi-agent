@@ -1425,7 +1425,14 @@ export class FeishuBot {
         }
         if(state==='target_ended') state='rejected'; // prior explicit backend refusal; never silently move it to a successor
         if(state==='unavailable' || state==='capability_blocked') state='pending';
-        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason};
+        // Unknown is the NORMAL transient state right after a steer attempt
+        // (the backend acceptance receipt has not landed yet); surfacing it on
+        // every insertion spams the chat (user report 2026-10-16: "每次插入消
+        // 息都发个这个"). Stay silent until it persists through several
+        // re-checks (~45s), then notify exactly once.
+        const unknownChecks = state === 'unknown' ? (Number(item.unknownChecks) || 0) + 1 : 0;
+        const unknownNotified = Boolean(item.unknownNotified) || (state === 'unknown' && unknownChecks >= 3);
+        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks,unknownNotified};
         this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,state,record,Date.now()+(state==='unknown'?15_000:5000));
         if(state==='ordinary') {
           void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:ordinary`,
@@ -1444,10 +1451,14 @@ export class FeishuBot {
             if(!list.some(a=>a.insertedId===item.rowId)) list.push({messageId:item.messageId,insertedId:item.rowId,batch:owner.batch});
             this.admittedSteerAcks.set(chatId,list);
           }
-        } else if(state==='unknown' || state==='target_changed' || state==='rejected') {
+        } else if(state==='target_changed' || state==='rejected') {
           if(item.state!==state) void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:${state}`,
             `ℹ️ 这条插入消息的状态为 ${state}，仍保留本地记录，未确认接收前不会显示 Get，也不会自动重复执行。${receipt.reason || ''}`,
             [],item.messageId,`insertion:${item.insertionId}:${state}`).catch(()=>{});
+        } else if(state==='unknown' && unknownNotified && !item.unknownNotified) {
+          void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:unknown-prolonged`,
+            `ℹ️ 这条插入消息约 45 秒仍未确认接收：本地记录保留中，不会自动重复执行；确认后会自动显示 Get。`,
+            [],item.messageId,`insertion:${item.insertionId}:unknown-prolonged`).catch(()=>{});
         }
       }
     } finally {this.insertionChecks.delete(chatId);}
