@@ -2691,6 +2691,32 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("drains a steer-fallback-restored trigger after the failed owner settles, without a new user message", async () => {
+    const h = makeHarness("GPT");
+    try {
+      let failFirst!: (err: Error) => void;
+      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
+        h.openclaw.chatCalls.push(p);
+        if (h.openclaw.chatCalls.length === 1) return new Promise<string>((_r, rej) => { failFirst = rej; });
+        return Promise.resolve("second answer");
+      });
+      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "first task", messageId: "sf-first" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      // Steer accepted into the active run: custody transfers at admission.
+      h.openclaw.steer = vi.fn(async () => ({ status: "steered" as const }));
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "steered input", messageId: "sf-second" }));
+      const row = h.store.getMessageId("sf-second")!;
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(row)).toBe(false);
+      // The batch fails with a generic error; the steer fallback restores the
+      // trigger and MUST drain it once the owner settles — no new user message.
+      failFirst(new Error("provider blew up"));
+      await first;
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 2000 });
+      expect(h.openclaw.chatCalls[1]?.currentMessage).toContain("steered input");
+      await ((h.bot as any).queueRuns.get("chat1") || Promise.resolve());
+    } finally { h.cleanup(); }
+  });
+
   it("force-expires a zombie queue owner when the gateway reports the session idle", async () => {
     const h = makeHarness("GPT");
     try {

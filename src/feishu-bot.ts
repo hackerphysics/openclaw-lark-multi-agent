@@ -6,6 +6,7 @@ import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient, InactiveRunObservation } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
+import { SupersededObservation } from "./openclaw-client.js";
 import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { GoController } from "./go-controller.js";
@@ -1268,8 +1269,15 @@ export class FeishuBot {
               this.admittedSteerAcks.set(chatId, (this.admittedSteerAcks.get(chatId) || []).filter((a) => a.insertedId !== insertedId));
               console.log(`[${this.config.name}] steer fallback restored after failed run for ${chatId.slice(-8)}: "${cleanText.substring(0, 40)}..."`);
               // Deferred: the current queue run is still active here; a fresh
-              // drain must start after its finally releases the chat.
-              setTimeout(() => { void this.processQueue(chatId).catch(() => {}); }, 0).unref?.();
+              // drain must start after its finally releases the chat. A 0ms
+              // timer is NOT enough — the owner's catch block still has
+              // in-flight awaits (error delivery), so processQueue would join
+              // the dying owner and return, stranding the restored trigger
+              // until the next user message (2026-10-16 audit finding).
+              const ownerNow = this.queueRuns.get(chatId);
+              const drainRestored = () => { void this.processQueue(chatId).catch(() => {}); };
+              if (ownerNow) void ownerNow.then(drainRestored, drainRestored).catch(() => {});
+              else setTimeout(drainRestored, 0).unref?.();
             });
             this.runFailureObservers.set(chatId, observers);
             const owner = this.queueRuns.get(chatId);
@@ -1501,6 +1509,10 @@ export class FeishuBot {
     const owner = this.queueRuns.get(chatId);
     if (!owner) return false;
     console.warn(`[${this.config.name}] force-expiring zombie queue owner for ${chatId.slice(-8)}: ${reason}`);
+    // Fence the stale batch's local observation BEFORE releasing custody: an
+    // alive old poller would keep destructively consuming the replacement
+    // batch's frames from the shared session bucket (2026-10-16 regression).
+    try { this.openclawClient.revokeSessionCollectors(this.getSessionKey(chatId), `queue owner force-expired: ${reason}`); } catch { /* isolated */ }
     this.queueRuns.delete(chatId);
     this.fireRunFailureObservers(chatId);
     this.runFailureObservers.delete(chatId);
@@ -2014,6 +2026,14 @@ export class FeishuBot {
           this.pendingAckMessages.set(chatId, acksAfter.filter((a) => !admittedSteers.some((s) => a.messageId === s.messageId)));
         }
       } catch (err) {
+        if (err instanceof SupersededObservation) {
+          // This batch's local observation was fenced by a newer batch (or a
+          // custody revocation). The new owner handles delivery from here; end
+          // quietly — no error notice, no replay, no Gateway abort. The old
+          // run's eventual reply still flows through the proactive path.
+          console.log(`[${this.config.name}] batch observation superseded for ${chatId.slice(-8)}; ending quietly`);
+          break;
+        }
         let pause = err instanceof SessionWaitPaused ? err : undefined;
         if (!pause && isWaitTimeout(err instanceof Error ? err.message : String(err))) {
           const state = await this.readSessionStatus(chatId);

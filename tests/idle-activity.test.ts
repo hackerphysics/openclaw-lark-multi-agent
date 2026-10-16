@@ -26,6 +26,48 @@ beforeEach(() => {
 });
 afterEach(async () => { await c.disconnect(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
+describe("stale collector fencing (2026-10-16 regression)", () => {
+  it("revoking a stale collector stops frame theft; the replacement sees its own activity and final", async () => {
+    // Old batch's collector: would otherwise stay alive up to 24h and
+    // destructively consume the shared session bucket.
+    const oldCollect = c.collectReply("old-run", 10 * 60_000, KEY, { onWaitPaused: notice });
+    // Queue custody revoked / new chat.send takes over: fence synchronously.
+    expect(c.revokeSessionCollectors(KEY, "regression test")).toBe(1);
+    await expect(oldCollect).rejects.toMatchObject({ name: "SupersededObservation" });
+    // Replacement collector for the new root run: must receive its own frames.
+    const pauses: number[] = [];
+    const replacement = c.collectReply("new-run", 10 * 60_000, KEY, {
+      expectedUserText: "new input",
+      onWaitPaused: () => { pauses.push(1); },
+    });
+    emit("sessionUser", { text: "new input" }, "new-run");
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    // Visible tool progress at 9:55 (the screenshot scenario).
+    emit("tool", { name: "tool_search", toolCallId: "t1", phase: "start" }, "new-run");
+    emit("tool", { name: "tool_search", toolCallId: "t1", phase: "result" }, "new-run");
+    await vi.advanceTimersByTimeAsync(9 * 60_000);
+    // Without fencing the stale poller stole these frames and the replacement
+    // paused at its 10-minute mark despite the visible progress.
+    expect(pauses).toHaveLength(0);
+    // The replacement's final must not be swallowed either.
+    emit("chatFinal", { text: "replacement final" }, "new-run");
+    emit("lifecycle", { phase: "end", livenessState: "working" }, "new-run");
+    await vi.advanceTimersByTimeAsync(50);
+    await expect(replacement).resolves.toBe("replacement final");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fences every live collector for the session and empties the registry", async () => {
+    const a = c.collectReply("a", 1000, KEY, { onWaitPaused: notice });
+    const b = c.collectReply("b", 1000, KEY, { onWaitPaused: notice });
+    expect(c.revokeSessionCollectors(KEY, "regression test")).toBe(2);
+    await expect(a).rejects.toMatchObject({ name: "SupersededObservation" });
+    await expect(b).rejects.toMatchObject({ name: "SupersededObservation" });
+    expect(c.sessionCollectorFences.size).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("collector effective activity (reply matching is unchanged)", () => {
   it.each([
     ["assistant", { delta: "new text" }],

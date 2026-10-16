@@ -23,6 +23,20 @@ export class InactiveRunObservation extends Error {
   }
 }
 
+/** The local collectReply observation was fenced because a newer batch took
+ *  over this session's queue custody. Purely local: no Gateway run was stopped,
+ *  and the superseded run's eventual reply still flows through the proactive
+ *  delivery path. Introduced for the 2026-10-16 stale-collector regression:
+ *  an alive old poller destructively consumed the replacement batch's frames
+ *  from the shared session bucket, starving the new collector's idle clock and
+ *  swallowing its final. */
+export class SupersededObservation extends Error {
+  constructor(reason = "本地观察已被更新的批次取代") {
+    super(`${reason}（未停止网关运行）`);
+    this.name = "SupersededObservation";
+  }
+}
+
 export type ChatAttachment = {
   type?: string;
   mimeType?: string;
@@ -89,6 +103,11 @@ export class OpenClawClient {
   private recentToolEventKeys: Map<string, number> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: ProactiveMessageMeta) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
+  /** Live collectReply fences per canonical session key. The most recent
+   *  collector for a session owns the shared event bucket; a new batch (or a
+   *  queue-custody revocation) fences stale ones synchronously so they cannot
+   *  steal frames from the replacement (2026-10-16 regression). */
+  private sessionCollectorFences: Map<string, Set<() => void>> = new Map();
   /** Per-session steered messages awaiting consumption confirmation. Each
    * accepted message is retained independently so identical/overlapping text
    * cannot overwrite another correlation. */
@@ -1383,6 +1402,29 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
         if (observationKey && this.runStateChecks.get(observationKey) === checkAfterNoActiveRun) this.runStateChecks.delete(observationKey);
       };
+      // Fence registration: a newer batch on this session must be able to end
+      // THIS observation synchronously (local cleanup + superseded settlement)
+      // so the shared bucket is no longer destructively consumed by a stale
+      // poller. The Gateway run is never aborted by fencing.
+      const fenceSuperseded = () => {
+        if (observationClosed) return;
+        cleanupObservation();
+        reject(new SupersededObservation());
+      };
+      if (observationKey) {
+        let fences = this.sessionCollectorFences.get(observationKey);
+        if (!fences) { fences = new Set(); this.sessionCollectorFences.set(observationKey, fences); }
+        fences.add(fenceSuperseded);
+        const unregisterFence = () => {
+          const current = this.sessionCollectorFences.get(observationKey);
+          if (current) {
+            current.delete(fenceSuperseded);
+            if (current.size === 0) this.sessionCollectorFences.delete(observationKey);
+          }
+        };
+        const baseCleanup = cleanupObservation;
+        cleanupObservation = () => { baseCleanup(); unregisterFence(); };
+      }
     }).finally(() => cleanupObservation());
   }
 
@@ -1687,6 +1729,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (timer) clearTimeout(timer);
     this.ownedDeliveryRunTimers.delete(runId);
     this.ownedDeliveryRuns.delete(runId);
+  }
+
+  /** Synchronously fence every live collectReply observation for a session.
+   *  Local only — never aborts a Gateway run. Returns the number superseded.
+   *  Used when queue custody is revoked or a new chat.send takes over, so a
+   *  stale poller cannot steal the replacement batch's frames (2026-10-16). */
+  revokeSessionCollectors(sessionKey: string, reason: string): number {
+    const key = this.canonicalSessionKey(sessionKey);
+    const fences = this.sessionCollectorFences.get(key);
+    if (!fences || fences.size === 0) return 0;
+    const count = fences.size;
+    for (const fence of [...fences]) {
+      try { fence(); } catch { /* each fence is isolated */ }
+    }
+    console.warn(`[OpenClaw] superseded ${count} stale collector(s) for ${key.slice(-24)}: ${reason}`);
+    return count;
   }
 
   async getSessionRuntimeStatus(sessionKey: string): Promise<SessionRuntimeStatus> {
@@ -2244,6 +2302,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let result: any;
       const sendStartedAt = Date.now();
       try {
+        // A stale collector from a previous batch must not steal this batch's
+        // frames from the shared session bucket (2026-10-16 regression). Fence
+        // any still-live local observation BEFORE issuing chat.send.
+        this.revokeSessionCollectors(sk, "new chat.send supersedes stale observation");
         await params.onSendAttempt?.();
         const sendChat = () => this.rpc("chat.send", {
           sessionKey: this.canonicalSessionKey(sk),
@@ -2285,8 +2347,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // collectReply returns. Keep a short grace window so normal chat replies
       // are not delivered twice via the proactive-message path. Cron/LMA runs
       // are unaffected because they do not go through chatSend.
-      this.progressCallbacks.delete(sk);
-      this.progressCallbacks.delete(fullSessionKey);
+      // CAS: a superseded send's finally must not delete a newer send's
+      // progress callback (the fence settles the old promise after the new
+      // batch may already have registered its own callback).
+      if (params.onProgress) {
+        if (this.progressCallbacks.get(sk) === params.onProgress) this.progressCallbacks.delete(sk);
+        if (this.progressCallbacks.get(fullSessionKey) === params.onProgress) this.progressCallbacks.delete(fullSessionKey);
+      }
       if (waitPaused) this.releasePausedWait(ownedRunId);
       else this.releaseOwnedDeliveryRunAfter(ownedRunId, 30000);
     }
