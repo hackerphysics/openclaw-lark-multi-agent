@@ -246,7 +246,7 @@ export class MessageStore {
       // run ids can repeat across gateways/sessions: require the exact durable target.
       const row=this.getDeliveryRunTarget(target.bot_name,target.chat_id,runId);
       const observed=this.db.prepare("SELECT 1 FROM run_observations WHERE session_key=? AND run_id=? AND state='observing'").get(sessionKey,runId);
-      if(observed && (!row?.sessionKey || row.sessionKey===sessionKey)) this.settleRunReactionIntents(target.bot_name,target.chat_id,runId);
+      if(observed && (row?.sessionKey || `agent:main:lma-${target.bot_name.toLowerCase()}-${target.chat_id}`)===sessionKey) this.settleRunReactionIntents(target.bot_name,target.chat_id,runId);
     }
   }
   finishRunObservation(sessionKey: string,runId: string,state = 'settled'): void {
@@ -391,7 +391,7 @@ export class MessageStore {
     // Match every supplied message to exactly one unresolved visible operation.
     const unknown=(this.db.prepare("SELECT * FROM delivery_operations WHERE outbox_id=? AND state IN ('attempted','unknown') ORDER BY operation_key").all(id) as any[])
       .map(r=>({...r,record:JSON.parse(r.record_json)}));
-    if(unknown.length!==messageIds.length || unknown.some(r=>!r.record.visible || !r.record.payload)) throw new Error('Exact visible unknown operations and independent receipts required');
+    if(unknown.length!==messageIds.length || unknown.some(r=>!r.record.visible || !r.record.payload || this.getDeliveryOperation(id,r.operation_key)?.state==='accepted')) throw new Error('Exact visible unknown operations and independent receipts required');
     this.db.transaction(()=>{
       unknown.forEach((r,i)=>{
         const record={...r.record,result:{code:0,data:{message_id:messageIds[i],chat_id:chat}},reconciliation:{independentlyVerified:true,at:Date.now(),bot,chat}};

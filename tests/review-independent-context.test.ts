@@ -373,3 +373,52 @@ describe('independent persistence beyond one-shot failure',()=>{
   }finally{if(r){clearTimers(r.bot);r.store.close();}h.cleanup();}
  });
 });
+
+describe('persistent local custody and explicit no-send reconciliation controls',()=>{
+ it('six main receipt journal UPDATE failures do not resend an accepted card or emit send-failed text',async()=>{
+  const h=makeHarness('Kimi');const w=uniqueWire(h.bot);let r:any;
+  try{
+   db(h).exec("CREATE TRIGGER fail_many_receipts BEFORE UPDATE OF state ON delivery_operations WHEN NEW.state='accepted' BEGIN SELECT RAISE(ABORT,'receipt checkpoint unavailable'); END;");
+   await enqueue(h,'receipt-many');clearTimers(h.bot);
+   for(let i=0;i<6;i++){await (h.bot as any).dispatchPendingDeliveries('chat1');clearTimers(h.bot);}
+   expect(w.accepted).toHaveLength(1);expect(w.calls).toHaveLength(1);
+   const out=h.store.getDeliveryByKey('Kimi','chat1','receipt-many')!;expect(out.status).toBe('pending');expect(out.attempts).toBe(0);
+   expect(db(h).prepare('SELECT failures FROM delivery_local_obligations WHERE outbox_id=?').get(out.id).failures).toBeGreaterThan(5);
+   db(h).exec('DROP TRIGGER fail_many_receipts');r=await reopen(h);await r.bot.dispatchPendingDeliveries('chat1');
+   expect(r.port.calls).toHaveLength(0);expect(rows(r)).toHaveLength(1);expect(r.store.getDeliveryByKey('Kimi','chat1','receipt-many')?.status).toBe('delivered');
+  }finally{if(r){clearTimers(r.bot);r.store.close();}h.cleanup();}
+ });
+ it('a receipt-custody INSERT outage retains the full known SDK result in the live process and retries only local writes',async()=>{
+  const h=makeHarness('Kimi');const w=uniqueWire(h.bot);
+  try{
+   db(h).exec("CREATE TRIGGER fail_escrow BEFORE INSERT ON delivery_receipt_custody BEGIN SELECT RAISE(ABORT,'receipt local journal unavailable'); END;");
+   await enqueue(h,'receipt-memory');clearTimers(h.bot);expect(w.accepted).toHaveLength(1);
+   for(let i=0;i<6;i++){await (h.bot as any).dispatchPendingDeliveries('chat1');clearTimers(h.bot);}
+   expect(w.calls).toHaveLength(1);expect(h.store.listDeliveryReceipts(h.store.getDeliveryByKey('Kimi','chat1','receipt-memory')!.id!)).toHaveLength(1);
+   db(h).exec('DROP TRIGGER fail_escrow');await (h.bot as any).dispatchPendingDeliveries('chat1');
+   expect(w.calls).toHaveLength(1);expect(rows(h)).toHaveLength(1);expect(h.store.getDeliveryByKey('Kimi','chat1','receipt-memory')?.status).toBe('delivered');
+  }finally{h.cleanup();}
+ });
+ it('an hour-later restart still repairs accepted context, with a separate local-attempt counter and no scary platform failure',async()=>{
+  vi.useFakeTimers();const h=makeHarness('Kimi');const w=uniqueWire(h.bot);let r:any;
+  try{
+   db(h).exec("CREATE TRIGGER hour_context_failure BEFORE INSERT ON messages WHEN NEW.sender_type='bot' BEGIN SELECT RAISE(ABORT,'offline context'); END;");
+   await enqueue(h,'hour-later');clearTimers(h.bot);
+   for(let i=0;i<8;i++){await (h.bot as any).dispatchPendingDeliveries('chat1');clearTimers(h.bot);}
+   expect(w.calls).toHaveLength(1);expect(h.store.getDeliveryByKey('Kimi','chat1','hour-later')?.attempts).toBe(0);
+   vi.setSystemTime(Date.now()+3600_000);db(h).exec('DROP TRIGGER hour_context_failure');r=await reopen(h);await r.bot.dispatchPendingDeliveries('chat1');
+   expect(r.port.calls).toHaveLength(0);expect(rows(r)).toHaveLength(1);
+  }finally{if(r){clearTimers(r.bot);r.store.close();}h.cleanup();vi.useRealTimers();}
+ });
+ it('unknown attachment caption remains audit-visible after confirmed file context, then exact proof settles with no SDK request',async()=>{
+  const h=makeHarness('Kimi');const w=uniqueWire(h.bot,p=>{if(p.data.msg_type==='interactive')throw new Error('unknown caption');return {code:0,data:{message_id:'confirmed-file',chat_id:'chat1'}};});let r:any;
+  try{
+   await enqueue(h,'proof-caption','',[fixture(h,'file')]);clearTimers(h.bot);const out=h.store.getDeliveryByKey('Kimi','chat1','proof-caption')!;
+   expect(rows(h)).toHaveLength(1);expect(rows(h)[0].content).not.toContain('confirmed report');
+   expect(h.store.previewMissingDeliveryContext('Kimi').map((x:any)=>x.id)).toContain(out.id);
+   h.store.registerHistoricalDeliveryContext(out.id!,'Kimi','chat1',['independently-confirmed-caption']);
+   r=await reopen(h);await r.bot.dispatchPendingDeliveries('chat1');expect(r.port.calls).toHaveLength(0);
+   expect(r.store.getDeliveryByKey('Kimi','chat1','proof-caption')?.status).toBe('delivered');expect(w.accepted).toHaveLength(1);
+  }finally{if(r){clearTimers(r.bot);r.store.close();}h.cleanup();}
+ });
+});

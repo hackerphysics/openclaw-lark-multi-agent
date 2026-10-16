@@ -37,7 +37,7 @@ export function registerSteer(api: any): () => void {
   const writeJson=(path:string,value:unknown)=>{
     mkdirSync(dir,{recursive:true,mode:0o700});const temp=path+'.tmp';
     writeFileSync(temp,JSON.stringify(value),{mode:0o600});
-    const fd=openSync(temp,'r');try{fsyncSync(fd);}finally{closeSync(fd);}
+    const fd=openSync(temp,'r+');try{fsyncSync(fd);}finally{closeSync(fd);}
     renameSync(temp,path);
     // Windows permits opening some directories but fsync then fails EPERM.
     // The file is already durable+renamed: never report a false failed attempt.

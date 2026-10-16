@@ -107,6 +107,7 @@ export class OpenClawClient {
   /** Deduplicates 2026.8 canonical `agent.stream=tool` events against legacy
    * `stream=item` mirrors when a runtime emits both representations. */
   private recentToolEventKeys: Map<string, number> = new Map();
+  private sessionSettlementCallbacks=new Map<string,(meta:ProactiveMessageMeta)=>void|Promise<void>>();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: ProactiveMessageMeta) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
   private progressGenerations=new Map<string,number>();
@@ -193,7 +194,7 @@ export class OpenClawClient {
         try {
           const snapshot=item.terminalObserved ? {runId:item.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:item.terminalText}} : await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
           if(this.recoveryStore.runObservationState(item.sessionKey,item.runId)!=='observing' || this.isExplicitlyStoppedRun(item.sessionKey,item.runId) || this.ownedDeliveryRuns.has(item.runId)) continue;
-          if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError) continue;
+          if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError || ['queue','gateway_draining'].includes(snapshot.timeoutPhase) || typeof snapshot.startedAt==='number' && snapshot.endedAt<snapshot.startedAt) continue;
           const terminal=snapshot.terminalReply;
           const callback=this.sessionMessageCallbacks.get(item.sessionKey) || this.sessionMessageCallbacks.get(this.shortKey(item.sessionKey));
           if(['error','timeout'].includes(snapshot.status)) {
@@ -211,6 +212,7 @@ export class OpenClawClient {
           if(terminal.disposition!=='visible') {
             this.recoveryStore.settleExactRunReactions(item.sessionKey,item.runId);
             this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+            await this.sessionSettlementCallbacks.get(this.canonicalSessionKey(item.sessionKey))?.({sessionKey:item.sessionKey,runId:item.runId,sessionId:item.sessionId,final:true});
           }
           // Visible custody ends only when the receiver's durable outbox has
           // claimed it. A callback resolving alone is not a delivery receipt.
@@ -2765,9 +2767,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    */
   async subscribeSession(
     sessionKey: string,
-    onMessage: (text: string, meta?: ProactiveMessageMeta) => void
+    onMessage: (text: string, meta?: ProactiveMessageMeta) => void,
+    onSettled?: (meta:ProactiveMessageMeta)=>void|Promise<void>
   ): Promise<void> {
     // Register under both the short key and the full key with agent:main: prefix
+    if(onSettled)this.sessionSettlementCallbacks.set(this.canonicalSessionKey(sessionKey),onSettled);
     this.sessionMessageCallbacks.set(sessionKey, onMessage);
     this.sessionMessageCallbacks.set(`agent:main:${sessionKey}`, onMessage);
     this.subscribedKeys.add(sessionKey);
@@ -2788,6 +2792,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }
 
   async unsubscribeSession(sessionKey: string): Promise<void> {
+    this.sessionSettlementCallbacks.delete(this.canonicalSessionKey(sessionKey));
     this.sessionMessageCallbacks.delete(sessionKey);
     this.sessionMessageCallbacks.delete(`agent:main:${sessionKey}`);
     this.toolEventCallbacks.delete(sessionKey);

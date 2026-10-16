@@ -227,7 +227,8 @@ export class FeishuBot {
         let result:any;
         if(previous?.state==='accepted') {
           result=previous.result;
-          if(context){this.store.flushKnownDeliveryReceipts(context.outboxId);save('accepted',{...previous,state:undefined});}
+          if(context){try{this.store.flushKnownDeliveryReceipts(context.outboxId);save('accepted',{...previous,state:undefined});}
+            catch(error){context.blocked=true;context.persistenceError=error;throw error;}}
         }
         else {
           if(context) save('attempted');
@@ -273,6 +274,7 @@ export class FeishuBot {
   }
   private goController: GoController | null = null;
   /** Per-chat durable outbox retry timer. */
+  private localDeliveryRetryCustody=new Map<string,Set<number>>();
   private deliveryRetryTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Last time a real assistant-visible reply was successfully handed to the delivery pipeline. */
   private lastRealDeliveryAt: Map<string, number> = new Map();
@@ -537,6 +539,13 @@ export class FeishuBot {
       } catch (err) {
         console.error(`[${this.config.name}] Failed to deliver proactive msg:`, (err as Error).message);
       }
+    },async meta=>{
+      if(!meta.runId || this.store.isStoppedObservation(`agent:main:${sessionKey.replace(/^agent:[^:]+:/,'')}`,meta.runId))return;
+      this.store.settleRunReactionIntents(this.config.name,chatId,meta.runId);
+      void this.reconcileReactions(chatId).catch(()=>{});
+      const target=this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId,meta.runId));
+      await target?.liveStatus?.complete().catch(()=>{});
+      this.releaseRunDeliveryTargetAfter(chatId,meta.runId,30_000);
     });
 
     // Subscribe to tool events for verbose mode
@@ -1893,6 +1902,7 @@ export class FeishuBot {
             onWaitPaused: async notice => {
               guard();
               await liveStatus?.showWaitingForResult(notice.message);
+              guard();
               // Yield is a confirmed handoff, not the timeout heuristic. A
               // recent unrelated reply must not suppress this turn's notice.
               if (notice.reason === "yield" ? !this.store.hasDeliveredReply(this.config.name, chatId, triggerId)
@@ -1926,6 +1936,9 @@ export class FeishuBot {
           liveStatus,
           runStartStopEpoch,
           guard,
+          onSendAttempt:submissionId=>{
+            guard();this.store.bindDeliveryRun(this.config.name,chatId,submissionId,{triggerId,messageId:lastHuman.messageId || '',runId:submissionId,stopGeneration:this.stopGeneration(chatId),sessionKey:`agent:main:${sessionKey.replace(/^agent:[^:]+:/,'')}`});
+          },
           onSubmitted:async runId=>{guard();owner.runId=runId;foregroundRunId=runId;this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || "",liveStatus});},
         });
 
@@ -2602,6 +2615,7 @@ export class FeishuBot {
      *  detect it even though it happened before this function was called. */
     runStartStopEpoch?: number;
     guard?:()=>void;
+    onSendAttempt?:(submissionId:string)=>void;
     onSubmitted?:(runId:string)=>Promise<void>;
   }): Promise<string> {
     const { chatId, sessionKey, senderName, triggerId, lastHumanMessageId, isNativeCommandTrigger, liveStatus } = params;
@@ -2659,7 +2673,7 @@ export class FeishuBot {
           timeoutMs: FOREGROUND_WAIT_MS,
           includeContext: false,
           includeBridgeAttachmentHint: false,
-          onSendAttempt:()=>{params.guard?.();if(wasStopped())throw new SupersededObservation("stopped probe");},
+          onSendAttempt:submissionId=>{params.guard?.();params.onSendAttempt?.(submissionId);params.guard?.();if(wasStopped())throw new SupersededObservation("stopped probe");},
           onSubmitted:async runId=>{params.guard?.();await params.onSubmitted?.(runId);params.guard?.();},
           onProgress: (event) => {params.guard?.();return liveStatus?.progress(event);},
           onWaitPaused: async notice => {
@@ -3118,6 +3132,10 @@ export class FeishuBot {
 
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
     this.installGoReceiptCapture();
+    for(const id of this.localDeliveryRetryCustody.get(chatId) || []) {
+      try {this.store.deferLocalDelivery(id,'local_store_unavailable');this.localDeliveryRetryCustody.get(chatId)?.delete(id);}
+      catch {this.scheduleDeliveryRetry(chatId,10,true);return;}
+    }
     let retryScheduled = false;
     while (true) {
       const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
@@ -3259,7 +3277,12 @@ export class FeishuBot {
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
           const localFailure=String((err as any)?.code || '').startsWith('SQLITE_');
           if(localFailure || this.store.hasUnknownDeliveryOperation(item.id!)) {
-            const failures=this.store.deferLocalDelivery(item.id!,localFailure ? 'local_checkpoint' : 'unknown_requires_audit');
+            let custody=this.localDeliveryRetryCustody.get(chatId);
+            if(!custody){custody=new Set();this.localDeliveryRetryCustody.set(chatId,custody);}
+            custody.add(item.id!);
+            let failures=10;
+            try {failures=this.store.deferLocalDelivery(item.id!,localFailure ? 'local_checkpoint' : 'unknown_requires_audit');custody.delete(item.id!);}
+            catch {/* Retry custody remains live even if SQLite cannot record it yet. */}
             retryScheduled=true;
             this.scheduleDeliveryRetry(chatId,failures,true);
             return;

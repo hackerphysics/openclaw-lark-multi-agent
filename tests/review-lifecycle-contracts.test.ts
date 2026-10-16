@@ -92,3 +92,61 @@ describe('independent lifecycle correctness contracts (positive assertions)',()=
   await h.client.recoverExactRuns();await h.client.recoverExactRuns();expect(delivered).toHaveBeenCalledTimes(1);
  });
 });
+
+describe('expanded exact recovery and own UI settlement',()=>{
+ it.each(['error','timeout'])('exact %s terminal uses the real error pipeline and persists settlement',async status=>{
+  await (FeishuBot.prototype as any).ensureSession.call(h.bot,'chat');
+  h.store.saveRunObservation(h.key,'failed-run',{});
+  const base=h.client.rpc;h.client.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait'?{runId:p.runId,status,endedAt:Date.now(),error:'confirmed upstream failure'}:base(m,p));
+  await h.client.recoverExactRuns();await tick();
+  expect(h.store.runObservationState(h.key,'failed-run')).toBe('settled');
+  expect(h.create).toHaveBeenCalledTimes(1);
+  const notices=h.store.db.prepare('SELECT * FROM error_notices').all();expect(notices).toHaveLength(1);
+  expect(h.store.db.prepare("SELECT status FROM delivery_outbox WHERE source_type='run_error'").get()?.status).toBe('delivered');
+  expect(h.store.getRecent('chat').filter((r:any)=>r.senderType==='bot')).toHaveLength(0);
+ });
+ it.each([{status:'timeout'},{status:'timeout',endedAt:1,timeoutPhase:'queue'},{status:'timeout',endedAt:1,timeoutPhase:'gateway_draining'},
+  {status:'error',endedAt:1,pendingError:true},{status:'ok',endedAt:1,yielded:true}])('does not settle a query/nonterminal outcome %j',async snapshot=>{
+  h.store.saveRunObservation(h.key,'quiet',{});const output=vi.fn();h.client.sessionMessageCallbacks.set(h.key,output);
+  h.client.rpc=vi.fn(async()=>({runId:'quiet',...snapshot}));await h.client.recoverExactRuns();
+  expect(output).not.toHaveBeenCalled();expect(h.store.runObservationState(h.key,'quiet')).toBe('observing');
+ });
+ it.each(['silent','empty'])('%s settles Get and status through a separate exact task callback without business text',async disposition=>{
+  const run=h.bot.handleMessage(event('A'));await tick();h.client.revokeSessionCollectors(h.key,'restart simulation');await tick();await run;
+  await (FeishuBot.prototype as any).ensureSession.call(h.bot,'chat');
+  const complete=vi.fn(async()=>{});const target=h.bot.deliveryTargetsByRun.get(h.bot.deliveryRunTargetKey('chat','r1'));target.liveStatus={complete};
+  h.client.releasePausedWait('r1');h.store.saveRunObservation(h.key,'r1',{},Date.now());
+  const before=h.create.mock.calls.length;
+  h.client.rpc=vi.fn(async()=>({runId:'r1',status:'ok',endedAt:Date.now(),terminalReply:{disposition}}));
+  await h.client.recoverExactRuns();await tick();
+  expect(h.store.getReactionIntent('Bot','chat',1).desired).toBe('DONE');expect(complete).toHaveBeenCalledTimes(1);
+  expect(h.create.mock.calls.length).toBe(before);expect(h.store.getDeliveryByKey('Bot','chat','trigger:1')).toBeNull();
+ });
+ it('silent exact settlement never changes a same run-id target from another session',async()=>{
+  h.store.saveRunObservation(h.key,'collision',{});
+  h.store.bindDeliveryRun('Other','foreign','collision',{sessionKey:'agent:main:foreign-session'});
+  h.store.setReactionIntent('Other','foreign',5,{desired:'Get',shown:'Get',runId:'collision',stopEpoch:0});
+  h.client.sessionMessageCallbacks.set(h.key,vi.fn());h.client.rpc=vi.fn(async()=>({runId:'collision',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'silent'}}));
+  await h.client.recoverExactRuns();expect(h.store.getReactionIntent('Other','foreign',5).desired).toBe('Get');
+ });
+ it('legacy own reaction lookup walks pages and never deletes another app or user',async()=>{
+  h.bot.botOpenId='own-app';const deletes:string[]=[];
+  h.bot.client.im.messageReaction={list:vi.fn(async(p:any)=>({code:0,data:p.params.page_token ? {items:[{reaction_id:'ours',operator:{operator_type:'app',operator_id:'own-app'},reaction_type:{emoji_type:'Get'}}],has_more:false} :
+    {items:[{reaction_id:'other-app',operator:{operator_type:'app',operator_id:'foreign'}},{reaction_id:'other-user',operator:{operator_type:'user',operator_id:'own-app'}}],has_more:true,page_token:'page-2'}})),
+   delete:vi.fn(async(p:any)=>{deletes.push(p.path.reaction_id);return {code:0};})};
+  await (FeishuBot.prototype as any).removeReaction.call(h.bot,'A','Get');expect(deletes).toEqual(['ours']);expect(h.bot.client.im.messageReaction.list).toHaveBeenCalledTimes(2);
+ });
+ it('legacy lookup without own identity never guesses or deletes another reaction',async()=>{
+  h.bot.botOpenId='';const remove=vi.fn();h.bot.client.im.messageReaction={list:vi.fn(),delete:remove};
+  await expect((FeishuBot.prototype as any).removeReaction.call(h.bot,'A','Get')).rejects.toThrow('identity');expect(remove).not.toHaveBeenCalled();
+ });
+ it('late stale add receipt is durable cleanup custody when deletion fails and can retry after UI restart',async()=>{
+  let release:any;h.bot.addReaction=vi.fn(async(_m:string,e:string)=>e==='Get'?await new Promise(r=>release=()=>r('our-late-get')):'our-typing');
+  h.bot.removeReaction=vi.fn(async()=>{});const run=h.bot.handleMessage(event('A'));await tick();
+  await h.bot.handleStopCommand('chat','stop');h.bot.removeReaction=vi.fn(async()=>{throw new Error('UI offline');});release();await tick();await run;
+  const stored=h.store.getReactionIntent('Bot','chat',1);expect(stored.shown).not.toBe('Get');expect(stored.cleanupReceipts).toEqual([{id:'our-late-get',emoji:'Get'}]);
+  expect(h.store.listReactionIntents('Bot','chat')).toHaveLength(1);
+  h.bot.removeReaction=vi.fn(async()=>{});await h.bot.reconcileReactions('chat');expect(h.bot.removeReaction).toHaveBeenCalledWith('A','Get','our-late-get');
+  expect(h.store.getReactionIntent('Bot','chat',1).cleanupReceipts).toEqual([]);
+ });
+});
