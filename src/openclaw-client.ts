@@ -206,6 +206,18 @@ export class OpenClawClient {
     } finally {this.recoveryChecking=false;}
   }
 
+  private bufferEvent(key:string,event:any):void {
+    let bucket=this.agentEvents.get(key);
+    if(!bucket){bucket=[];this.agentEvents.set(key,bucket);}
+    bucket.push(event);
+    if(bucket.length>2048) bucket.splice(0,bucket.length-2048);
+    if(this.agentEvents.size>512) {
+      for(const candidate of this.agentEvents.keys()) {
+        if(candidate!==key && !this.sessionCollectorFences.has(this.canonicalSessionKey(candidate))) {this.agentEvents.delete(candidate);break;}
+      }
+    }
+  }
+
   constructor(config: OpenClawConfig) {
     this.config = config;
   }
@@ -323,7 +335,7 @@ export class OpenClawClient {
               // v4: chat delta events carry deltaText (incremental text chunk)
               const deltaText = frame.payload?.deltaText;
               if (deltaText) {
-                this.agentEvents.get(sk)!.push({
+                this.bufferEvent(sk,{
                   ...frame.payload,
                   stream: "chatDelta",
                   data: {
@@ -342,7 +354,7 @@ export class OpenClawClient {
                 }
               }
               // Store as a special chatFinal event (not assistant delta to avoid double-counting)
-              this.agentEvents.get(sk)!.push({
+              this.bufferEvent(sk,{
                 ...frame.payload,
                 stream: "chatFinal",
                 // Only the Gateway chat-final envelope confirms a handoff.
@@ -354,14 +366,14 @@ export class OpenClawClient {
               // must NOT be silently dropped — otherwise mid-run delta text gets
               // surfaced as if it were a normal reply and the run neither errors
               // nor retries. Record it so the collect loop can surface/handle it.
-              this.agentEvents.get(sk)!.push({
+              this.bufferEvent(sk,{
                 ...frame.payload,
                 stream: "chatError",
                 data: { error: frame.payload?.errorMessage || frame.payload?.error || "chat error" },
               });
             }
           } else {
-            this.agentEvents.get(sk)!.push(frame.payload);
+            this.bufferEvent(sk,frame.payload);
           }
         }
 
@@ -391,7 +403,7 @@ export class OpenClawClient {
           const visibleUserText = this.extractVisibleUserText(msg);
           if (visibleUserText) {
             if (!this.agentEvents.has(rawKey)) this.agentEvents.set(rawKey, []);
-            this.agentEvents.get(rawKey)!.push({
+            this.bufferEvent(rawKey,{
               runId: frame.payload.runId,
               sessionKey: rawKey,
               stream: "sessionUser",
@@ -406,7 +418,7 @@ export class OpenClawClient {
           const visibleAssistantText = this.extractVisibleAssistantText(msg);
           if (visibleAssistantText) {
             if (!this.agentEvents.has(rawKey)) this.agentEvents.set(rawKey, []);
-            this.agentEvents.get(rawKey)!.push({
+            this.bufferEvent(rawKey,{
               runId: frame.payload.runId,
               sessionKey: rawKey,
               stream: "transcriptAssistant",
@@ -724,7 +736,7 @@ export class OpenClawClient {
     const deltaText = !fullText && typeof data.delta === "string" ? data.delta : !fullText && typeof data.deltaText === "string" ? data.deltaText : "";
     const key = rawKey;
     const previous = this.verboseAssistantLatest.get(key) || "";
-    const text = (fullText || (previous + deltaText)).trim();
+    const text = (fullText || (previous + deltaText)).trim().slice(-1024*1024);
     if (!text) return;
     const now = Date.now();
     this.verboseAssistantLatest.set(key, text);
@@ -830,6 +842,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let chatFinalText = "";
       let chatFinalSeen = false;
       let transcriptAssistantText = "";
+      let draftOverflow=false;
+      const boundedDraft=(value:string)=>{if(value.length>1024*1024){draftOverflow=true;return value.slice(-1024*1024);}return value;};
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey.replace(/^agent:[^:]+:/, "")}` : "";
       let shortSessionKey = targetSessionKey ? targetSessionKey.replace(/^agent:[^:]+:/, "") : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1058,6 +1072,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       resetIdleTimer();
 
       const finish = (finalText: string) => {
+        if(draftOverflow && finalText!=='NO_REPLY' && finalText!==chatFinalText) {
+          // Never publish a truncated accumulator. Keep exact result custody
+          // until authoritative root terminalReply or full root chat final.
+          void checkRunState(()=>true,true);return;
+        }
         clearTimeout(idleTimer);
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
@@ -1212,21 +1231,21 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               const chunk = ev.data.deltaText || ev.data.delta;
               if (ev.stream === "assistant") {
                 if (ev.data?.replace) {
-                  text = chunk;
+                  text = boundedDraft(chunk);
                 } else {
-                  text += chunk;
+                  text = boundedDraft(text+chunk);
                 }
               } else if (ev.stream === "chatDelta") {
                 if (ev.data?.replace) {
-                  chatDeltaText = chunk;
+                  chatDeltaText = boundedDraft(chunk);
                 } else {
-                  chatDeltaText += chunk;
+                  chatDeltaText = boundedDraft(chatDeltaText+chunk);
                 }
               } else {
                 if (ev.data?.replace) {
-                  transcriptAssistantText = chunk;
+                  transcriptAssistantText = boundedDraft(chunk);
                 } else {
-                  transcriptAssistantText += chunk;
+                  transcriptAssistantText = boundedDraft(transcriptAssistantText+chunk);
                 }
               }
             }
