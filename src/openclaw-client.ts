@@ -865,6 +865,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let lifecycleEndTimer: ReturnType<typeof setTimeout> | null = null;
       let replayInvalidTimer: ReturnType<typeof setTimeout> | null = null;
       let genericChatErrorTimer: ReturnType<typeof setTimeout> | null = null;
+      // A channel message-tool send marked terminate=true is the turn's intended
+      // user-visible output (2026-10-16 incident: it bypassed the bridge and the
+      // collector waited forever). Capture its text and settle on a short grace.
+      let terminatingSendText = "";
+      let terminatingSendTimer: ReturnType<typeof setTimeout> | null = null;
       let pendingRuntimeFailureText = "";
       let lastActivitySummary = "";
       let lastActivityAt = 0;
@@ -1098,6 +1103,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
         if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
+        if (terminatingSendTimer) clearTimeout(terminatingSendTimer);
         resolve(finalText);
       };
 
@@ -1224,6 +1230,39 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
             if (hasEffectiveActivity(ev)) resetIdleTimer();
             rememberActivity(ev);
+            // Terminating channel-send detection: a message-tool result carrying
+            // terminate=true ends the turn with that send as its user-visible
+            // output. The bridge is the delivery channel for LMA sessions, so
+            // waiting for a further final would hang forever (2026-10-16 frozen
+            // card incident). Capture the sent text at tool start; settle on a
+            // short grace unless a real final arrives first.
+            {
+              const tdata = ev.data || {};
+              if (ev.stream === "tool" || (ev.stream === "item" && tdata.kind === "tool")) {
+                const toolName = String(tdata.name || tdata.toolName || "");
+                const tphase = tdata.phase === "result" ? (tdata.isError || tdata.error ? "error" : "end") : tdata.phase;
+                if (toolName === "message" && tphase === "start") {
+                  const raw = tdata.input ?? tdata.args ?? tdata.meta ?? null;
+                  if (raw !== null) {
+                    try {
+                      const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
+                      if (parsed && typeof parsed.message === "string" && parsed.message.trim()) terminatingSendText = parsed.message;
+                    } catch { /* non-JSON tool input */ }
+                  }
+                } else if (toolName === "message" && (tphase === "end" || tphase === "error")) {
+                  const out = String(JSON.stringify(tdata.output ?? tdata.result ?? tdata.error ?? ""));
+                  if (/"?terminate"?\s*[:=]\s*true/i.test(out) && !terminatingSendTimer) {
+                    terminatingSendTimer = setTimeout(() => {
+                      terminatingSendTimer = null;
+                      if (observationClosed) return;
+                      const best = (chatFinalText.trim() || text.trim() || terminatingSendText || "").trim();
+                      finish(best || "NO_REPLY");
+                    }, 10_000);
+                    terminatingSendTimer.unref?.();
+                  }
+                }
+              }
+            }
             // If more events arrive after a replay-invalid lifecycle end, that lifecycle
             // was not terminal for the user-visible run. Keep waiting for the real final.
             if (replayInvalidTimer) {
@@ -1502,6 +1541,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
         if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
         if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
+        if (terminatingSendTimer) clearTimeout(terminatingSendTimer);
         if (observationKey && this.runStateChecks.get(observationKey) === checkAfterNoActiveRun) this.runStateChecks.delete(observationKey);
       };
       // Fence registration: a newer batch on this session must be able to end

@@ -26,6 +26,32 @@ beforeEach(() => {
 });
 afterEach(async () => { await c.disconnect(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
+describe("terminating message-tool send never waits forever (2026-10-16 incident)", () => {
+  it("settles on a short grace and delivers the captured send text", async () => {
+    const run = start();
+    emit("tool", { name: "message", toolCallId: "tm1", phase: "start", input: { action: "send", message: "答复内容ABC" } });
+    emit("tool", { name: "message", toolCallId: "tm1", phase: "result", output: { terminate: true } });
+    // No lifecycle end, no chatFinal — the old code waited forever here.
+    await vi.advanceTimersByTimeAsync(10_500);
+    await expect(run).resolves.toBe("答复内容ABC");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not settle early for a message-tool send without terminate", async () => {
+    let settledText: string | undefined;
+    const run = start().then(t => { settledText = t; return t; });
+    emit("tool", { name: "message", toolCallId: "tn1", phase: "start", input: { action: "send", message: "普通发送" } });
+    emit("tool", { name: "message", toolCallId: "tn1", phase: "result", output: { delivered: true } });
+    await vi.advanceTimersByTimeAsync(10_500);
+    expect(settledText).toBeUndefined();
+    emit("chatFinal", { text: "real final" });
+    emit("lifecycle", { phase: "end", livenessState: "working" });
+    await vi.advanceTimersByTimeAsync(50);
+    await expect(run).resolves.toBe("real final");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("audit 2026-10-16 fixes: B5 double-splice / B6 empty terminal", () => {
   it("a real final buffered right after a timeout error frame is not swallowed (B5)", async () => {
     const run = start();
