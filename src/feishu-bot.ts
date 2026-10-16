@@ -3106,6 +3106,22 @@ export class FeishuBot {
             } else {
               this.store.markDeliveryTextDelivered(item.id);
             }
+            // Proactive deliveries have no trigger-reply recording path, so
+            // without this row other bots' context sync never sees them
+            // (2026-10-16 blind spot: an audit reply delivered to Feishu but
+            // invisible to every other group member). The deterministic id
+            // keyed by deliveryKey keeps crash-retries idempotent; the unique
+            // constraint turns a replay into a no-op.
+            if (String(item.deliveryKey || "").startsWith("proactive:")) {
+              this.store.insert({
+                chatId,
+                messageId: `self-${this.config.name}-proactive-${item.deliveryKey}`,
+                senderType: "bot",
+                senderName: this.config.name,
+                content: item.content,
+                timestamp: Date.now(),
+              });
+            }
           }
 
           // Attachments are independent from status-card cleanup. An unpatchable

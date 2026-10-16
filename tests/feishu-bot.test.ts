@@ -1837,6 +1837,24 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("records proactive outbox deliveries into the message store for other bots' context sync (2026-10-16 blind spot)", async () => {
+    const h = makeHarness("GPT");
+    try {
+      // Kimi scenario: a yielded/paused run's final answer is delivered via the
+      // proactive outbox path — Feishu gets it, but before this fix no other
+      // bot ever saw it in context sync.
+      await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "proactive:ikgyal-test", "audit reply content", [], undefined, "proactive:ikgyal-test", "model-GPT");
+      await (h.bot as any).dispatchPendingDeliveries("chat1");
+      const recorded = h.store.getRecent("chat1").filter((m) => m.senderType === "bot" && String(m.messageId).includes("ikgyal-test"));
+      expect(recorded).toHaveLength(1);
+      expect(recorded[0].senderName).toBe("GPT");
+      expect(recorded[0].content).toContain("audit reply");
+      // Crash-retry must not duplicate (deterministic id + unique constraint).
+      await (h.bot as any).dispatchPendingDeliveries("chat1");
+      expect(h.store.getRecent("chat1").filter((m) => String(m.messageId).includes("ikgyal-test"))).toHaveLength(1);
+    } finally { h.cleanup(); }
+  });
+
   it("does not let a NO_REPLY chat-final overwrite a proactive answer on the shared card", async () => {
     const h = makeHarness("GPT");
     try {
