@@ -21,7 +21,7 @@ import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
 const nonemptyReceipt=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
-type QueueOwner = { id:string;batchId?:string;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string };
+type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string };
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -1198,9 +1198,20 @@ export class FeishuBot {
 
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot, chatId, routing)) return;
+      let reservedAtIngress=false;
       if (!isBot && insertedId > 0) {
         this.goController?.onHumanInput(chatId);
         this.store.markPendingTrigger(this.config.name, chatId, insertedId);
+        // Reserve BEFORE the first health/reaction await. Otherwise an ending
+        // owner can ordinary-drain this row while its handler is still waiting,
+        // and the later steer would submit the same message a second time.
+        const ingressOwner=this.queueOwners.get(chatId);
+        if(this.queueRuns.has(chatId) && !ingressOwner?.triggerIds?.has(insertedId)) {
+          this.store.saveInsertion(this.config.name,chatId,insertedId,JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
+            messageId,text:cleanText,stopEpoch:this.stopGeneration(chatId),expectedRunId:ingressOwner?.runId || '',
+            ownerId:ingressOwner?.id,batchId:ingressOwner?.batchId,sessionKey:this.getSessionKey(chatId)});
+          reservedAtIngress=true;
+        }
         // Received/queued is not accepted by Gateway. Keep Typing until an
         // exact admission receipt, independently of reaction API availability.
         const acks=this.pendingAckMessages.get(chatId)||[];
@@ -1219,6 +1230,13 @@ export class FeishuBot {
         await this.warnUnhealthySessionAndContinue(chatId, messageId, unhealthy);
       }
 
+      // Another ingress handler may already have selected/admitted this row
+      // as an ordinary batch while this handler awaited health. Do not re-steer
+      // a message that already belongs to that batch.
+      if(!isBot && insertedId>0 && !reservedAtIngress &&
+        (this.queueOwners.get(chatId)?.triggerIds?.has(insertedId) ||
+        !this.store.getPendingTriggerIds(this.config.name,chatId).has(insertedId))) return;
+
       // Anti-loop
       const streak = this.store.getBotStreak(chatId, this.config.name);
       if (isBot && streak >= MAX_BOT_STREAK) {
@@ -1231,13 +1249,13 @@ export class FeishuBot {
       // --- Queue-based sending: if agent is busy, just accumulate ---
       // The actual queue owner, not elapsed wall time, decides whether input
       // should steer/queue. Long healthy runs must not lose their busy ownership.
-      const isBusy = this.queueRuns.has(chatId);
+      const isBusy = reservedAtIngress || this.queueRuns.has(chatId);
 
       if (isBusy) {
         const owner=this.queueOwners.get(chatId);
         const record={messageId,text:cleanText,stopEpoch:this.stopGeneration(chatId),
           expectedRunId:owner?.runId || '',ownerId:owner?.id,batchId:owner?.batchId,sessionKey:this.getSessionKey(chatId)};
-        if(insertedId>0) this.store.saveInsertion(this.config.name,chatId,insertedId,
+        if(insertedId>0 && !this.store.getInsertion(this.config.name,chatId,insertedId)) this.store.saveInsertion(this.config.name,chatId,insertedId,
           JSON.stringify([this.config.appId,chatId,messageId]),'pending',record);
         // Reservation is durable BEFORE any RPC. Ordinary drain cannot race a
         // late ACK and execute this same input a second time.
@@ -1540,6 +1558,7 @@ export class FeishuBot {
       const batchToken={};
       owner.batch=batchToken;
       owner.batchId=randomUUID();
+      owner.triggerIds=undefined;
       owner.runId=undefined;
       this.queueRunTokens.set(chatId,batchToken);
       // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
@@ -1635,6 +1654,7 @@ export class FeishuBot {
       const runStartStopEpoch = this.stopEpoch.get(chatId) || 0;
       const mergedContent = mergedTriggers.map((m) => m.content).join("\n");
       const mergedTriggerIds = mergedTriggers.map((m) => m.id || 0).filter(Boolean);
+      owner.triggerIds=new Set(mergedTriggerIds);
       // These rows are now taking the ordinary queue path. Remove any stale
       // provisional native-steer correlation before chat.send so a later
       // identical steer cannot acknowledge the wrong Feishu message.

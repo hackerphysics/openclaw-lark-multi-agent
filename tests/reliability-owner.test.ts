@@ -49,6 +49,18 @@ describe('owner and real-batch generation correctness',()=>{
  });
 });
 describe('durable insertion reservation and exact receipt reactions',()=>{
+ it('ingress reserves insertion before a slow health await so the old owner cannot ordinary-drain it',async()=>{
+  const first=await start();let releaseHealth:any;h.bot.getUnhealthySessionStatus=()=>new Promise(r=>releaseHealth=()=>r(null));
+  const input=h.bot.handleMessage(event('B'));await tick();const row=h.store.getMessageId('B')!;expect(h.store.isInsertionReserved('Bot','chat',row)).toBe(true);
+  h.final('r1');await tick(300);await first.promise;expect(h.sends).toHaveLength(1);
+  releaseHealth();await tick();await input;expect(h.sends).toHaveLength(1);expect(h.store.getInsertion('Bot','chat',row).expectedRunId).toBe('r1');
+ });
+ it('a handler delayed by health cannot steer its own message after another handler ordinary-admitted it',async()=>{
+  let releaseHealth:any,calls=0;h.bot.getUnhealthySessionStatus=async()=>++calls===1?await new Promise(r=>releaseHealth=()=>r(null)):null;
+  const first=h.bot.handleMessage(event('B'));await tick();const second=h.bot.handleMessage(event('C'));await tick();expect(h.sends).toHaveLength(1);
+  releaseHealth();await tick();await first;expect(h.store.getInsertion('Bot','chat',h.store.getMessageId('B')!)).toBeNull();
+  h.final('r1');await tick(300);await second;expect(h.sends).toHaveLength(1);
+ });
  it('late accepted ACK cannot ordinary-drain the same input while RPC is pending',async()=>{
   const first=await start();let accept:any;h.client.steer=vi.fn(async(_s:any,_t:any,_d:any,id:any)=>await new Promise(r=>accept=()=>r(acceptance(id))));
   await h.bot.handleMessage(event('B'));await tick();const row=h.store.getMessageId('B')!;
