@@ -67,7 +67,7 @@ describe("Controller/public-admission conservative legacy observation fixtures",
  });
  it("real bridge dispatch captures body, file/image payloads and captions separately; restart never replays",async()=>{
   const h=runtime();let bot:FeishuBot|undefined;try{const job=await h.start();bot=new FeishuBot({name:"synthetic",appId:"synthetic-id",appSecret:"not-a-secret",model:"synthetic/model"},h.client,h.store);
-   const api:any=bot;const messages:any[]=[];api.client={im:{message:{create:async(p:any)=>{if(p.data.msg_type==="interactive" && p.data.content.length>4000)throw Object.assign(new Error("length of the message content"),{response:{data:{code:230025,msg:"length of the message content"}}});messages.push(p);return {data:{message_id:`platform-${messages.length}`}};},reply:async(p:any)=>{messages.push(p);return {data:{message_id:`platform-${messages.length}`}};}},file:{create:async()=>({data:{file_key:"synthetic-file"}})},image:{create:async()=>({data:{image_key:"synthetic-image"}})}}};
+   const api:any=bot;const messages:any[]=[];api.client={im:{message:{create:async(p:any)=>{if(p.data.msg_type==="interactive" && p.data.content.length>4000)throw Object.assign(new Error("length of the message content"),{response:{data:{code:230025,msg:"length of the message content"}}});messages.push(p);return {code:0,data:{message_id:`platform-${messages.length}`}};},reply:async(p:any)=>{messages.push(p);return {code:0,data:{message_id:`platform-${messages.length}`}};}},file:{create:async()=>({data:{file_key:"synthetic-file"}})},image:{create:async()=>({data:{image_key:"synthetic-image"}})}}};
    api.validateBridgeAttachmentPath=(p:string)=>p;api.readSessionStatus=async()=>({status:"idle",running:false});
    const file=join(h.dir,"report.txt"),image=join(h.dir,"report.png");writeFileSync(file,"synthetic report");writeFileSync(image,"synthetic image fixture");
    await api.enqueueAndDispatchDelivery("chat","assistant_visible","synthetic-outbox","report body ".repeat(1200),[{type:"file",path:file,caption:"file caption"},{type:"image",path:image,caption:"image caption"}],undefined,"synthetic-key",undefined,{sessionKey:job.executorSessionKey,sessionId:job.executorSessionId,runId:"executor-root",final:true});
@@ -79,12 +79,12 @@ describe("Controller/public-admission conservative legacy observation fixtures",
   try {
    const job=await h.start();bot=new FeishuBot({name:"synthetic",appId:"synthetic-id",appSecret:"fixture",model:"synthetic/model"},h.client,h.store);
    const api:any=bot;let calls=0;
-   api.client={im:{message:{create:async()=>{calls++;if(outcome==="unknown")throw new Error("platform accepted, reply lost");return {data:{message_id:"original-platform-id"}};},reply:async()=>({})}}};api.installGoReceiptCapture();
+   api.client={im:{message:{create:async()=>{calls++;if(outcome==="unknown")throw new Error("platform accepted, reply lost");return {code:0,data:{message_id:"original-platform-id"}};},reply:async()=>({})}}};api.installGoReceiptCapture();
    const context=()=>({receipts:[],goId:job.id,outboxId:777,stage:"attachment:0",ordinals:new Map(),onReceipt:()=>{}});
    const invoke=()=>api.goDeliveryReceipts.run(context(),()=>api.client.im.message.create({data:{msg_type:"file",content:"original-file-key"}}));
    if(outcome==="unknown")await expect(invoke()).rejects.toThrow("reply lost");else expect((await invoke()).data.message_id).toBe("original-platform-id");
    h.store.close();reopened=new MessageStore(join(h.dir,"db"));api.store=reopened;
-   if(outcome==="unknown")await expect(invoke()).rejects.toThrow("cannot be replayed");else expect((await invoke()).data.message_id).toBe("original-platform-id");
+   if(outcome==="unknown")await expect(invoke()).rejects.toThrow("without blind resend");else expect((await invoke()).data.message_id).toBe("original-platform-id");
    expect(calls).toBe(1);
   } finally {reopened?.close();(bot as any)?.goController?.dispose();h.cleanup();}
  });

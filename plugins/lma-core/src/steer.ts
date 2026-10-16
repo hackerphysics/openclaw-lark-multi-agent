@@ -1,10 +1,10 @@
-import { queueAgentHarnessMessage, resolveActiveEmbeddedRunSessionId, onAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { resolveActiveEmbeddedRunSessionId, onAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-type Status = "pending" | "accepted" | "rejected" | "unknown" | "target_changed" | "stopped";
+type Status = "pending" | "accepted" | "rejected" | "unknown" | "target_changed" | "stopped" | "capability_blocked";
 type Custody = { insertionId: string; sessionKey: string; expectedRunId: string; textHash?: string; sessionId?: string; status: Status; attempted: boolean; reason?: string };
 const canonical=(key:string)=>/^agent:/.test(key) ? key : `agent:main:${key}`;
 const nonempty=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
@@ -28,6 +28,8 @@ export function registerSteer(api: any): void {
   const file=(id:string)=>join(dir,createHash('sha256').update(id).digest('hex')+'.json');
   const read=(id:string):Custody|undefined=>{try{return JSON.parse(readFileSync(file(id),'utf8'));}catch(e:any){if(e.code==='ENOENT')return;throw e;}};
   const save=(record:Custody)=>{mkdirSync(dir,{recursive:true});const path=file(record.insertionId);const temp=path+'.tmp';writeFileSync(temp,JSON.stringify(record),{mode:0o600});renameSync(temp,path);};
+  api.registerGatewayMethod('lma.steer.capabilities',({respond}:any)=>respond(true,{protocol:1,atomicRunBound:false,acceptanceCallback:true,durableIntent:true,
+    reason:'Public queue API lacks expectedRunId/source authority CAS and durable item query'}));
   api.registerGatewayMethod('lma.steer',async({params,respond}:any)=>{
     if(!nonempty(params.sessionKey) || !nonempty(params.text) || !nonempty(params.insertionId) || !nonempty(params.expectedRunId)) {
       respond(false,undefined,{code:'INVALID_REQUEST',message:'lma.steer requires sessionKey, text, stable insertionId and expectedRunId'});return;
@@ -55,24 +57,15 @@ export function registerSteer(api: any): void {
         record.reason='exact_run_unverifiable_from_public_events';save(record);respond(true,record);return;
       }
       record.sessionId=sessionId;
-      // Durable unknown fence precedes the only injection attempt. A crash at
-      // this point trades availability for no duplicate business side effects.
-      record.attempted=true;record.status='unknown';save(record);
-      let callbackSeen=false;
-      const eligible=queueAgentHarnessMessage(sessionId,params.text,{
-        steeringMode:'all',queueIdentity:record.insertionId,waitForTranscriptCommit:true,
-        onQueueAccepted:(accepted:boolean)=>{
-          callbackSeen=true;
-          const latest=read(record.insertionId);
-          if(!latest || latest.status==='stopped') return;
-          latest.status=accepted ? 'accepted' : 'rejected';
-          latest.reason=accepted ? 'public onQueueAccepted(true); not a consumption receipt' : 'public onQueueAccepted(false)';
-          save(latest);
-        },
-      });
-      if(!eligible && !callbackSeen) {
-        record.attempted=false;record.status='pending';record.reason='SDK preflight ineligible; no injection attempted';save(record);
-      }
+      // Public SDK has no host-owned expectedRunId CAS. sessionId is reused
+      // by successor runs, and onAgentEvent is only advisory. Do NOT convert
+      // this read/check into final-effect authority, or call the boolean API
+      // "just to test readiness" (true already invokes backend mutation).
+      // A strict original-run intent stays durably blocked, not silently sent
+      // to whichever handle currently occupies this sessionId.
+      record.status='capability_blocked';
+      record.reason='Public SDK lacks atomic expectedRunId + durable submit/query; no injection attempted';
+      save(record);
       respond(true,read(record.insertionId));
     } catch(error) {
       respond(false,undefined,{code:'INTERNAL',message:`lma.steer: ${error instanceof Error ? error.message : String(error)}`});

@@ -48,8 +48,8 @@ async function harness() {
     throw new Error(`Unexpected offline RPC ${method}`);
   });
   const bot: any = new FeishuBot({ name: "Gemini", appId: "offline", appSecret: "synthetic", model: "x/gemini-3.8-flash" }, client, store);
-  bot.client.im.message.create = vi.fn(async () => ({ data: { message_id: "offline-platform-receipt" } }));
-  bot.client.im.message.reply = vi.fn(async () => ({ data: { message_id: "offline-platform-receipt" } }));
+  bot.client.im.message.create = vi.fn(async () => ({ code: 0, data: { message_id: "offline-platform-receipt" } }));
+  bot.client.im.message.reply = vi.fn(async () => ({ code: 0, data: { message_id: "offline-platform-receipt" } }));
   bot.addReaction = vi.fn(async () => {}); bot.removeReaction = vi.fn(async () => {});
   bot.sendLiveStatusCard = vi.fn(async () => "offline-status"); bot.replyLiveStatusCard = vi.fn(async () => "offline-status");
   bot.patchLiveStatusCard = vi.fn(async () => {}); bot.patchLiveStatusDoneSummary = vi.fn(async () => {});

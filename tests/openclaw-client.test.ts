@@ -595,82 +595,23 @@ describe("OpenClawClient 2026.8 session model policy", () => {
 });
 
 describe("OpenClawClient plugin steering", () => {
-  it("uses lma.steer and waits for transcript consumption", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ sessionId: "active-session", status: "steered" }));
-
-    await expect(client.steer("agent:main:s1", "wrapped input", "display input")).resolves.toMatchObject({
-      status: "steered",
-      cancelPending: expect.any(Function),
-    });
-    expect((client as any).rpc).toHaveBeenCalledWith("lma.steer", {
-      sessionKey: "agent:main:s1",
-      text: "wrapped input",
-    }, 10000);
-
-    const consumed = vi.fn(() => true);
-    client.onSteerConsumed("s1", "wrapped input", consumed);
-    expect((client as any).handleSteerConsumption("agent:main:s1", "prefix wrapped input suffix")).toBe(true);
-    expect(consumed).toHaveBeenCalledWith("wrapped input");
+  it("does not invoke a mutation endpoint without immutable message/run identity",async()=>{
+    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn();
+    expect(await c.steer('s1','input')).toMatchObject({status:'pending',attempted:false});expect(c.rpc).not.toHaveBeenCalled();
   });
-
-  it.each(["no_active_run", "rejected"].map(s => [s]))("does not claim plugin status %s as inserted", async (status) => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ status }));
-    // no_active_run passes through (zombie-owner detection); rejected stays unavailable.
-    const expected = status === "no_active_run" ? { status: "no_active_run" } : { status: "unavailable" };
-    await expect(client.steer("s1", "input")).resolves.toEqual(expected);
-    expect((client as any).handleSteerConsumption("s1", "input")).toBe(false);
-    expect((client as any).rpc).not.toHaveBeenCalledWith("chat.send", expect.anything(), expect.anything());
+  it.each(['steered','no_active_run','rejected'])("legacy %s is not a verified strict-run injection contract",async status=>{
+    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async()=>({status}));
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'capability_blocked',attempted:false});
+    expect(c.rpc.mock.calls.map((x:any)=>x[0])).toEqual(['lma.steer.capabilities']);
   });
-
-  it("queues safely instead of using ambiguous native steering when the plugin is missing", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => { throw new Error("unknown method: lma.steer"); });
-    await expect(client.steer("s1", "input")).resolves.toEqual({ status: "unavailable" });
-    expect((client as any).rpc).toHaveBeenCalledTimes(1);
+  it("missing plugin retains capability-blocked intent without a business RPC",async()=>{
+    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async()=>{throw new Error('unknown method');});
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'capability_blocked',attempted:false});
   });
-
-  it("cancels stale provisional correlation before an identical later steer", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ sessionId: "active-session", status: "steered" }));
-    const stale = await client.steer("s1", "same text", "old");
-    stale.cancelPending?.();
-    const fresh = vi.fn(() => true);
-    await client.steer("s1", "same text", "new");
-    client.onSteerConsumed("s1", "same text", fresh);
-
-    expect((client as any).handleSteerConsumption("s1", "same text")).toBe(true);
-    expect(fresh).toHaveBeenCalledOnce();
-    expect((client as any).handleSteerConsumption("s1", "same text")).toBe(false);
-  });
-
-  it("correlates duplicate and overlapping steer text one transcript event at a time", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    (client as any).rpc = vi.fn(async () => ({ sessionId: "active-session", status: "steered" }));
-    const first = vi.fn(() => true);
-    const duplicate = vi.fn(() => true);
-    const longer = vi.fn(() => true);
-
-    await client.steer("s1", "yes", "yes");
-    client.onSteerConsumed("s1", "yes", first);
-    await client.steer("s1", "yes", "yes duplicate");
-    client.onSteerConsumed("s1", "yes", duplicate);
-    await client.steer("s1", "yes please", "yes please");
-    client.onSteerConsumed("s1", "yes please", longer);
-
-    expect((client as any).handleSteerConsumption("s1", "yes please")).toBe(true);
-    expect(longer).toHaveBeenCalledTimes(1);
-    expect(first).not.toHaveBeenCalled();
-    expect(duplicate).not.toHaveBeenCalled();
-
-    expect((client as any).handleSteerConsumption("s1", "yes")).toBe(true);
-    expect(first).toHaveBeenCalledTimes(1);
-    expect(duplicate).not.toHaveBeenCalled();
-
-    expect((client as any).handleSteerConsumption("s1", "yes")).toBe(true);
-    expect(duplicate).toHaveBeenCalledTimes(1);
-    expect((client as any).handleSteerConsumption("s1", "yes")).toBe(false);
+  it("a verified protocol mutation with lost response remains unknown, never replayable",async()=>{
+    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async(m:string)=>{if(m==='lma.steer.capabilities')return {protocol:1,atomicRunBound:true};throw new Error('lost response');});
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'unknown',attempted:true});
+    expect(c.rpc.mock.calls.filter((x:any)=>x[0]==='lma.steer')).toHaveLength(1);
   });
 
   it("formats structured protocol-4 tool details instead of object coercion", () => {
@@ -965,7 +906,7 @@ describe("OpenClawClient bridge attachment hint", () => {
     const events: string[] = [];
     (client as any).rpc = vi.fn(async () => {
       events.push("rpc");
-      return { runId: "run-1" };
+      return { runId: "run-1", status: "started" };
     });
     (client as any).collectReply = vi.fn(async () => {
       events.push("collectReply");

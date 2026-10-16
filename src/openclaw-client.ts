@@ -37,6 +37,12 @@ export class SupersededObservation extends Error {
   }
 }
 
+export class AdmissionUnconfirmed extends Error {
+  constructor(readonly submissionId:string,cause?:unknown) {
+    super('消息提交结果尚未确认；本地保留原提交身份，不会自动重复发送。',{cause});this.name='AdmissionUnconfirmed';
+  }
+}
+
 export type ChatAttachment = {
   type?: string;
   mimeType?: string;
@@ -139,6 +145,7 @@ export class OpenClawClient {
   private pendingExplicitStops = new Map<string, Promise<void>>();
   private isExplicitlyStoppedRun(sessionKey: string, runId?: string): boolean {
     if (!runId) return false;
+    if(this.recoveryStore?.isStoppedObservation(this.canonicalSessionKey(sessionKey),runId)) return true;
     const key = JSON.stringify([this.canonicalSessionKey(sessionKey), runId]);
     const at = this.explicitlyStoppedRuns.get(key);
     if (at === undefined) return false;
@@ -163,6 +170,7 @@ export class OpenClawClient {
   private recoveryTimer?: ReturnType<typeof setTimeout>;
   private recoveryChecking = false;
   private eventCollectors = new Set<() => void>();
+  private forwardedFinals = new Map<string,string>();
   /** One paced recovery scheduler for all persisted exact runs. No business
    * replay, no per-run infinite timers, and each query has its own deadline. */
   bindRecoveryStore(store: MessageStore): void { this.recoveryStore=store; this.scheduleRecovery(); }
@@ -180,7 +188,7 @@ export class OpenClawClient {
         if(this.ownedDeliveryRuns.has(item.runId)) continue;
         this.recoveryStore.saveRunObservation(item.sessionKey,item.runId,item,Date.now()+60_000);
         try {
-          const snapshot=await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
+          const snapshot=item.terminalObserved ? {runId:item.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:item.terminalText}} : await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
           if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError) continue;
           const terminal=snapshot.terminalReply;
           if(snapshot.status!=='ok' || !['visible','silent','empty'].includes(terminal?.disposition)) continue;
@@ -188,7 +196,9 @@ export class OpenClawClient {
             const callback=this.sessionMessageCallbacks.get(item.sessionKey) || this.sessionMessageCallbacks.get(this.shortKey(item.sessionKey));
             await callback?.(terminal.text,{sessionKey:item.sessionKey,runId:item.runId,sessionId:item.sessionId,final:true});
           }
-          this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+          if(terminal.disposition!=='visible') this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+          // Visible custody ends only when the receiver's durable outbox has
+          // claimed it. A callback resolving alone is not a delivery receipt.
         } catch { /* Query failed, not the task. Leave exact custody in SQLite. */ }
       }
     } finally {this.recoveryChecking=false;}
@@ -755,13 +765,10 @@ export class OpenClawClient {
       console.log(`[OpenClaw] Dropping proactive transcript msg for ${shortKey}; waiting for final delivery path`);
       return false;
     }
-    const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-    if (cb) {
-      if (runId) cb(proactiveText, { runId, sessionId, sessionKey: this.canonicalSessionKey(rawKey), final: msg?.stopReason === "stop",
-        ...(!msg?.stopReason && genericFailure(proactiveText) ? { genericErrorCandidate: true } : {}) });
-      else cb(proactiveText);
-    }
-    return Boolean(cb);
+    if(runId && this.isExplicitlyStoppedRun(rawKey,runId)) return false;
+    return this.emitProactiveForSession(rawKey,proactiveText,runId ? {runId,sessionId,sessionKey:this.canonicalSessionKey(rawKey),final:msg?.stopReason==='stop',
+      ...(!msg?.stopReason && genericFailure(proactiveText) ? {genericErrorCandidate:true} : {})} : undefined);
+
   }
 
   private scheduleReconnect(): void {
@@ -836,6 +843,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let anchorSeen = !expectedUserText;
       const activeRunIds = new Set<string>([runId]);
       let preAnchorEvents: any[] = [];
+      const foreignUserRuns=new Set<string>();
       const normalizeText = (value: string) => value.replace(/\s+/g, " ").trim();
       const isExpectedUserText = (value: string) => {
         const actual = normalizeText(value);
@@ -861,13 +869,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       const handleTimeoutResult = async (error: Error) => {
         if (observationClosed) return;
         if (chatFinalText.trim()) { finish(chatFinalText); return; }
-        if (error instanceof SessionWaitPaused && options?.onWaitPaused) {
+        if (error instanceof SessionWaitPaused) {
           // Foreground notice, background observation. Keep the original queue
           // owner/progress path so later input still steers into the same run.
           foregroundPaused = true;
           if (!waitNoticeSent) {
             waitNoticeSent = true;
-            try { await options.onWaitPaused(error); }
+            try { await options?.onWaitPaused?.(error); }
             catch { console.warn("[OpenClaw] wait notice delivery pending; observation retained"); }
           }
           decidingTimeout = false;
@@ -960,6 +968,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         const key = createHash("sha256").update(value).digest("hex");
         if (activityKeys.has(key)) return false;
         activityKeys.add(key);
+        if(activityKeys.size>4096) activityKeys.delete(activityKeys.values().next().value!);
         return true;
       };
       const hasEffectiveActivity = (ev: any): boolean => {
@@ -988,7 +997,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           if (!claimActivity(JSON.stringify([source, ev.seq ?? null, replace, chunk]))) return false;
           const previous = activityText.get(source) || "";
           const next = replace ? chunk : previous + chunk;
-          activityText.set(source, next);
+          activityText.set(source, next.slice(-256*1024));
           if (next === previous || (replace && previous.includes(next))) return false;
           // Replayed replacement snapshots and assistant/chat/transcript mirrors
           // with the same accumulated text are not additional task progress.
@@ -1089,6 +1098,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             const matchesRun = evRunId ? activeRunIds.has(evRunId) : false;
 
             if (options?.exactRunIdentity && !matchesRun) { i++; continue; }
+            if(evRunId && foreignUserRuns.has(evRunId)) {i++;continue;}
 
             if (!sessionKey && ev.sessionKey) {
               shortSessionKey = String(ev.sessionKey).replace(/^agent:[^:]+:/, "");
@@ -1096,6 +1106,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
 
             if (eventSessionMatches && ev.stream === "sessionUser") {
+              if(anchorSeen && evRunId && !matchesRun) {foreignUserRuns.add(evRunId);i++;continue;}
               bucket.splice(i, 1);
               if (!anchorSeen && isExpectedUserText(ev.data?.text || "")) {
                 anchorSeen = true;
@@ -1133,6 +1144,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             if (eventSessionMatches && expectedUserText && !anchorSeen && !matchesRun) {
               bucket.splice(i, 1);
               preAnchorEvents.push(ev);
+              if(preAnchorEvents.length>2048) preAnchorEvents.splice(0,preAnchorEvents.length-2048);
               if (preAnchorEvents.length > 200) preAnchorEvents.shift();
               continue;
             }
@@ -1223,7 +1235,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 // Finish scanning this batch first so an already-arrived real
                 // final/error wins over a stale waiting notice. No status RPC
                 // (or ten-minute silence) is needed to confirm this wire fact.
-                if (options?.onWaitPaused) void Promise.resolve().then(() => handleTimeoutResult(
+                void Promise.resolve().then(() => handleTimeoutResult(
                   new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined), false, "yield")
                 ));
                 continue;
@@ -1239,9 +1251,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                   // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
                   const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
                   // Never abort a yielded original run, nor an empty final.
-                  if (!foregroundYielded && latestFinalText) this.abortChat(targetSessionKey || sessionKey, runId).catch((err) => {
-                    console.warn(`[OpenClaw] abort after chatFinal fallback failed:`, safeErrorSummary(err));
-                  });
                   if (latestFinalText) {
                     finish(latestFinalText);
                   } else if (options?.emptyFinalAsNoReply) {
@@ -1628,19 +1637,24 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }
 
   async steer(sessionKey: string,text: string,displayText?: string,identity?: {insertionId:string;expectedRunId:string;cancel?:boolean;queryOnly?:boolean}): Promise<{
-    status:'pending'|'accepted'|'rejected'|'unknown'|'target_changed'|'stopped'|'unavailable'|'no_active_run';
+    status:'pending'|'accepted'|'rejected'|'unknown'|'target_changed'|'stopped'|'capability_blocked'|'unavailable'|'no_active_run';
     attempted?:boolean;sessionId?:string;reason?:string;insertionId?:string;expectedRunId?:string;
   }> {
     if(!identity?.insertionId || !identity.expectedRunId) return {status:'pending',attempted:false,reason:'exact target not admitted yet'};
+    let attempted=false;
     try {
+      const capability=await this.rpc('lma.steer.capabilities',{},2500);
+      if(capability?.protocol!==1 || capability?.atomicRunBound!==true) return {status:'capability_blocked',attempted:false,insertionId:identity.insertionId,expectedRunId:identity.expectedRunId,reason:'Public host cannot atomically bind injection to original run; no attempt made'};
+      attempted=true;
       const result=await this.rpc('lma.steer',{sessionKey:this.canonicalSessionKey(sessionKey),text,...identity},2500);
       if(result?.insertionId!==identity.insertionId || result?.expectedRunId!==identity.expectedRunId ||
-        !['pending','accepted','rejected','unknown','target_changed','stopped'].includes(result.status)) {
+        !['pending','accepted','rejected','unknown','target_changed','stopped','capability_blocked'].includes(result.status)) {
         return {status:'unknown',attempted:true,reason:'Invalid or legacy plugin receipt; not replayed'};
       }
+      if(result.status==='pending' && result.attempted===false && result.reason==='target_not_ready') await this.runStateChecks.get(this.canonicalSessionKey(sessionKey))?.();
       return result;
     } catch(error) {
-      return {status:'unknown',attempted:true,reason:'RPC result unknown; query same insertion identity only'};
+      return {status:attempted?'unknown':'capability_blocked',attempted,insertionId:identity.insertionId,expectedRunId:identity.expectedRunId,reason:attempted?'Insertion receipt unknown; query stable identity only':'No verified public strict-run injection capability; no business request sent'};
     }
   }
 
@@ -2041,6 +2055,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // still reach the proactive callback.
       return;
     }
+    if(runId && this.isExplicitlyStoppedRun(sessionKey,runId) && state==='final') return;
     const stopReason = [payload?.stopReason, payload?.message?.stopReason].find(reason => reason === "error" || reason === "aborted")
       || payload?.stopReason || payload?.message?.stopReason;
     const isError = state === "error" || state === "aborted" || stopReason === "error" || stopReason === "aborted";
@@ -2084,11 +2099,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return parts.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
   }
 
-  private emitProactiveForSession(sessionKey: string, text: string, meta?: ProactiveMessageMeta): boolean {
-    const [shortKey, fullKey] = this.sessionKeyVariants(sessionKey);
-    const cb = this.sessionMessageCallbacks.get(fullKey) || this.sessionMessageCallbacks.get(shortKey);
-    if (!cb) return false;
-    cb(text, meta);
+  private emitProactiveForSession(sessionKey: string,text: string,meta?: ProactiveMessageMeta): boolean {
+    const keys=this.sessionKeyVariants(sessionKey);
+    const callback=keys.map(k=>this.sessionMessageCallbacks.get(k)).find(Boolean);
+    if(!callback) return false;
+    const identity=meta?.final && meta.runId ? JSON.stringify([this.canonicalSessionKey(sessionKey),meta.runId]) : '';
+    const fingerprint=createHash('sha256').update(text).digest('hex');
+    if(identity && this.forwardedFinals.get(identity)===fingerprint) return true;
+    if(identity) {
+      this.forwardedFinals.set(identity,fingerprint);
+      if(this.forwardedFinals.size>2048) this.forwardedFinals.delete(this.forwardedFinals.keys().next().value!);
+    }
+    if(identity) this.recoveryStore?.saveRunObservation(this.canonicalSessionKey(sessionKey),meta!.runId!,{sessionId:meta?.sessionId,terminalText:text,terminalObserved:true},Date.now()+60_000);
+    try {
+      const result=meta ? callback(text,meta) : callback(text);
+      if(identity) void Promise.resolve(result).catch(()=>this.forwardedFinals.delete(identity));
+    } catch(error) {if(identity)this.forwardedFinals.delete(identity);throw error;}
     return true;
   }
 
@@ -2328,9 +2354,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     timeoutMs?: number;
     emptyFinalAsNoReply?: boolean;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
-    onSendAttempt?: () => void | Promise<void>;
+    onSendAttempt?: (submissionId:string) => void | Promise<void>;
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the user message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
+    /** Identifies collection target; not an acceptance receipt. */
+    onRunIdentified?: (runId:string)=>void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
     onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
   }): Promise<string> {
@@ -2342,6 +2370,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     const isCurrent=()=>this.observationEpoch.get(fullSessionKey)===generation && (this.stopGenerations.get(fullSessionKey)||0)===stopGeneration;
     const assertCurrent=()=>{if(!isCurrent()) throw new SupersededObservation('admission generation revoked');};
     this.clearVerboseAssistantState(sk);
+    const submissionId=randomUUID();
     let ownedRunId = "";
     let waitPaused = false;
     try {
@@ -2350,10 +2379,14 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       const sendStartedAt = Date.now();
       try {
         assertCurrent();
-        await params.onSendAttempt?.();
+        this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,'reserved',{generation,stopGeneration});
+        await params.onSendAttempt?.(submissionId);
         assertCurrent();
-        const idempotencyKey=randomUUID();
-        const sendChat = () => { assertCurrent(); return this.rpc("chat.send", {
+        const idempotencyKey=submissionId;
+        const sendChat = () => { assertCurrent();
+          this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,'dispatching',{generation,stopGeneration,payloadDigest:createHash('sha256').update(params.message).digest('hex')});
+          this.recoveryStore?.saveRunObservation(fullSessionKey,submissionId,{admissionOnly:true},Date.now()+30_000);
+          return this.rpc("chat.send", {
           sessionKey: this.canonicalSessionKey(sk),
           message: params.message,
           attachments: params.attachments,
@@ -2366,7 +2399,12 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // The Gateway auto-archives sessions past the active-session cap; an
           // archived session refuses new work. Restore it once and retry — the
           // user should never have to fix this by hand.
-          if (!this.isArchivedSessionError(err)) throw err;
+          if (!this.isArchivedSessionError(err)) {
+            const rejected=err instanceof Error && /^RPC error:/.test(err.message);
+            this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,rejected?'rejected':'unknown',{generation,stopGeneration});
+            if(rejected) {this.recoveryStore?.finishRunObservation(fullSessionKey,submissionId,'rejected');throw err;}
+            throw new AdmissionUnconfirmed(idempotencyKey,err);
+          }
           console.warn(`[OpenClaw] chat.send hit archived session for ${sk}; restoring and retrying once`);
           const restored = await this.unarchiveSession(sk);
           if (!restored) throw err;
@@ -2376,7 +2414,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         releaseChatSendSlot();
       }
       ownedRunId = typeof result?.runId === "string" ? result.runId : "";
-      if(!ownedRunId) throw new Error('Unknown chat.send admission receipt; not replayed');
+      if(!ownedRunId) throw new AdmissionUnconfirmed('unidentified-receipt');
+      this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,['started','ok'].includes(result.status)?'accepted':'unconfirmed',{generation,stopGeneration,runId:ownedRunId});
+      if(ownedRunId!==submissionId) this.recoveryStore?.finishRunObservation(fullSessionKey,submissionId,'identified');
       this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId});
       if(this.isExplicitlyStoppedRun(fullSessionKey,ownedRunId) || (this.stopGenerations.get(fullSessionKey)||0)!==stopGeneration) {
         this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId,'stopped');
@@ -2389,7 +2429,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if(previous) for(const fence of [...previous]) fence();
       this.ownDeliveryRun(ownedRunId);
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
-      await params.onSubmitted?.(result.runId);
+      await params.onRunIdentified?.(result.runId);
+      assertCurrent();
+      // A reservation/in_flight reply is not confirmed acceptance. Keep UI
+      // Typing while exact collection/read-only receipt reconciliation proceeds.
+      if(result.status==='started' || result.status==='ok' || Number.isFinite(result.messageSeq)) await params.onSubmitted?.(result.runId);
       assertCurrent();
       if (params.onProgress) {
         this.progressCallbacks.set(sk, params.onProgress);
@@ -2397,7 +2441,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
       const reply=await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
-      this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
+      if(reply.trim().toUpperCase()==='NO_REPLY') this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
+      else this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId,terminalText:reply,terminalObserved:true},Date.now()+30_000);
       return reply;
     } catch (error) {
       waitPaused = error instanceof SessionWaitPaused || error instanceof SupersededObservation;
@@ -2461,9 +2506,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     /** Disable bridge attachment hints for native commands and other exact pass-through messages. */
     includeBridgeAttachmentHint?: boolean;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
-    onSendAttempt?: () => void | Promise<void>;
+    onSendAttempt?: (submissionId:string) => void | Promise<void>;
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the combined message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
+    /** Identifies collection target; not an acceptance receipt. */
+    onRunIdentified?: (runId:string)=>void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
     onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
   }): Promise<string> {
@@ -2487,6 +2534,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         emptyFinalAsNoReply: params.emptyFinalAsNoReply,
         onSendAttempt: params.onSendAttempt,
         onSubmitted: params.onSubmitted,
+        onRunIdentified: params.onRunIdentified,
         onProgress: params.onProgress,
         onWaitPaused: params.onWaitPaused,
       });
@@ -2526,6 +2574,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       emptyFinalAsNoReply: params.emptyFinalAsNoReply,
       onSendAttempt: params.onSendAttempt,
       onSubmitted: params.onSubmitted,
+      onRunIdentified: params.onRunIdentified,
       onProgress: params.onProgress,
       onWaitPaused: params.onWaitPaused,
     });
@@ -2624,6 +2673,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
   async disconnect() {
     this.shouldReconnect = false;
+    for(const key of [...this.sessionCollectorFences.keys()]) this.revokeSessionCollectors(key,'bridge disconnected; durable exact observation retained');
     if(this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer=undefined;
     for (const timer of this.suppressedSessionTimers.values()) clearTimeout(timer);

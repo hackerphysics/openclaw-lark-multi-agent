@@ -53,9 +53,9 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
   it("reconciles a no-active-run steer against the original terminal without waiting 30 minutes", async () => {
     const run = start();
     snapshot = { runId: "r", status: "ok", endedAt: Date.now(), terminalReply: { disposition: "visible", text: "recovered original reply" } };
-    expect(await c.steer("s1", "new input")).toEqual({ status: "no_active_run" });
+    await c.runStateChecks.get(KEY)();
     expect(await run.result).toEqual({ text: "recovered original reply" });
-    expect(calls).toEqual(["lma.steer", "agent.wait"]);
+    expect(calls).toEqual(['agent.wait']);
     expect(c.runStateChecks.size).toBe(0);
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -68,7 +68,7 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
       if (method === "chat.history") return { sessionKey: KEY, sessionInfo: { hasActiveRun: false } };
       return { runId: "r", status: "timeout" };
     });
-    await c.steer("s1", "new input");
+    await c.runStateChecks.get(KEY)();
     expect((await run.result).error).toBeInstanceOf(InactiveRunObservation);
     expect(calls).not.toContain("chat.abort");
     expect(c.runStateChecks.size).toBe(0);
@@ -79,7 +79,7 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
     const run = start();
     c.rpc = vi.fn(async (method: string) => method === "lma.steer" ? { status: "no_active_run" }
       : method === "chat.history" ? { sessionKey: KEY, sessionInfo: { hasActiveRun } } : { runId: "r", status: "timeout" });
-    await c.steer("s1", "new input");
+    await c.runStateChecks.get(KEY)();
     expect(run.settled()).toBe(false);
     await final();
     expect(await run.result).toEqual({ text: "normal reply" });
@@ -88,7 +88,7 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
   it("does not adopt another run's wait response", async () => {
     const run = start();
     snapshot = { runId: "other", status: "ok", endedAt: Date.now(), terminalReply: { disposition: "visible", text: "wrong" } };
-    await c.steer("s1", "new input");
+    await c.runStateChecks.get(KEY)();
     expect(run.settled()).toBe(false);
     await final();
     expect(await run.result).toEqual({ text: "normal reply" });
@@ -116,16 +116,9 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
     expect(calls).not.toContain("chat.abort");
   });
 
-  it("observes steer consumption that precedes the RPC response", async () => {
-    const consumed = vi.fn(() => true);
-    c.onSteerConsumed("s1", "fast input", consumed);
-    c.rpc = vi.fn(async () => {
-      expect(c.handleSteerConsumption(KEY, "fast input")).toBe(true);
-      return { status: "steered" };
-    });
-    const r = await c.steer("s1", "fast input");
-    expect(consumed).toHaveBeenCalledOnce();
-    expect(c.handleSteerConsumption(KEY, "fast input")).toBe(false);
-    r.cancelPending?.();
+  it("a text-only user mirror is not a message acceptance receipt",async()=>{
+    const consumed=vi.fn();c.onSteerConsumed('s1','fast input',consumed);
+    expect(await c.steer('s1','fast input')).toMatchObject({status:'pending',attempted:false});
+    expect(consumed).not.toHaveBeenCalled();expect(calls).toEqual([]);
   });
 });

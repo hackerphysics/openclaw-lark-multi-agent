@@ -43,9 +43,12 @@ async function harness(tasks: TaskEvidence[] = [task()], dbPath?: string) {
   });
   const bot: any = new FeishuBot({ name: "GPT", appId: "offline", appSecret: "test", model: "test-model" }, client, store);
   bot.readSessionStatus = vi.fn(async () => ({ status: "running" }));
-  bot.sendFinalMessage = vi.fn(async () => {});
+  let platformSequence=0;
+  bot.client.im.message.create=vi.fn(async()=>({code:0,data:{message_id:`terminal-${++platformSequence}`}}));
+  bot.client.im.message.reply=vi.fn(async()=>({code:0,data:{message_id:`terminal-${++platformSequence}`}}));
+  bot.sendFinalMessage = vi.fn((FeishuBot.prototype as any).sendFinalMessage.bind(bot));
   bot.sendErrorNotice = bot.sendFinalMessage;
-  bot.replyFinalMessage = vi.fn(async () => {});
+  bot.replyFinalMessage = vi.fn((FeishuBot.prototype as any).replyFinalMessage.bind(bot));
   bot.sendBridgeAttachment = vi.fn(async () => {});
   bot.cancelDelayedFailure = vi.fn();
   await bot.ensureSession("chat1");

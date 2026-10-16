@@ -127,6 +127,11 @@ export class MessageStore {
    * remain durable and are never selected by the ordinary pending drain. */
   private initReliabilityTables(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS bridge_generations(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,stop_epoch INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot_name,chat_id));
+      CREATE TABLE IF NOT EXISTS reaction_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,row_id INTEGER NOT NULL,record_json TEXT NOT NULL,
+        PRIMARY KEY(bot_name,chat_id,row_id));
+      CREATE TABLE IF NOT EXISTS run_delivery_targets(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,run_id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(bot_name,chat_id,run_id));
+      CREATE TABLE IF NOT EXISTS admission_custody(session_key TEXT NOT NULL,submission_id TEXT PRIMARY KEY,state TEXT NOT NULL,record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS run_observations (
         session_key TEXT NOT NULL, run_id TEXT NOT NULL, record_json TEXT NOT NULL,
         state TEXT NOT NULL DEFAULT 'observing', next_check_at INTEGER NOT NULL DEFAULT 0,
@@ -146,10 +151,58 @@ export class MessageStore {
     `);
   }
 
+  getStopGeneration(bot:string,chat:string):number {
+    return (this.db.prepare('SELECT stop_epoch FROM bridge_generations WHERE bot_name=? AND chat_id=?').get(bot,chat) as any)?.stop_epoch || 0;
+  }
+  bumpStopGeneration(bot:string,chat:string):number {
+    this.db.prepare(`INSERT INTO bridge_generations VALUES(?,?,1) ON CONFLICT(bot_name,chat_id) DO UPDATE SET stop_epoch=stop_epoch+1`).run(bot,chat);
+    return this.getStopGeneration(bot,chat);
+  }
+  setReactionIntent(bot:string,chat:string,row:number,record:object):void {
+    this.db.prepare(`INSERT INTO reaction_custody VALUES(?,?,?,?) ON CONFLICT(bot_name,chat_id,row_id) DO UPDATE SET record_json=excluded.record_json`).run(bot,chat,row,JSON.stringify(record));
+  }
+  getReactionIntent(bot:string,chat:string,row:number):any {
+    const r=this.db.prepare('SELECT record_json FROM reaction_custody WHERE bot_name=? AND chat_id=? AND row_id=?').get(bot,chat,row) as any;
+    return r ? JSON.parse(r.record_json) : null;
+  }
+  listReactionIntents(bot:string,chat?:string):any[] {
+    return (this.db.prepare(`SELECT chat_id,row_id,record_json FROM reaction_custody WHERE bot_name=? ${chat ? 'AND chat_id=?' : ''}
+      AND json_extract(record_json,'$.desired')!=json_extract(record_json,'$.shown') LIMIT 200`).all(bot,...(chat ? [chat] : [])) as any[])
+      .map(r=>({...JSON.parse(r.record_json),chatId:r.chat_id,rowId:r.row_id})).filter(r=>r.desired!==r.shown);
+  }
+  bindDeliveryRun(bot:string,chat:string,runId:string,record:object):void {
+    this.db.prepare('INSERT OR REPLACE INTO run_delivery_targets VALUES(?,?,?,?)').run(bot,chat,runId,JSON.stringify(record));
+  }
+  getDeliveryRunTarget(bot:string,chat:string,runId:string):any {
+    const row=this.db.prepare('SELECT record_json FROM run_delivery_targets WHERE bot_name=? AND chat_id=? AND run_id=?').get(bot,chat,runId) as any;
+    return row ? JSON.parse(row.record_json) : null;
+  }
+  saveAdmission(sessionKey:string,submissionId:string,state:string,record:object):void {
+    this.db.prepare(`INSERT INTO admission_custody VALUES(?,?,?,?) ON CONFLICT(submission_id) DO UPDATE SET state=excluded.state,record_json=excluded.record_json`).run(sessionKey,submissionId,state,JSON.stringify(record));
+  }
+  listAdmissions(sessionKey:string):any[] {
+    return (this.db.prepare('SELECT * FROM admission_custody WHERE session_key=? ORDER BY rowid DESC LIMIT 100').all(sessionKey) as any[]).map(r=>({...JSON.parse(r.record_json),submissionId:r.submission_id,state:r.state}));
+  }
+  isStoppedObservation(sessionKey:string,runId:string):boolean {
+    return !!this.db.prepare("SELECT 1 FROM run_observations WHERE session_key=? AND run_id=? AND state='stopped'").get(sessionKey,runId);
+  }
+  settleRunReactionIntents(bot:string,chat:string,runId:string):void {
+    this.db.prepare(`UPDATE reaction_custody SET record_json=json_set(record_json,'$.desired','DONE')
+      WHERE bot_name=? AND chat_id=? AND json_extract(record_json,'$.runId')=?
+      AND json_extract(record_json,'$.desired') IN ('Get','Typing')
+      AND json_extract(record_json,'$.stopEpoch')=?`).run(bot,chat,runId,this.getStopGeneration(bot,chat));
+  }
+  cancelReactionIntents(bot:string,chat:string,epoch:number):void {
+    this.db.prepare(`UPDATE reaction_custody SET record_json=json_set(record_json,'$.desired','','$.stopEpoch',?)
+      WHERE bot_name=? AND chat_id=? AND json_extract(record_json,'$.desired') IN ('Typing','Get')`).run(epoch,bot,chat);
+  }
   saveRunObservation(sessionKey: string, runId: string, record: object, nextCheckAt = Date.now()): void {
     this.db.prepare(`INSERT INTO run_observations VALUES(?,?,?,'observing',?)
       ON CONFLICT(session_key,run_id) DO UPDATE SET record_json=excluded.record_json,next_check_at=excluded.next_check_at
       WHERE run_observations.state='observing'`).run(sessionKey,runId,JSON.stringify(record),nextCheckAt);
+  }
+  runObservationState(sessionKey:string,runId:string):string|undefined {
+    return (this.db.prepare('SELECT state FROM run_observations WHERE session_key=? AND run_id=?').get(sessionKey,runId) as any)?.state;
   }
   finishRunObservation(sessionKey: string,runId: string,state = 'settled'): void {
     this.db.prepare('UPDATE run_observations SET state=? WHERE session_key=? AND run_id=?').run(state,sessionKey,runId);
@@ -164,13 +217,17 @@ export class MessageStore {
       ON CONFLICT(bot_name,chat_id,message_row_id) DO UPDATE SET state=excluded.state,record_json=excluded.record_json,next_check_at=excluded.next_check_at
       WHERE insertion_custody.state NOT IN ('stopped','committed')`).run(bot,chat,row,id,JSON.stringify(record),state,next);
   }
+  claimInsertionAttempt(bot:string,chat:string,row:number):boolean {
+    return this.db.prepare(`UPDATE insertion_custody SET state='dispatching',record_json=json_set(record_json,'$.attempted',json('true'))
+      WHERE bot_name=? AND chat_id=? AND message_row_id=? AND state='pending'`).run(bot,chat,row).changes===1;
+  }
   getInsertion(bot: string,chat: string,row: number): any {
     const r=this.db.prepare('SELECT * FROM insertion_custody WHERE bot_name=? AND chat_id=? AND message_row_id=?').get(bot,chat,row) as any;
     return r ? {...JSON.parse(r.record_json),state:r.state,insertionId:r.insertion_id,rowId:r.message_row_id} : null;
   }
   listInsertions(bot: string,chat?: string): any[] {
     return (this.db.prepare(`SELECT * FROM insertion_custody WHERE bot_name=? ${chat ? 'AND chat_id=?' : ''}
-      AND state NOT IN ('stopped','committed','ordinary') ORDER BY next_check_at LIMIT 100`).all(bot,...(chat ? [chat] : [])) as any[])
+      AND state IN ('pending','accepted','unknown','dispatching') ORDER BY next_check_at LIMIT 100`).all(bot,...(chat ? [chat] : [])) as any[])
       .map(r=>({...JSON.parse(r.record_json),state:r.state,insertionId:r.insertion_id,rowId:r.message_row_id,chatId:r.chat_id,nextCheckAt:r.next_check_at}));
   }
   isInsertionReserved(bot: string,chat: string,row: number): boolean {
@@ -200,7 +257,7 @@ export class MessageStore {
   /** Context registration and the corresponding payload checkpoint are one
    * SQLite transaction. Receipt aliases deduplicate platform echoes by identity,
    * not by text (two identical legitimate tasks must remain two tasks). */
-  confirmDeliveryStage(id: number,stage: string,content: string,receipts: Array<{messageId:string}>,checkpoint: 'text' | number): void {
+  confirmDeliveryStage(id: number,stage: string,content: string,receipts: Array<{messageId:string}>,checkpoint: 'text' | 'none' | number): void {
     this.db.transaction(()=>{
       const item=this.db.prepare('SELECT * FROM delivery_outbox WHERE id=?').get(id) as any;
       if(!item) throw new Error('Missing outbox identity');
@@ -209,16 +266,26 @@ export class MessageStore {
         let row: number | null=null;
         if(worthy && content.trim() && content.trim().toUpperCase()!=='NO_REPLY') {
           const existing=receipts.map(r=>this.getMessageId(r.messageId)).find(Boolean);
-          row=existing ?? this.insert({chatId:item.chat_id,messageId:`lma:${JSON.stringify([item.bot_name,item.chat_id,item.delivery_key,stage])}`,
+          const identity=JSON.parse(item.delivery_meta_json || '{}').botIdentity || item.bot_name;
+          const messageId=`lma:${JSON.stringify([identity,item.bot_name,item.chat_id,item.delivery_key,stage])}`;
+          row=existing ?? this.insert({chatId:item.chat_id,messageId,
             senderType:'bot',senderName:item.bot_name,content,timestamp:Date.now()});
-          if(row===-1) row=this.getMessageId(`lma:${JSON.stringify([item.bot_name,item.chat_id,item.delivery_key,stage])}`);
+          if(row===-1) row=this.getMessageId(messageId);
           for(const receipt of receipts) if(row) this.db.prepare('INSERT OR IGNORE INTO platform_message_aliases VALUES(?,?)').run(receipt.messageId,row);
         }
         this.db.prepare('INSERT INTO delivery_context VALUES(?,?,?)').run(id,stage,row);
       }
       if(checkpoint==='text') this.markDeliveryTextDelivered(id);
-      else this.markDeliveryAttachmentCursor(id,checkpoint);
+      else if(typeof checkpoint==='number') this.markDeliveryAttachmentCursor(id,checkpoint);
     })();
+  }
+  registerPartialBodyContext(id:number,onlyIfAlreadyPartial=false):void {
+    const hasPartial=!!this.db.prepare("SELECT 1 FROM delivery_context WHERE outbox_id=? AND stage LIKE 'body:partial:%' LIMIT 1").get(id);
+    if(onlyIfAlreadyPartial && !hasPartial)return;
+    for(const receipt of this.listDeliveryReceipts(id).filter(r=>r.stage==='body' && r.payload?.msg_type==='text')) {
+      let text='';try{text=JSON.parse(receipt.payload.content).text || '';}catch{continue;}
+      this.confirmDeliveryStage(id,`body:partial:${receipt.messageId}`,text,[receipt],'none');
+    }
   }
   /** Read-only preview. Historical text_delivered alone is not a receipt.
    * Explicit repair requires supplied exact outbox+platform IDs, never resends. */
@@ -1006,6 +1073,7 @@ export class MessageStore {
   }
 
   enqueueDelivery(item: Omit<DeliveryOutboxItem, "id" | "status" | "attempts" | "createdAt" | "updatedAt">): number | null {
+    return this.db.transaction(()=>{
     const now = Date.now();
     const result = this.db.prepare(`
       INSERT OR IGNORE INTO delivery_outbox
@@ -1031,7 +1099,10 @@ export class MessageStore {
       now,
       now,
     );
+    const p=JSON.parse(item.deliveryMetaJson || '{}').provenance;
+    if(p?.final===true && p.sessionKey && p.runId) this.finishRunObservation(p.sessionKey,p.runId,'outbox_owned');
     return result.changes ? Number(result.lastInsertRowid) : null;
+    })();
   }
 
   getDeliveryBySource(sessionKey: string, sourceType: string, sourceId: string): DeliveryOutboxItem | null {

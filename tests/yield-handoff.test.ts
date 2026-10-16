@@ -40,7 +40,7 @@ beforeEach(async () => {
   const connected = c.connect();
   c.ws.emit("message", Buffer.from(JSON.stringify({ type: "res", ok: true, payload: { type: "hello-ok", protocol: 4 } })));
   await connected;
-  c.rpc = vi.fn(async (method: string) => method === "chat.send" ? { runId: "r" }
+  c.rpc = vi.fn(async (method: string) => method === "chat.send" ? { runId: "r", status:'started' }
     : method === "sessions.describe" ? { session: { status: "running" } } : { runId: "r", status: "timeout" });
   notice = vi.fn();
 });
@@ -209,7 +209,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
   it("honors explicit stop after yield without a resend or second notice", async () => {
     const run = await start(); chat({ yielded: true }); await vi.advanceTimersByTimeAsync(50);
     await c.abortChat(KEY); await vi.advanceTimersByTimeAsync(100);
-    expect(await run.result).toEqual({ text: "NO_REPLY" }); expect(notice).toHaveBeenCalledOnce();
+    expect((await run.result).error?.name).toBe('SupersededObservation'); expect(notice).toHaveBeenCalledOnce();
     expect(c.rpc.mock.calls.filter(([method]: string[]) => method === "chat.abort")).toHaveLength(1);
     expect(c.rpc.mock.calls.filter(([method]: string[]) => method === "chat.send")).toHaveLength(1);
   });
@@ -294,10 +294,10 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     live.start(); await vi.advanceTimersByTimeAsync(0);
     notice.mockImplementation((pause: SessionWaitPaused) => live.showWaitingForResult(pause.message));
     const run = await start({ onProgress: (ev: any) => live.progress(ev) });
-    // Deliver just before the poll at 9:35, so receipt is processed at 9:35.
-    await vi.advanceTimersByTimeAsync(575000 - 1);
+    // Event-driven collector processes the actual 9:35 receipt without a poll lag.
+    await vi.advanceTimersByTimeAsync(575000);
     agent("tool", { name: "write", toolCallId: "write:1", phase: "result", result: "done" });
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(0);
     expect(views.at(-1).lines.some((line: any) => line.kind === "tool_end")).toBe(true);
     await vi.advanceTimersByTimeAsync(24000); // 9:59
     expect(notice).not.toHaveBeenCalled(); expect(views.at(-1).title).not.toContain("停止刷新");
@@ -334,7 +334,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     await vi.advanceTimersByTimeAsync(11 * 60000);
     expect(notice).not.toHaveBeenCalled(); expect(run.settled()).toBe(false);
     const beforeAccepted = edit.mock.calls.length;
-    release({ runId: "r" }); await vi.advanceTimersByTimeAsync(0);
+    release({ runId: "r",status:"started" }); await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(FOREGROUND_WAIT_MS - 1);
     expect(notice).not.toHaveBeenCalled(); expect(edit.mock.calls.length).toBeGreaterThan(beforeAccepted);
     await vi.advanceTimersByTimeAsync(1); expect(notice).toHaveBeenCalledOnce();
@@ -351,7 +351,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     live.start(); await vi.advanceTimersByTimeAsync(0);
     const run = await start();
     await vi.advanceTimersByTimeAsync(11 * 60000); expect(notice).not.toHaveBeenCalled();
-    reject(new Error("admission failed")); expect((await run.result).error?.message).toBe("admission failed");
+    reject(new Error("RPC error: admission rejected")); expect((await run.result).error?.message).toContain("admission rejected");
     await live.fail(); expect(vi.getTimerCount()).toBe(0);
     const count = edit.mock.calls.length;
     await vi.advanceTimersByTimeAsync(11 * 60000); expect(edit).toHaveBeenCalledTimes(count);

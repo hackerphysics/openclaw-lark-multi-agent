@@ -29,6 +29,8 @@ class MockOpenClaw {
   muteProactiveDelivery = vi.fn(() => vi.fn());
   async chatSendWithContext(params: any) {
     this.chatCalls.push(params);
+    await params.onSendAttempt?.();
+    await params.onSubmitted?.(`fixture-run-${this.chatCalls.length}`);
     if (this.replies.length > 0) return this.replies.shift()!;
     return "mock reply";
   }
@@ -77,8 +79,11 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   (bot as any).ensureSession = async (chatId: string) => bot.getSessionKey(chatId);
   (bot as any).addReaction = vi.fn(async () => {});
   (bot as any).removeReaction = vi.fn(async () => {});
-  (bot as any).replyMessage = vi.fn(async () => {});
-  (bot as any).sendMessage = vi.fn(async () => {});
+  let receiptSequence=0;
+  const receipt=async(p:any)=>({code:0,data:{message_id:`offline-${name}-${++receiptSequence}`,chat_id:p.data.receive_id}});
+  (bot as any).client={im:{message:{create:vi.fn(receipt),reply:vi.fn(receipt),patch:vi.fn(async()=>({code:0}))},file:{create:vi.fn(async()=>({code:0,data:{file_key:'offline-file'}}))},image:{create:vi.fn(async()=>({code:0,data:{image_key:'offline-image'}}))}}};
+  (bot as any).replyMessage = vi.fn((FeishuBot.prototype as any).replyMessage.bind(bot));
+  (bot as any).sendMessage = vi.fn((FeishuBot.prototype as any).sendMessage.bind(bot));
   (bot as any).sendLiveStatusCard = vi.fn(async () => "live-status-msg");
   (bot as any).replyLiveStatusCard = vi.fn(async () => "live-status-msg");
   (bot as any).patchLiveStatusCard = vi.fn(async () => {});
@@ -90,10 +95,23 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
     (bot as any).deliveryTargetsByRun.clear();
     for (const cleanup of (bot as any).pendingSteerCleanups.values()) cleanup();
     (bot as any).pendingSteerCleanups.clear();
+    if((bot as any).insertionTimer) clearTimeout((bot as any).insertionTimer);
     store.close();
     rmSync(dir, { recursive: true, force: true });
   } };
 }
+
+async function deferredRun(h:any,id='first') {
+ let resolve!:(x:string)=>void,reject!:(x:Error)=>void;
+ h.openclaw.chatSendWithContext=vi.fn(async(p:any)=>{
+   h.openclaw.chatCalls.push(p);await p.onSendAttempt?.();await p.onSubmitted?.(`run-${h.openclaw.chatCalls.length}`);
+   if(h.openclaw.chatCalls.length===1)return await new Promise<string>((a,b)=>{resolve=a;reject=b;});
+   return 'later answer';
+ });
+ const first=h.bot.handleMessage(event({chatType:'p2p',text:'original',messageId:id}));
+ await vi.waitUntil(()=>!!resolve,{timeout:1000});return {first,resolve,reject};
+}
+const matchingSteer=(status='accepted',extra:any={})=>vi.fn(async(_s:any,_t:any,_d:any,id:any)=>({...id,status,attempted:status!=='pending',...extra}));
 
 function markBotSeen(botName: string, chatId = "chat1") {
   const seen = (FeishuBot as any).seenBotChats as Map<string, Set<string>>;
@@ -149,12 +167,13 @@ describe("FeishuBot routing and queue behavior", () => {
         const status = (h.bot as any).replyStatusFooters.get(id);
         const card = (h.bot as any).buildMarkdownCard(text, model, status);
         footers.push(card.body.elements.at(-1).content);
+        return (h.bot as any).client.im.message.reply({data:{msg_type:'interactive',content:JSON.stringify(card)}});
       });
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "footer-test", "answer", [], "original", "footer-test", "model-GPT");
       expect(footers[0]).toContain("🧠 model-GPT · running · 85K/200K");
       expect(footers[0]).not.toMatch(/status:|查询时/);
       expect(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")?.content).toBe("answer");
-      expect(JSON.parse(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")!.deliveryMetaJson)).toEqual({ model: "model-GPT" });
+      expect(JSON.parse(h.store.getDeliveryByKey("GPT", "chat1", "footer-test")!.deliveryMetaJson)).toMatchObject({ model: "model-GPT",botIdentity:'app-GPT' });
       (h.openclaw as any).getSessionRuntimeStatus.mockResolvedValue(normalizeSessionRuntimeStatus({session: {status: "idle", totalTokens: 120000, contextTokens: 200000}}));
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "footer-test-2", "answer2", [], "original2", "footer-test-2", "model-GPT");
       expect(footers[1]).toContain("idle · 120K/200K");
@@ -165,7 +184,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("retains model and status in plain-text fallback", async () => {
     const h = makeHarness("GPT");
     try {
-      const reply = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ data: { message_id: "sent" } });
+      const reply = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ code: 0, data: { message_id: "sent" } });
       (h.bot as any).client = { im: { message: { reply } } };
       (h.bot as any).replyMessage = (FeishuBot.prototype as any).replyMessage.bind(h.bot);
       await (h.bot as any).replyFinalMessage("source", "answer", "model-GPT", "running · 85K/200K");
@@ -177,7 +196,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("retains compact state and context in new-message plain-text fallback", async () => {
     const h = makeHarness("GPT");
     try {
-      const create = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ data: { message_id: "sent" } });
+      const create = vi.fn().mockRejectedValueOnce(new Error("card refused")).mockResolvedValue({ code: 0, data: { message_id: "sent" } });
       (h.bot as any).client = { im: { message: { create } } };
       (h.bot as any).sendMessage = (FeishuBot.prototype as any).sendMessage.bind(h.bot);
       await (h.bot as any).sendFinalMessage("chat1", "answer", "model-GPT", "running · 85K/200K");
@@ -1904,7 +1923,7 @@ describe("FeishuBot routing and queue behavior", () => {
     try {
       delete (h.bot as any).ensureSession;
       await (h.bot as any).ensureSession("chat1");
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
@@ -2029,7 +2048,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("durably delivers attachments added by a competing duplicate final", async () => {
     const h = makeHarness("GPT");
     try {
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "first", "same answer", [], "reply-1", "trigger:extra-file");
       const attachment = { type: "file", path: "/tmp/new.pdf" };
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "second", "same answer", [attachment], "reply-1", "trigger:extra-file", "model-GPT");
@@ -2042,7 +2061,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("does not redeliver a supplemental attachment across repeated collisions", async () => {
     const h = makeHarness("GPT");
     try {
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "base", "answer", [], "m", "trigger:supplemental");
       const a = { type: "file", path: "/tmp/a.pdf" };
       const b = { type: "file", path: "/tmp/b.pdf" };
@@ -2056,7 +2075,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("revives a failed supplemental attachment when it is explicitly retried", async () => {
     const h = makeHarness("GPT");
     try {
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "base", "answer", [], "m", "trigger:failed-file");
       const a = { type: "file", path: "/tmp/retry.pdf" };
       const json = JSON.stringify([a]);
@@ -2118,31 +2137,31 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("uses short-window content dedupe for source-only proactive duplicates", async () => {
+  it("does not dedupe independent source-only proactive tasks by matching text", async () => {
     const h = makeHarness("GPT");
     try {
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "same proactive text", []);
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "same proactive text", []);
-      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(2);
     } finally { h.cleanup(); }
   });
 
-  it("deduplicates recent discussion content without touching live status", async () => {
+  it("keeps distinct discussion identities even when their text matches", async () => {
     const h = makeHarness("GPT");
     try {
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "discussion", "discussion-a", "same discussion answer", [], undefined, undefined, "model-GPT");
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "discussion", "discussion-b", "same discussion answer", [], undefined, undefined, "model-GPT");
-      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(2);
       expect((h.bot as any).patchLiveStatusDoneSummary).not.toHaveBeenCalled();
     } finally { h.cleanup(); }
   });
 
-  it("uses short-window containment dedupe for chat-final plus proactive overlap", async () => {
+  it("does not use global containment to swallow another task result", async () => {
     const h = makeHarness("GPT");
     try {
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-a", "我来处理。最终结果是 OK。", []);
       await (h.bot as any).enqueueAndDispatchDelivery("chat1", "assistant_visible", "source-b", "最终结果是 OK。", []);
-      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(1);
+      expect((h.bot as any).sendMessage).toHaveBeenCalledTimes(2);
     } finally { h.cleanup(); }
   });
 
@@ -2181,7 +2200,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("sends final text separately with model metadata and still delivers attachments", async () => {
     const h = makeHarness("Claude");
     try {
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       const attachment = { type: "file", path: "/tmp/result.pdf", caption: "结果" };
       await (h.bot as any).enqueueAndDispatchDelivery(
         "chat1",
@@ -2195,7 +2214,7 @@ describe("FeishuBot routing and queue behavior", () => {
       );
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("trigger-file", "结果如下");
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", attachment);
-      expect(JSON.parse(h.store.getDeliveryByKey("Claude", "chat1", "trigger:with-file")?.deliveryMetaJson || "{}")).toEqual({ model: "model-Claude" });
+      expect(JSON.parse(h.store.getDeliveryByKey("Claude", "chat1", "trigger:with-file")?.deliveryMetaJson || "{}")).toMatchObject({ model: "model-Claude",botIdentity:'app-Claude' });
     } finally { h.cleanup(); }
   });
 
@@ -2228,7 +2247,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const rowId = h.store.getMessageId("quota-error")!;
       expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(false);
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("quota-error", expect.stringContaining("额度已用尽"));
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("quota-error", "DONE");
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("quota-error", "DONE");
     } finally { h.cleanup(); }
   });
 
@@ -2395,7 +2414,7 @@ describe("FeishuBot routing and queue behavior", () => {
       );
       const finalRow = h.store.getDeliveryByKey("Claude", "chat1", "trigger:1");
       expect(finalRow?.deliveryMode).toBe("send");
-      expect(JSON.parse(finalRow?.deliveryMetaJson || "{}")).toEqual({ model: "model-Claude" });
+      expect(JSON.parse(finalRow?.deliveryMetaJson || "{}")).toMatchObject({ model: "model-Claude",provenance:{runId:'run-live',final:true} });
       expect((h.bot as any).deleteMessageById).not.toHaveBeenCalled();
       expect(h.store.hasDeliveredReply("Claude", "chat1", 1)).toBe(true);
     } finally {
@@ -2675,64 +2694,33 @@ describe("FeishuBot routing and queue behavior", () => {
 
       expect(h.openclaw.chatCalls).toHaveLength(1);
       expect(h.store.getPendingTriggerIds("Claude", "chat1").size).toBe(0);
-      expect((h.bot as any).removeReaction).toHaveBeenCalledWith("pending-killed", "Typing");
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith("pending-killed", "Get");
       expect((h.bot as any).addReaction).toHaveBeenCalledWith("pending-killed", "DONE");
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("pending-killed", "mock reply");
       expect((h.bot as any).busyChats.get("chat1")).toBe(0);
     } finally { h.cleanup(); }
   });
 
-  it("drains new input after an idle Gateway releases the phantom old queue owner", async () => {
-    const h = makeHarness("GPT");
-    try {
-      let rejectOld!: (err: Error) => void;
-      h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
-        h.openclaw.chatCalls.push(params);
-        await params.onSendAttempt?.();
-        if (h.openclaw.chatCalls.length === 1) return new Promise<string>((_resolve, reject) => { rejectOld = reject; });
-        return "new answer";
-      });
-      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "old task", messageId: "idle-old" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1 && Boolean(rejectOld), { timeout: 1000 });
-      h.openclaw.steer = vi.fn(async () => {
-        rejectOld(new InactiveRunObservation());
-        return { status: "unavailable" as const };
-      });
-      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "new task", messageId: "idle-new" }));
-      await first;
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
-      await ((h.bot as any).queueRuns.get("chat1") || Promise.resolve());
-      expect(h.openclaw.chatCalls.map(p => p.currentMessage)).toEqual(["old task", "new task"]);
-      expect(h.openclaw.abortChat).not.toHaveBeenCalled();
-      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("idle-old", "DONE");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("idle-new", "new answer");
-    } finally { h.cleanup(); }
+  it("moves never-attempted insertion to ordinary only after explicit idle evidence", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h,'idle-old');
+      h.openclaw.steer=matchingSteer('pending',{attempted:false,reason:'target_not_ready'});
+      (h.openclaw as any).getSessionRuntimeStatus=vi.fn(async()=>({status:'idle',running:false,idleConfirmed:true}));
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'new task',messageId:'idle-new'}));
+      await vi.waitUntil(()=>h.openclaw.chatCalls.length===2,{timeout:1500});run.resolve('late old');await run.first;
+      await ((h.bot as any).queueRuns.get('chat1')||Promise.resolve());expect(h.openclaw.chatCalls[1].currentMessage).toBe('new task');
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('idle-old','DONE');
+    } finally {h.cleanup();}
   });
 
-  it("drains a steer-fallback-restored trigger after the failed owner settles, without a new user message", async () => {
-    const h = makeHarness("GPT");
-    try {
-      let failFirst!: (err: Error) => void;
-      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
-        h.openclaw.chatCalls.push(p);
-        if (h.openclaw.chatCalls.length === 1) return new Promise<string>((_r, rej) => { failFirst = rej; });
-        return Promise.resolve("second answer");
-      });
-      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "first task", messageId: "sf-first" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      // Steer accepted into the active run: custody transfers at admission.
-      h.openclaw.steer = vi.fn(async () => ({ status: "steered" as const }));
-      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "steered input", messageId: "sf-second" }));
-      const row = h.store.getMessageId("sf-second")!;
-      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(row)).toBe(false);
-      // The batch fails with a generic error; the steer fallback restores the
-      // trigger and MUST drain it once the owner settles — no new user message.
-      failFirst(new Error("provider blew up"));
-      await first;
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 2000 });
-      expect(h.openclaw.chatCalls[1]?.currentMessage).toContain("steered input");
-      await ((h.bot as any).queueRuns.get("chat1") || Promise.resolve());
-    } finally { h.cleanup(); }
+  it("accepted insertion is not blindly replayed after whole-run failure", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h);h.openclaw.steer=matchingSteer('accepted');
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'B',messageId:'B'}));
+      const row=h.store.getMessageId('B')!;await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='accepted');
+      run.reject(new Error('run failed'));await run.first;expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.store.getInsertion('GPT','chat1',row).state).toBe('accepted');expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','DONE');
+    } finally {h.cleanup();}
   });
 
   it("does NOT force-expire a queue owner on an unknown session status (B1: RPC failure is not idle evidence)", async () => {
@@ -2759,223 +2747,73 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
-  it("force-expires a zombie queue owner when the gateway reports the session idle", async () => {
-    const h = makeHarness("GPT");
-    try {
-      // First run never settles: a zombie owner holding chat custody forever
-      // (the 2026-10-15 guangzi incident — completion routed via proactive path).
-      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
-        h.openclaw.chatCalls.push(p);
-        if (h.openclaw.chatCalls.length === 1) return new Promise<string>(() => {});
-        return Promise.resolve("new answer");
-      });
-      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "old task", messageId: "zombie-first" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      expect((h.bot as any).queueRuns.has("chat1")).toBe(true);
-      // Gateway authoritatively idle; steer confirms no active run.
-      h.openclaw.steer = vi.fn(async () => ({ status: "no_active_run" as const }));
-      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ running: false, status: "done" }));
-      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "new task", messageId: "zombie-second" }));
-      // The zombie owner was force-expired and the new input processed now.
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
-      expect(h.openclaw.chatCalls[1]?.currentMessage).toContain("new task");
-      expect((h.bot as any).replyMessage).toHaveBeenCalledWith("zombie-second", "new answer");
-      // The still-pending zombie promise settling later must not delete the new owner.
-      await ((h.bot as any).queueRuns.get("chat1") || Promise.resolve());
-      // NOTE: `first` (the zombie batch) is intentionally never awaited — it
-      // stays pending forever, simulating the real incident's dead collector.
-    } finally { h.cleanup(); }
+  it("force-expiration closes old dispatch and respects an exact positive idle snapshot", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h,'old');const oldOwner=(h.bot as any).queueRuns.get('chat1');
+      h.openclaw.steer=matchingSteer('pending',{attempted:false,reason:'target_not_ready'});
+      (h.openclaw as any).getSessionRuntimeStatus=vi.fn(async()=>({status:'idle',running:false,idleConfirmed:true}));
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'new',messageId:'new'}));
+      await vi.waitUntil(()=>h.openclaw.chatCalls.length===2);expect((h.bot as any).queueRuns.get('chat1')).not.toBe(oldOwner);
+      run.resolve('late');await run.first;expect(h.openclaw.chatCalls).toHaveLength(2);
+    } finally {h.cleanup();}
   });
 
-  it("retains no stale cleanup when the inserted message is consumed before the RPC ack", async () => {
-    const h = makeHarness("GPT");
-    try {
-      let release!: (text: string) => void;
-      h.openclaw.chatSendWithContext = vi.fn((p: any) => { h.openclaw.chatCalls.push(p); return new Promise<string>(r => { release = r; }); });
-      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "first", messageId: "pre-ack-first" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      h.openclaw.steer = vi.fn(async (_key: string, text: string) => { h.openclaw.fireSteerConsumed(text); return { status: "steered" as const }; });
-      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "fast insert", messageId: "pre-ack-second" }));
-      const row = h.store.getMessageId("pre-ack-second")!;
-      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(row)).toBe(false);
-      expect((h.bot as any).pendingSteerCleanups.has(row)).toBe(false);
-      release("done"); await first;
-      expect(h.openclaw.chatCalls).toHaveLength(1);
-    } finally { h.cleanup(); }
+  it("text mirror before an unknown ACK does not manufacture acceptance", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h);h.openclaw.steer=matchingSteer('unknown');
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'fast insert',messageId:'B'}));h.openclaw.fireSteerConsumed('fast insert');
+      const row=h.store.getMessageId('B')!;await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='unknown');
+      expect(h.store.getPendingTriggerIds('GPT','chat1').has(row)).toBe(true);expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','Get');
+      run.resolve('done');await run.first;expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally {h.cleanup();}
   });
 
-  it("still steers input after a healthy queue owner has run for over 30 minutes", async () => {
-    const h = makeHarness("GPT");
-    let clock: ReturnType<typeof vi.spyOn> | undefined;
-    try {
-      let release!: (text: string) => void;
-      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
-        h.openclaw.chatCalls.push(p);
-        return new Promise<string>(r => { release = r; });
-      });
-      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "long task", messageId: "long-owner" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      const later = Date.now() + 31 * 60_000;
-      clock = vi.spyOn(Date, "now").mockReturnValue(later);
-      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "insert after thirty minutes", messageId: "long-insert" }));
-      expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("insert after thirty minutes"), "insert after thirty minutes");
-      h.openclaw.fireSteerConsumed("insert after thirty minutes");
-      release("finished");
-      await first;
-      expect(h.openclaw.chatCalls).toHaveLength(1);
-    } finally { clock?.mockRestore(); h.cleanup(); }
+  it("long-running owner retains a run-bound pending insertion beyond thirty minutes", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h);h.openclaw.steer=matchingSteer('pending',{attempted:false});
+      const clock=vi.spyOn(Date,'now').mockReturnValue(Date.now()+31*60000);
+      try {await (h.bot as any).handleMessage(event({chatType:'p2p',text:'long insert',messageId:'B'}));
+        await vi.waitUntil(()=>h.openclaw.steer.mock.calls.length>0);expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String),expect.stringContaining('long insert'),'long insert',expect.objectContaining({expectedRunId:'run-1',insertionId:expect.any(String)}));
+      } finally {clock.mockRestore();}run.resolve('finished');await run.first;expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally {h.cleanup();}
   });
 
-  it("does not mark queued mid-run messages DONE or synced before processing", async () => {
-    const h = makeHarness("GLM");
-    try {
-      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
-      h.store.setBotMode("GLM", "chat1", "free");
-      // Force the queue-and-wait fallback (steer unavailable) so this test keeps
-      // validating the original mid-run queuing behavior.
-      h.openclaw.steer = vi.fn(async () => ({ status: "unavailable" as const }));
-      let releaseFirst!: (value: string) => void;
-      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
-        h.openclaw.chatCalls.push(params);
-        if (h.openclaw.chatCalls.length === 1) {
-          return new Promise<string>((resolve) => { releaseFirst = resolve; });
-        }
-        return Promise.resolve("second reply");
-      });
-
-      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "第一条", messageId: "busy-1" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      await (h.bot as any).handleMessage(event({ chatType: "group", text: "第二条", messageId: "busy-2" }));
-
-      const secondRow = h.store.getMessageId("busy-2")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(true);
-      releaseFirst("first reply");
-      await first;
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
-      expect(h.openclaw.chatCalls[1].currentMessage).toBe("第二条");
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "DONE");
-    } finally { h.cleanup(); }
+  it("unknown insertion stays Typing/reserved and is not ordinary-drained after original completion", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h);h.openclaw.steer=matchingSteer('unknown');
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'second',messageId:'B'}));const row=h.store.getMessageId('B')!;
+      await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='unknown');run.resolve('first answer');await run.first;
+      expect(h.openclaw.chatCalls).toHaveLength(1);expect(h.store.getPendingTriggerIds('GPT','chat1').has(row)).toBe(true);
+      expect((h.bot as any).addReaction).toHaveBeenCalledWith('B','Typing');expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','Get');expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','DONE');
+    } finally {h.cleanup();}
   });
 
-  it("steers a mid-run message into the active run instead of queuing a second run", async () => {
-    const h = makeHarness("GLM");
-    try {
-      h.store.setChairmanBot("chat1", "GLM"); // Ordinary group triggers require a Chairman.
-      h.store.setBotMode("GLM", "chat1", "free");
-      delete (h.bot as any).ensureSession;
-      // Default mock plugin steer confirms queueing into the existing run.
-      let releaseFirst!: (value: string) => void;
-      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
-        h.openclaw.chatCalls.push(params);
-        if (h.openclaw.chatCalls.length === 1) {
-          return new Promise<string>((resolve) => { releaseFirst = resolve; });
-        }
-        return Promise.resolve("should-not-happen");
-      });
-
-      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "第一条", messageId: "busy-1" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入的话", messageId: "busy-2" }));
-
-      // It was steered into the active run: steer() called with the wrapped text
-      // (insertion prefix + original) plus the original as the display text.
-      expect(h.openclaw.steer).toHaveBeenCalledWith(
-        expect.any(String),
-        expect.stringContaining("中途插入的话"),
-        "中途插入的话",
-      );
-      // Admission transfers custody (OpenClaw 2026.9.9 no longer mirrors
-      // injected messages, so waiting for a transcript confirmation would
-      // duplicate the message after the run ends): Typing flips to Get and
-      // the durable fallback is cleared immediately.
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Typing");
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
-      const secondRow = h.store.getMessageId("busy-2")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
-
-      // A confirmed plugin steer belongs to the existing run; it must not replace
-      // that run's original final-reply target with the inserted message.
-      const activeTargetDuringSteer = (h.bot as any).activeDeliveryTargets.get("chat1");
-      expect(activeTargetDuringSteer?.messageId).toBe("busy-1");
-      expect((h.bot as any).deliveryTargetsByRun.size).toBe(0);
-
-      // Model consumption controls only the visible Typing -> Get transition.
-      h.openclaw.fireSteerConsumed("中途插入的话");
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "Get");
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(secondRow)).toBe(false);
-
-      releaseFirst("first reply");
-      await first;
-      // The owning run completed: the steered message flips Get -> DONE.
-      expect((h.bot as any).removeReaction).toHaveBeenCalledWith("busy-2", "Get");
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("busy-2", "DONE");
-      // No second chatSendWithContext run for the steered message.
-      expect(h.openclaw.chatCalls).toHaveLength(1);
-    } finally { h.cleanup(); }
+  it("genuine run-bound acceptance gets Get and only its exact task settlement gets DONE", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h,'original');h.openclaw.steer=matchingSteer('accepted');
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'insertion',messageId:'B'}));const row=h.store.getMessageId('B')!;
+      await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='accepted');expect((h.bot as any).addReaction).toHaveBeenCalledWith('B','Get');
+      expect((h.bot as any).activeDeliveryTargets.get('chat1').messageId).toBe('original');expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','DONE');
+      run.resolve('done');await run.first;expect((h.bot as any).addReaction).toHaveBeenCalledWith('B','DONE');expect(h.openclaw.chatCalls).toHaveLength(1);
+    } finally {h.cleanup();}
   });
 
-  it("restores the steered fallback when the owning run fails, but not after /stop", async () => {
-    const h = makeHarness("GLM");
-    try {
-      h.store.setChairmanBot("chat1", "GLM");
-      h.store.setBotMode("GLM", "chat1", "free");
-      delete (h.bot as any).ensureSession;
-      let rejectFirst!: (err: Error) => void;
-      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
-        h.openclaw.chatCalls.push(params);
-        if (h.openclaw.chatCalls.length === 1) {
-          return new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
-        }
-        return Promise.resolve("fallback reply");
-      });
-
-      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "主任务", messageId: "fail-1" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入", messageId: "fail-2" }));
-      expect(h.openclaw.steer).toHaveBeenCalledWith(expect.any(String), expect.stringContaining("中途插入"), "中途插入");
-      const row = h.store.getMessageId("fail-2")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(row)).toBe(false);
-
-      // Owning run fails: the steered input must come back as the durable fallback.
-      rejectFirst(new Error("run failed"));
-      await first;
-      await vi.waitUntil(() => h.store.getPendingTriggerIds("GLM", "chat1").has(row), { timeout: 1000 });
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
-      expect(h.openclaw.chatCalls[1].currentMessage).toContain("中途插入");
-    } finally { h.cleanup(); }
+  it("unknown acceptance retains custody through failed task without replay", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h);h.openclaw.steer=matchingSteer('unknown');
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'B',messageId:'B'}));const row=h.store.getMessageId('B')!;
+      await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='unknown');run.reject(new Error('failed'));await run.first;
+      expect(h.openclaw.chatCalls).toHaveLength(1);expect(h.store.isInsertionReserved('GPT','chat1',row)).toBe(true);
+    } finally {h.cleanup();}
   });
 
-  it("does not resurrect a steered message after the user stops the run", async () => {
-    const h = makeHarness("GLM");
-    try {
-      h.store.setChairmanBot("chat1", "GLM");
-      h.store.setBotMode("GLM", "chat1", "free");
-      delete (h.bot as any).ensureSession;
-      let rejectFirst!: (err: Error) => void;
-      (h.openclaw as any).chatSendWithContext = vi.fn((params: any) => {
-        h.openclaw.chatCalls.push(params);
-        if (h.openclaw.chatCalls.length === 1) {
-          return new Promise<string>((_resolve, reject) => { rejectFirst = reject; });
-        }
-        return Promise.resolve("should-not-happen");
-      });
-
-      const first = (h.bot as any).handleMessage(event({ chatType: "group", text: "主任务", messageId: "stop-1" }));
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
-      await (h.bot as any).handleMessage(event({ chatType: "group", text: "中途插入", messageId: "stop-2" }));
-      const row = h.store.getMessageId("stop-2")!;
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(row)).toBe(false);
-
-      // User stops the run, then the run fails: the steered input must NOT be
-      // resurrected (that would restart stopped work).
-      await (h.bot as any).handleStopCommand("chat1", "stop-msg");
-      rejectFirst(new Error("aborted"));
-      await first;
-      await new Promise((r) => setTimeout(r, 300));
-      expect(h.store.getPendingTriggerIds("GLM", "chat1").has(row)).toBe(false);
-      expect(h.openclaw.chatCalls).toHaveLength(1);
-    } finally { h.cleanup(); }
+  it("stopped insertion cannot regain Get or custody from a failed old run", async () => {
+    const h=makeHarness("GPT");try {
+      const run=await deferredRun(h);h.openclaw.steer=matchingSteer('accepted');
+      await (h.bot as any).handleMessage(event({chatType:'p2p',text:'B',messageId:'B'}));const row=h.store.getMessageId('B')!;
+      await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='accepted');await (h.bot as any).handleStopCommand('chat1','stop');
+      run.reject(new Error('aborted'));await run.first;expect(h.openclaw.chatCalls).toHaveLength(1);expect(h.store.getInsertion('GPT','chat1',row).state).toBe('stopped');expect(h.store.getPendingTriggerIds('GPT','chat1').has(row)).toBe(false);
+    } finally {h.cleanup();}
   });
 
   it("cancels stale steer correlation when a retained trigger takes the normal queue path", async () => {
@@ -3037,8 +2875,8 @@ describe("FeishuBot routing and queue behavior", () => {
 
       releaseFirst("first reply");
       await first;
-      await vi.waitUntil(() => h.openclaw.chatCalls.length === 2, { timeout: 1500 });
-      expect(h.openclaw.chatCalls[1].currentMessage).toBe("第二条");
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      expect(h.store.isInsertionReserved('GLM','chat1',h.store.getRecent('chat1').filter(m=>m.senderType==='human').at(-1)!.id!)).toBe(true);
     } finally { h.cleanup(); }
   });
 
@@ -3126,6 +2964,7 @@ describe("FeishuBot routing and queue behavior", () => {
           secondAttempts++;
           if (secondAttempts === 1) throw new Error("upload exploded");
         }
+        await (h.bot as any).client.im.message.create({data:{receive_id:_chatId,msg_type:'file',content:'{}'}});
       });
       await (h.bot as any).enqueueAndDispatchDelivery(
         "chat1", "assistant_visible", "source-attachment", "",
@@ -3167,7 +3006,7 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatCalls.push(params);
         return `正文说明\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"document","path":"${attachmentPath}","caption":"文档"}]}</LMA_BRIDGE_ATTACHMENTS>`;
       });
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "写 md 文档并发给我", messageId: "m1" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", "正文说明");
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", {
@@ -3215,7 +3054,7 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatCalls.push(params);
         return `正文\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</parameter>`;
       });
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "生成图", messageId: "bad-close-marker" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("bad-close-marker", "正文");
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath, caption: "图" }));
@@ -3233,7 +3072,7 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatCalls.push(params);
         return `正文\n_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</LMA_BRIDGE_ATTACHMENTS>`;
       });
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "生成图", messageId: "bad-open-marker" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("bad-open-marker", "正文");
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath, caption: "图" }));
@@ -3253,7 +3092,7 @@ describe("FeishuBot routing and queue behavior", () => {
         // The JSON payload itself is intact — parse it regardless of the mangled tag.
         return `正文\nRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"活度图叠CT/前位平片/后位平片,共享强度标尺"}]}</LMA_BRIDGE_ATTACHMENTS>`;
       });
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "发图", messageId: "severe-trunc" }));
       // Attachment recovered with the right path + caption.
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath, caption: "活度图叠CT/前位平片/后位平片,共享强度标尺" }));
@@ -3274,7 +3113,7 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatCalls.push(params);
         return `正文\n{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</LMA_BRIDGE_ATTACHMENTS>`;
       });
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "发图", messageId: "no-open" }));
       expect((h.bot as any).sendBridgeAttachment).toHaveBeenCalledWith("chat1", expect.objectContaining({ type: "image", path: attachmentPath }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("no-open", "正文");
@@ -3290,7 +3129,7 @@ describe("FeishuBot routing and queue behavior", () => {
         h.openclaw.chatCalls.push(params);
         return `已经画好了\n\nMEDIA:${imagePath}\n\n1024×1024 正方形。`;
       });
-      (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+      (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "发图", messageId: "m1" }));
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("m1", expect.stringContaining("已经画好了"));
       expect((h.bot as any).replyMessage.mock.calls[0][1]).toContain("1024×1024 正方形。");
@@ -3512,7 +3351,7 @@ describe("FeishuBot routing and queue behavior", () => {
           // attachment marker -> hard rule must skip auto-retry.
           return `已生成\n<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"image","path":"${attachmentPath}","caption":"图"}]}</LMA_BRIDGE_ATTACHMENTS>`;
         });
-        (h.bot as any).sendBridgeAttachment = vi.fn(async () => {});
+        (h.bot as any).sendBridgeAttachment = vi.fn(async (chatId:string) => {await (h.bot as any).client.im.message.create({data:{receive_id:chatId,msg_type:'file',content:'{}'}});});
         await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "画个图", messageId: "m1" }));
         // No probe round: exactly one call.
         expect(h.openclaw.chatCalls).toHaveLength(1);
@@ -3619,6 +3458,7 @@ describe("FeishuBot routing and queue behavior", () => {
   it("semantic mode falls back to Gateway transcript trim when summarization skips", async () => {
       const h = makeHarness("GPT");
       try {
+        (h.bot as any).replyCompactCard=vi.fn(async()=>undefined);
         h.openclaw.semanticCompact = vi.fn(async () => ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
         h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: false, reason: "transcript too small" })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
@@ -3631,6 +3471,7 @@ describe("FeishuBot routing and queue behavior", () => {
     it("falls back to Gateway-owned transcript trim for SQLite-compatible compaction", async () => {
       const h = makeHarness("GPT");
       try {
+        (h.bot as any).replyCompactCard=vi.fn(async()=>undefined);
         h.openclaw.semanticCompact = vi.fn(async () => ({ ok: true, compacted: false, reason: "prompt too long" })) as any;
         h.openclaw.compactSession = vi.fn(async () => ({ ok: true, compacted: true, kept: 137 })) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
@@ -3653,6 +3494,7 @@ describe("FeishuBot routing and queue behavior", () => {
     it("reports both failures when semantic compaction and transcript trim throw", async () => {
       const h = makeHarness("GPT");
       try {
+        (h.bot as any).replyCompactCard=vi.fn(async()=>undefined);
         h.openclaw.semanticCompact = vi.fn(async () => { throw new Error("semantic rpc timeout"); }) as any;
         h.openclaw.compactSession = vi.fn(async () => { throw new Error("trim rpc timeout"); }) as any;
         await (h.bot as any).handleCompactCommand("chat1", "m1", "semantic");
@@ -4097,7 +3939,7 @@ describe("Feishu 230025 chunked delivery", () => {
     const h = makeHarness("GPT");
     try {
       const calls: any[] = [];
-      (h.bot as any).client = { im: { message: { create: async (p: any) => { calls.push(p); return { data: { message_id: `mid-${calls.length}` } }; }, reply: async () => ({ data: { message_id: "rid" } }) } } };
+      (h.bot as any).client = { im: { message: { create: async (p: any) => { calls.push(p); return { code: 0, data: { message_id: `mid-${calls.length}` } }; }, reply: async () => ({ code: 0, data: { message_id: "rid" } }) } } };
       const long = ("行\n\n".repeat(4000)); // 12000 chars
       const first = await (h.bot as any).sendChunkedText("chat1", long, "m1", undefined);
       expect(first).toBe("mid-1");

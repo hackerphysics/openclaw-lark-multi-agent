@@ -166,6 +166,59 @@ async function subscribe(h: any, chat = "chat1") {
   return h.openclaw.sessionCallbacks.get(h.bot.getSessionKey(chat))! as any;
 }
 
+describe('receipt stages and restart recovery correctness',()=>{
+ it.each(['trigger:1','go-run:g:r','discussion:turn','proactive:result'])('all visible paths %s share receipt-aware context',async key=>{
+  const h=makeHarness('Kimi');wire(h.bot);try{await enqueue(h,key);expect(rows(h)).toHaveLength(1);}finally{h.cleanup();}
+ });
+ it.each([
+  {code:0,data:{}}, {code:230002,data:{message_id:'not-accepted'}},
+  {code:0,data:{message_id:'wrong-chat',chat_id:'another-chat'}},
+  {code:0,data:{message_id:'wrong-app',sender:{sender_type:'app',id_type:'app_id',id:'another-app'}}},
+ ])('invalid/missing/mistargeted receipt %j cannot become context or success',async response=>{
+  const h=makeHarness('Kimi');const port=wire(h.bot,()=>response);try{await enqueue(h,'receipt-invalid');expect(rows(h)).toHaveLength(0);expect(h.store.getDeliveryByKey('Kimi','chat1','receipt-invalid')?.status).not.toBe('delivered');
+   const count=port.calls.length;clearTimers(h.bot);await (h.bot as any).dispatchPendingDeliveries('chat1');expect(port.calls.length).toBe(count);
+  }finally{h.cleanup();}
+ });
+ it('confirmed chunk prefix is context even when the next chunk outcome is unknown; happy body stays one logical row',async()=>{
+  const h=makeHarness('Kimi');let chunks=0;wire(h.bot,(p:any)=>{
+   if(p.data.msg_type==='interactive')throw Object.assign(new Error('length of the message content'),{response:{data:{code:230025,msg:'length of the message content'}}});
+   if(++chunks===2)throw new Error('second chunk outcome unknown');return {code:0,data:{message_id:`chunk-${chunks}`,chat_id:'chat1'}};
+  });try{await enqueue(h,'partial-chunks','A'.repeat(7000));expect(chunks).toBe(2);expect(rows(h)).toHaveLength(1);expect(rows(h)[0].content.length).toBeLessThan(7000);expect(h.store.getDeliveryByKey('Kimi','chat1','partial-chunks')?.textDelivered).toBe(false);
+  }finally{h.cleanup();}
+ });
+ it('context insert failure rolls back text checkpoint, then SQLite restart repairs without a second platform send',async()=>{
+  const h=makeHarness('Kimi');const port=wire(h.bot);const original=h.store.insert.bind(h.store);let reopened:MessageStore|undefined,recovered:any;
+  try {
+   h.store.insert=((m:any)=>{if(m.messageId.startsWith('lma:'))throw new Error('SQLite insert boundary');return original(m);}) as any;
+   await enqueue(h,'crash-context');clearTimers(h.bot);expect(port.accepted).toHaveLength(1);expect(h.store.getDeliveryByKey('Kimi','chat1','crash-context')?.textDelivered).toBe(false);
+   h.store.close();reopened=new MessageStore(h.dbPath);recovered=new FeishuBot({name:'Kimi',appId:'app-Kimi',appSecret:'offline',model:'model-Kimi'},h.openclaw as any,reopened);const newPort=wire(recovered);reopened.resetDeliveringOnStartup('Kimi');
+   await recovered.dispatchPendingDeliveries('chat1');expect(port.accepted).toHaveLength(1);expect(newPort.calls).toHaveLength(0);expect(reopened.getRecent('chat1').filter(m=>m.senderType==='bot')).toHaveLength(1);expect(reopened.getDeliveryByKey('Kimi','chat1','crash-context')?.textDelivered).toBe(true);
+  } finally{h.store.insert=original;if(recovered){clearTimers(recovered);recovered.goController?.dispose();}reopened?.close();h.cleanup();}
+ });
+ it('platform accepted but response lost remains unknown across SQLite reopen without send/fallback replay',async()=>{
+  const h=makeHarness('Kimi');let effects=0;wire(h.bot,()=>{effects++;throw new Error('accepted then disconnected');});let reopened:MessageStore|undefined,recovered:any;
+  try {
+   await enqueue(h,'lost-platform');clearTimers(h.bot);expect(effects).toBe(1);expect(rows(h)).toHaveLength(0);
+   h.store.close();reopened=new MessageStore(h.dbPath);recovered=new FeishuBot({name:'Kimi',appId:'app-Kimi',appSecret:'offline',model:'model-Kimi'},h.openclaw as any,reopened);const newPort=wire(recovered);reopened.resetDeliveringOnStartup('Kimi');
+   await recovered.dispatchPendingDeliveries('chat1');expect(effects).toBe(1);expect(newPort.calls).toHaveLength(0);expect(reopened.getRecent('chat1')).toHaveLength(0);
+  }finally{if(recovered){clearTimers(recovered);recovered.goController?.dispose();}reopened?.close();h.cleanup();}
+ });
+ it('text checkpoint already true but missing context is repaired from actual durable receipt, not resent',async()=>{
+  const h=makeHarness('Kimi');const port=wire(h.bot);try{
+   await enqueue(h,'gap');const item=h.store.getDeliveryByKey('Kimi','chat1','gap')!;
+   db(h).prepare('DELETE FROM delivery_context WHERE outbox_id=?').run(item.id);db(h).prepare('DELETE FROM messages').run();db(h).prepare('DELETE FROM platform_message_aliases').run();
+   db(h).prepare("UPDATE delivery_outbox SET status='pending' WHERE id=?").run(item.id);
+   await (h.bot as any).dispatchPendingDeliveries('chat1');expect(rows(h)).toHaveLength(1);expect(port.accepted).toHaveLength(1);
+  }finally{h.cleanup();}
+ });
+ it('platform echo reuses receipt alias and cannot add a second peer context row',async()=>{
+  const h=makeHarness('Kimi');const port=wire(h.bot);try{await enqueue(h,'echo');const id=port.accepted[0].result.data.message_id;
+   expect(h.store.insert({chatId:'chat1',messageId:id,senderType:'bot',senderName:'Kimi',content:'offline result',timestamp:Date.now()})).toBe(-1);expect(rows(h)).toHaveLength(1);
+  }finally{h.cleanup();}
+ });
+ it('two legitimate identical-text tasks remain two logical rows',async()=>{const h=makeHarness('Kimi');wire(h.bot);try{await enqueue(h,'task-one','same text');await enqueue(h,'task-two','same text');expect(rows(h)).toHaveLength(2);}finally{h.cleanup();}});
+});
+
 describe("context-sync closure desired invariants",()=>{
   it("I01 trigger-key continuation becomes peer context",async()=>{const h=makeHarness("Kimi");wire(h.bot);try{await enqueue(h,"trigger:42");expect(rows(h)).toHaveLength(1);}finally{h.cleanup();}});
   it("I02 retry after SQLite insert failure repairs missing shared row",async()=>{const h=makeHarness("Kimi");wire(h.bot);const original=h.store.insert.bind(h.store);try{h.store.insert=((m:any)=>{if(m.messageId.startsWith("lma:"))throw new Error("injected SQLite failure");return original(m);}) as any;await enqueue(h,"proactive:insert");h.store.insert=original;clearTimers(h.bot);await (h.bot as any).dispatchPendingDeliveries("chat1");expect(rows(h)).toHaveLength(1);}finally{h.store.insert=original;h.cleanup();}});

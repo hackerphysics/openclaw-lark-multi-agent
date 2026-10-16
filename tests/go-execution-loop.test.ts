@@ -58,7 +58,7 @@ function fixture() {
  };
  const makeBot=()=>{
   const b=new FeishuBot({name:"synthetic",appId:"synthetic-id",appSecret:"fixture",model:"synthetic/model"},client,store) as any;
-  const send=async(p:any)=>{platform.push(p);if(platformLost){platformLost=false;throw new Error("platform accepted but response lost");}return {data:{message_id:`platform-${platform.length}`}};};
+  const send=async(p:any)=>{platform.push(p);if(platformLost){platformLost=false;throw new Error("platform accepted but response lost");}return {code:0,data:{message_id:`platform-${platform.length}`}};};
   b.client={im:{message:{create:send,reply:async(p:any)=>{
    if(markCommandPending && p.path.message_id==="go-command"){
     markCommandPending=false;const row=store.getMessageId("go-command")!;store.markPendingTrigger("synthetic","chat",row);

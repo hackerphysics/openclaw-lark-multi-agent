@@ -2,7 +2,7 @@
   "id": "lma-core",
   "name": "LMA Core",
   "description": "Consolidated LMA plugin: mid-run steer injection, Go checker tool enforcement, custom compaction R&D.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "activation": {
     "onStartup": true
   },
@@ -15,13 +15,28 @@
         "items": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["checkerSessionKey", "checkerSessionId", "executorSessionKey", "executorSessionId"],
+          "required": [
+            "checkerSessionKey",
+            "checkerSessionId",
+            "executorSessionKey",
+            "executorSessionId"
+          ],
           "properties": {
-            "checkerSessionKey": { "type": "string" },
-            "checkerSessionId": { "type": "string" },
-            "executorSessionKey": { "type": "string" },
-            "executorSessionId": { "type": "string" },
-            "goalId": { "type": "string" }
+            "checkerSessionKey": {
+              "type": "string"
+            },
+            "checkerSessionId": {
+              "type": "string"
+            },
+            "executorSessionKey": {
+              "type": "string"
+            },
+            "executorSessionId": {
+              "type": "string"
+            },
+            "goalId": {
+              "type": "string"
+            }
           }
         }
       }

@@ -45,18 +45,20 @@ describe('session status and paused waits',()=>{
  });
  it.each(['chatError','lifecycle'])('pauses %s wait timeouts when the session is still running',async stream=>{
   c.rpc=vi.fn(async(method:string)=>method==='sessions.describe'?{session:{status:'running'}}:{runId:'r',status:'timeout'});
-  const p=c.collectReply('r',30000,key).catch((e:Error)=>e);
+  const notice=vi.fn();const p=c.collectReply('r',30000,key,{onWaitPaused:notice}).catch((e:Error)=>e);
   event(stream,stream==='chatError'?{error:'Request timed out'}:{phase:'error',error:'Request timeout'});
   await vi.advanceTimersByTimeAsync(100);
-  expect(await p).toBeInstanceOf(SessionWaitPaused);
+  expect(notice.mock.calls[0][0]).toBeInstanceOf(SessionWaitPaused);
+  event('chatFinal',{text:'late exact result'});event('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);expect(await p).toBe('late exact result');
   expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
   expect(vi.getTimerCount()).toBe(0);
  });
  it('pauses a quiet local wait, not the running session',async()=>{
   c.rpc=vi.fn(async(method:string)=>method==='sessions.describe'?{session:{status:'running'}}:{runId:'r',status:'timeout'});
-  const p=c.collectReply('r',1000,key).catch((e:Error)=>e);
+  const notice=vi.fn();const p=c.collectReply('r',1000,key,{onWaitPaused:notice}).catch((e:Error)=>e);
   await vi.advanceTimersByTimeAsync(1000);
-  expect(await p).toBeInstanceOf(SessionWaitPaused);
+  expect(notice.mock.calls[0][0]).toBeInstanceOf(SessionWaitPaused);
+  event('chatFinal',{text:'late exact result'});event('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);expect(await p).toBe('late exact result');
   expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
  });
  it('does not mask a real non-timeout failure merely because another task is running',async()=>{
@@ -78,10 +80,11 @@ describe('session status and paused waits',()=>{
  });
  it('reconciles a generic timeout into a running-session pause',async()=>{
   c.rpc=vi.fn(async(method:string)=>method==='agent.wait'?{runId:'r',status:'timeout',endedAt:Date.now()}:{session:{status:'running'}});
-  const p=c.collectReply('r',1000,key).catch((e:Error)=>e);
+  const notice=vi.fn();const p=c.collectReply('r',1000,key,{onWaitPaused:notice}).catch((e:Error)=>e);
   event('chatError',{error:'chat error'});
   await vi.advanceTimersByTimeAsync(500);
-  expect(await p).toBeInstanceOf(SessionWaitPaused);
+  expect(notice.mock.calls[0][0]).toBeInstanceOf(SessionWaitPaused);
+  event('chatFinal',{text:'late exact result'});event('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);expect(await p).toBe('late exact result');
  });
  it('lets a real final beat a pending timeout classification',async()=>{
   let release:any;
@@ -131,12 +134,10 @@ describe('session status and paused waits',()=>{
   expect(c.rpc.mock.calls.filter((v:any[])=>v[0]==='chat.send')).toHaveLength(1);
   expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
  });
- it('releases exact run final-delivery ownership immediately after pausing',async()=>{
-  c.rpc=vi.fn(async(method:string)=>method==='chat.send'?{runId:'r'}:method==='sessions.describe'?{session:{status:'running'}}:{runId:'r',status:'timeout'});
-  const p=c.chatSend({sessionKey:key,message:'test',timeoutMs:1000}).catch((e:Error)=>e);
-  await vi.advanceTimersByTimeAsync(1000);
-  expect(await p).toBeInstanceOf(SessionWaitPaused);
-  expect(c.ownedDeliveryRuns.has('r')).toBe(false);
-  expect(c.ownedDeliveryRunTimers.has('r')).toBe(false);
+ it('retains exact run ownership when silence pauses presentation without a callback',async()=>{
+  c.rpc=vi.fn(async(method:string)=>method==='chat.send'?{runId:'r',status:'started'}:method==='sessions.describe'?{session:{status:'running'}}:{runId:'r',status:'timeout'});
+  let settled=false;const p=c.chatSend({sessionKey:key,message:'test',timeoutMs:1000}).then((x:string)=>{settled=true;return x;});
+  await vi.advanceTimersByTimeAsync(1000);expect(settled).toBe(false);expect(c.ownedDeliveryRuns.has('r')).toBe(true);
+  event('chatFinal',{text:'late final'});event('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);expect(await p).toBe('late final');
  });
 });

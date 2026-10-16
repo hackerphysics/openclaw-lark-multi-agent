@@ -1,6 +1,6 @@
 {
   "name": "openclaw-lark-multi-agent",
-  "version": "1.8.4",
+  "version": "1.8.5",
   "description": "Multi-bot Lark/Feishu bridge for OpenClaw, with per-bot model routing and isolated sessions",
   "type": "module",
   "scripts": {
@@ -13,7 +13,8 @@
     "prepack": "npm run build",
     "prepublishOnly": "npm test && npm pack --dry-run",
     "build:go-plugin": "tsc -p plugins/lma-go/tsconfig.json",
-    "build:core-plugin": "tsc -p plugins/lma-core/tsconfig.json"
+    "build:core-plugin": "tsc -p plugins/lma-core/tsconfig.json",
+    "test:sdk-contract": "tsc --noEmit --strict --target ES2022 --module ESNext --moduleResolution bundler --skipLibCheck tests/reliability-public-sdk.test.ts"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.73.3",
@@ -67,7 +68,12 @@
     "README.md",
     "README.zh-CN.md",
     "LICENSE",
-    "SECURITY.md"
+    "SECURITY.md",
+    "plugins/lma-core/dist",
+    "plugins/lma-core/openclaw.plugin.json",
+    "plugins/lma-core/package.json",
+    "plugins/lma-core/README.md",
+    "docs/releases/1.8.5.md"
   ],
   "engines": {
     "node": ">=22"

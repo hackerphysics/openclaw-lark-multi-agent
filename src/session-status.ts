@@ -6,6 +6,8 @@ export type SessionRuntimeStatus = {
   status: string;
   running: boolean;
   checkedAt: number;
+  /** Positive public activity evidence, never inferred from !running. */
+  idleConfirmed?: boolean;
   contextUsedTokens?: number;
   contextLimitTokens?: number;
 };
@@ -23,6 +25,7 @@ export function normalizeSessionRuntimeStatus(value: any): SessionRuntimeStatus 
   const contextUsedTokens = session?.totalTokensFresh !== false && typeof used === "number" && Number.isFinite(used) && used >= 0 ? used : undefined;
   const contextLimitTokens = typeof limit === "number" && Number.isFinite(limit) && limit > 0 ? limit : undefined;
   return { status: running ? "running" : status, running, checkedAt: Date.now(),
+    ...(session?.hasActiveRun===false && !running ? {idleConfirmed:true} : {}),
     ...(contextUsedTokens !== undefined ? { contextUsedTokens } : {}),
     ...(contextLimitTokens !== undefined ? { contextLimitTokens } : {}),
   };
