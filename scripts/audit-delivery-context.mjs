@@ -37,9 +37,13 @@ if(args.includes('--register')) {
  const db=new Database(path,{readonly:true,fileMustExist:true});
  try {
   const hasContext=!!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_context'").get();
+  const hasOperations=!!db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_operations'").get();
   const limit=Math.min(1000,Math.max(1,Number(value('--limit')||100)));
+  // Preview must work before upgrading a legacy LMA database. Never create or
+  // migrate a missing journal merely to list already-delivered historical rows.
+  const unknownOperations=hasOperations ? "EXISTS(SELECT 1 FROM delivery_operations o WHERE o.outbox_id=d.id AND o.state IN ('attempted','unknown'))" : '0';
   const rows=db.prepare(`SELECT d.id,d.chat_id,d.delivery_key,d.source_type,d.text_delivered,d.attachment_cursor FROM delivery_outbox d
-   WHERE bot_name=? AND (status='delivered' ${hasContext?"AND NOT EXISTS(SELECT 1 FROM delivery_context c WHERE c.outbox_id=d.id)":''} OR EXISTS(SELECT 1 FROM delivery_operations o WHERE o.outbox_id=d.id AND o.state IN ('attempted','unknown'))) ORDER BY d.id LIMIT ?`).all(bot,limit);
+   WHERE bot_name=? AND (status='delivered' ${hasContext?"AND NOT EXISTS(SELECT 1 FROM delivery_context c WHERE c.outbox_id=d.id)":''} OR ${unknownOperations}) ORDER BY d.id LIMIT ?`).all(bot,limit);
   console.log(JSON.stringify({dryRun:true,registered:false,resent:false,requiresIndependentReceiptVerification:true,rows},null,2));
  } finally{db.close();}
 }

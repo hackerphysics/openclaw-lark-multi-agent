@@ -325,6 +325,20 @@ describe('independent identity and reconciliation boundaries',()=>{
    expect(()=>h.store.registerHistoricalDeliveryContext(out.id!,'Kimi','chat1',['independently-verified-actual-id'])).not.toThrow();
   }finally{h.cleanup();}
  });
+ it.each([false,true])('historical preview reads legacy journals without migration (context table=%s)',hasContext=>{
+  const dir=mkdtempSync(join(tmpdir(),'lma-legacy-preview-'));const file=join(dir,'messages.db');
+  try {
+   const legacy=new Database(file);
+   legacy.exec("CREATE TABLE delivery_outbox(id INTEGER PRIMARY KEY,chat_id TEXT,delivery_key TEXT,source_type TEXT,text_delivered INTEGER,attachment_cursor INTEGER,bot_name TEXT,status TEXT); INSERT INTO delivery_outbox VALUES(1,'chat1','proactive:old','assistant_visible',1,0,'Kimi','delivered'),(2,'chat1','other','assistant_visible',1,0,'GPT','delivered'),(3,'chat1','pending','assistant_visible',0,0,'Kimi','pending');");
+   if(hasContext)legacy.exec('CREATE TABLE delivery_context(outbox_id INTEGER PRIMARY KEY)');
+   legacy.close();const before=readFileSync(file);
+   const preview=JSON.parse(execFileSync(process.execPath,[resolve('scripts/audit-delivery-context.mjs'),'--db',file,'--bot','Kimi'],{encoding:'utf8'}));
+   expect(preview).toMatchObject({dryRun:true,registered:false,resent:false});
+   expect(preview.rows.map((row:any)=>row.id)).toEqual([1]);expect(readFileSync(file)).toEqual(before);
+   const check=new Database(file,{readonly:true});
+   try{expect(check.prepare("SELECT name FROM sqlite_master WHERE name IN ('delivery_operations','lma_database_identity')").all()).toEqual([]);}finally{check.close();}
+  } finally {rmSync(dir,{recursive:true,force:true});}
+ });
  it('historical dry run and explicit register are exact and idempotent, no transport',()=>{
   const h=makeHarness('Kimi');const script=resolve('scripts/audit-delivery-context.mjs');
   try{
