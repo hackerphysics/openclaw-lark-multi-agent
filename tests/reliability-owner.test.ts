@@ -86,8 +86,8 @@ describe('durable insertion reservation and exact receipt reactions',()=>{
  });
  it('verified missing host capability is retained and surfaced, not fake-success or an ordinary send',async()=>{
   const first=await start();await h.bot.handleMessage(event('B'));await tick();const row=h.store.getMessageId('B')!;
-  expect(h.store.getInsertion('Bot','chat',row).state).toBe('capability_blocked');h.final('r1');await tick(300);await first.promise;expect(h.sends).toHaveLength(1);
-  expect(h.bot.addReaction).not.toHaveBeenCalledWith('B','Get');expect(h.store.listDeliveriesByKeyPrefix('Bot','chat','insertion:').length).toBe(1);
+  expect(h.store.getInsertion('Bot','chat',row).state).toBe('pending');h.final('r1');await tick(300);await first.promise;expect(h.sends).toHaveLength(1);
+  expect(h.bot.addReaction).not.toHaveBeenCalledWith('B','Get');expect(h.store.listDeliveriesByKeyPrefix('Bot','chat','insertion:').length).toBe(0);
  });
 });
 describe('ordinary receipt-driven reactions',()=>{

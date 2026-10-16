@@ -605,17 +605,25 @@ describe("OpenClawClient plugin steering", () => {
   });
   it.each(['steered','no_active_run','rejected'])("legacy %s is not a verified strict-run injection contract",async status=>{
     const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async()=>({status}));
-    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'capability_blocked',attempted:false});
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'unavailable',attempted:false});
     expect(c.rpc.mock.calls.map((x:any)=>x[0])).toEqual(['lma.steer.capabilities']);
   });
-  it("missing plugin retains capability-blocked intent without a business RPC",async()=>{
+  it("missing plugin retains pending intent without a business RPC",async()=>{
     const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async()=>{throw new Error('unknown method');});
-    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'capability_blocked',attempted:false});
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'pending',attempted:false});
   });
   it("a verified protocol mutation with lost response remains unknown, never replayable",async()=>{
-    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async(m:string)=>{if(m==='lma.steer.capabilities')return {protocol:1,atomicRunBound:true};throw new Error('lost response');});
+    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);c.rpc=vi.fn(async(m:string)=>{if(m==='lma.steer.capabilities')return {protocol:2,atomicRunBound:false,durableAttempts:true,acceptanceCallback:true};if(m==='sessions.describe')return {session:{sessionId:'generation'}};throw new Error('lost response');});
     expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run'})).toMatchObject({status:'unknown',attempted:true});
     expect(c.rpc.mock.calls.filter((x:any)=>x[0]==='lma.steer')).toHaveLength(1);
+  });
+
+  it('capability/query outage cannot turn a previously attempted input into retryable no-effect',async()=>{
+    const c:any=new OpenClawClient({baseUrl:'ws://offline',token:'test'} as any);
+    c.rpc=vi.fn(async()=>({protocol:1,atomicRunBound:false}));
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run',queryOnly:true})).toMatchObject({status:'unavailable',attempted:true});
+    c.rpc=vi.fn(async()=>{throw new Error('disconnected');});
+    expect(await c.steer('s1','input','input',{insertionId:'id',expectedRunId:'run',queryOnly:true})).toMatchObject({status:'pending',attempted:true});
   });
 
   it("formats structured protocol-4 tool details instead of object coercion", () => {

@@ -148,6 +148,10 @@ export class MessageStore {
         PRIMARY KEY(outbox_id,stage));
       CREATE TABLE IF NOT EXISTS platform_message_aliases (
         message_id TEXT PRIMARY KEY,message_row_id INTEGER NOT NULL);
+      -- The preceding local candidate never dispatched these blocked inputs.
+      -- Migrate ONLY its explicit no-attempt rows; unknown/attempted stay fenced.
+      UPDATE insertion_custody SET state='pending',next_check_at=0
+        WHERE state='capability_blocked' AND json_extract(record_json,'$.attempted')=0;
     `);
   }
 

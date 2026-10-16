@@ -21,6 +21,16 @@ describe('LMA-owned recovery boundaries and explicit historical repair',()=>{
   const dir=mkdtempSync(join(tmpdir(),'lma-unsent-stop-'));const store=new MessageStore(join(dir,'db'));
   try {const id=store.insert({chatId:'chat',messageId:'A',senderType:'human',senderName:'u',content:'A',timestamp:1});store.bindDeliveryRun('Bot','chat','submission',{triggerId:id,triggerIds:[id],stopGeneration:0});store.saveAdmission(KEY,'submission','reserved',{});store.bumpStopGeneration('Bot','chat');expect(store.recoverUnsentReservations('Bot')).toBe(0);expect(store.getPendingTriggerIds('Bot','chat').size).toBe(0);}finally{store.close();rmSync(dir,{recursive:true,force:true});}
  });
+ it('candidate upgrade restores only explicitly never-attempted blocked inputs',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'lma-insertion-migrate-')),path=join(dir,'db');let store=new MessageStore(path);
+  try {
+   store.saveInsertion('Bot','chat',1,'never','capability_blocked',{attempted:false});
+   store.saveInsertion('Bot','chat',2,'uncertain','capability_blocked',{attempted:true});
+   store.saveInsertion('Bot','chat',3,'unknown','unknown',{attempted:true});store.close();store=new MessageStore(path);
+   expect(store.getInsertion('Bot','chat',1).state).toBe('pending');expect(store.getInsertion('Bot','chat',2).state).toBe('capability_blocked');
+   expect(store.getInsertion('Bot','chat',3).state).toBe('unknown');
+  } finally {store.close();rmSync(dir,{recursive:true,force:true});}
+ });
  it('historical registration refuses a non-LMA database before migrations or writes',()=>{
   const dir=mkdtempSync(join(tmpdir(),'lma-wrong-db-')),path=join(dir,'not-lma.db');const db=new Database(path);db.exec('CREATE TABLE unrelated_state(value TEXT)');db.close();
   try {const before=readFileSync(path);expect(()=>execFileSync(process.execPath,[resolve('scripts/audit-delivery-context.mjs'),'--db',path,'--bot','Bot','--register','--outbox','1','--chat','chat','--verified-message-id','id'],{encoding:'utf8',stdio:'pipe'})).toThrow();expect(readFileSync(path)).toEqual(before);}finally{rmSync(dir,{recursive:true,force:true});}

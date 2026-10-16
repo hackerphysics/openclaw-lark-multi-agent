@@ -1647,44 +1647,51 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return this.rpc("chat.inject", { ...params, sessionKey: this.canonicalSessionKey(params.sessionKey) }, 10000);
   }
 
-  /**
-   * Submit a mid-run message through the lma-steer plugin.
-   *
-   * OpenClaw's public `chat.send { queueMode: "steer" }` returns `started` even
-   * when it falls through to a later ordinary run; it therefore cannot tell the
-   * bridge whether THIS message entered the active run. The plugin resolves the
-   * active embedded run and reports `steered` only when it actually queued there.
-   * A matching session.message remains the final consumption confirmation.
-   *
-   * If the plugin is missing, stale, or rejects the injection, return unavailable
-   * and let LMA's durable trigger run normally after the current turn. Never use
-   * the ambiguous public admission as a realtime-insertion success signal.
-   */
+  /** Real-time session input uses the coordinated plugin's durable callback
+   * receipt protocol. SDK eligibility/text mirrors never prove acceptance;
+   * missing/legacy plugin observations stay pending without blind mutation. */
   async exactRunSettled(runId:string): Promise<boolean> {
     try {const r=await this.rpc('agent.wait',{runId,timeoutMs:1},2500);
       return r?.runId===runId && !r.pendingError && !r.yielded && ['ok','error','timeout'].includes(r.status) && Number.isFinite(r.endedAt) && r.endedAt>0 && (r.status!=='ok' || ['visible','silent','empty'].includes(r.terminalReply?.disposition));
     } catch {return false;}
   }
 
-  async steer(sessionKey: string,text: string,displayText?: string,identity?: {insertionId:string;expectedRunId:string;cancel?:boolean;queryOnly?:boolean}): Promise<{
-    status:'pending'|'accepted'|'rejected'|'unknown'|'target_changed'|'stopped'|'capability_blocked'|'unavailable'|'no_active_run';
-    attempted?:boolean;sessionId?:string;reason?:string;insertionId?:string;expectedRunId?:string;
+  async cancelSteerSession(sessionKey:string,stopEpoch:number):Promise<void> {
+    await this.rpc('lma.steer.stop',{sessionKey:this.canonicalSessionKey(sessionKey),stopEpoch},2500);
+  }
+
+  async steer(sessionKey: string,text: string,displayText?: string,identity?: {
+    insertionId:string;expectedRunId:string;expectedSessionId?:string;stopEpoch?:number;cancel?:boolean;queryOnly?:boolean;originalRunEnded?:boolean;
+  }): Promise<{
+    status:'pending'|'accepted'|'rejected'|'unknown'|'target_changed'|'target_ended'|'stopped'|'capability_blocked'|'unavailable'|'no_active_run';
+    attempted?:boolean;ordinaryEligible?:boolean;sessionId?:string;reason?:string;insertionId?:string;expectedRunId?:string;
   }> {
     if(!identity?.insertionId || !identity.expectedRunId) return {status:'pending',attempted:false,reason:'exact target not admitted yet'};
     let attempted=false;
+    const base={insertionId:identity.insertionId,expectedRunId:identity.expectedRunId,sessionId:identity.expectedSessionId};
     try {
       const capability=await this.rpc('lma.steer.capabilities',{},2500);
-      if(capability?.protocol!==1 || capability?.atomicRunBound!==true) return {status:'capability_blocked',attempted:false,insertionId:identity.insertionId,expectedRunId:identity.expectedRunId,reason:'Public host cannot atomically bind injection to original run; no attempt made'};
+      // This is an LMA protocol-version check, NOT a fictitious source-CAS
+      // requirement. Builtin callbacks can be used with atomicRunBound=false.
+      if(capability?.protocol!==2 || capability?.durableAttempts!==true || capability?.acceptanceCallback!==true)
+        return {...base,status:'unavailable',attempted:identity.queryOnly===true,reason:'Update the coordinated LMA plugin; legacy booleans are not acceptance receipts'};
+      const info=await this.getSessionStatus(sessionKey);
+      const currentId=info?.session?.sessionId;
+      if(info?.session?.archived===true || (identity.expectedSessionId && currentId && currentId!==identity.expectedSessionId))
+        return {...base,status:'target_changed',attempted:identity.queryOnly===true,reason:'session archived or generation changed; no automatic migration'};
+      if(!currentId) return {...base,status:'pending',attempted:identity.queryOnly===true,reason:'session generation observation unavailable'};
+      base.sessionId=currentId;
       attempted=true;
-      const result=await this.rpc('lma.steer',{sessionKey:this.canonicalSessionKey(sessionKey),text,...identity},2500);
-      if(result?.insertionId!==identity.insertionId || result?.expectedRunId!==identity.expectedRunId ||
-        !['pending','accepted','rejected','unknown','target_changed','stopped','capability_blocked'].includes(result.status)) {
-        return {status:'unknown',attempted:true,reason:'Invalid or legacy plugin receipt; not replayed'};
-      }
+      const result=await this.rpc('lma.steer',{sessionKey:this.canonicalSessionKey(sessionKey),text,...identity,
+        expectedSessionId:identity.expectedSessionId || currentId,stopEpoch:identity.stopEpoch ?? 0},2500);
+      if(result?.insertionId!==identity.insertionId || result?.expectedRunId!==identity.expectedRunId || result?.sessionId!==currentId ||
+        !['pending','accepted','rejected','unknown','target_changed','target_ended','stopped'].includes(result.status))
+        return {...base,status:'unknown',attempted:true,reason:'Invalid or legacy plugin receipt; not replayed'};
       if(result.status==='pending' && result.attempted===false && result.reason==='target_not_ready') await this.runStateChecks.get(this.canonicalSessionKey(sessionKey))?.();
       return result;
     } catch(error) {
-      return {status:attempted?'unknown':'capability_blocked',attempted,insertionId:identity.insertionId,expectedRunId:identity.expectedRunId,reason:attempted?'Insertion receipt unknown; query stable identity only':'No verified public strict-run injection capability; no business request sent'};
+      return {...base,status:attempted?'unknown':'pending',attempted:attempted || identity.queryOnly===true,
+        reason:attempted?'Insertion receipt unknown; query stable identity only':'Readiness observation unavailable; retained for paced recovery'};
     }
   }
 
@@ -1699,8 +1706,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }>> = new Map();
 
   /** Register a callback (per bare session key) invoked when a steered message
-   *  is actually consumed by the active run. The bridge uses this to flip the
-   *  Feishu reaction from "Typing" (awaiting insertion) to "Get" (inserted).
+   *  is actually consumed by the active run. This legacy text observer is
+   *  presentation-only; it cannot authorize a receipt reaction.
    *  Return true from the callback to consume/remove it (one-shot). */
   onSteerConsumed(sessionKey: string, matchText: string, cb: (text: string) => boolean | void): () => void {
     const key = this.shortKey(sessionKey);

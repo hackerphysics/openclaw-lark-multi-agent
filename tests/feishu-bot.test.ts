@@ -18,7 +18,7 @@ class MockOpenClaw {
   replies: string[] = [];
   resolvers: Array<(value: string) => void> = [];
   sessionCallbacks = new Map<string, (text: string, meta?: { sourceType?: string; runId?: string }) => void>();
-  async getSessionInfo() { return { session: { totalTokens: 0 } }; }
+  async getSessionInfo() { return { session: { sessionId: "fixture-generation", totalTokens: 0 } }; }
   async ensureModel() { return false; }
   async createSession() {}
   patchSession = vi.fn(async (_params?: any) => ({}));

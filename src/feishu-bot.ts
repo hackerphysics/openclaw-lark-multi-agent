@@ -1298,7 +1298,11 @@ export class FeishuBot {
           if(!latest || latest.stopEpoch!==this.stopGeneration(chatId) || latest.desired!==item.desired) continue;
           if(item.desired) await this.addReaction(item.messageId,item.desired);
           const after=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
-          if(after) this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...after,shown:item.desired});
+          if(after) {
+            // Record the real platform side effect but preserve the CURRENT
+            // desired/epoch, so a late Get is removed, never resurrected.
+            this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...after,shown:item.desired});
+          }
         } catch { /* UI-only retry; never roll back business acceptance. */ }
       }
     } finally {this.reactionChecks.delete(chatId);this.scheduleInsertionRecovery();}
@@ -1321,69 +1325,100 @@ export class FeishuBot {
     try {
       for(const item of this.store.listInsertions(this.config.name,chatId)) {
         if(item.nextCheckAt>Date.now()) continue;
-        if(item.state==='target_changed' || item.state==='rejected' || item.state==='capability_blocked') continue;
-        if(this.stopGeneration(chatId)!==item.stopEpoch) {this.store.stopInsertions(this.config.name,chatId);continue;}
+        const stillCurrent=()=>this.stopGeneration(chatId)===item.stopEpoch && this.store.getInsertion(this.config.name,chatId,item.rowId)?.state!=='stopped';
+        if(!stillCurrent()) {this.store.stopInsertions(this.config.name,chatId);continue;}
         const owner=this.queueOwners.get(chatId);
         if(!item.expectedRunId && owner?.id===item.ownerId && owner?.batchId===item.batchId && owner?.runId) item.expectedRunId=owner.runId;
         if(!item.expectedRunId) {
           const stillOriginal=owner?.id===item.ownerId && owner?.batchId===item.batchId;
           this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,stillOriginal?'pending':'target_changed',
             {...item,reason:stillOriginal?'original admission not identified yet':'original admission target unavailable; no retargeting'},Date.now()+5000);
-          if(!stillOriginal) void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:target-unidentified`,
-            'ℹ️ 原插入目标未能确认，消息仍保留，未发送到其他 run，也不会自动重放。',[],item.messageId,`insertion:${item.insertionId}:target-unidentified`).catch(()=>{});
           continue;
         }
+        // Pin the real session generation BEFORE the dispatching journal. A
+        // crash/lost response can then query using precisely the same identity.
+        const info=await this.openclawClient.getSessionInfo(item.sessionKey).catch(()=>null);
+        if(!stillCurrent()) continue;
+        const sessionId=info?.session?.sessionId;
+        if(info?.session?.archived===true || (item.sessionId && sessionId && item.sessionId!==sessionId)) {
+          this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'target_changed',
+            {...item,reason:'session archived or generation changed; retained without migration'});
+          continue;
+        }
+        if(!sessionId) {
+          this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,item.state,item,Date.now()+5000);continue;
+        }
+        item.sessionId=sessionId;
         if(item.state==='accepted') {
-          if(await this.openclawClient.exactRunSettled?.(item.expectedRunId)) {
+          this.store.clearPendingTrigger(this.config.name,chatId,item.rowId);
+          const reaction=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
+          if(!reaction || reaction.desired==='Typing') await this.receiptReaction(chatId,item.rowId,item.messageId,'Get',item.expectedRunId);
+          if(!stillCurrent()) continue;
+          const settled=await this.openclawClient.exactRunSettled?.(item.expectedRunId);
+          if(!stillCurrent()) continue;
+          if(settled) {
             this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'committed',item);
             await this.receiptReaction(chatId,item.rowId,item.messageId,'DONE',item.expectedRunId);
           } else this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'accepted',item,Date.now()+60_000);
           continue;
         }
-        const batchAtCheck=owner?.batch;
-        const runAtCheck=owner?.runId;
+        const batchAtCheck=owner?.batch,runAtCheck=owner?.runId;
         const wrapped=`${steerInjectionPrefix(this.isEn(chatId))}\n${item.text}`;
         const queryOnly=item.attempted===true || item.state==='dispatching';
-        // Persist a no-replay fence BEFORE the first network await. A process
-        // loss here is unknown, never an undispatched ordinary trigger.
+        // Public exact terminal facts survive an absent plugin event map (e.g.
+        // plugin restart). Do not discover old-run end by queueing a successor.
+        const originalRunEnded=!queryOnly && await this.openclawClient.exactRunSettled?.(item.expectedRunId)===true;
+        if(!stillCurrent()) continue;
+        // Bridge no-replay fence is durable before network mutation. Plugin
+        // owns the final synchronous attempt fence and asynchronous callback.
+        this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,item.state,item,item.nextCheckAt);
         if(!queryOnly && !this.store.claimInsertionAttempt(this.config.name,chatId,item.rowId)) continue;
-        const receipt=await this.openclawClient.steer(item.sessionKey,wrapped,item.text,{insertionId:item.insertionId,expectedRunId:item.expectedRunId,queryOnly});
-        const current=this.store.getInsertion(this.config.name,chatId,item.rowId);
-        if(!current || current.state==='stopped' || this.stopGeneration(chatId)!==item.stopEpoch) continue;
-        const valid=receipt.insertionId===item.insertionId && receipt.expectedRunId===item.expectedRunId;
+        const receipt=await this.openclawClient.steer(item.sessionKey,wrapped,item.text,{insertionId:item.insertionId,
+          expectedRunId:item.expectedRunId,expectedSessionId:item.sessionId,stopEpoch:item.stopEpoch,queryOnly,originalRunEnded});
+        if(!stillCurrent()) continue;
+        const valid=receipt.insertionId===item.insertionId && receipt.expectedRunId===item.expectedRunId && (!receipt.sessionId || receipt.sessionId===item.sessionId);
         let state:string=valid ? receipt.status : 'unknown';
-        if(state==='pending' && receipt.attempted===false && receipt.reason==='target_not_ready' && runAtCheck===item.expectedRunId) {
+        // Explicit no-effect means a real old-run terminal can hand this SAME
+        // input back to the ordinary queue once. Time elapsed never authorizes
+        // this handoff. An attempted unknown can never take this branch.
+        if(valid && receipt.attempted===false && receipt.ordinaryEligible!==false && ['pending','target_ended'].includes(state) &&
+          ['target_not_ready','backend_rejected_no_effect','original run ended without an insertion attempt'].includes(receipt.reason || '')) {
           const status=await this.openclawClient.getSessionRuntimeStatus(item.sessionKey).catch(()=>null);
-          const rootSettled=status?.idleConfirmed===true && await this.openclawClient.exactRunSettled?.(item.expectedRunId);
-          if(rootSettled===true && this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck) {
-            // Positive idle + unchanged exact batch, and proven no injection
-            // attempt. This input can explicitly move to the next ordinary turn.
+          if(!stillCurrent()) continue;
+          const rootSettled=await this.openclawClient.exactRunSettled?.(item.expectedRunId);
+          if(!stillCurrent()) continue;
+          const unchanged=this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck;
+          if(rootSettled===true && status?.idleConfirmed===true && unchanged) {
             state='ordinary';
-            this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never attempted');
-          }
+            // Never expire a successor merely to schedule the old input.
+            if(runAtCheck===item.expectedRunId) this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never accepted/unknown');
+          } else if(state==='target_ended') state='pending';
         }
-        const record={...item,attempted:receipt.attempted??true,sessionId:receipt.sessionId,reason:receipt.reason};
-        this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,state,record,Date.now()+5000);
+        if(state==='target_ended') state='rejected'; // prior explicit backend refusal; never silently move it to a successor
+        if(state==='unavailable' || state==='capability_blocked') state='pending';
+        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason};
+        this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,state,record,Date.now()+(state==='unknown'?15_000:5000));
         if(state==='ordinary') {
+          void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:ordinary`,
+            'ℹ️ 原 run 已明确结束，且这条消息确定未被插入；现已交回普通队列，只执行一次。',[],item.messageId,`insertion:${item.insertionId}:ordinary`).catch(()=>{});
           void this.processQueue(chatId).catch(()=>{});
         } else if(state==='accepted') {
           this.store.clearPendingTrigger(this.config.name,chatId,item.rowId);
-          const acks=this.pendingAckMessages.get(chatId)||[];
-          const ack=acks.find(a=>a.rowId===item.rowId);
-          if(ack && ack.emoji!=='Get') {
-            await this.receiptReaction(chatId,item.rowId,item.messageId,'Get',item.expectedRunId);ack.emoji='Get';
-          }
-          // DONE belongs only to this exact task, never the response-time batch.
+          // Durable acceptance drives Get, including after bridge restart when
+          // its ephemeral pendingAckMessages array no longer exists.
+          await this.receiptReaction(chatId,item.rowId,item.messageId,'Get',item.expectedRunId);
+          if(!stillCurrent()) continue;
+          const ack=(this.pendingAckMessages.get(chatId)||[]).find(a=>a.rowId===item.rowId);
+          if(ack) ack.emoji='Get';
           if(owner && owner.runId===item.expectedRunId && owner.batch) {
             const list=this.admittedSteerAcks.get(chatId)||[];
             if(!list.some(a=>a.insertedId===item.rowId)) list.push({messageId:item.messageId,insertedId:item.rowId,batch:owner.batch});
             this.admittedSteerAcks.set(chatId,list);
           }
-        } else if(state==='unknown' || state==='target_changed' || state==='rejected' || state==='capability_blocked') {
+        } else if(state==='unknown' || state==='target_changed' || state==='rejected') {
           if(item.state!==state) void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:${state}`,
             `ℹ️ 这条插入消息的状态为 ${state}，仍保留本地记录，未确认接收前不会显示 Get，也不会自动重复执行。${receipt.reason || ''}`,
             [],item.messageId,`insertion:${item.insertionId}:${state}`).catch(()=>{});
-          console.warn(`[${this.config.name}] insertion ${item.insertionId} ${state}; retained, no automatic replay (${receipt.reason || 'receipt not confirmed'})`);
         }
       }
     } finally {this.insertionChecks.delete(chatId);}
@@ -4617,6 +4652,10 @@ export class FeishuBot {
       // Go supervision: a reset replaces the executor session generation; pause
       // supervision instead of letting the checker judge a wiped transcript.
       void this.goController?.onExecutorSessionChanged(chatId, "执行会话被 /reset");
+      this.stopEpoch.set(chatId,this.store.bumpStopGeneration(this.config.name,chatId));
+      this.store.stopInsertions(this.config.name,chatId);
+      this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
+      void this.openclawClient.cancelSteerSession?.(sessionKey,this.stopGeneration(chatId)).catch(()=>{});
       // Fire reset (no response expected)
       this.openclawClient.resetSession(sessionKey).catch(() => {});
       // Wait a moment for it to take effect
@@ -4647,6 +4686,7 @@ export class FeishuBot {
       this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
       void this.reconcileReactions(chatId).catch(()=>{});
       this.store.stopInsertions(this.config.name,chatId);
+      void this.openclawClient.cancelSteerSession?.(sessionKey,this.stopGeneration(chatId)).catch(()=>{});
       this.forceExpireQueueOwner(chatId,'explicit user stop');
       // Capture/retire only pre-stop custody synchronously. A later user
       // input must survive the abort RPC await and keep its own reaction list.
