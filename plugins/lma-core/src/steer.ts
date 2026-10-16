@@ -1,7 +1,7 @@
 import { resolveActiveEmbeddedRunSessionId, queueAgentHarnessMessage, onAgentEvent } from "openclaw/plugin-sdk/agent-harness-runtime";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync, openSync, fsyncSync, closeSync } from "node:fs";
-import { homedir } from "node:os";
+import { resolveStateDir } from "openclaw/plugin-sdk/state-paths";
 import { join } from "node:path";
 
 type Status = "pending" | "accepted" | "unknown" | "target_changed" | "target_ended" | "stopped";
@@ -15,7 +15,7 @@ const nonempty=(value:unknown):value is string=>typeof value==='string' && !!val
  * synchronous on one event-loop turn. This is session-generation custody and
  * observed lifecycle fencing, NOT a host final-effect original-run CAS. */
 export function registerSteer(api: any): () => void {
-  const dir=join(process.env.OPENCLAW_STATE_DIR || join(homedir(),'.openclaw'),'lma-core','steer-custody');
+  const dir=join(resolveStateDir(),'lma-core','steer-custody');
   const active=new Map<string,{runId:string;sessionId?:string;startedAt:number}>(),ended=new Set<string>();
   const unsubscribe=onAgentEvent(event=>{
     if(!event.sessionKey || !event.runId || event.stream!=='lifecycle') return;
@@ -38,7 +38,12 @@ export function registerSteer(api: any): () => void {
     mkdirSync(dir,{recursive:true,mode:0o700});const temp=path+'.tmp';
     writeFileSync(temp,JSON.stringify(value),{mode:0o600});
     const fd=openSync(temp,'r');try{fsyncSync(fd);}finally{closeSync(fd);}
-    renameSync(temp,path);const parent=openSync(dir,'r');try{fsyncSync(parent);}finally{closeSync(parent);}
+    renameSync(temp,path);
+    // Windows permits opening some directories but fsync then fails EPERM.
+    // The file is already durable+renamed: never report a false failed attempt.
+    if(process.platform!=='win32') {
+      const parent=openSync(dir,'r');try{fsyncSync(parent);}finally{closeSync(parent);}
+    }
   };
   const read=(id:string)=>readJson<Custody>(pathFor(id));
   const save=(record:Custody)=>{record.ordinaryEligible=record.attempted===false && record.everAttempted!==true;writeJson(pathFor(record.insertionId),record);};

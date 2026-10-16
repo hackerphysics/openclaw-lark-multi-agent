@@ -171,8 +171,8 @@ export class MessageStore {
   }
   listReactionIntents(bot:string,chat?:string):any[] {
     return (this.db.prepare(`SELECT chat_id,row_id,record_json FROM reaction_custody WHERE bot_name=? ${chat ? 'AND chat_id=?' : ''}
-      AND json_extract(record_json,'$.desired')!=json_extract(record_json,'$.shown') LIMIT 200`).all(bot,...(chat ? [chat] : [])) as any[])
-      .map(r=>({...JSON.parse(r.record_json),chatId:r.chat_id,rowId:r.row_id})).filter(r=>r.desired!==r.shown);
+      AND (json_extract(record_json,'$.desired')!=json_extract(record_json,'$.shown') OR json_array_length(json_extract(record_json,'$.cleanupReceipts'))>0) LIMIT 200`).all(bot,...(chat ? [chat] : [])) as any[])
+      .map(r=>({...JSON.parse(r.record_json),chatId:r.chat_id,rowId:r.row_id})).filter(r=>r.desired!==r.shown || r.cleanupReceipts?.length);
   }
   bindDeliveryRun(bot:string,chat:string,runId:string,record:object):void {
     this.db.prepare('INSERT OR REPLACE INTO run_delivery_targets VALUES(?,?,?,?)').run(bot,chat,runId,JSON.stringify(record));
@@ -229,8 +229,20 @@ export class MessageStore {
   runObservationState(sessionKey:string,runId:string):string|undefined {
     return (this.db.prepare('SELECT state FROM run_observations WHERE session_key=? AND run_id=?').get(sessionKey,runId) as any)?.state;
   }
+  stopSessionObservations(sessionKey:string):void {
+    this.db.prepare("UPDATE run_observations SET state='stopped' WHERE session_key=? AND state='observing'").run(sessionKey);
+  }
+  settleExactRunReactions(sessionKey:string,runId:string):void {
+    const targets=this.db.prepare('SELECT bot_name,chat_id FROM run_delivery_targets WHERE run_id=?').all(runId) as any[];
+    for(const target of targets) {
+      // run ids can repeat across gateways/sessions: require the exact durable target.
+      const row=this.getDeliveryRunTarget(target.bot_name,target.chat_id,runId);
+      const observed=this.db.prepare("SELECT 1 FROM run_observations WHERE session_key=? AND run_id=? AND state='observing'").get(sessionKey,runId);
+      if(observed && (!row?.sessionKey || row.sessionKey===sessionKey)) this.settleRunReactionIntents(target.bot_name,target.chat_id,runId);
+    }
+  }
   finishRunObservation(sessionKey: string,runId: string,state = 'settled'): void {
-    this.db.prepare('UPDATE run_observations SET state=? WHERE session_key=? AND run_id=?').run(state,sessionKey,runId);
+    this.db.prepare("UPDATE run_observations SET state=? WHERE session_key=? AND run_id=? AND state='observing'").run(state,sessionKey,runId);
   }
   listRunObservations(sessionKey?: string, due = Date.now(), limit = 50): any[] {
     return (this.db.prepare(`SELECT * FROM run_observations WHERE state='observing' AND next_check_at<=?
@@ -1103,6 +1115,8 @@ export class MessageStore {
 
   enqueueDelivery(item: Omit<DeliveryOutboxItem, "id" | "status" | "attempts" | "createdAt" | "updatedAt">): number | null {
     return this.db.transaction(()=>{
+    const p=JSON.parse(item.deliveryMetaJson || '{}').provenance;
+    if(p?.final && p.sessionKey && p.runId && this.isStoppedObservation(p.sessionKey,p.runId)) return null;
     const now = Date.now();
     const result = this.db.prepare(`
       INSERT OR IGNORE INTO delivery_outbox
@@ -1128,7 +1142,6 @@ export class MessageStore {
       now,
       now,
     );
-    const p=JSON.parse(item.deliveryMetaJson || '{}').provenance;
     if(p?.final===true && p.sessionKey && p.runId) this.finishRunObservation(p.sessionKey,p.runId,'outbox_owned');
     return result.changes ? Number(result.lastInsertRowid) : null;
     })();

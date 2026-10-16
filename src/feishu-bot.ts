@@ -1277,7 +1277,7 @@ export class FeishuBot {
   private reactionChecks=new Set<string>();
   private async receiptReaction(chatId:string,rowId:number,messageId:string,desired:string,runId=''):Promise<void> {
     const previous=this.store.getReactionIntent(this.config.name,chatId,rowId);
-    const record={messageId,desired,shown:previous?.shown || '',runId:runId || previous?.runId || '',stopEpoch:this.stopGeneration(chatId)};
+    const record={...previous,messageId,desired,shown:previous?.shown || '',runId:runId || previous?.runId || '',stopEpoch:this.stopGeneration(chatId)};
     this.store.setReactionIntent(this.config.name,chatId,rowId,record);
     void this.reconcileReactions(chatId).catch(()=>{}).finally(()=>this.scheduleInsertionRecovery());
     this.scheduleInsertionRecovery();
@@ -1289,19 +1289,28 @@ export class FeishuBot {
       for(const item of this.store.listReactionIntents(this.config.name,chatId)) {
         if(item.stopEpoch!==this.stopGeneration(chatId)) continue;
         try {
+          // Orphaned late successes retain their exact own receipt until deletion.
+          for(const receipt of item.cleanupReceipts || []) {
+            await this.removeReaction(item.messageId,receipt.emoji,receipt.id);
+            const current=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
+            if(current)this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...current,cleanupReceipts:(current.cleanupReceipts || []).filter((r:any)=>r.id!==receipt.id)});
+          }
           if(item.shown) {
-            await this.removeReaction(item.messageId,item.shown);
+            await this.removeReaction(item.messageId,item.shown,item.reactionId);
             const latest=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
-            if(latest && latest.shown===item.shown) this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...latest,shown:''});
+            if(latest && latest.shown===item.shown && latest.reactionId===item.reactionId) this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...latest,shown:'',reactionId:undefined});
           }
           const latest=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
           if(!latest || latest.stopEpoch!==this.stopGeneration(chatId) || latest.desired!==item.desired) continue;
-          if(item.desired) await this.addReaction(item.messageId,item.desired);
+          const reactionId=item.desired ? await this.addReaction(item.messageId,item.desired) : undefined;
           const after=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
-          if(after) {
-            // Record the real platform side effect but preserve the CURRENT
-            // desired/epoch, so a late Get is removed, never resurrected.
-            this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...after,shown:item.desired});
+          if(after && after.stopEpoch===item.stopEpoch && after.stopEpoch===this.stopGeneration(chatId) && after.desired===item.desired) {
+            this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...after,shown:item.desired,reactionId});
+          } else if(after && reactionId) {
+            this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...after,cleanupReceipts:[...(after.cleanupReceipts || []),{id:reactionId,emoji:item.desired}]});
+            await this.removeReaction(item.messageId,item.desired,reactionId);
+            const current=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
+            if(current)this.store.setReactionIntent(this.config.name,chatId,item.rowId,{...current,cleanupReceipts:(current.cleanupReceipts || []).filter((r:any)=>r.id!==reactionId)});
           }
         } catch { /* UI-only retry; never roll back business acceptance. */ }
       }
@@ -1906,6 +1915,8 @@ export class FeishuBot {
           initialReply: reply,
           liveStatus,
           runStartStopEpoch,
+          guard,
+          onSubmitted:async runId=>{guard();owner.runId=runId;foregroundRunId=runId;this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || "",liveStatus});},
         });
 
         guard();
@@ -2580,6 +2591,8 @@ export class FeishuBot {
      *  from the main run onward bumps the epoch past this baseline, so we can
      *  detect it even though it happened before this function was called. */
     runStartStopEpoch?: number;
+    guard?:()=>void;
+    onSubmitted?:(runId:string)=>Promise<void>;
   }): Promise<string> {
     const { chatId, sessionKey, senderName, triggerId, lastHumanMessageId, isNativeCommandTrigger, liveStatus } = params;
     let reply = params.initialReply ?? "";
@@ -2595,6 +2608,7 @@ export class FeishuBot {
     const wasStopped = () => this.stopGeneration(chatId) !== startStopEpoch;
     for (let attempt = 1; attempt <= maxRetry; attempt++) {
       // /stop while we were looping: abandon retries and deliver what we have.
+      params.guard?.();
       if (wasStopped()) {
         console.log(`[${this.config.name}] auto-retry: aborted by /stop for ${chatId.slice(-8)}`);
         return reply;
@@ -2615,6 +2629,8 @@ export class FeishuBot {
         ? `⚠️ Reply looks incomplete — auto-checking (${attempt}/${maxRetry})…`
         : `⚠️ 疑似任务未完成，正在自动重试（${attempt}/${maxRetry}）…`).catch(() => {});
 
+      params.guard?.();
+      if(wasStopped())return reply;
       // One short line, in the user's own voice (we intentionally do not change
       // senderName). Each locale uses its own done-phrase so the English probe
       // stays fully English; detection accepts both phrases.
@@ -2633,13 +2649,17 @@ export class FeishuBot {
           timeoutMs: FOREGROUND_WAIT_MS,
           includeContext: false,
           includeBridgeAttachmentHint: false,
-          onProgress: (event) => liveStatus?.progress(event),
+          onSendAttempt:()=>{params.guard?.();if(wasStopped())throw new SupersededObservation("stopped probe");},
+          onSubmitted:async runId=>{params.guard?.();await params.onSubmitted?.(runId);params.guard?.();},
+          onProgress: (event) => {params.guard?.();return liveStatus?.progress(event);},
           onWaitPaused: async notice => {
-            await liveStatus?.showWaitingForResult(notice.message);
-            await this.sendWaitPaused(chatId, triggerId, lastHumanMessageId, notice);
+            params.guard?.();await liveStatus?.showWaitingForResult(notice.message);
+            params.guard?.();await this.sendWaitPaused(chatId, triggerId, lastHumanMessageId, notice);
+            params.guard?.();
           },
         }));
       } catch (err) {
+        params.guard?.();
         if (err instanceof SessionWaitPaused) throw err;
         // The confirmation round itself failed (timeout/unhealthy). Do not spin:
         // deliver the existing (truncated-looking) reply as-is.
@@ -2647,9 +2667,11 @@ export class FeishuBot {
         return reply;
       }
 
+      params.guard?.();
       const probeText = this.extractBridgeAttachments(probeReply).text.trim();
       // /stop landed while the probe was in flight: stop here rather than loop
       // again. Deliver the latest meaningful output we have.
+      params.guard?.();
       if (wasStopped()) {
         console.log(`[${this.config.name}] auto-retry: aborted by /stop mid-probe for ${chatId.slice(-8)}`);
         return probeText && probeText.toUpperCase() !== "NO_REPLY" ? probeReply : reply;
@@ -2688,7 +2710,7 @@ export class FeishuBot {
     const key = this.deliveryRunTargetKey(chatId, runId);
     const previous = this.deliveryTargetsByRun.get(key);
     if (previous?.timer) clearTimeout(previous.timer);
-    this.store.bindDeliveryRun(this.config.name,chatId,runId,{triggerId:target.triggerId,messageId:target.messageId,runId});
+    this.store.bindDeliveryRun(this.config.name,chatId,runId,{triggerId:target.triggerId,messageId:target.messageId,runId,sessionKey:`agent:main:${this.getSessionKey(chatId).replace(/^agent:[^:]+:/,'')}`});
     this.deliveryTargetsByRun.set(key, {
       triggerId: target.triggerId,
       messageId: target.messageId,
@@ -4213,15 +4235,29 @@ export class FeishuBot {
    * Remove a reaction by emoji type from a message.
    * Finds the bot's own reaction of that type and deletes it.
    */
-  private async removeReaction(messageId:string,emojiType:string):Promise<void> {
-    const response=await this.client.im.messageReaction.list({path:{message_id:messageId},params:{reaction_type:emojiType}});
-    if(response.code!==0) throw new Error('Reaction lookup not confirmed');
-    const items=(response.data as any)?.items || [];
-    for(const item of items) if(item.reaction_id) {
-      const deleted=await this.client.im.messageReaction.delete({path:{message_id:messageId,reaction_id:item.reaction_id}});
-      if(deleted.code!==0) throw new Error('Reaction removal not confirmed');
-      break;
-    }
+  private async removeReaction(messageId:string,emojiType:string,reactionId?:string):Promise<void> {
+    const remove=async(id:string)=>{
+      const deleted=await this.client.im.messageReaction.delete({path:{message_id:messageId,reaction_id:id}});
+      if(deleted.code!==0)throw new Error('Reaction removal not confirmed');
+    };
+    if(reactionId){await remove(reactionId);return;}
+    // Migration of pre-receipt records: never guess ownership from list order
+    // or operator_type alone. Feishu operator_id is the bot's open identity.
+    if(!this.botOpenId)throw new Error('Own reaction operator identity unavailable');
+    let page:string|undefined;
+    const seen=new Set<string>();
+    do {
+      const response=await this.client.im.messageReaction.list({path:{message_id:messageId},params:{reaction_type:emojiType,page_token:page,page_size:100}});
+      if(response.code!==0)throw new Error('Reaction lookup not confirmed');
+      const data=response.data as any;
+      for(const item of data?.items || []) {
+        if(item.reaction_id && item.operator?.operator_type==='app' && item.operator.operator_id===this.botOpenId &&
+          (!item.reaction_type?.emoji_type || item.reaction_type.emoji_type===emojiType))await remove(item.reaction_id);
+      }
+      page=data?.has_more ? data.page_token : undefined;
+      if(data?.has_more && (!page || seen.has(page)))throw new Error('Incomplete reaction ownership pagination');
+      if(page)seen.add(page);
+    }while(page);
   }
 
 

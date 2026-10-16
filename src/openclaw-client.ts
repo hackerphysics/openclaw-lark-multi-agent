@@ -192,14 +192,26 @@ export class OpenClawClient {
         if(this.ownedDeliveryRuns.has(item.runId)) continue;
         try {
           const snapshot=item.terminalObserved ? {runId:item.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:item.terminalText}} : await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
+          if(this.recoveryStore.runObservationState(item.sessionKey,item.runId)!=='observing' || this.isExplicitlyStoppedRun(item.sessionKey,item.runId) || this.ownedDeliveryRuns.has(item.runId)) continue;
           if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError) continue;
           const terminal=snapshot.terminalReply;
+          const callback=this.sessionMessageCallbacks.get(item.sessionKey) || this.sessionMessageCallbacks.get(this.shortKey(item.sessionKey));
+          if(['error','timeout'].includes(snapshot.status)) {
+            // endedAt + exact run is terminal evidence; bare query timeouts never get here.
+            await callback?.(String(snapshot.error || snapshot.status),{sourceType:'run_error',sessionKey:item.sessionKey,runId:item.runId,
+              error:{sessionKey:item.sessionKey,runId:item.runId,source:'chat',state:'error',detail:String(snapshot.error || snapshot.status)}});
+            this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+            continue;
+          }
           if(snapshot.status!=='ok' || !['visible','silent','empty'].includes(terminal?.disposition)) continue;
           if(terminal.disposition==='visible' && typeof terminal.text==='string' && terminal.text.trim()) {
             const callback=this.sessionMessageCallbacks.get(item.sessionKey) || this.sessionMessageCallbacks.get(this.shortKey(item.sessionKey));
             await callback?.(terminal.text,{sessionKey:item.sessionKey,runId:item.runId,sessionId:item.sessionId,final:true});
           }
-          if(terminal.disposition!=='visible') this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+          if(terminal.disposition!=='visible') {
+            this.recoveryStore.settleExactRunReactions(item.sessionKey,item.runId);
+            this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+          }
           // Visible custody ends only when the receiver's durable outbox has
           // claimed it. A callback resolving alone is not a delivery receipt.
         } catch { /* Query failed, not the task. Leave exact custody in SQLite. */ }
@@ -1228,7 +1240,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               lifecycleStartedLogged = true;
               console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
             }
-            if ((ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") && (ev.data?.deltaText || ev.data?.delta)) {
+            if ((!evRunId || evRunId===runId) && (ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") && (ev.data?.deltaText || ev.data?.delta)) {
               const chunk = ev.data.deltaText || ev.data.delta;
               if (ev.stream === "assistant") {
                 if (ev.data?.replace) {
@@ -2047,7 +2059,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (!runId) {
       this.stopGenerations.set(key,(this.stopGenerations.get(key)||0)+1);
       this.revokeSessionCollectors(key,'explicit stop');
-      for(const item of this.recoveryStore?.listRunObservations(key,Number.MAX_SAFE_INTEGER) || []) this.recoveryStore?.finishRunObservation(key,item.runId,'stopped');
+      this.recoveryStore?.stopSessionObservations(key);
       for (const [identity, at] of this.explicitlyStoppedRuns) if (Date.now() - at > 24 * 60 * 60_000) this.explicitlyStoppedRuns.delete(identity);
       // Mark the session so any in-flight collectReply finishes immediately
       // instead of treating the cancelled lifecycle as a transient state.
