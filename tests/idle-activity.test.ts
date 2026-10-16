@@ -26,6 +26,35 @@ beforeEach(() => {
 });
 afterEach(async () => { await c.disconnect(); vi.clearAllTimers(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
+describe("audit 2026-10-16 fixes: B5 double-splice / B6 empty terminal", () => {
+  it("a real final buffered right after a timeout error frame is not swallowed (B5)", async () => {
+    const run = start();
+    // Same poll batch: timeout lifecycle error, then the REAL final.
+    emit("lifecycle", { phase: "error", error: "request timeout" });
+    emit("chatFinal", { text: "real final after timeout" });
+    await vi.advanceTimersByTimeAsync(2000);
+    // The timeout classifier consults sessions.describe (running) → wait-pause
+    // path, but the buffered final must win over the stale timeout decision.
+    expect(await run).toBe("real final after timeout");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("an authoritative empty terminal never recycles interim draft text (B6)", async () => {
+    c.rpc = vi.fn(async (method: string) => {
+      if (method === "agent.wait") return { runId: "r", status: "ok", endedAt: Date.now(), yielded: false,
+        terminalReply: { disposition: "empty", text: "" } };
+      return { session: { status: "running" } };
+    });
+    const run = start();
+    emit("assistant", { delta: "interim draft." });
+    // Trigger the state check via idle expiry so checkRunState reads agent.wait.
+    await vi.advanceTimersByTimeAsync(1100);
+    const text = await run;
+    expect(text).not.toContain("interim draft");
+    expect(["NO_REPLY", ""]).toContain(text);
+  });
+});
+
 describe("stale collector fencing (2026-10-16 regression)", () => {
   it("revoking a stale collector stops frame theft; the replacement sees its own activity and final", async () => {
     // Old batch's collector: would otherwise stay alive up to 24h and

@@ -24,7 +24,7 @@ const ERR_INVALID = "INVALID_REQUEST";
 // A run can be accepted but not yet resolvable/streaming (cold-start window).
 // Wait up to STEER_WAIT_MS (polling every STEER_POLL_MS) for it to become
 // steerable before falling back to no_active_run. Env-tunable.
-const STEER_WAIT_MS = Number(process.env.LMA_STEER_WAIT_MS || 8000);
+const STEER_WAIT_MS = Number(process.env.LMA_STEER_WAIT_MS || 3000);
 const STEER_POLL_MS = Number(process.env.LMA_STEER_POLL_MS || 300);
 
 function sleep(ms: number): Promise<void> {

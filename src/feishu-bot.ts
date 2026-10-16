@@ -175,7 +175,12 @@ export class FeishuBot {
   /** Steered messages admitted into the CURRENT batch (per chat). Flipped to
    * DONE when that batch completes successfully; cleared (unflipped) when the
    * batch scope ends any other way. */
-  private admittedSteerAcks: Map<string, Array<{ messageId: string; insertedId: number }>> = new Map();
+  private admittedSteerAcks: Map<string, Array<{ messageId: string; insertedId: number; batch?: object }>> = new Map();
+  /** Identity token of the CURRENT queue owner per chat. Steer acks carry
+   *  the token of the batch that admitted them; a completion path only flips
+   *  acks of its OWN batch, so a superseded inner can never DONE a newer
+   *  batch's steered inputs (2026-10-16 audit B9). */
+  private queueRunTokens: Map<string, object> = new Map();
   /** Go / Go-Checker supervision controller (per-bot instance). */
   private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;stage:string;ordinals:Map<string,number>;blocked?:boolean}>();
   private readonly goReceiptApis = new WeakSet<object>();
@@ -1245,7 +1250,7 @@ export class FeishuBot {
             // never (2026.9.9 removed mirrors); either way the message belongs
             // to this batch for the Get -> DONE flip.
             const steerAckList = this.admittedSteerAcks.get(chatId) || [];
-            steerAckList.push({ messageId, insertedId });
+            steerAckList.push({ messageId, insertedId, batch: this.queueRunTokens.get(chatId) });
             this.admittedSteerAcks.set(chatId, steerAckList);
           }
           if (insertedId > 0 && !consumedBeforeAck) {
@@ -1315,8 +1320,14 @@ export class FeishuBot {
         // path and it will never settle). Force-expire it and process this input
         // NOW instead of queueing behind a dead promise forever.
         if (steer.status === "no_active_run" && this.queueRuns.has(chatId)) {
+          const ownerAtCheck = this.queueRuns.get(chatId);
           const live = await this.openclawClient.getSessionRuntimeStatus(sessionKeyForSteer).catch(() => null);
-          if (live && !live.running) {
+          // B1 (2026-10-16 audit): require POSITIVE idle evidence. An RPC
+          // failure normalizes to {status:"unknown", running:false} and must
+          // never authorize expiring a legitimately running owner. The owner
+          // identity is also CAS-checked across the status RPC: a newer batch
+          // that took over meanwhile must not be expired by stale evidence.
+          if (live && !live.running && live.status !== "unknown" && this.queueRuns.get(chatId) === ownerAtCheck) {
             console.warn(
               `[${this.config.name}] gateway reports session idle while queue owner exists for ${chatId.slice(-8)} — expiring zombie owner (status=${live.status})`
             );
@@ -1484,7 +1495,9 @@ export class FeishuBot {
       console.log(`[${this.config.name}] processQueue already running for ${chatId.slice(-8)}, joining existing run`);
       return existing;
     }
-    const run = this.processQueueInner(chatId).finally(() => {
+    const batchToken = {};
+    this.queueRunTokens.set(chatId, batchToken);
+    const run = this.processQueueInner(chatId, batchToken).finally(() => {
       // Ownership token guard: only the CURRENT owner may release the slot. A
       // zombie owner that settles after forceExpireQueueOwner must not delete
       // the replacement owner's entry (that would open a concurrent-run window).
@@ -1492,6 +1505,7 @@ export class FeishuBot {
         this.queueRuns.delete(chatId);
         this.runFailureObservers.delete(chatId);
         this.admittedSteerAcks.delete(chatId);
+        this.queueRunTokens.delete(chatId);
       }
     });
     this.queueRuns.set(chatId, run);
@@ -1517,10 +1531,11 @@ export class FeishuBot {
     this.fireRunFailureObservers(chatId);
     this.runFailureObservers.delete(chatId);
     this.admittedSteerAcks.delete(chatId);
+    this.queueRunTokens.delete(chatId);
     return true;
   }
 
-  private async processQueueInner(chatId: string): Promise<void> {
+  private async processQueueInner(chatId: string, batchToken: object): Promise<void> {
     while (true) {
       // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
       // completed with it (consumed or not); their failure observers are stale.
@@ -2015,9 +2030,15 @@ export class FeishuBot {
         this.pendingAckMessages.set(chatId, remainingAcks);
         // Steered messages admitted into THIS batch were consumed with it:
         // flip their Get → DONE alongside the batch's own triggers.
-        const admittedSteers = this.admittedSteerAcks.get(chatId) || [];
+        // B9 (2026-10-16 audit): flip only THIS batch's admitted steer acks. A
+        // superseded inner completing late must never DONE a newer batch's
+        // steered inputs — foreign acks stay for their owning batch.
+        const allSteers = this.admittedSteerAcks.get(chatId) || [];
+        const admittedSteers = allSteers.filter((s) => s.batch === batchToken);
+        if (allSteers.length > 0) {
+          this.admittedSteerAcks.set(chatId, allSteers.filter((s) => s.batch !== batchToken));
+        }
         if (admittedSteers.length > 0) {
-          this.admittedSteerAcks.delete(chatId);
           for (const s of admittedSteers) {
             await this.removeReaction(s.messageId, "Get").catch(() => {});
             await this.addReaction(s.messageId, "DONE").catch(() => {});

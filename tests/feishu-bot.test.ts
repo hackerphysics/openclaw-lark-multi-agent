@@ -2717,6 +2717,30 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally { h.cleanup(); }
   });
 
+  it("does NOT force-expire a queue owner on an unknown session status (B1: RPC failure is not idle evidence)", async () => {
+    const h = makeHarness("GPT");
+    try {
+      h.openclaw.chatSendWithContext = vi.fn((p: any) => {
+        h.openclaw.chatCalls.push(p);
+        if (h.openclaw.chatCalls.length === 1) return new Promise<string>(() => {});
+        return Promise.resolve("later answer");
+      });
+      const first = (h.bot as any).handleMessage(event({ chatType: "p2p", text: "busy task", messageId: "b1-first" }));
+      await vi.waitUntil(() => h.openclaw.chatCalls.length === 1, { timeout: 1000 });
+      expect((h.bot as any).queueRuns.has("chat1")).toBe(true);
+      // steer says no active run, but the status RPC failed → status unknown.
+      h.openclaw.steer = vi.fn(async () => ({ status: "no_active_run" as const }));
+      (h.openclaw as any).getSessionRuntimeStatus = vi.fn(async () => ({ running: false, status: "unknown" }));
+      await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "queued input", messageId: "b1-second" }));
+      // Unknown evidence must NOT expire the owner: it stays busy (queuing path).
+      expect((h.bot as any).queueRuns.has("chat1")).toBe(true);
+      expect(h.openclaw.chatCalls).toHaveLength(1);
+      const row = h.store.getMessageId("b1-second")!;
+      expect(h.store.getPendingTriggerIds("GPT", "chat1").has(row)).toBe(true);
+      // NOTE: `first` (the zombie batch) intentionally never settles.
+    } finally { h.cleanup(); }
+  });
+
   it("force-expires a zombie queue owner when the gateway reports the session idle", async () => {
     const h = makeHarness("GPT");
     try {

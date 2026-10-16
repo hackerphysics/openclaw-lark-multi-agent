@@ -847,8 +847,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             || (typeof snapshot.startedAt === "number" && ended < snapshot.startedAt)) return;
           if (snapshot.status === "ok" && snapshot.yielded !== true) {
             const terminal = snapshot.terminalReply;
+            // B6 (2026-10-16 audit): disposition "empty" is an authoritative
+            // no-visible-text terminal — never recycle an interim draft as the
+            // final answer. Only genuinely unspecified metadata may fall back.
             const visible = terminal?.disposition === "visible" && typeof terminal.text === "string"
-              ? terminal.text : terminal?.disposition === "silent" ? "NO_REPLY"
+              ? terminal.text
+              : terminal?.disposition === "silent" || terminal?.disposition === "empty"
+                ? "NO_REPLY"
                 : this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
             resolve(visible || "NO_REPLY");
           } else if (snapshot.status === "error" || snapshot.status === "timeout") {
@@ -1296,7 +1301,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 return;
               }
               if (isWaitTimeout(errText)) {
-                bucket.splice(i, 1);
+                // B5 (2026-10-16 audit): already dequeued by the unified splice
+                // above; a second splice here deleted the NEXT buffered frame
+                // (a real chatFinal following a timeout error was swallowed).
                 if (!decidingTimeout) {
                   decidingTimeout = true;
                   void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(handleTimeoutResult);
@@ -1342,11 +1349,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               if (this.isRecoverableAgentError(errText)) {
                 pendingRuntimeFailureText = `⚠️ Agent 未正常完成\n原因: ${safeErrorSummary(errText)}`;
                 console.warn(`[OpenClaw] recoverable chat error for runId=${evRunId || runId}; deferring: ${safeErrorSummary(errText)}`);
-                bucket.splice(i, 1);
+                // B5: already dequeued above — no second splice.
                 continue;
               }
               if (isWaitTimeout(errText)) {
-                bucket.splice(i, 1);
+                // B5 (2026-10-16 audit): already dequeued by the unified splice
+                // above; a second splice here deleted the NEXT buffered frame
+                // (a real chatFinal following a timeout error was swallowed).
                 if (!decidingTimeout) {
                   decidingTimeout = true;
                   void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(handleTimeoutResult);
