@@ -110,13 +110,15 @@ export type GoJobRow = {
 
 export class MessageStore {
   private db: Database.Database;
+  private knownDeliveryReceipts=new Map<string,{outbox:number;key:string;record:any}>();
 
-  constructor(dbPath?: string) {
+  constructor(dbPath?: string,options:{existingOnly?:boolean}={}) {
     const path = dbPath || resolve(process.cwd(), "data", "messages.db");
     const dir = resolve(path, "..");
-    mkdirSync(dir, { recursive: true });
+    if(!options.existingOnly)mkdirSync(dir, { recursive: true });
 
-    this.db = new Database(path);
+    this.db = new Database(path,options.existingOnly ? {fileMustExist:true} : {});
+    if(options.existingOnly)return;
     this.db.pragma("journal_mode = WAL");
     this.init();
     this.initGoTables();
@@ -127,6 +129,8 @@ export class MessageStore {
    * remain durable and are never selected by the ordinary pending drain. */
   private initReliabilityTables(): void {
     this.db.exec(`
+      CREATE TABLE IF NOT EXISTS lma_database_identity (id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL);
+      INSERT OR IGNORE INTO lma_database_identity VALUES(1,'openclaw-lark-multi-agent:messages:v1');
       CREATE TABLE IF NOT EXISTS bridge_generations(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,stop_epoch INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot_name,chat_id));
       CREATE TABLE IF NOT EXISTS reaction_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,row_id INTEGER NOT NULL,record_json TEXT NOT NULL,
         PRIMARY KEY(bot_name,chat_id,row_id));
@@ -143,6 +147,10 @@ export class MessageStore {
       CREATE TABLE IF NOT EXISTS delivery_operations (
         outbox_id INTEGER NOT NULL,operation_key TEXT NOT NULL,state TEXT NOT NULL,
         record_json TEXT NOT NULL DEFAULT '{}',PRIMARY KEY(outbox_id,operation_key));
+      CREATE TABLE IF NOT EXISTS delivery_receipt_custody (
+        outbox_id INTEGER NOT NULL,operation_key TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(outbox_id,operation_key));
+      CREATE TABLE IF NOT EXISTS delivery_local_obligations (
+        outbox_id INTEGER PRIMARY KEY,failures INTEGER NOT NULL DEFAULT 0,reason TEXT NOT NULL,updated_at INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS delivery_context (
         outbox_id INTEGER NOT NULL,stage TEXT NOT NULL,message_row_id INTEGER,
         PRIMARY KEY(outbox_id,stage));
@@ -275,17 +283,46 @@ export class MessageStore {
     this.db.prepare("UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND state NOT IN ('committed','ordinary')").run(bot,chat);
   }
   hasUnknownDeliveryOperation(outbox:number): boolean {
-    return !!this.db.prepare("SELECT 1 FROM delivery_operations WHERE outbox_id=? AND state IN ('attempted','unknown') LIMIT 1").get(outbox);
+    return !!this.db.prepare(`SELECT 1 FROM delivery_operations o WHERE outbox_id=? AND state IN ('attempted','unknown')
+      AND NOT EXISTS(SELECT 1 FROM delivery_receipt_custody k WHERE k.outbox_id=o.outbox_id AND k.operation_key=o.operation_key) LIMIT 1`).get(outbox);
+  }
+  /** Retain the full known result BEFORE the fallible main-journal checkpoint.
+   * The memory copy survives local SQLite failures while this process is alive;
+   * the independent insert journal also survives an interrupted UPDATE/reopen. */
+  rememberKnownDeliveryReceipt(outbox:number,key:string,record:any):void {
+    this.knownDeliveryReceipts.set(`${outbox}:${key}`,{outbox,key,record});
+    this.flushKnownDeliveryReceipts(outbox);
+  }
+  flushKnownDeliveryReceipts(outbox:number):void {
+    for(const [identity,item] of this.knownDeliveryReceipts)if(item.outbox===outbox){
+      this.db.prepare('INSERT OR REPLACE INTO delivery_receipt_custody VALUES(?,?,?)').run(outbox,item.key,JSON.stringify(item.record));
+      this.knownDeliveryReceipts.delete(identity);
+    }
   }
   listDeliveryReceipts(outbox:number): Array<{messageId:string;operation:string;payload:any;stage:string}> {
-    return (this.db.prepare("SELECT operation_key,record_json FROM delivery_operations WHERE outbox_id=? AND state='accepted'").all(outbox) as any[])
-      .map(r=>({...JSON.parse(r.record_json),stage:r.operation_key.split(':').slice(2,-1).join(':')}))
+    const records=new Map<string,any>();
+    for(const r of this.db.prepare(`SELECT operation_key,record_json FROM delivery_operations WHERE outbox_id=? AND state='accepted'
+      UNION ALL SELECT operation_key,record_json FROM delivery_receipt_custody WHERE outbox_id=?`).all(outbox,outbox) as any[]) records.set(r.operation_key,JSON.parse(r.record_json));
+    for(const item of this.knownDeliveryReceipts.values())if(item.outbox===outbox)records.set(item.key,item.record);
+    return [...records].map(([key,r])=>({...r,stage:key.split(':').slice(2,-1).join(':')}))
       .filter(r=>r.result?.data?.message_id || r.result?.message_id)
       .map(r=>({messageId:r.result?.data?.message_id || r.result?.message_id,operation:r.operation,payload:r.payload,stage:r.stage}));
   }
   getDeliveryOperation(outbox: number,key: string): any {
+    const known=this.knownDeliveryReceipts.get(`${outbox}:${key}`)?.record;
+    const receipt=this.db.prepare('SELECT record_json FROM delivery_receipt_custody WHERE outbox_id=? AND operation_key=?').get(outbox,key) as any;
+    if(known || receipt)return {state:'accepted',...(known || JSON.parse(receipt.record_json))};
     const r=this.db.prepare('SELECT * FROM delivery_operations WHERE outbox_id=? AND operation_key=?').get(outbox,key) as any;
     return r ? {state:r.state,...JSON.parse(r.record_json)} : null;
+  }
+  deferLocalDelivery(id:number,reason:string):number {
+    return this.db.transaction(()=>{
+      this.db.prepare(`INSERT INTO delivery_local_obligations VALUES(?,1,?,?) ON CONFLICT(outbox_id)
+        DO UPDATE SET failures=failures+1,reason=excluded.reason,updated_at=excluded.updated_at`).run(id,reason,Date.now());
+      // Local persistence and unknown audit custody consume no platform retry budget.
+      this.db.prepare("UPDATE delivery_outbox SET status='pending',attempts=MAX(0,attempts-1),updated_at=? WHERE id=? AND status='delivering'").run(Date.now(),id);
+      return (this.db.prepare('SELECT failures FROM delivery_local_obligations WHERE outbox_id=?').get(id) as any).failures;
+    })();
   }
   saveDeliveryOperation(outbox: number,key: string,state: string,record: object = {}): void {
     this.db.prepare(`INSERT INTO delivery_operations VALUES(?,?,?,?) ON CONFLICT(outbox_id,operation_key)
@@ -328,17 +365,44 @@ export class MessageStore {
       this.confirmDeliveryStage(id,`body:partial:${receipt.messageId}`,text,[receipt],'none');
     }
   }
+  registerPartialAttachmentContext(id:number):void {
+    for(const receipt of this.listDeliveryReceipts(id).filter(r=>/^attachment:\d+$/.test(r.stage))) {
+      // Only confirmed, visible file/image payload. A document upload is not a message.
+      if(!['file','image'].includes(receipt.payload?.msg_type))continue;
+      let payload:any;try{payload=JSON.parse(receipt.payload.content);}catch{continue;}
+      this.confirmDeliveryStage(id,`${receipt.stage}:partial:${receipt.messageId}`,
+        `[Attachment: ${receipt.payload.msg_type}] ${JSON.stringify(payload)}`,[receipt],'none');
+    }
+  }
   /** Read-only preview. Historical text_delivered alone is not a receipt.
    * Explicit repair requires supplied exact outbox+platform IDs, never resends. */
   previewMissingDeliveryContext(bot: string,limit = 100): any[] {
     return this.db.prepare(`SELECT d.id,d.chat_id,d.delivery_key,d.source_type,d.text_delivered,d.attachment_cursor
-      FROM delivery_outbox d WHERE bot_name=? AND status='delivered'
-      AND NOT EXISTS(SELECT 1 FROM delivery_context c WHERE c.outbox_id=d.id) ORDER BY d.id LIMIT ?`).all(bot,limit);
+      FROM delivery_outbox d WHERE bot_name=? AND (status='delivered' AND NOT EXISTS(SELECT 1 FROM delivery_context c WHERE c.outbox_id=d.id)
+        OR EXISTS(SELECT 1 FROM delivery_operations o WHERE o.outbox_id=d.id AND o.state IN ('attempted','unknown'))) ORDER BY d.id LIMIT ?`).all(bot,limit);
   }
   registerHistoricalDeliveryContext(id: number,bot: string,chat: string,messageIds: string[]): void {
-    const item=this.db.prepare("SELECT * FROM delivery_outbox WHERE id=? AND bot_name=? AND chat_id=? AND status='delivered'").get(id,bot,chat) as any;
-    if(!item || !messageIds.length || messageIds.some(x=>!x)) throw new Error('Exact delivered outbox and independently verified platform receipts required');
-    this.confirmDeliveryStage(id,'body',item.content,messageIds.map(messageId=>({messageId})),'text');
+    const item=this.db.prepare("SELECT * FROM delivery_outbox WHERE id=? AND bot_name=? AND chat_id=?").get(id,bot,chat) as any;
+    if(!item || !messageIds.length || messageIds.some(x=>!x) || new Set(messageIds).size!==messageIds.length) throw new Error('Exact outbox and independently verified platform receipts required');
+    if(item.status==='delivered') {
+      this.confirmDeliveryStage(id,'body',item.content,messageIds.map(messageId=>({messageId})),'text');return;
+    }
+    // Explicit operator reconciliation, never an automatic rejection or resend.
+    // Match every supplied message to exactly one unresolved visible operation.
+    const unknown=(this.db.prepare("SELECT * FROM delivery_operations WHERE outbox_id=? AND state IN ('attempted','unknown') ORDER BY operation_key").all(id) as any[])
+      .map(r=>({...r,record:JSON.parse(r.record_json)}));
+    if(unknown.length!==messageIds.length || unknown.some(r=>!r.record.visible || !r.record.payload)) throw new Error('Exact visible unknown operations and independent receipts required');
+    this.db.transaction(()=>{
+      unknown.forEach((r,i)=>{
+        const record={...r.record,result:{code:0,data:{message_id:messageIds[i],chat_id:chat}},reconciliation:{independentlyVerified:true,at:Date.now(),bot,chat}};
+        this.rememberKnownDeliveryReceipt(id,r.operation_key,record);
+        this.saveDeliveryOperation(id,r.operation_key,'accepted',record);
+      });
+      this.registerPartialBodyContext(id);
+      this.registerPartialAttachmentContext(id);
+      if(unknown.every(r=>r.operation_key.split(':').slice(2,-1).join(':')==='body'))this.confirmDeliveryStage(id,'body',item.content,messageIds.map(messageId=>({messageId})),'text');
+      this.db.prepare("UPDATE delivery_outbox SET status='pending' WHERE id=?").run(id);
+    })();
   }
 
   /** Go / Go-Checker supervision state (design: artifacts/lma-go-checker-design-20260917 §10). */
@@ -1269,7 +1333,8 @@ export class MessageStore {
     const result = this.db.prepare(`
       UPDATE delivery_outbox
       SET status = 'pending', updated_at = ?
-      WHERE bot_name = ? AND status = 'delivering'
+      WHERE bot_name = ? AND (status = 'delivering' OR status='failed' AND EXISTS(
+        SELECT 1 FROM delivery_operations o WHERE o.outbox_id=delivery_outbox.id AND o.state IN ('accepted','attempted','unknown')))
     `).run(Date.now(), botName);
     return result.changes;
   }

@@ -187,7 +187,7 @@ export class FeishuBot {
    *  batch's steered inputs (2026-10-16 audit B9). */
   private queueRunTokens: Map<string, object> = new Map();
   /** Go / Go-Checker supervision controller (per-bot instance). */
-  private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;chatId?:string;stage:string;ordinals:Map<string,number>;blocked?:boolean}>();
+  private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;chatId?:string;stage:string;ordinals:Map<string,number>;blocked?:boolean;persistenceError?:unknown}>();
   private readonly goReceiptApis = new WeakSet<object>();
   private installGoReceiptCapture(): void {
     const docx=(this.client as any).docx;
@@ -210,19 +210,25 @@ export class FeishuBot {
         context?.ordinals.set(context.stage,ordinal+1);
         const key=`outbox:${context?.outboxId}:${context?.stage}:${ordinal}`;
         const previous=context ? this.store.getDeliveryOperation(context.outboxId,key) : null;
+        const attemptRecord={payload:params.data,operation,visible};
         const save=(state:string,record:object={})=>{
+          record={...attemptRecord,...record};
           if(context) this.store.saveDeliveryOperation(context.outboxId,key,state,record);
           if(context?.goId) this.store.recordGoDeliveryOperation(context.goId,key,state as any,record);
         };
-        if(previous?.state==='rejected') {
+        if(previous?.state==='rejected' && !previous.retryable) {
           throw Object.assign(new Error(previous.message),{code:previous.code,response:{data:{code:previous.code,msg:previous.message}}});
         }
-        if(context?.blocked || context && this.store.hasUnknownDeliveryOperation(context.outboxId)) {
+        if(previous?.state!=='accepted' && (context?.blocked || context && this.store.hasUnknownDeliveryOperation(context.outboxId))) {
+          if(context?.persistenceError)throw context.persistenceError;
           if(context) context.blocked=true;
           throw new Error('Platform outcome unknown; retained without blind resend or fallback');
         }
         let result:any;
-        if(previous?.state==='accepted') result=previous.result;
+        if(previous?.state==='accepted') {
+          result=previous.result;
+          if(context){this.store.flushKnownDeliveryReceipts(context.outboxId);save('accepted',{...previous,state:undefined});}
+        }
         else {
           if(context) save('attempted');
           try {
@@ -243,12 +249,16 @@ export class FeishuBot {
             const status=err?.response?.status;
             if(context && !context.blocked) {
               if(Number.isFinite(Number(code)) && Number(code)>0 || Number.isInteger(status) && status>=400 && status<500) {
-                save('rejected',{code,message:err?.response?.data?.msg ?? err?.message ?? 'Platform rejected'});
+                save('rejected',{code,retryable:Number(code)===99991400 || status===429,message:err?.response?.data?.msg ?? err?.message ?? 'Platform rejected'});
               } else {save('unknown');context.blocked=true;}
             }
             throw error;
           }
-          if(context) save('accepted',{result,payload:visible ? params.data : undefined,operation});
+          if(context) {
+            const record={result,...attemptRecord};
+            try {this.store.rememberKnownDeliveryReceipt(context.outboxId,key,record);save('accepted',record);}
+            catch(error){context.blocked=true;context.persistenceError=error;throw error;}
+          }
         }
         const id=result?.data?.message_id ?? result?.message_id;
         if(visible && context && nonemptyReceipt(id)) {
@@ -3070,9 +3080,9 @@ export class FeishuBot {
     return promise;
   }
 
-  private scheduleDeliveryRetry(chatId: string, attempt: number): void {
+  private scheduleDeliveryRetry(chatId: string, attempt: number,local=false): void {
     if (this.deliveryRetryTimers.has(chatId)) return;
-    const delay = Math.min(30_000, DELIVERY_RETRY_BASE_MS * Math.max(1, 2 ** Math.max(0, attempt - 1)));
+    const delay = Math.min(local ? 300_000 : 30_000, DELIVERY_RETRY_BASE_MS * Math.max(1, 2 ** Math.min(16,Math.max(0, attempt - 1))));
     const timer = setTimeout(() => {
       this.deliveryRetryTimers.delete(chatId);
       void this.dispatchPendingDeliveries(chatId).catch((err) => {
@@ -3125,6 +3135,8 @@ export class FeishuBot {
         if (!item.id || !this.store.claimDelivery(item.id)) return;
         let failureStage: "text" | "attachment" | "cleanup" = "text";
         try {
+          this.store.flushKnownDeliveryReceipts(item.id);
+          this.store.registerPartialAttachmentContext(item.id);
           const job = deliveryJob;
           const provenance = JSON.parse(item.deliveryMetaJson || "{}").provenance;
           const goSource = `outbox:${item.id}`;
@@ -3241,9 +3253,17 @@ export class FeishuBot {
           if(failureStage==='text') {
             try {this.store.registerPartialBodyContext(item.id!);}catch{/* Durable operation receipts retain recoverable context custody. */}
           }
+          try {this.store.registerPartialAttachmentContext(item.id!);}catch{/* Confirmed payload remains in receipt custody. */}
           const activeJob = deliveryJob;
           if (activeJob && receipts.length) this.store.recordGoDeliveryReceipt(activeJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
+          const localFailure=String((err as any)?.code || '').startsWith('SQLITE_');
+          if(localFailure || this.store.hasUnknownDeliveryOperation(item.id!)) {
+            const failures=this.store.deferLocalDelivery(item.id!,localFailure ? 'local_checkpoint' : 'unknown_requires_audit');
+            retryScheduled=true;
+            this.scheduleDeliveryRetry(chatId,failures,true);
+            return;
+          }
           const willRetry = this.store.retryDelivery(item.id, DELIVERY_MAX_ATTEMPTS);
           if (willRetry) {
             retryScheduled = true;

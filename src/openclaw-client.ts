@@ -1217,7 +1217,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             // committed terminalReply can authorize another run's final text.
             if(evRunId && evRunId!==runId && (ev.stream==='chatFinal' || ev.stream==='chatError' || ev.stream==='lifecycle' && ['end','error'].includes(ev.data?.phase))) {
               if(ev.stream==='chatFinal' && ev.data?.gatewayYielded===true) continue;
-              if(ev.stream==='lifecycle' && ev.data?.phase==='end' && !text.trim() && !chatDeltaText.trim() && !transcriptAssistantText.trim()) continue;
               void checkRunState(()=>true,true);
               continue;
             }
