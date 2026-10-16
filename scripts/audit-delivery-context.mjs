@@ -10,6 +10,15 @@ if(args.includes('--register')) {
  const id=Number(value('--outbox')),chat=value('--chat');
  const ids=args.flatMap((x,i)=>x==='--verified-message-id'?[args[i+1]]:[]);
  if(!Number.isSafeInteger(id)||id<=0||!chat||!ids.length||ids.some(x=>!x))throw new Error('Registration requires exact bot/chat/outbox and independently verified actual platform message IDs. It never sends.');
+ // Refuse a wrong/non-LMA database BEFORE constructing a writable store or
+ // running any migration. Registration is for an existing exact delivered row.
+ const check=new Database(path,{readonly:true,fileMustExist:true});
+ try {
+  const tables=check.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('messages','delivery_outbox')").all();
+  if(tables.length!==2)throw new Error('Not an existing LMA outbox database; refusing all writes');
+  const row=check.prepare("SELECT id FROM delivery_outbox WHERE id=? AND bot_name=? AND chat_id=? AND status='delivered'").get(id,bot,chat);
+  if(!row)throw new Error('Exact delivered LMA bot/chat/outbox identity not found; refusing all writes');
+ }finally{check.close();}
  const store=new MessageStore(path);
  try {store.registerHistoricalDeliveryContext(id,bot,chat,ids);console.log(JSON.stringify({registered:true,outboxId:id,bot,chat,receipts:ids.length,resent:false}));}finally{store.close();}
 } else {

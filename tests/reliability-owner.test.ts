@@ -41,6 +41,12 @@ describe('owner and real-batch generation correctness',()=>{
   releaseStatus({status:'idle',running:false,idleConfirmed:true});await tick();expect(h.bot.queueRuns.get('chat')).toBe(owner);
   h.final('r2');await tick(300);await first.promise;
  });
+ it('session idle alone cannot expire an original run still queued without an exact terminal',async()=>{
+  const first=await start();h.client.steer=vi.fn(async(_s:any,_t:any,_d:any,id:any)=>({...acceptance(id,'pending'),reason:'target_not_ready'}));
+  h.client.getSessionRuntimeStatus=vi.fn(async()=>({status:'idle',running:false,idleConfirmed:true}));
+  const owner=h.bot.queueRuns.get('chat');await h.bot.handleMessage(event('B'));await tick();expect(h.bot.queueRuns.get('chat')).toBe(owner);expect(h.sends).toHaveLength(1);
+  h.final('r1');await tick(300);await first.promise;
+ });
  it('unknown/future activity states do not authorize owner expiration',async()=>{
   const first=await start();h.client.steer=vi.fn(async(_s:any,_t:any,_d:any,id:any)=>({...acceptance(id,'pending'),reason:'target_not_ready'}));
   h.client.getSessionRuntimeStatus=vi.fn(async()=>({running:false,status:'future_busy_state'}));

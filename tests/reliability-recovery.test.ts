@@ -3,6 +3,7 @@ import {mkdtempSync,readFileSync,rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join,resolve} from 'node:path';
 import {execFileSync} from 'node:child_process';
+import Database from 'better-sqlite3';
 import {MessageStore} from '../src/message-store.js';
 const KEY='agent:main:recovery';
 describe('LMA-owned recovery boundaries and explicit historical repair',()=>{
@@ -19,6 +20,10 @@ describe('LMA-owned recovery boundaries and explicit historical repair',()=>{
  it('stop generation prevents restoring old unsubmitted input after restart',()=>{
   const dir=mkdtempSync(join(tmpdir(),'lma-unsent-stop-'));const store=new MessageStore(join(dir,'db'));
   try {const id=store.insert({chatId:'chat',messageId:'A',senderType:'human',senderName:'u',content:'A',timestamp:1});store.bindDeliveryRun('Bot','chat','submission',{triggerId:id,triggerIds:[id],stopGeneration:0});store.saveAdmission(KEY,'submission','reserved',{});store.bumpStopGeneration('Bot','chat');expect(store.recoverUnsentReservations('Bot')).toBe(0);expect(store.getPendingTriggerIds('Bot','chat').size).toBe(0);}finally{store.close();rmSync(dir,{recursive:true,force:true});}
+ });
+ it('historical registration refuses a non-LMA database before migrations or writes',()=>{
+  const dir=mkdtempSync(join(tmpdir(),'lma-wrong-db-')),path=join(dir,'not-lma.db');const db=new Database(path);db.exec('CREATE TABLE unrelated_state(value TEXT)');db.close();
+  try {const before=readFileSync(path);expect(()=>execFileSync(process.execPath,[resolve('scripts/audit-delivery-context.mjs'),'--db',path,'--bot','Bot','--register','--outbox','1','--chat','chat','--verified-message-id','id'],{encoding:'utf8',stdio:'pipe'})).toThrow();expect(readFileSync(path)).toEqual(before);}finally{rmSync(dir,{recursive:true,force:true});}
  });
  it('historical preview is read-only; explicit exact registration is idempotent and has no transport',()=>{
   const dir=mkdtempSync(join(tmpdir(),'lma-history-preview-')),path=join(dir,'db');let store=new MessageStore(path);

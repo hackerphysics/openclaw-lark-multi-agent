@@ -1662,7 +1662,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    */
   async exactRunSettled(runId:string): Promise<boolean> {
     try {const r=await this.rpc('agent.wait',{runId,timeoutMs:1},2500);
-      return r?.runId===runId && !r.pendingError && !r.yielded && ['ok','error','timeout'].includes(r.status) && Number.isFinite(r.endedAt) && r.endedAt>0;
+      return r?.runId===runId && !r.pendingError && !r.yielded && ['ok','error','timeout'].includes(r.status) && Number.isFinite(r.endedAt) && r.endedAt>0 && (r.status!=='ok' || ['visible','silent','empty'].includes(r.terminalReply?.disposition));
     } catch {return false;}
   }
 
@@ -2469,7 +2469,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       assertCurrent();
       // A reservation/in_flight reply is not confirmed acceptance. Keep UI
       // Typing while exact collection/read-only receipt reconciliation proceeds.
-      if(result.status==='started' || result.status==='ok' || Number.isFinite(result.messageSeq)) await params.onSubmitted?.(result.runId);
+      if(result.status==='started' || result.status==='ok' || Number.isSafeInteger(result.messageSeq) && result.messageSeq>=0) await params.onSubmitted?.(result.runId);
       assertCurrent();
       if (params.onProgress) {
         this.progressCallbacks.set(sk, params.onProgress);

@@ -1354,7 +1354,8 @@ export class FeishuBot {
         let state:string=valid ? receipt.status : 'unknown';
         if(state==='pending' && receipt.attempted===false && receipt.reason==='target_not_ready' && runAtCheck===item.expectedRunId) {
           const status=await this.openclawClient.getSessionRuntimeStatus(item.sessionKey).catch(()=>null);
-          if(status?.idleConfirmed===true && this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck) {
+          const rootSettled=status?.idleConfirmed===true && await this.openclawClient.exactRunSettled?.(item.expectedRunId);
+          if(rootSettled===true && this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck) {
             // Positive idle + unchanged exact batch, and proven no injection
             // attempt. This input can explicitly move to the next ordinary turn.
             state='ordinary';

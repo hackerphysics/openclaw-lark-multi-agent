@@ -2706,6 +2706,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const run=await deferredRun(h,'idle-old');
       h.openclaw.steer=matchingSteer('pending',{attempted:false,reason:'target_not_ready'});
       (h.openclaw as any).getSessionRuntimeStatus=vi.fn(async()=>({status:'idle',running:false,idleConfirmed:true}));
+      (h.openclaw as any).exactRunSettled=vi.fn(async()=>true);
       await (h.bot as any).handleMessage(event({chatType:'p2p',text:'new task',messageId:'idle-new'}));
       await vi.waitUntil(()=>h.openclaw.chatCalls.length===2,{timeout:1500});run.resolve('late old');await run.first;
       await ((h.bot as any).queueRuns.get('chat1')||Promise.resolve());expect(h.openclaw.chatCalls[1].currentMessage).toBe('new task');
@@ -2752,6 +2753,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const run=await deferredRun(h,'old');const oldOwner=(h.bot as any).queueRuns.get('chat1');
       h.openclaw.steer=matchingSteer('pending',{attempted:false,reason:'target_not_ready'});
       (h.openclaw as any).getSessionRuntimeStatus=vi.fn(async()=>({status:'idle',running:false,idleConfirmed:true}));
+      (h.openclaw as any).exactRunSettled=vi.fn(async()=>true);
       await (h.bot as any).handleMessage(event({chatType:'p2p',text:'new',messageId:'new'}));
       await vi.waitUntil(()=>h.openclaw.chatCalls.length===2);expect((h.bot as any).queueRuns.get('chat1')).not.toBe(oldOwner);
       run.resolve('late');await run.first;expect(h.openclaw.chatCalls).toHaveLength(2);
