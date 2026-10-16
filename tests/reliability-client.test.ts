@@ -101,6 +101,12 @@ describe('exact-run collector and admission custody correctness',()=>{
   let settled=false;void old.promise.then(()=>settled=true);await vi.advanceTimersByTimeAsync(100);expect(settled).toBe(false);
   final('r1','complete authoritative final');await vi.advanceTimersByTimeAsync(50);expect(await old.promise).toEqual({text:'complete authoritative final'});
  });
+ it('reused progress callback reference still has generation-CAS cleanup after a late old result',async()=>{
+  const collect=c.collectReply.bind(c);let release:any,n=0;c.collectReply=vi.fn((...args:any[])=>++n===1?new Promise(r=>release=r):collect(...args));
+  const progress=vi.fn();const old=await send('old',{onProgress:progress}),newer=await send('new',{onProgress:progress});
+  release('old result');await vi.advanceTimersByTimeAsync(0);await old.promise;expect(c.progressCallbacks.get(KEY)).toBe(progress);
+  final('r2','new result');await vi.advanceTimersByTimeAsync(50);expect(await newer.promise).toEqual({text:'new result'});
+ });
  it.each([undefined,'future-disposition'])('unknown terminal metadata %s cannot promote an interim draft',async(disposition)=>{
   const old=await send('old');wire('agent',{runId:'r1',stream:'assistant',data:{delta:'unverified draft.'}});
   c.rpc=vi.fn(async()=>({runId:'r1',status:'ok',endedAt:Date.now(),terminalReply:disposition?{disposition}:undefined}));

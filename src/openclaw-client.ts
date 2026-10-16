@@ -109,6 +109,7 @@ export class OpenClawClient {
   private recentToolEventKeys: Map<string, number> = new Map();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: ProactiveMessageMeta) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
+  private progressGenerations=new Map<string,number>();
   /** Live collectReply fences per canonical session key. The most recent
    *  collector for a session owns the shared event bucket; a new batch (or a
    *  queue-custody revocation) fences stale ones synchronously so they cannot
@@ -2404,6 +2405,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     let ownedRunId = "";
     let waitPaused = false;
     try {
+      // New user inputs arriving after /stop are admitted only AFTER that
+      // authorized session-wide abort returns. They are not part of its cutoff.
+      const stopBarrier=this.pendingExplicitStops.get(fullSessionKey);
+      if(stopBarrier) await stopBarrier;
+      assertCurrent();
       const releaseChatSendSlot = await this.acquireChatSendSlot();
       let result: any;
       const sendStartedAt = Date.now();
@@ -2468,6 +2474,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if (params.onProgress) {
         this.progressCallbacks.set(sk, params.onProgress);
         this.progressCallbacks.set(fullSessionKey, params.onProgress);
+        this.progressGenerations.set(sk,generation);
+        this.progressGenerations.set(fullSessionKey,generation);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
       const reply=await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
@@ -2486,8 +2494,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // progress callback (the fence settles the old promise after the new
       // batch may already have registered its own callback).
       if (params.onProgress) {
-        if (this.progressCallbacks.get(sk) === params.onProgress) this.progressCallbacks.delete(sk);
-        if (this.progressCallbacks.get(fullSessionKey) === params.onProgress) this.progressCallbacks.delete(fullSessionKey);
+        if (this.progressGenerations.get(sk)===generation && this.progressCallbacks.get(sk) === params.onProgress) {this.progressCallbacks.delete(sk);this.progressGenerations.delete(sk);}
+        if (this.progressGenerations.get(fullSessionKey)===generation && this.progressCallbacks.get(fullSessionKey) === params.onProgress) {this.progressCallbacks.delete(fullSessionKey);this.progressGenerations.delete(fullSessionKey);}
       }
       if (waitPaused) this.releasePausedWait(ownedRunId);
       else this.releaseOwnedDeliveryRunAfter(ownedRunId, 30000);

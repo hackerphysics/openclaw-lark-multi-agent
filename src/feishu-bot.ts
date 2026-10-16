@@ -1722,7 +1722,7 @@ export class FeishuBot {
         this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, `${this.config.name}:${chatId}:${triggerId}:session-setup-failed`);
         if (mergedTriggerIds.length > 0) this.store.markSynced(this.config.name, chatId, Math.max(...mergedTriggerIds));
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
-        this.pendingAckMessages.set(chatId, pendingAcks.filter((ack) => !completedTriggerIdSet.has(ack.rowId)));
+        guard(); this.pendingAckMessages.set(chatId, pendingAcks.filter((ack) => !completedTriggerIdSet.has(ack.rowId)));
         break;
       }
 
@@ -1887,7 +1887,7 @@ export class FeishuBot {
               remainingAcks.push(ack);
             }
           }
-          this.pendingAckMessages.set(chatId, remainingAcks);
+          guard(); this.pendingAckMessages.set(chatId, remainingAcks);
           break;
         }
 
@@ -2020,7 +2020,7 @@ export class FeishuBot {
             remainingAcks.push(ack);
           }
         }
-        this.pendingAckMessages.set(chatId, remainingAcks);
+        guard(); this.pendingAckMessages.set(chatId, remainingAcks);
         // Steered messages admitted into THIS batch were consumed with it:
         // flip their Get → DONE alongside the batch's own triggers.
         // B9 (2026-10-16 audit): flip only THIS batch's admitted steer acks. A
@@ -2040,7 +2040,7 @@ export class FeishuBot {
             await this.receiptReaction(chatId,s.insertedId,s.messageId,'DONE',owner.runId);
           }
           const acksAfter = this.pendingAckMessages.get(chatId) || [];
-          this.pendingAckMessages.set(chatId, acksAfter.filter((a) => !admittedSteers.some((s) => a.messageId === s.messageId)));
+          guard(); this.pendingAckMessages.set(chatId, acksAfter.filter((a) => !admittedSteers.some((s) => a.messageId === s.messageId)));
         }
       } catch (err) {
         if (!current() || err instanceof SupersededObservation) {
@@ -2072,7 +2072,7 @@ export class FeishuBot {
           this.store.markMessagesSynced(this.config.name, chatId, mergedTriggerIds, `${this.config.name}:${chatId}:${triggerId}:wait-paused`);
           const acks = this.pendingAckMessages.get(chatId) || [];
           for (const ack of acks) if (completedTriggerIdSet.has(ack.rowId)) await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
-          this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
+          guard(); this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
           break;
         }
         if (err instanceof InactiveRunObservation) {
@@ -2081,7 +2081,7 @@ export class FeishuBot {
           if (!liveStatus?.id && lastHuman.messageId) await this.replyMessage(lastHuman.messageId, `ℹ️ ${err.message}`).catch(() => {});
           const acks = this.pendingAckMessages.get(chatId) || [];
           for (const ack of acks) if (completedTriggerIdSet.has(ack.rowId)) await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
-          this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
+          guard(); this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
           // No DONE/delivered mark and no replay of the old input. The new
           // pending trigger resumes after this queue owner's finally releases.
           break;
@@ -2103,13 +2103,14 @@ export class FeishuBot {
           // is a separate message that we mark interrupted afterwards.
           await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
             .then(() => {
-              if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+              if (current() && triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
             })
             .catch(() => {});
           await liveStatus?.fail().catch(() => {});
         } else {
           await liveStatus?.fail().catch(() => {});
         }
+        if(!current()) break;
         if (triggerId) {
           // At-most-once: if anything after send attempt failed, this batch has
           // already been marked/cleared by onSendAttempt. If failure happened
@@ -2129,7 +2130,7 @@ export class FeishuBot {
             remainingAcks.push(ack);
           }
         }
-        this.pendingAckMessages.set(chatId, remainingAcks);
+        guard(); this.pendingAckMessages.set(chatId, remainingAcks);
         break;
       } finally {
         if(current()) this.busyChats.set(chatId, 0);
@@ -4626,18 +4627,14 @@ export class FeishuBot {
       void this.reconcileReactions(chatId).catch(()=>{});
       this.store.stopInsertions(this.config.name,chatId);
       this.forceExpireQueueOwner(chatId,'explicit user stop');
-      // Abort all active runs for this session (chat.abort with no runId).
-      await this.openclawClient.abortChat(sessionKey).catch(() => {});
-      // Force-unlock the busy gate so queued messages can be processed.
-      this.busyChats.set(chatId, 0);
-      // Drop every pending trigger for this bot/chat so the stuck run is not retried.
-      const cleared = this.store.clearAllPendingTriggers(this.config.name, chatId);
-      // Clear stuck Typing/Get reactions on queued messages.
-      const acks = this.pendingAckMessages.get(chatId) || [];
-      for (const ack of acks) {
-        await this.receiptReaction(chatId,ack.rowId,ack.messageId,'').catch(()=>{});
-      }
-      this.pendingAckMessages.set(chatId, []);
+      // Capture/retire only pre-stop custody synchronously. A later user
+      // input must survive the abort RPC await and keep its own reaction list.
+      const cleared=this.store.clearAllPendingTriggers(this.config.name,chatId);
+      const acks=this.pendingAckMessages.get(chatId)||[];
+      this.pendingAckMessages.set(chatId,[]);
+      for(const ack of acks) void this.receiptReaction(chatId,ack.rowId,ack.messageId,'').catch(()=>{});
+      await this.openclawClient.abortChat(sessionKey).catch(()=>{});
+      if(!this.queueRuns.has(chatId)) this.busyChats.set(chatId,0);
       const locale = this.chatLocale(chatId);
       await this.replyMessage(messageId, locale === "en"
         ? `⏹️ Stopped. Aborted the active run, unlocked the queue, and cleared ${cleared} pending message(s). You can send a new message now.`

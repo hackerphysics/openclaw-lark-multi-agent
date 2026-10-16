@@ -87,6 +87,14 @@ describe('ordinary receipt-driven reactions',()=>{
   const base=h.client.rpc;h.client.rpc=vi.fn(async(m:string,p:any)=>m==='chat.send'?{runId:'r1',status:'in_flight'}:base(m,p));
   const pending=h.bot.handleMessage(event('A'));await tick();expect(h.bot.addReaction).not.toHaveBeenCalledWith('A','Get');h.final('r1');await tick(300);await pending;
  });
+ it('new user input during stop RPC survives the cutoff and waits for abort completion',async()=>{
+  const first=await start();let releaseAbort:any;const base=h.client.rpc;
+  h.client.rpc=vi.fn(async(m:string,p:any)=>m==='chat.abort'?await new Promise(r=>releaseAbort=()=>r({aborted:true,runIds:['r1']})):base(m,p));
+  const stopping=h.bot.handleStopCommand('chat','stop');await tick();const next=h.bot.handleMessage(event('new-after-stop'));await tick();
+  expect(h.sends).toHaveLength(1);expect(h.bot.addReaction).not.toHaveBeenCalledWith('new-after-stop','Get');
+  releaseAbort();await tick();await stopping;expect(h.sends).toHaveLength(2);expect(h.bot.addReaction).toHaveBeenCalledWith('new-after-stop','Get');
+  h.final('r2');await tick(300);await next;await first.promise;expect(h.bot.addReaction).toHaveBeenCalledWith('new-after-stop','DONE');
+ });
  it('failed reaction API is retried without rolling back accepted business custody',async()=>{
   h.bot.addReaction.mockRejectedValueOnce(new Error('UI unavailable'));const first=await start();await h.bot.reconcileReactions('chat');
   expect(h.bot.addReaction).toHaveBeenCalledWith('A','Get');expect(h.sends).toHaveLength(1);h.final('r1');await tick(300);await first.promise;
