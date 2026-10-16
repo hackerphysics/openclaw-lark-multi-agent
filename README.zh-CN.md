@@ -422,7 +422,9 @@ LMA 以 Gateway protocol 4 为基线，并使用 `openclaw@2026.8.2` 构建和�
 
 新版把模型元数据与模型覆盖允许列表分开。如果 `agents.defaults.modelPolicy.allow` 非空，LMA 配置中的每个模型都必须被该列表的精确模型引用或 `provider/*` 通配符允许。遇到拒绝时，LMA 会直接报告 model policy 错误，不再错误记录“模型已确保”。
 
-执行中插入的消息使用内置 `lma-steer` 插件。插件会解析当前 active embedded run，只有消息确实排入该 run 时才返回 `steered`。LMA 仍会保留本地 pending trigger，直到匹配的 `session.message` 确认消息已写入转录并被消费后才清除，同时把飞书标记从 Typing 切换为 Get。公开的 `chat.send { queueMode: "steer" }` 即使退化为稍后的普通 run 也只返回 `started`，因此不再把它当作实时插入成功的证据。插件不可用、没有 active run 或拒绝插入时，消息会安全保留在普通队列中，不会伪报已插入。
+执行中插入使用配套 **lma-core / protocol 2** 插件。入站先持久预留消息；短 submit/query RPC 加 paced 恢复调度会跨过 3/8 秒乃至小时级未 ready 等待，不按消息年龄放弃。插件真实调用公开 `queueAgentHarnessMessage(..., { onQueueAccepted })`，**只有 backend callback true 才 Get**；同步 boolean true 只是尝试。Get 不是模型已消费；callback 缺失、断线或未知尝试不可自动重发。只有确定从未 dispatch 给 backend、原 run 已明确结束且会话确认 idle 时，才明示交回普通队列唯一执行一次。
+
+安装入口为 `lma install-core-plugin`，旧 `lma install-steer-plugin` 现在是同一入口的兼容别名。通过支持的插件管理入口退役旧 standalone lma-steer/lma-go，避免重复 RPC owner。文件安装不等于运行生效；授权加载后应只读验证 `lma.steer.capabilities` 的 protocol 2 / durableAttempts / acceptanceCallback。`atomicRunBound:false` 如实披露：会话代际和 lifecycle 围栏不冒充 host 最终副作用处原 run CAS，但这不再成为禁用正常当前会话插入的自设前置。详见 [1.8.5 候选说明](docs/releases/1.8.5.md)。
 
 ## Live Status 与最终回复
 

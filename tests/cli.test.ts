@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync, chmodSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -47,6 +47,23 @@ describe("CLI", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it.each(['install-core-plugin','install-steer-plugin'])('%s installs coordinated callback plugin, not the retired boolean plugin',command=>{
+    const dir=mkdtempSync(join(tmpdir(),'lma-plugin-installer-'));
+    try {
+      // A local synthetic CLI captures arguments only. No real OpenClaw
+      // install/config/load or Gateway request is performed by this test.
+      const fake=join(dir,'fake-openclaw'),record=join(dir,'args.json');
+      writeFileSync(fake,`#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.LMA_INSTALL_TEST_RECORD,JSON.stringify(process.argv.slice(2)));\n`);
+      chmodSync(fake,0o755);
+      const out=run([command],{OPENCLAW_BIN:fake,LMA_INSTALL_TEST_RECORD:record});
+      const args=JSON.parse(readFileSync(record,'utf8'));
+      expect(args.slice(0,2)).toEqual(['plugins','install']);expect(args[2]).toBe(join(process.cwd(),'plugins','lma-core'));expect(args[3]).toBe('--force');
+      expect(out).toContain('not runtime activation proof');expect(out).toContain('lma.steer.capabilities');expect(out).not.toContain('"text":"ping"');
+      run([command,'--no-force'],{OPENCLAW_BIN:fake,LMA_INSTALL_TEST_RECORD:record});
+      expect(JSON.parse(readFileSync(record,'utf8'))).toHaveLength(3);
+    } finally {rmSync(dir,{recursive:true,force:true});}
   });
 
   it("install-steer-plugin reports a distinct 'could not start' error when the openclaw binary cannot be spawned", () => {

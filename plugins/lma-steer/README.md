@@ -1,3 +1,10 @@
+> **Legacy standalone plugin (retired from the 1.8.5 install path).**
+> Use the consolidated lma-core 0.2.0 callback/attempt journal protocol. The CLI
+> `lma install-steer-plugin` is now a compatibility alias for `install-core-plugin`.
+> Do not activate this legacy boolean-only plugin alongside lma-core. Its source
+> is retained for old-package history, not as the current receipt implementation.
+> Historical consumption/replay wording below describes the old version only.
+
 # lma-steer
 
 `lma-steer` provides observable mid-run insertion for

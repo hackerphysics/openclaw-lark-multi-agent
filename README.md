@@ -101,17 +101,24 @@ lma install-windows-service
 
 ### Real-time steering
 
-When the agent is mid-run and a new message arrives, the bridge calls the
-bundled `lma-steer` plugin. The plugin resolves the active embedded run and only
-returns `steered` after queueing the message into that run. LMA then retains its
-durable pending trigger until a matching `session.message` proves transcript
-commitment/consumption, and only then switches Feishu from Typing to Get.
+Mid-run messages use the coordinated **lma-core** plugin (protocol 2). Inputs
+are durably reserved before network work; a short submit/query RPC and paced
+recovery keep waiting beyond 3/8 seconds and hours of temporary non-readiness.
+The plugin actually uses public `queueAgentHarnessMessage` with the runtime's
+`onQueueAccepted` callback. **Only callback true permits Get**; SDK boolean true
+is an attempt, not acceptance. Get is backend acceptance, not model consumption.
+Missing callbacks/lost responses remain unknown and cannot be automatically
+replayed. Only a proven never-dispatched input whose original run truly ended
+can be explicitly handed to the ordinary queue once after confirmed idle.
 
-OpenClaw's public `chat.send { queueMode: "steer" }` returns `started` even when
-a message falls through to a later ordinary run, so LMA does not use that
-ambiguous response as proof of realtime insertion. If the plugin is unavailable,
-there is no active run, or injection is rejected, the message safely stays in
-the normal queue and is never falsely shown as inserted.
+Install the matching consolidated plugin with `lma install-core-plugin` (the
+old `install-steer-plugin` command is now an alias). Retire old standalone
+lma-steer/lma-go entries through supported plugin controls to avoid duplicate
+RPC owners. Installation is not activation proof: after authorized plugin load,
+check `lma.steer.capabilities` read-only for protocol 2 / durableAttempts true.
+`atomicRunBound` is honestly **false**: session generation and lifecycle fences
+are not a host final-effect original-run CAS; that stronger promise is not
+required to enable normal current-session inputs. See [1.8.5 notes](docs/releases/1.8.5.md).
 
 Useful CLI commands:
 
@@ -121,7 +128,7 @@ lma doctor
 lma start [config]
 lma init [--state-dir DIR] [--force]
 lma install-systemd [--user|--system] [--state-dir DIR]
-lma install-steer-plugin [--no-force]  # required for realtime mid-run insertion
+lma install-core-plugin [--no-force]   # coordinated persistent real-time insertion
 ```
 
 ## Quick start from source
@@ -471,11 +478,10 @@ when that list is non-empty. Exact refs and `provider/*` wildcards are accepted.
 LMA now surfaces a model-policy rejection instead of logging a false “model
 ensured” success.
 
-Mid-run messages use the bundled `lma-steer` plugin because public
-`chat.send { queueMode: "steer" }` cannot distinguish true in-run insertion from
-a later ordinary run. LMA keeps the durable trigger until `session.message`
-confirms consumption; this is also the signal for the visible Typing-to-Get
-transition. Without the plugin, messages remain safely queued.
+Mid-run insertion uses lma-core's durable backend callback receipts, not a
+boolean eligibility value or a text-matched transcript echo. Public
+`chat.send { queueMode: "steer" }` cannot distinguish live insertion from ordinary
+followup, so it is not used to manufacture a realtime-insertion receipt.
 
 ## Live status
 

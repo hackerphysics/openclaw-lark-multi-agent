@@ -24,7 +24,8 @@ Usage:
   ${CLI_NAME} init [--state-dir DIR] [--force]
   ${CLI_NAME} install-systemd [--user|--system] [--state-dir DIR] [--no-restart]
   ${CLI_NAME} install-windows-service [--state-dir DIR] [--no-start]
-  ${CLI_NAME} install-steer-plugin [--no-force]
+  ${CLI_NAME} install-core-plugin [--no-force]
+  ${CLI_NAME} install-steer-plugin [--no-force]  (compatibility alias)
   ${CLI_NAME} doctor [--state-dir DIR]
   ${CLI_NAME} --help
 
@@ -33,7 +34,7 @@ Examples:
   ${CLI_NAME} start ~/.openclaw/${APP_NAME}/config.json
   ${CLI_NAME} install-systemd --user
   ${CLI_NAME} install-windows-service
-  ${CLI_NAME} install-steer-plugin
+  ${CLI_NAME} install-core-plugin
 
 (The command is also available as \`${APP_NAME}\` for back-compat.)
 `);
@@ -209,27 +210,26 @@ function runCapture(cmd: string, args: string[]): { code: number; spawnError?: s
 }
 
 /**
- * Install the bundled lma-steer plugin used for observable realtime mid-run
- * insertion. LMA remains functional without it, but busy messages queue until
- * the active run completes.
+ * Install the coordinated consolidated plugin, including callback receipts.
+ * Keep the old command as an alias, not an installer for a retired boolean API.
  */
-function cmdInstallSteerPlugin(args: string[]) {
-  console.warn("Note: lma-steer is required for confirmed realtime mid-run insertion; without it, busy messages remain safely queued.");
+function cmdInstallCorePlugin(args: string[]) {
+  console.warn("Note: use the coordinated lma-core plugin for durable callback-confirmed insertion. Retire old lma-steer/lma-go entries through the supported plugin controls; do not load duplicate RPC owners.");
   // Default to --force so reinstalling an updated bundled plugin overwrites the
   // previously installed copy. Pass --no-force to keep an existing install.
   const noForce = hasFlag(args, "--no-force");
   hasFlag(args, "--force");
-  if (args.length > 0) throw new Error(`Unknown install-steer-plugin arguments: ${args.join(" ")}`);
-  // Resolve the bundled plugin dir relative to this CLI file: dist/cli.js -> ../plugins/lma-steer.
+  if (args.length > 0) throw new Error(`Unknown install-core-plugin arguments: ${args.join(" ")}`);
+  // Resolve the bundled plugin dir relative to this CLI file: dist/cli.js -> ../plugins/lma-core.
   const cliDir = dirname(fileURLToPath(import.meta.url));
-  const pluginDir = resolve(cliDir, "..", "plugins", "lma-steer");
+  const pluginDir = resolve(cliDir, "..", "plugins", "lma-core");
   if (!existsSync(resolve(pluginDir, "openclaw.plugin.json")) || !existsSync(resolve(pluginDir, "dist", "index.js"))) {
-    throw new Error(`bundled lma-steer plugin not found or not built at: ${pluginDir}`);
+    throw new Error(`bundled lma-core plugin not found or not built at: ${pluginDir}`);
   }
   const openclawBin = process.env.OPENCLAW_BIN || "openclaw";
   const installArgs = ["plugins", "install", pluginDir];
   if (!noForce) installArgs.push("--force");
-  console.log(`Installing lma-steer plugin from: ${pluginDir}`);
+  console.log(`Installing lma-core plugin from: ${pluginDir}`);
   const res = runCapture(openclawBin, installArgs);
   if (res.code !== 0) {
     if (res.spawnError) {
@@ -243,14 +243,14 @@ function cmdInstallSteerPlugin(args: string[]) {
       console.error(`\n"${openclawBin} plugins install" failed (exit ${res.code}).`);
       console.error(`Make sure the OpenClaw CLI is installed and on PATH (or set OPENCLAW_BIN),`);
     }
-    console.error(`then rerun: ${CLI_NAME} install-steer-plugin`);
+    console.error(`then rerun: ${CLI_NAME} install-core-plugin`);
     process.exit(res.code);
   }
-  console.log(`\nlma-steer plugin installed. Restart the OpenClaw gateway to load it, e.g.:`);
-  console.log(`  systemctl --user restart openclaw-gateway.service`);
-  console.log(`Then verify:`);
-  console.log(`  openclaw gateway call lma.steer --params '{"sessionKey":"test","text":"ping"}'`);
-  console.log(`  (expect {"status":"no_active_run"} for an idle session)`);
+  console.log(`\nlma-core files installed; this is not runtime activation proof.`);
+  console.log(`Load/reload with the Gateway's supported plugin control path, then verify the read-only capability endpoint:`);
+  console.log(`  openclaw gateway call lma.steer.capabilities --params '{}'`);
+  console.log(`  (expect protocol:2, durableAttempts:true, acceptanceCallback:true, atomicRunBound:false)`);
+
 }
 
 function cmdDoctor(args: string[]) {
@@ -271,7 +271,7 @@ async function main() {
   if (cmd === "init") return cmdInit(args);
   if (cmd === "install-systemd") return cmdInstallSystemd(args);
   if (cmd === "install-windows-service") return cmdInstallWindowsService(args);
-  if (cmd === "install-steer-plugin") return cmdInstallSteerPlugin(args);
+  if (cmd === "install-core-plugin" || cmd === "install-steer-plugin") return cmdInstallCorePlugin(args);
   if (cmd === "doctor") return cmdDoctor(args);
   if (cmd === "start") {
     const configPath = args[0] ? resolve(args[0]) : DEFAULT_CONFIG_PATH;
