@@ -150,3 +150,17 @@ describe('expanded exact recovery and own UI settlement',()=>{
   expect(h.store.getReactionIntent('Bot','chat',1).cleanupReceipts).toEqual([]);
  });
 });
+
+describe('recovered final platform-effect cutoff',()=>{
+ it('stop during recovered final status await forbids the later SDK operation and preserves stopped custody',async()=>{
+  const run=h.bot.handleMessage(event('A'));await tick();h.client.revokeSessionCollectors(h.key,'recovery takeover');await tick();await run;
+  await (FeishuBot.prototype as any).ensureSession.call(h.bot,'chat');h.client.releasePausedWait('r1');h.store.saveRunObservation(h.key,'r1',{},Date.now());
+  let release:any;h.bot.readSessionStatus=vi.fn(async()=>await new Promise(r=>release=r));
+  const base=h.client.rpc;h.client.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait'?{runId:p.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'old recovered result'}}:base(m,p));
+  const recovery=h.client.recoverExactRuns();await tick();expect(release).toBeTypeOf('function');
+  await h.bot.handleStopCommand('chat','stop');const calls=h.create.mock.calls.length;
+  release({});await recovery;await tick();
+  expect(h.create.mock.calls.length).toBe(calls);expect(h.store.runObservationState(h.key,'r1')).toBe('stopped');
+  expect(h.store.getDeliveryByKey('Bot','chat','trigger:1')?.status).not.toBe('delivered');
+ });
+});

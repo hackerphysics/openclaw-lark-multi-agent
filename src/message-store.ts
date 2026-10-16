@@ -238,7 +238,7 @@ export class MessageStore {
     return (this.db.prepare('SELECT state FROM run_observations WHERE session_key=? AND run_id=?').get(sessionKey,runId) as any)?.state;
   }
   stopSessionObservations(sessionKey:string):void {
-    this.db.prepare("UPDATE run_observations SET state='stopped' WHERE session_key=? AND state='observing'").run(sessionKey);
+    this.db.prepare("UPDATE run_observations SET state='stopped' WHERE session_key=? AND state IN ('observing','outbox_owned')").run(sessionKey);
   }
   settleExactRunReactions(sessionKey:string,runId:string):void {
     const targets=this.db.prepare('SELECT bot_name,chat_id FROM run_delivery_targets WHERE run_id=?').all(runId) as any[];

@@ -187,7 +187,7 @@ export class FeishuBot {
    *  batch's steered inputs (2026-10-16 audit B9). */
   private queueRunTokens: Map<string, object> = new Map();
   /** Go / Go-Checker supervision controller (per-bot instance). */
-  private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;chatId?:string;stage:string;ordinals:Map<string,number>;blocked?:boolean;persistenceError?:unknown}>();
+  private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;chatId?:string;stage:string;ordinals:Map<string,number>;blocked?:boolean;persistenceError?:unknown;effectGuard?:()=>void}>();
   private readonly goReceiptApis = new WeakSet<object>();
   private installGoReceiptCapture(): void {
     const docx=(this.client as any).docx;
@@ -231,6 +231,7 @@ export class FeishuBot {
             catch(error){context.blocked=true;context.persistenceError=error;throw error;}}
         }
         else {
+          context?.effectGuard?.();
           if(context) save('attempted');
           try {
             result=await original(params);
@@ -1715,7 +1716,7 @@ export class FeishuBot {
       // we snapshotted inside auto-retry instead, a /stop that landed during the
       // main run would already be baked into the baseline and go undetected —
       // that was the "stop then auto-retry anyway" bug.
-      const runStartStopEpoch = this.stopEpoch.get(chatId) || 0;
+      const runStartStopEpoch = this.stopGeneration(chatId);
       const mergedContent = mergedTriggers.map((m) => m.content).join("\n");
       const mergedTriggerIds = mergedTriggers.map((m) => m.id || 0).filter(Boolean);
       owner.triggerIds=new Set(mergedTriggerIds);
@@ -2829,6 +2830,7 @@ export class FeishuBot {
     errorNoticeId?: string,
   ): Promise<void> {
     if(provenance?.sessionKey && !/^agent:/.test(provenance.sessionKey)) provenance={...provenance,sessionKey:`agent:main:${provenance.sessionKey}`};
+    if(provenance?.sessionKey && provenance.runId && this.store.isStoppedObservation(provenance.sessionKey,provenance.runId))return;
     if(text.trim().toUpperCase()==='NO_REPLY') text='';
     if (!text.trim() && attachments.length === 0) return;
     const attachmentsJson = JSON.stringify(attachments);
@@ -2837,6 +2839,7 @@ export class FeishuBot {
     const finalDeliveryKey = deliveryKey || sourceId;
     const deliveryMetaJson = JSON.stringify({
       botIdentity:this.config.appId,
+      deliveryStopEpoch:this.stopGeneration(chatId),
       ...(finalReplyModel?.trim() ? { model: finalReplyModel.trim() } : {}),
       ...(provenance ? { provenance } : {}), ...(errorNoticeId ? { errorNoticeId } : {}),
     });
@@ -3147,7 +3150,14 @@ export class FeishuBot {
           ...this.store.listDeliveryReceipts(item.id!),
           ...(deliveryJob ? this.store.listGoVisibleEvidence(deliveryJob.id).find(e=>e.sourceKey===`outbox:${item.id}`)?.receipt?.messages ?? [] : []),
         ];
-        await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,chatId,stage:"body",ordinals:new Map(),onReceipt:()=>{
+        await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,chatId,stage:"body",ordinals:new Map(),effectGuard:()=>{
+          const meta=JSON.parse(item.deliveryMetaJson || '{}'),p=meta.provenance;
+          if((p?.final || item.sourceType==='run_error') &&
+            (typeof meta.deliveryStopEpoch==='number' && meta.deliveryStopEpoch!==this.stopGeneration(chatId) ||
+             p?.sessionKey && p.runId && this.store.isStoppedObservation(p.sessionKey,p.runId))) {
+            throw Object.assign(new Error('Delivery revoked by explicit stop before platform attempt'),{deliveryStopped:true});
+          }
+        },onReceipt:()=>{
           if(deliveryJob) this.store.recordGoDeliveryReceipt(deliveryJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
         }}, async () => {
         if (!item.id || !this.store.claimDelivery(item.id)) return;
@@ -3275,6 +3285,7 @@ export class FeishuBot {
           const activeJob = deliveryJob;
           if (activeJob && receipts.length) this.store.recordGoDeliveryReceipt(activeJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
+          if((err as any)?.deliveryStopped){this.store.markDeliveryFailed(item.id!);return;}
           const localFailure=String((err as any)?.code || '').startsWith('SQLITE_');
           if(localFailure || this.store.hasUnknownDeliveryOperation(item.id!)) {
             let custody=this.localDeliveryRetryCustody.get(chatId);
