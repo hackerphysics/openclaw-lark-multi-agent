@@ -120,6 +120,117 @@ export class MessageStore {
     this.db.pragma("journal_mode = WAL");
     this.init();
     this.initGoTables();
+    this.initReliabilityTables();
+  }
+
+  /** LMA-owned recovery journal. Never edits OpenClaw state. Unknown attempts
+   * remain durable and are never selected by the ordinary pending drain. */
+  private initReliabilityTables(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS run_observations (
+        session_key TEXT NOT NULL, run_id TEXT NOT NULL, record_json TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'observing', next_check_at INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(session_key,run_id));
+      CREATE TABLE IF NOT EXISTS insertion_custody (
+        bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,message_row_id INTEGER NOT NULL,
+        insertion_id TEXT UNIQUE NOT NULL,record_json TEXT NOT NULL,state TEXT NOT NULL,
+        next_check_at INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot_name,chat_id,message_row_id));
+      CREATE TABLE IF NOT EXISTS delivery_operations (
+        outbox_id INTEGER NOT NULL,operation_key TEXT NOT NULL,state TEXT NOT NULL,
+        record_json TEXT NOT NULL DEFAULT '{}',PRIMARY KEY(outbox_id,operation_key));
+      CREATE TABLE IF NOT EXISTS delivery_context (
+        outbox_id INTEGER NOT NULL,stage TEXT NOT NULL,message_row_id INTEGER,
+        PRIMARY KEY(outbox_id,stage));
+      CREATE TABLE IF NOT EXISTS platform_message_aliases (
+        message_id TEXT PRIMARY KEY,message_row_id INTEGER NOT NULL);
+    `);
+  }
+
+  saveRunObservation(sessionKey: string, runId: string, record: object, nextCheckAt = Date.now()): void {
+    this.db.prepare(`INSERT INTO run_observations VALUES(?,?,?,'observing',?)
+      ON CONFLICT(session_key,run_id) DO UPDATE SET record_json=excluded.record_json,next_check_at=excluded.next_check_at
+      WHERE run_observations.state='observing'`).run(sessionKey,runId,JSON.stringify(record),nextCheckAt);
+  }
+  finishRunObservation(sessionKey: string,runId: string,state = 'settled'): void {
+    this.db.prepare('UPDATE run_observations SET state=? WHERE session_key=? AND run_id=?').run(state,sessionKey,runId);
+  }
+  listRunObservations(sessionKey?: string, due = Date.now(), limit = 50): any[] {
+    return (this.db.prepare(`SELECT * FROM run_observations WHERE state='observing' AND next_check_at<=?
+      ${sessionKey ? 'AND session_key=?' : ''} ORDER BY next_check_at LIMIT ?`).all(due,...(sessionKey ? [sessionKey] : []),limit) as any[])
+      .map(r=>({...JSON.parse(r.record_json),sessionKey:r.session_key,runId:r.run_id}));
+  }
+  saveInsertion(bot: string,chat: string,row: number,id: string,state: string,record: object,next = Date.now()): void {
+    this.db.prepare(`INSERT INTO insertion_custody VALUES(?,?,?,?,?,?,?)
+      ON CONFLICT(bot_name,chat_id,message_row_id) DO UPDATE SET state=excluded.state,record_json=excluded.record_json,next_check_at=excluded.next_check_at
+      WHERE insertion_custody.state NOT IN ('stopped','committed')`).run(bot,chat,row,id,JSON.stringify(record),state,next);
+  }
+  getInsertion(bot: string,chat: string,row: number): any {
+    const r=this.db.prepare('SELECT * FROM insertion_custody WHERE bot_name=? AND chat_id=? AND message_row_id=?').get(bot,chat,row) as any;
+    return r ? {...JSON.parse(r.record_json),state:r.state,insertionId:r.insertion_id,rowId:r.message_row_id} : null;
+  }
+  listInsertions(bot: string,chat?: string): any[] {
+    return (this.db.prepare(`SELECT * FROM insertion_custody WHERE bot_name=? ${chat ? 'AND chat_id=?' : ''}
+      AND state NOT IN ('stopped','committed','ordinary') ORDER BY next_check_at LIMIT 100`).all(bot,...(chat ? [chat] : [])) as any[])
+      .map(r=>({...JSON.parse(r.record_json),state:r.state,insertionId:r.insertion_id,rowId:r.message_row_id,chatId:r.chat_id,nextCheckAt:r.next_check_at}));
+  }
+  isInsertionReserved(bot: string,chat: string,row: number): boolean {
+    const item=this.getInsertion(bot,chat,row);
+    return !!item && !['ordinary','stopped'].includes(item.state);
+  }
+  stopInsertions(bot: string,chat: string): void {
+    this.db.prepare("UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND state NOT IN ('committed','ordinary')").run(bot,chat);
+  }
+  hasUnknownDeliveryOperation(outbox:number): boolean {
+    return !!this.db.prepare("SELECT 1 FROM delivery_operations WHERE outbox_id=? AND state IN ('attempted','unknown') LIMIT 1").get(outbox);
+  }
+  listDeliveryReceipts(outbox:number): Array<{messageId:string;operation:string;payload:any;stage:string}> {
+    return (this.db.prepare("SELECT operation_key,record_json FROM delivery_operations WHERE outbox_id=? AND state='accepted'").all(outbox) as any[])
+      .map(r=>({...JSON.parse(r.record_json),stage:r.operation_key.split(':').slice(2,-1).join(':')}))
+      .filter(r=>r.result?.data?.message_id || r.result?.message_id)
+      .map(r=>({messageId:r.result?.data?.message_id || r.result?.message_id,operation:r.operation,payload:r.payload,stage:r.stage}));
+  }
+  getDeliveryOperation(outbox: number,key: string): any {
+    const r=this.db.prepare('SELECT * FROM delivery_operations WHERE outbox_id=? AND operation_key=?').get(outbox,key) as any;
+    return r ? {state:r.state,...JSON.parse(r.record_json)} : null;
+  }
+  saveDeliveryOperation(outbox: number,key: string,state: string,record: object = {}): void {
+    this.db.prepare(`INSERT INTO delivery_operations VALUES(?,?,?,?) ON CONFLICT(outbox_id,operation_key)
+      DO UPDATE SET state=excluded.state,record_json=excluded.record_json`).run(outbox,key,state,JSON.stringify(record));
+  }
+  /** Context registration and the corresponding payload checkpoint are one
+   * SQLite transaction. Receipt aliases deduplicate platform echoes by identity,
+   * not by text (two identical legitimate tasks must remain two tasks). */
+  confirmDeliveryStage(id: number,stage: string,content: string,receipts: Array<{messageId:string}>,checkpoint: 'text' | number): void {
+    this.db.transaction(()=>{
+      const item=this.db.prepare('SELECT * FROM delivery_outbox WHERE id=?').get(id) as any;
+      if(!item) throw new Error('Missing outbox identity');
+      if(!this.db.prepare('SELECT 1 FROM delivery_context WHERE outbox_id=? AND stage=?').get(id,stage)) {
+        const worthy=['assistant_visible','discussion','proactive'].some(k=>item.source_type.startsWith(k));
+        let row: number | null=null;
+        if(worthy && content.trim() && content.trim().toUpperCase()!=='NO_REPLY') {
+          const existing=receipts.map(r=>this.getMessageId(r.messageId)).find(Boolean);
+          row=existing ?? this.insert({chatId:item.chat_id,messageId:`lma:${JSON.stringify([item.bot_name,item.chat_id,item.delivery_key,stage])}`,
+            senderType:'bot',senderName:item.bot_name,content,timestamp:Date.now()});
+          if(row===-1) row=this.getMessageId(`lma:${JSON.stringify([item.bot_name,item.chat_id,item.delivery_key,stage])}`);
+          for(const receipt of receipts) if(row) this.db.prepare('INSERT OR IGNORE INTO platform_message_aliases VALUES(?,?)').run(receipt.messageId,row);
+        }
+        this.db.prepare('INSERT INTO delivery_context VALUES(?,?,?)').run(id,stage,row);
+      }
+      if(checkpoint==='text') this.markDeliveryTextDelivered(id);
+      else this.markDeliveryAttachmentCursor(id,checkpoint);
+    })();
+  }
+  /** Read-only preview. Historical text_delivered alone is not a receipt.
+   * Explicit repair requires supplied exact outbox+platform IDs, never resends. */
+  previewMissingDeliveryContext(bot: string,limit = 100): any[] {
+    return this.db.prepare(`SELECT d.id,d.chat_id,d.delivery_key,d.source_type,d.text_delivered,d.attachment_cursor
+      FROM delivery_outbox d WHERE bot_name=? AND status='delivered'
+      AND NOT EXISTS(SELECT 1 FROM delivery_context c WHERE c.outbox_id=d.id) ORDER BY d.id LIMIT ?`).all(bot,limit);
+  }
+  registerHistoricalDeliveryContext(id: number,bot: string,chat: string,messageIds: string[]): void {
+    const item=this.db.prepare("SELECT * FROM delivery_outbox WHERE id=? AND bot_name=? AND chat_id=? AND status='delivered'").get(id,bot,chat) as any;
+    if(!item || !messageIds.length || messageIds.some(x=>!x)) throw new Error('Exact delivered outbox and independently verified platform receipts required');
+    this.confirmDeliveryStage(id,'body',item.content,messageIds.map(messageId=>({messageId})),'text');
   }
 
   /** Go / Go-Checker supervision state (design: artifacts/lma-go-checker-design-20260917 §10). */
@@ -771,6 +882,7 @@ export class MessageStore {
    */
   insert(msg: ChatMessage): number {
     try {
+      if(this.db.prepare('SELECT 1 FROM platform_message_aliases WHERE message_id=?').get(msg.messageId)) return -1;
       const result = this.db.prepare(`
         INSERT INTO messages (chat_id, message_id, sender_type, sender_name, content, timestamp, trigger_kind)
         VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -784,7 +896,7 @@ export class MessageStore {
 
   getMessageId(messageId: string): number | null {
     const row = this.db.prepare(`SELECT id FROM messages WHERE message_id = ?`).get(messageId) as any;
-    return row?.id || null;
+    return row?.id || (this.db.prepare('SELECT message_row_id FROM platform_message_aliases WHERE message_id=?').get(messageId) as any)?.message_row_id || null;
   }
 
   getMessageByMessageId(messageId: string): ChatMessage | null {

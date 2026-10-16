@@ -7,7 +7,7 @@ import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve, sep } from "path";
 import { OpenClawConfig } from "./config.js";
-import { ChatMessage } from "./message-store.js";
+import { MessageStore, ChatMessage } from "./message-store.js";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 
 export type ProgressEvent =
@@ -156,6 +156,43 @@ export class OpenClawClient {
   private maintenanceConcurrency = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY || 1);
   private activeMaintenanceRpcs = 0;
   private maintenanceWaiters: Array<() => void> = [];
+
+  private observationEpoch = new Map<string, number>();
+  private stopGenerations = new Map<string, number>();
+  private recoveryStore?: MessageStore;
+  private recoveryTimer?: ReturnType<typeof setTimeout>;
+  private recoveryChecking = false;
+  private eventCollectors = new Set<() => void>();
+  /** One paced recovery scheduler for all persisted exact runs. No business
+   * replay, no per-run infinite timers, and each query has its own deadline. */
+  bindRecoveryStore(store: MessageStore): void { this.recoveryStore=store; this.scheduleRecovery(); }
+  private scheduleRecovery(): void {
+    if(this.recoveryTimer || !this.shouldReconnect || !this.recoveryStore) return;
+    this.recoveryTimer=setTimeout(()=>{this.recoveryTimer=undefined;void this.recoverExactRuns().finally(()=>this.scheduleRecovery());},30_000);
+    this.recoveryTimer.unref?.();
+  }
+  private async recoverExactRuns(): Promise<void> {
+    if(this.recoveryChecking || !this.recoveryStore) return;
+    this.recoveryChecking=true;
+    try {
+      for(const item of this.recoveryStore.listRunObservations(undefined,Date.now(),20)) {
+        if(!this.sessionMessageCallbacks.has(item.sessionKey) && !this.sessionMessageCallbacks.has(this.shortKey(item.sessionKey))) continue;
+        if(this.ownedDeliveryRuns.has(item.runId)) continue;
+        this.recoveryStore.saveRunObservation(item.sessionKey,item.runId,item,Date.now()+60_000);
+        try {
+          const snapshot=await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
+          if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError) continue;
+          const terminal=snapshot.terminalReply;
+          if(snapshot.status!=='ok' || !['visible','silent','empty'].includes(terminal?.disposition)) continue;
+          if(terminal.disposition==='visible' && typeof terminal.text==='string' && terminal.text.trim()) {
+            const callback=this.sessionMessageCallbacks.get(item.sessionKey) || this.sessionMessageCallbacks.get(this.shortKey(item.sessionKey));
+            await callback?.(terminal.text,{sessionKey:item.sessionKey,runId:item.runId,sessionId:item.sessionId,final:true});
+          }
+          this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+        } catch { /* Query failed, not the task. Leave exact custody in SQLite. */ }
+      }
+    } finally {this.recoveryChecking=false;}
+  }
 
   constructor(config: OpenClawConfig) {
     this.config = config;
@@ -316,6 +353,12 @@ export class OpenClawClient {
           }
         }
 
+        if (frame.type === "event" && ["agent", "chat"].includes(frame.event)) {
+          for(const wake of this.eventCollectors) wake();
+          // Bound disconnected/unobserved event buffers. Terminal recovery uses
+          // exact public agent.wait, never an unbounded transcript cache.
+          for(const [key,bucket] of this.agentEvents) if(bucket.length>2048) bucket.splice(0,bucket.length-2048);
+        }
         if (frame.type === "event" && ["agent", "chat", "session.message"].includes(frame.event)) {
           for (const observer of this.goEvidenceObservers) {
             try { observer({ channel: frame.event, payload: frame.payload }); }
@@ -359,6 +402,7 @@ export class OpenClawClient {
             });
           }
           this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId, frame.payload.sessionId);
+          for(const wake of this.eventCollectors) wake();
 
           // Tool calls in assistant messages — skip, using agent item events instead
           // (session.message toolCall events are batched, not real-time)
@@ -854,7 +898,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               ? terminal.text
               : terminal?.disposition === "silent" || terminal?.disposition === "empty"
                 ? "NO_REPLY"
-                : this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
+                : "";
+            if (!visible && terminal?.disposition !== "visible") return;
             resolve(visible || "NO_REPLY");
           } else if (snapshot.status === "error" || snapshot.status === "timeout") {
             if (snapshot.status === "timeout" || isWaitTimeout(String(snapshot.error || ""))) {
@@ -1017,24 +1062,14 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         // never deliver a reply on this connection, so stop waiting instead of
         // hanging until the idle timeout. Failing fast lets the bridge
         // release its busy lock so new messages are not stuck "waiting".
-        if (startedConnected && !this.connected) {
-          clearInterval(poller);
-          if (chatFinalTimer) clearTimeout(chatFinalTimer);
-          if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
-          if (replayInvalidTimer) clearTimeout(replayInvalidTimer);
-          if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
-          if (idleTimer) clearTimeout(idleTimer);
-          const salvaged = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
-          if (salvaged) { resolve(salvaged); return; }
-          reject(new Error("Gateway disconnected during run"));
-          return;
-        }
+        // A disconnect is an observation gap, not an execution failure. The
+        // connection resubscribes and the paced exact-run query reconciles it.
         // /stop force-abort: finish immediately instead of waiting for the
         // cancelled lifecycle to be treated as a transient state (idle timeout).
         if (sessionKey && (this.forceAbortedSessions.has(sessionKey) || this.forceAbortedSessions.has(shortSessionKey))) {
           this.forceAbortedSessions.delete(sessionKey);
           this.forceAbortedSessions.delete(shortSessionKey);
-          finish(text || chatDeltaText || chatFinalText || transcriptAssistantText || "NO_REPLY");
+          finish("NO_REPLY");
           return;
         }
         const bucketsToScan = sessionKey
@@ -1379,7 +1414,18 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           }
         }
       };
-      const poller = setInterval(collectEvents, 50);
+      let poller: ReturnType<typeof setTimeout>;
+      const poll = () => {
+        collectEvents();
+        if(!observationClosed) {
+          const quiet=Date.now()-(lastActivityAt || collectStartedAt);
+          poller=setTimeout(poll,!startedConnected || quiet<1000 ? 50 : quiet<10_000 ? 1000 : 30_000);
+          poller.unref?.();
+        }
+      };
+      poller=setTimeout(poll,50);
+      const wakeCollector=()=>{if(!observationClosed) collectEvents();};
+      this.eventCollectors.add(wakeCollector);
       const observationKey = targetSessionKey ? this.canonicalSessionKey(targetSessionKey) : "";
       const checkAfterNoActiveRun = async () => {
         await checkRunState();
@@ -1395,15 +1441,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         } catch { /* Unknown activity cannot authorize releasing an active owner. */ }
       };
       if (observationKey) this.runStateChecks.set(observationKey, checkAfterNoActiveRun);
-      // Bound local resources without cancelling an execution we cannot prove stuck.
-      const observationHorizon = setTimeout(() => reject(new Error(
-        "LMA 本地监听达到 24 小时上限，结果未确认；未发送停止请求，请检查原运行。"
-      )), 24 * 60 * 60_000);
-      observationHorizon.unref?.();
       cleanupObservation = () => {
         observationClosed = true;
         clearTimeout(idleTimer);
-        clearTimeout(observationHorizon);
+        this.eventCollectors.delete(wakeCollector);
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
         if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
@@ -1417,6 +1458,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // poller. The Gateway run is never aborted by fencing.
       const fenceSuperseded = () => {
         if (observationClosed) return;
+        // Atomic custody transfer BEFORE closing the old consumer; a final
+        // arriving in this tick is immediately eligible for exact proactive.
+        this.releasePausedWait(runId);
         cleanupObservation();
         reject(new SupersededObservation());
       };
@@ -1577,36 +1621,26 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    * and let LMA's durable trigger run normally after the current turn. Never use
    * the ambiguous public admission as a realtime-insertion success signal.
    */
-  async steer(sessionKey: string, text: string, displayText?: string): Promise<{
-    status: "steered" | "unavailable" | "no_active_run";
-    runId?: string;
-    /** Cancel provisional transcript correlation when LMA falls back to a normal run. */
-    cancelPending?: () => void;
+  async exactRunSettled(runId:string): Promise<boolean> {
+    try {const r=await this.rpc('agent.wait',{runId,timeoutMs:1},2500);
+      return r?.runId===runId && !r.pendingError && !r.yielded && ['ok','error','timeout'].includes(r.status) && Number.isFinite(r.endedAt) && r.endedAt>0;
+    } catch {return false;}
+  }
+
+  async steer(sessionKey: string,text: string,displayText?: string,identity?: {insertionId:string;expectedRunId:string;cancel?:boolean;queryOnly?:boolean}): Promise<{
+    status:'pending'|'accepted'|'rejected'|'unknown'|'target_changed'|'stopped'|'unavailable'|'no_active_run';
+    attempted?:boolean;sessionId?:string;reason?:string;insertionId?:string;expectedRunId?:string;
   }> {
-    const key = this.canonicalSessionKey(sessionKey);
-    // Consumption can arrive before the plugin RPC response at a tool boundary.
-    const cancelPending = this.registerPendingSteer(key, text, displayText);
+    if(!identity?.insertionId || !identity.expectedRunId) return {status:'pending',attempted:false,reason:'exact target not admitted yet'};
     try {
-      const res = await this.rpc("lma.steer", { sessionKey: key, text }, 10000);
-      if (res?.status !== "steered") {
-        // A locally busy collector can outlive the actual Gateway turn. Check
-        // its exact terminal record now, rather than parking input for 30 min.
-        if (res?.status === "no_active_run") await this.runStateChecks.get(key)?.();
-        if (res?.status && res.status !== "no_active_run") {
-          console.warn(`[OpenClaw] lma.steer ${res.status} for ${key.slice(-8)}`);
-        }
-        cancelPending();
-        // Pass the gateway's authoritative "no active run" verdict through: the
-        // caller uses it to detect a zombie queue owner (2026-10-15 incident).
-        if (res?.status === "no_active_run") return { status: "no_active_run" };
-        return { status: "unavailable" };
+      const result=await this.rpc('lma.steer',{sessionKey:this.canonicalSessionKey(sessionKey),text,...identity},2500);
+      if(result?.insertionId!==identity.insertionId || result?.expectedRunId!==identity.expectedRunId ||
+        !['pending','accepted','rejected','unknown','target_changed','stopped'].includes(result.status)) {
+        return {status:'unknown',attempted:true,reason:'Invalid or legacy plugin receipt; not replayed'};
       }
-      return { status: "steered", cancelPending };
-    } catch (err) {
-      cancelPending();
-      const message = (err as Error)?.message || String(err);
-      console.warn(`[OpenClaw] lma.steer unavailable for ${key.slice(-8)}: ${message}`);
-      return { status: "unavailable" };
+      return result;
+    } catch(error) {
+      return {status:'unknown',attempted:true,reason:'RPC result unknown; query same insertion identity only'};
     }
   }
 
@@ -1746,6 +1780,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    *  stale poller cannot steal the replacement batch's frames (2026-10-16). */
   revokeSessionCollectors(sessionKey: string, reason: string): number {
     const key = this.canonicalSessionKey(sessionKey);
+    this.observationEpoch.set(key,(this.observationEpoch.get(key)||0)+1);
     const fences = this.sessionCollectorFences.get(key);
     if (!fences || fences.size === 0) return 0;
     const count = fences.size;
@@ -1959,6 +1994,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     // chat.abort supports { sessionKey } with no runId to abort ALL active runs
     // for that session. Used by /stop to force-clear a stuck run.
     if (!runId) {
+      this.stopGenerations.set(key,(this.stopGenerations.get(key)||0)+1);
+      this.revokeSessionCollectors(key,'explicit stop');
+      for(const item of this.recoveryStore?.listRunObservations(key,Number.MAX_SAFE_INTEGER) || []) this.recoveryStore?.finishRunObservation(key,item.runId,'stopped');
       for (const [identity, at] of this.explicitlyStoppedRuns) if (Date.now() - at > 24 * 60 * 60_000) this.explicitlyStoppedRuns.delete(identity);
       // Mark the session so any in-flight collectReply finishes immediately
       // instead of treating the cancelled lifecycle as a transient state.
@@ -2298,31 +2336,30 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }): Promise<string> {
     const sk = this.shortKey(params.sessionKey);
     const fullSessionKey = this.canonicalSessionKey(params.sessionKey);
+    const generation=(this.observationEpoch.get(fullSessionKey)||0)+1;
+    this.observationEpoch.set(fullSessionKey,generation);
+    const stopGeneration=this.stopGenerations.get(fullSessionKey)||0;
+    const isCurrent=()=>this.observationEpoch.get(fullSessionKey)===generation && (this.stopGenerations.get(fullSessionKey)||0)===stopGeneration;
+    const assertCurrent=()=>{if(!isCurrent()) throw new SupersededObservation('admission generation revoked');};
     this.clearVerboseAssistantState(sk);
     let ownedRunId = "";
     let waitPaused = false;
     try {
-      // Drop stale buffered events for this session before starting a new run.
-      // This prevents an old final text (e.g. previous "ok") from being consumed by
-      // the next message while still allowing sessionKey matching for internal runIds.
-      this.agentEvents.set(fullSessionKey, []);
-      this.agentEvents.set(sk, []);
       const releaseChatSendSlot = await this.acquireChatSendSlot();
       let result: any;
       const sendStartedAt = Date.now();
       try {
-        // A stale collector from a previous batch must not steal this batch's
-        // frames from the shared session bucket (2026-10-16 regression). Fence
-        // any still-live local observation BEFORE issuing chat.send.
-        this.revokeSessionCollectors(sk, "new chat.send supersedes stale observation");
+        assertCurrent();
         await params.onSendAttempt?.();
-        const sendChat = () => this.rpc("chat.send", {
+        assertCurrent();
+        const idempotencyKey=randomUUID();
+        const sendChat = () => { assertCurrent(); return this.rpc("chat.send", {
           sessionKey: this.canonicalSessionKey(sk),
           message: params.message,
           attachments: params.attachments,
           deliver: params.deliver ?? false,
-          idempotencyKey: randomUUID(),
-        });
+          idempotencyKey,
+        }); };
         try {
           result = await sendChat();
         } catch (err) {
@@ -2339,17 +2376,31 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         releaseChatSendSlot();
       }
       ownedRunId = typeof result?.runId === "string" ? result.runId : "";
+      if(!ownedRunId) throw new Error('Unknown chat.send admission receipt; not replayed');
+      this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId});
+      if(this.isExplicitlyStoppedRun(fullSessionKey,ownedRunId) || (this.stopGenerations.get(fullSessionKey)||0)!==stopGeneration) {
+        this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId,'stopped');
+        throw new SupersededObservation('late stopped admission');
+      }
+      if(!isCurrent()) throw new SupersededObservation('late admission is not current');
+      // Commit replacement only AFTER confirmed admission. A failed new send
+      // must leave the healthy old collector and its custody intact.
+      const previous=this.sessionCollectorFences.get(fullSessionKey);
+      if(previous) for(const fence of [...previous]) fence();
       this.ownDeliveryRun(ownedRunId);
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       await params.onSubmitted?.(result.runId);
+      assertCurrent();
       if (params.onProgress) {
         this.progressCallbacks.set(sk, params.onProgress);
         this.progressCallbacks.set(fullSessionKey, params.onProgress);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      return await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
+      const reply=await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
+      this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
+      return reply;
     } catch (error) {
-      waitPaused = error instanceof SessionWaitPaused;
+      waitPaused = error instanceof SessionWaitPaused || error instanceof SupersededObservation;
       throw error;
     } finally {
       // OpenClaw can emit the final assistant session.message a moment after
@@ -2573,6 +2624,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
   async disconnect() {
     this.shouldReconnect = false;
+    if(this.recoveryTimer) clearTimeout(this.recoveryTimer);
+    this.recoveryTimer=undefined;
     for (const timer of this.suppressedSessionTimers.values()) clearTimeout(timer);
     this.suppressedSessionTimers.clear();
     this.suppressedSessions.clear();
