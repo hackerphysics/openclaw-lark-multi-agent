@@ -248,3 +248,14 @@ describe('terminal Gateway error envelope remains authoritative after foreground
   final('r2','B actual result');await tick(350);await b;
  });
 });
+
+describe('old exact transcript final is not suppressed by a new run stream',()=>{
+ it('A session.message-only final during B chat.delta keeps old durable delivery custody without borrowing B frames',async()=>{
+  await start();yieldRoot();await tick(100);activity={status:'done',hasActiveRun:false};const b=h.bot.handleMessage(event('B'));await tick(100);activity={status:'running',hasActiveRun:true};
+  wire('chat',{runId:'r2',state:'delta',deltaText:'B draft'});
+  wire('session.message',{runId:'r1',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'A exact transcript-only result'}]}});await tick(100);
+  expect(h.store.getDeliveryByKey('Bot','chat','trigger:1')?.content).toBe('A exact transcript-only result');
+  expect(h.store.getDeliveryByKey('Bot','chat',`trigger:${h.store.getMessageId('B')}`)).toBeNull();expect(h.client.eventCollectors.size).toBe(1);
+  final('r2','B final result');await tick(350);await b;expect(h.store.getDeliveryByKey('Bot','chat',`trigger:${h.store.getMessageId('B')}`)?.content).toBe('B final result');
+ });
+});
