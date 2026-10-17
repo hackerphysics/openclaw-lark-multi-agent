@@ -69,6 +69,12 @@ export interface DeliveryOutboxItem {
   updatedAt: number;
 }
 
+/** A resolved dispatcher promise is not a platform receipt. */
+export type DeliveryDispatchOutcome = {
+  state: "delivered" | "pending" | "unknown" | "failed" | "suppressed";
+  outboxIds: number[];
+};
+
 export interface PendingErrorNotice {
   botName: string;
   chatId: string;
@@ -251,7 +257,14 @@ export class MessageStore {
   isStoppedObservation(sessionKey:string,runId:string):boolean {
     return !!this.db.prepare("SELECT 1 FROM run_observations WHERE session_key=? AND run_id=? AND state='stopped'").get(sessionKey,runId);
   }
+  hasUnconfirmedRunDelivery(bot:string,chat:string,runId:string):boolean {
+    const rows=this.db.prepare(`SELECT delivery_key,source_type FROM delivery_outbox WHERE bot_name=? AND chat_id=?
+      AND json_extract(delivery_meta_json,'$.provenance.runId')=?`).all(bot,chat,runId) as any[];
+    const finals=rows.filter(row=>row.source_type.startsWith('assistant_visible'));
+    return (finals.length ? finals : rows).some(row=>this.getDeliveryDispatchOutcome(bot,chat,row.delivery_key).state!=='delivered');
+  }
   settleRunReactionIntents(bot:string,chat:string,runId:string):void {
+    if(this.hasUnconfirmedRunDelivery(bot,chat,runId)) return;
     this.db.prepare(`UPDATE insertion_custody SET state='committed' WHERE bot_name=? AND chat_id=? AND state='accepted'
       AND json_extract(record_json,'$.expectedRunId')=? AND json_extract(record_json,'$.stopEpoch')=?`)
       .run(bot,chat,runId,this.getStopGeneration(bot,chat));
@@ -351,6 +364,15 @@ export class MessageStore {
     return !!this.db.prepare(`SELECT 1 FROM delivery_operations o WHERE outbox_id=? AND state IN ('attempted','unknown')
       AND NOT EXISTS(SELECT 1 FROM delivery_receipt_custody k WHERE k.outbox_id=o.outbox_id AND k.operation_key=o.operation_key) LIMIT 1`).get(outbox);
   }
+  /** Includes non-visible uploads/doc creation: absence of a message_id is
+   * not proof that no SDK effect has been attempted or accepted. */
+  getDeliveryEffectState(outbox:number):'not_attempted'|'unknown'|'accepted'|'rejected' {
+    if(this.hasUnknownDeliveryOperation(outbox)) return 'unknown';
+    if([...this.knownDeliveryReceipts.values()].some(item=>item.outbox===outbox) ||
+      this.db.prepare(`SELECT 1 FROM delivery_operations WHERE outbox_id=? AND state='accepted'
+        UNION ALL SELECT 1 FROM delivery_receipt_custody WHERE outbox_id=? LIMIT 1`).get(outbox,outbox)) return 'accepted';
+    return this.db.prepare('SELECT 1 FROM delivery_operations WHERE outbox_id=? LIMIT 1').get(outbox) ? 'rejected' : 'not_attempted';
+  }
   /** Retain the full known result BEFORE the fallible main-journal checkpoint.
    * The memory copy survives local SQLite failures while this process is alive;
    * the independent insert journal also survives an interrupted UPDATE/reopen. */
@@ -385,7 +407,9 @@ export class MessageStore {
       this.db.prepare(`INSERT INTO delivery_local_obligations VALUES(?,1,?,?) ON CONFLICT(outbox_id)
         DO UPDATE SET failures=failures+1,reason=excluded.reason,updated_at=excluded.updated_at`).run(id,reason,Date.now());
       // Local persistence and unknown audit custody consume no platform retry budget.
-      this.db.prepare("UPDATE delivery_outbox SET status='pending',attempts=MAX(0,attempts-1),updated_at=? WHERE id=? AND status='delivering'").run(Date.now(),id);
+      this.db.prepare(`UPDATE delivery_outbox SET status='pending',
+        attempts=CASE WHEN status='delivering' THEN MAX(0,attempts-1) ELSE attempts END,updated_at=?
+        WHERE id=? AND status IN ('delivering','delivered')`).run(Date.now(),id);
       return (this.db.prepare('SELECT failures FROM delivery_local_obligations WHERE outbox_id=?').get(id) as any).failures;
     })();
   }
@@ -1302,6 +1326,29 @@ export class MessageStore {
     return rows.map((row) => this.mapDelivery(row));
   }
 
+  bindDeliveryCompletionTriggers(bot:string,chat:string,key:string,ids:number[]):void {
+    const row=this.getDeliveryByKey(bot,chat,key);
+    if(!row) return;
+    const meta=JSON.parse(row.deliveryMetaJson || '{}');
+    meta.completionTriggerIds=[...new Set([...(meta.completionTriggerIds || []),...ids])];
+    this.db.prepare('UPDATE delivery_outbox SET delivery_meta_json=? WHERE id=?').run(JSON.stringify(meta),row.id);
+  }
+
+  /** Include stable correction/supplement rows: the first accepted body alone
+   * cannot settle a logical final whose remaining attachments are unknown. */
+  getDeliveryDispatchOutcome(bot:string,chat:string,key:string):DeliveryDispatchOutcome {
+    const root=this.getDeliveryByKey(bot,chat,key);
+    const rows=[...(root ? [root] : []),...this.listDeliveriesByKeyPrefix(bot,chat,`${key}:`).filter(row=>
+      ['authoritative:','attachments:','recovery:'].some(kind=>row.deliveryKey.startsWith(`${key}:${kind}`)))];
+    const outboxIds=rows.map(row=>row.id!);
+    if(!rows.length) return {state:'unknown',outboxIds};
+    if(rows.some(row=>this.hasUnknownDeliveryOperation(row.id!))) return {state:'unknown',outboxIds};
+    const confirmed=rows.every(row=>row.status==='delivered' &&
+      (!row.content.trim() || this.listDeliveryReceipts(row.id!).some(r=>r.stage==='body')) &&
+      (JSON.parse(row.attachmentsJson || '[]') as unknown[]).every((_,i)=>this.listDeliveryReceipts(row.id!).some(r=>r.stage===`attachment:${i}`)));
+    return {state:confirmed ? 'delivered' : rows.some(row=>row.status==='failed') ? 'failed' : 'pending',outboxIds};
+  }
+
   getPendingDeliveries(chatId?: string, botName?: string, maxCount: number = 20): DeliveryOutboxItem[] {
     if (chatId && botName) {
       const rows = this.db.prepare(`
@@ -1465,9 +1512,10 @@ export class MessageStore {
   }
 
   markDeliveryDelivered(id: number): void {
-    this.db.prepare(`
-      UPDATE delivery_outbox SET status = 'delivered', updated_at = ? WHERE id = ?
-    `).run(Date.now(), id);
+    this.db.transaction(()=>{
+      this.db.prepare(`UPDATE delivery_outbox SET status = 'delivered', updated_at = ? WHERE id = ?`).run(Date.now(), id);
+      this.db.prepare('DELETE FROM delivery_local_obligations WHERE outbox_id=?').run(id);
+    })();
   }
 
   markDeliveryFailed(id: number): void {

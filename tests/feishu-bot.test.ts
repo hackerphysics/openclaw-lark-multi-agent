@@ -2316,7 +2316,8 @@ describe("FeishuBot routing and queue behavior", () => {
       const rowId = h.store.getMessageId("empty-reply")!;
       expect(h.store.getPendingTriggerIds("GLM", "chat1").has(rowId)).toBe(false);
       expect(h.store.getUnsyncedMessagesForBot("GLM", "chat1", rowId).map((m) => m.id)).not.toContain(rowId);
-      expect((h.bot as any).addReaction).toHaveBeenCalledWith("empty-reply", "DONE");
+      expect((h.bot as any).addReaction).not.toHaveBeenCalledWith("empty-reply", "DONE");
+      expect(h.store.hasDeliveredReply("GLM", "chat1", rowId)).toBe(false);
       expect(h.store.getChatInfo("chat1")).toBeTruthy();
     } finally { h.cleanup(); }
   });

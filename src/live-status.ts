@@ -54,11 +54,48 @@ export type LiveStatusFinalMeta = {
   noReply?: boolean;
 };
 
+/** Optional external presentation owner (e.g. the durable outbox). A local
+ * execution outcome is NOT a platform delivery receipt. Once handed off, late
+ * card effects request reconciliation from this owner instead of writing a
+ * compact done view over its possibly-unknown final payload. */
+export type LiveStatusTerminalOwner = {
+  onReconcileNeeded: (meta: LiveStatusFinalMeta) => void | Promise<void>;
+};
+
+/** The adapter MUST call run inside its ordered callback, immediately around
+ * the actual SDK invocation. Its receipt survives an outer queue deadline. */
+export type LiveStatusEffect<T> = {
+  run: (send: () => Promise<T>) => Promise<T | undefined>;
+};
+
+/** A transport/observation error is not proof that a platform effect failed. */
+export class LiveStatusEffectUnknownError extends Error {
+  constructor(readonly cause: unknown) {
+    super("live status effect outcome unknown");
+    this.name = "LiveStatusEffectUnknownError";
+  }
+}
+
+/** Only a definitive platform rejection is safe for the terminal retry loop. */
+export class LiveStatusEffectRejectedError extends Error {}
+
+type EditRequest = {
+  view: LiveStatusView;
+  generation: number;
+  priority: boolean;
+  force: boolean;
+  started: boolean;
+  settled: boolean;
+  accepted: boolean;
+  rejection?: LiveStatusEffectRejectedError;
+};
+
 export type LiveStatusCallbacks = {
   /** Create the status card; returns the new message id. */
-  create: (view: LiveStatusView) => Promise<string | undefined>;
-  /** Patch the existing status card. */
-  edit: (messageId: string, view: LiveStatusView) => Promise<void>;
+  create: (view: LiveStatusView, effect: LiveStatusEffect<string | undefined>) => Promise<string | undefined>;
+  /** Patch the existing status card. Reject with LiveStatusEffectRejectedError
+   * only for a definitive no-effect failure; all other rejection is unknown. */
+  edit: (messageId: string, view: LiveStatusView, effect: LiveStatusEffect<void>) => Promise<void>;
   warn?: (message: string, err?: unknown) => void;
 };
 
@@ -87,6 +124,16 @@ export class LiveStatusController {
   private tickTimer?: NodeJS.Timeout;
   private createPromise?: Promise<void>;
   private finalized = false;
+  private terminalOutcome = false;
+  private disposed = false;
+  private generation = 0;
+  /** Frozen/terminal presentation wins over every older progress snapshot. */
+  private pinnedView?: LiveStatusView;
+  private terminalOwner?: LiveStatusTerminalOwner;
+  private pendingEdit?: EditRequest;
+  private editPump?: Promise<void>;
+  /** Timed-out SDK effects retain receipt ownership, but must not be replayed. */
+  private unknownEdits = new Set<EditRequest>();
   private waitingForResult = false;
   private updatesFrozen = false;
   private disabled = false;
@@ -107,7 +154,7 @@ export class LiveStatusController {
   get id(): string | undefined { return this.messageId; }
 
   start(initialDetail?: string): void {
-    if (this.disabled || this.finalized || this.updatesFrozen || this.createTimer || this.messageId) return;
+    if (this.disabled || this.finalized || this.updatesFrozen || this.createTimer || this.createPromise || this.messageId) return;
     this.startedAt = Date.now();
     // Presentation may start before chat.send admission. Only the collector's
     // effective-activity idle decision (or confirmed yield) freezes this card;
@@ -169,9 +216,7 @@ export class LiveStatusController {
     this.waitingForResult = true;
     this.pushLine("lifecycle", detail);
     this.stopTimers();
-    if (this.createPromise) await this.createPromise.catch(() => {});
-    this.stopTimers();
-    if (this.messageId && !this.disabled) await this.safeEditFinal(this.buildView());
+    await this.finishView(this.buildView());
   }
 
   /** Release only local observation of a now-idle session, without claiming
@@ -181,34 +226,49 @@ export class LiveStatusController {
     this.pushLine("lifecycle", detail);
     this.finalized = true;
     this.stopTimers();
-    if (this.createPromise) await this.createPromise.catch(() => {});
-    if (!this.messageId || this.disabled) return;
     const view = this.buildView();
     view.title = title || (this.opts.locale === "en" ? `${this.opts.botName} result unconfirmed` : `${this.opts.botName} 结果未确认`);
-    await this.safeEditFinal(view);
+    await this.finishView(view);
   }
 
   async complete(): Promise<void> {
+    if (this.disposed || this.terminalOutcome) return;
+    this.terminalOutcome = true;
     this.state = "done";
     this.finalized = true;
     this.stopTimers();
-    if (this.createPromise) await this.createPromise.catch(() => {});
-    if (!this.messageId || this.disabled) return;
-    await this.safeEditFinal(this.buildView());
+    await this.finishView(this.buildView());
   }
 
   /**
    * Freeze any successful terminal state (text, attachment-only, or NO_REPLY)
    * without first emitting the compact done patch. The caller persists this
    * metadata in the outbox, which owns the final patch/cleanup. If no card was
-   * created, the caller falls back to normal new-message delivery.
+   * created, the caller falls back to normal new-message delivery. Metadata is
+   * a target/execution snapshot, never a receipt. B2/outbox callers that may own
+   * an unknown or same-card final should supply owner BEFORE attempting it;
+   * late IDs/stale effects then delegate reconciliation instead of patching.
    */
-  async prepareTerminalDelivery(noReply = false): Promise<LiveStatusFinalMeta | undefined> {
-    this.state = "done";
-    this.noReplyResult = noReply;
-    this.finalized = true;
+  async prepareTerminalDelivery(noReply = false, owner?: LiveStatusTerminalOwner): Promise<LiveStatusFinalMeta | undefined> {
+    if (this.disposed || (this.terminalOutcome && this.state !== "done")) return undefined;
+    if (owner) {
+      this.terminalOwner = owner;
+      this.generation++; // retire any queued controller-owned terminal effect
+      this.pendingEdit = undefined;
+    }
+    if (!this.terminalOutcome) {
+      this.terminalOutcome = true;
+      this.state = "done";
+      this.noReplyResult = noReply;
+      this.finalized = true;
+      this.pinView(this.buildView()); // retire queued progress before handing off
+    }
     this.stopTimers();
     if (this.createPromise) await this.createPromise.catch(() => {});
+    return this.finalMeta();
+  }
+
+  private finalMeta(): LiveStatusFinalMeta | undefined {
     if (!this.messageId) return undefined;
     return {
       messageId: this.messageId,
@@ -217,21 +277,21 @@ export class LiveStatusController {
       model: this.opts.model,
       thinkingLevel: this.opts.thinkingLevel,
       locale: this.opts.locale === "en" ? "en" : "zh",
-      noReply,
+      noReply: this.noReplyResult,
     };
   }
 
-  async prepareFinalDelivery(): Promise<LiveStatusFinalMeta | undefined> {
-    return this.prepareTerminalDelivery(false);
+  async prepareFinalDelivery(owner?: LiveStatusTerminalOwner): Promise<LiveStatusFinalMeta | undefined> {
+    return this.prepareTerminalDelivery(false, owner);
   }
 
   async fail(): Promise<void> {
+    if (this.disposed || this.terminalOutcome) return;
+    this.terminalOutcome = true;
     this.state = "failed";
     this.finalized = true;
     this.stopTimers();
-    if (this.createPromise) await this.createPromise.catch(() => {});
-    if (!this.messageId || this.disabled) return;
-    await this.safeEditFinal(this.buildView());
+    await this.finishView(this.buildView());
   }
 
   /**
@@ -240,18 +300,51 @@ export class LiveStatusController {
    * activity window, so the user understands the run finished without output.
    */
   async noReply(): Promise<void> {
+    if (this.disposed || this.terminalOutcome) return;
+    this.terminalOutcome = true;
     this.state = "done";
     this.noReplyResult = true;
     this.finalized = true;
     this.stopTimers();
-    if (this.createPromise) await this.createPromise.catch(() => {});
-    if (!this.messageId || this.disabled) return;
-    await this.safeEditFinal(this.buildView());
+    await this.finishView(this.buildView());
   }
 
   dispose(): void {
+    this.disposed = true;
     this.finalized = true;
+    this.generation++;
+    this.pendingEdit = undefined;
     this.stopTimers();
+  }
+
+  private pinView(view: LiveStatusView): void {
+    this.generation++;
+    this.pinnedView = view;
+    this.pendingEdit = undefined;
+  }
+
+  private async finishView(view: LiveStatusView): Promise<void> {
+    // Pin BEFORE awaiting creation: a create already in flight may finish late.
+    this.pinView(view);
+    if (this.createPromise) await this.createPromise.catch(() => {});
+    if (this.messageId && !this.disposed) await this.reconcilePinnedView();
+  }
+
+  private async reconcilePinnedView(force = false): Promise<void> {
+    if (!this.pinnedView || this.disposed) return;
+    if (!this.terminalOwner) {
+      await this.queueEdit(this.pinnedView, true, force);
+      return;
+    }
+    const meta = this.finalMeta();
+    if (!meta) return;
+    try {
+      // This is a custody signal, NOT retry authority. The owner must retain
+      // attempted/unknown effects and reconcile its own desired final payload.
+      await this.terminalOwner.onReconcileNeeded(meta);
+    } catch (err) {
+      this.callbacks.warn?.("live status external reconciliation failed (not replayed)", err);
+    }
   }
 
   /**
@@ -310,18 +403,37 @@ export class LiveStatusController {
   private async ensureCreated(): Promise<void> {
     if (this.disabled || this.finalized || this.messageId) return;
     const view = this.buildView();
-    try {
-      const id = await this.callbacks.create(view);
-      if (!id) {
-        this.disabled = true;
-        return;
-      }
+    let started = false;
+    let settled = false;
+    const accept = (id: string | undefined) => {
+      if (settled) return;
+      settled = true;
+      if (!id) { this.disabled = true; return; }
       this.messageId = id;
       this.lastSentSignature = this.signature(view);
-      this.startTicker();
+      if (this.pinnedView && !this.disposed) {
+        void this.reconcilePinnedView();
+      } else this.startTicker();
+    };
+    const effect: LiveStatusEffect<string | undefined> = {
+      run: async send => {
+        // A create waiting behind another chat send is no longer needed once
+        // the task finished. Do not create a stale running card at effect time.
+        if (this.finalized || this.updatesFrozen || this.disposed) { settled = true; return undefined; }
+        started = true;
+        const id = await send();
+        accept(id); // do not attach receipt ownership to the deadline promise
+        return id;
+      },
+    };
+    try {
+      const id = await this.callbacks.create(view, effect);
+      if (!settled) accept(id); // direct/non-queued callbacks remain supported
     } catch (err) {
-      this.disabled = true;
-      this.callbacks.warn?.("live status create failed", err);
+      // No duplicate create, including when the outer deadline expired. The
+      // original effect context still adopts a late successful message ID.
+      if (!started) this.disabled = true;
+      this.callbacks.warn?.("live status create failed (not replayed)", err);
     }
   }
 
@@ -336,58 +448,117 @@ export class LiveStatusController {
     this.tickTimer.unref?.();
   }
 
-  private async safeEdit(view: LiveStatusView, force = false): Promise<boolean> {
-    if (!this.messageId || this.disabled) return false;
-    if (!force && (this.finalized || this.updatesFrozen)) return false;
-    const sig = this.signature(view);
-    if (!force && sig === this.lastSentSignature) return true;
-    try {
-      await this.callbacks.edit(this.messageId, view);
-      this.lastSentSignature = sig;
-      this.consecutiveEditFailures = 0; // recovered
-      return true;
-    } catch (err) {
-      // A single transient Feishu error (e.g. card patch code=2200 "Internal
-      // Error", rate limit, network blip) must NOT permanently freeze the card.
-      // Skip this tick and keep the ticker running so the next patch recovers it.
-      // Only give up after several CONSECUTIVE failures (a persistent problem,
-      // e.g. the message was deleted or we truly lost access).
-      this.consecutiveEditFailures++;
-      const giveUp = this.consecutiveEditFailures >= MAX_CONSECUTIVE_EDIT_FAILURES;
-      this.callbacks.warn?.(
-        `live status edit failed (${this.consecutiveEditFailures}/${MAX_CONSECUTIVE_EDIT_FAILURES}${giveUp ? ", disabling" : ", will retry next tick"})`,
-        err,
-      );
-      if (giveUp) {
-        this.disabled = true;
-        this.stopTimers();
-      }
-      return false;
-    }
+  private async safeEdit(view: LiveStatusView): Promise<void> {
+    if (!this.messageId || this.disabled || this.finalized || this.updatesFrozen) return;
+    await this.queueEdit(view, false);
   }
 
-  /**
-   * Terminal edits (complete/fail/noReply) are one-shot — there is no next tick to
-   * recover them — so a transient Feishu error (code=2200 etc.) would leave the
-   * card stuck on "running". Retry the final patch a few times with small backoff
-   * so the card reliably reaches its terminal state.
-   */
-  private async safeEditFinal(view: LiveStatusView): Promise<void> {
-    if (!this.messageId || this.disabled) return;
-    const attempts = Math.max(1, MAX_CONSECUTIVE_EDIT_FAILURES);
-    for (let i = 0; i < attempts; i++) {
+  /** One flight + one latest pending snapshot, regardless of tick/event rate. */
+  private queueEdit(view: LiveStatusView, priority: boolean, force = false): Promise<void> {
+    if (!this.messageId || this.disposed || (priority && view !== this.pinnedView)
+      || (!priority && (this.disabled || this.finalized || this.updatesFrozen))) return Promise.resolve();
+    if (!priority) this.generation++;
+    this.pendingEdit = { view, generation: this.generation, priority, force, started: false, settled: false, accepted: false };
+    return this.flushEdits();
+  }
+
+  private canRunPendingEdit(): boolean {
+    const request = this.pendingEdit;
+    if (!request || this.disposed) return false;
+    // An unknown progress is not retried by ticking. A new terminal/frozen
+    // view may supersede it once; an unknown terminal is never blind retried.
+    return ![...this.unknownEdits].some(old => !request.priority
+      || (old.priority && old.generation >= request.generation));
+  }
+
+  private flushEdits(): Promise<void> {
+    if (this.editPump) return this.editPump;
+    // Start on a microtask so editPump is installed before callbacks/receipts
+    // can re-enter, including immediately resolved test/SDK implementations.
+    const pump = Promise.resolve().then(async () => {
+      while (this.canRunPendingEdit()) {
+        const request = this.pendingEdit!;
+        this.pendingEdit = undefined;
+        if (!request.force && this.signature(request.view) === this.lastSentSignature) continue;
+        await this.performEdit(request);
+      }
+    });
+    const owned: Promise<void> = pump.finally(() => {
+      if (this.editPump === owned) this.editPump = undefined;
+      // queueEdit can arrive after the loop's last check, while it still sees
+      // this flight. Hand runnable work to a NEW owner and adopt its promise:
+      // callers awaiting the old flight must also await the terminal handoff.
+      // Do not restart blocked unknown work: that would spin microtasks forever.
+      if (this.canRunPendingEdit()) return this.flushEdits();
+    });
+    this.editPump = owned;
+    return owned;
+  }
+
+  private async performEdit(request: EditRequest): Promise<void> {
+    const current = () => !this.disposed && request.generation === this.generation;
+    const accept = () => {
+      if (request.settled) return;
+      request.settled = true;
+      request.accepted = true;
+      this.unknownEdits.delete(request);
+      if (current()) {
+        this.lastSentSignature = this.signature(request.view);
+        this.consecutiveEditFailures = 0;
+      } else if (this.pinnedView && !this.disposed) {
+        // A deadline frees the ordered chain, not the SDK operation. If old
+        // progress applies AFTER done/frozen, repair it on this same card.
+        void this.reconcilePinnedView(true);
+      }
+      void this.flushEdits();
+    };
+    const effect: LiveStatusEffect<void> = {
+      run: async send => {
+        if (!current()) { request.settled = true; return; }
+        request.started = true;
+        try {
+          await send();
+          accept();
+        } catch (err) {
+          if (err instanceof LiveStatusEffectRejectedError) {
+            request.settled = true;
+            request.rejection = err;
+            this.unknownEdits.delete(request);
+            // A late definitive rejection also releases the unknown gate.
+            void this.flushEdits();
+          }
+          throw err;
+        }
+      },
+    };
+    const attempts = request.priority ? Math.max(1, MAX_CONSECUTIVE_EDIT_FAILURES) : 1;
+    for (let i = 0; i < attempts && current(); i++) {
       try {
-        await this.callbacks.edit(this.messageId, view);
-        this.lastSentSignature = this.signature(view);
+        await this.callbacks.edit(this.messageId!, request.view, effect);
+        if (!request.settled) accept(); // direct/non-queued callback
         return;
       } catch (err) {
-        const last = i === attempts - 1;
-        this.callbacks.warn?.(
-          `live status final edit failed (${i + 1}/${attempts}${last ? ", giving up" : ", retrying"})`,
-          err,
-        );
-        if (last) return;
-        await new Promise((r) => setTimeout(r, 300 * (i + 1)));
+        // The low-level receipt can beat this catch even if the outer race
+        // already chose its deadline. Never retain "unknown" after acceptance.
+        if (request.accepted) return;
+        const failure = request.rejection ?? err;
+        const unknown = !(failure instanceof LiveStatusEffectRejectedError);
+        if (unknown) {
+          this.unknownEdits.add(request);
+          this.callbacks.warn?.("live status edit outcome unknown (not replayed)", failure);
+          return;
+        }
+        this.consecutiveEditFailures++;
+        this.callbacks.warn?.("live status edit failed", failure);
+        if (request.priority && i + 1 < attempts) {
+          await new Promise(resolve => setTimeout(resolve, 300 * (i + 1)));
+          request.started = false;
+          request.settled = false;
+          request.rejection = undefined;
+        } else if (!request.priority && this.consecutiveEditFailures >= MAX_CONSECUTIVE_EDIT_FAILURES) {
+          this.disabled = true;
+          this.stopTimers();
+        }
       }
     }
   }
@@ -429,9 +600,9 @@ export class LiveStatusController {
     // the last few steps before the failure are visible for debugging.
     let lines: LiveStatusLine[];
     if (this.state === "running") {
-      lines = [...this.lines];
+      lines = this.lines.map(line => ({ ...line }));
     } else if (this.state === "failed") {
-      lines = [...this.lines, this.buildSummaryLine(en)];
+      lines = [...this.lines.map(line => ({ ...line })), this.buildSummaryLine(en)];
     } else {
       lines = [this.buildSummaryLine(en)];
     }

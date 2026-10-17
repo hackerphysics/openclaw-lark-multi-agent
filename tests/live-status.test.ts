@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { LiveStatusController, type LiveStatusView } from "../src/live-status.js";
+import { LiveStatusController, LiveStatusEffectRejectedError, type LiveStatusView } from "../src/live-status.js";
 
 describe("LiveStatusController (interactive card)", () => {
   it("freezes waiting-card updates while retaining a final one-time summary", async () => {
@@ -603,7 +603,7 @@ describe("LiveStatusController (interactive card)", () => {
       edit: vi.fn(async (_id, view) => {
         calls++;
         // Fail exactly once (simulating a transient Feishu code=2200), then recover.
-        if (calls === 2) throw new Error("code=2200 Internal Error");
+        if (calls === 2) throw new LiveStatusEffectRejectedError("code=2200 Internal Error");
         editOk.push(view);
       }),
     }, { botName: "Claude", delayMs: 0, tickMs: 1000 });
@@ -628,7 +628,7 @@ describe("LiveStatusController (interactive card)", () => {
     let editCalls = 0;
     const live = new LiveStatusController({
       create: vi.fn(async () => "msg1"),
-      edit: vi.fn(async () => { editCalls++; throw new Error("code=2200 Internal Error"); }),
+      edit: vi.fn(async () => { editCalls++; throw new LiveStatusEffectRejectedError("code=2200 Internal Error"); }),
       warn,
     }, { botName: "Claude", delayMs: 0, tickMs: 1000 });
 
@@ -655,7 +655,7 @@ describe("LiveStatusController (interactive card)", () => {
       edit: vi.fn(async (_id, view) => {
         if (view.state === "done") {
           completeAttempts++;
-          if (completeAttempts === 1) throw new Error("code=2200 Internal Error"); // first terminal patch fails
+          if (completeAttempts === 1) throw new LiveStatusEffectRejectedError("code=2200 Internal Error"); // first terminal patch fails
         }
         views.push(view);
       }),

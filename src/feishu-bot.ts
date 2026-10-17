@@ -8,10 +8,10 @@ import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient, InactiveRunObservation, AdmissionUnconfirmed } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { SupersededObservation } from "./openclaw-client.js";
-import { LiveStatusController, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
+import { LiveStatusController, LiveStatusEffectRejectedError, LiveStatusEffectUnknownError, type LiveStatusCallbacks, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { GoController } from "./go-controller.js";
-import { MessageStore, type PendingErrorNotice } from "./message-store.js";
+import { MessageStore, type PendingErrorNotice, type DeliveryDispatchOutcome } from "./message-store.js";
 import { errorIdentity, type ErrorVerdict, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { formatProviderError, safeErrorSummary } from "./provider-errors.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -19,6 +19,14 @@ import { basename, extname, join, resolve } from "path";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
+
+/** Observation deadline, never a claim that the underlying SDK was cancelled. */
+export class SendDeadlineError extends Error {
+  constructor(readonly chatId:string, readonly limit:number) {
+    super(`send deadline ${limit}ms exceeded for ${chatId.slice(-8)}`);
+    this.name='SendDeadlineError';
+  }
+}
 
 const nonemptyReceipt=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
 type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; collecting?:boolean; yielded?:boolean };
@@ -192,6 +200,12 @@ export class FeishuBot {
   /** Go / Go-Checker supervision controller (per-bot instance). */
   private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;chatId?:string;stage:string;ordinals:Map<string,number>;blocked?:boolean;persistenceError?:unknown;effectGuard?:()=>void}>();
   private readonly goReceiptApis = new WeakSet<object>();
+  private readonly sendEffectLeases = new AsyncLocalStorage<{expired:boolean}>();
+  /** A deadline releases the chat queue, NOT this exact operation's ownership. */
+  private readonly inFlightDeliveryWork = new Set<number>();
+  private assertSendEffectLease(chatId:string):void {
+    if(this.sendEffectLeases.getStore()?.expired) throw new SendDeadlineError(chatId,SEND_DEADLINE_MS);
+  }
   private installGoReceiptCapture(): void {
     const docx=(this.client as any).docx;
     const candidates=[
@@ -234,6 +248,7 @@ export class FeishuBot {
             catch(error){context.blocked=true;context.persistenceError=error;throw error;}}
         }
         else {
+          this.assertSendEffectLease(context?.chatId || '');
           context?.effectGuard?.();
           if(context) save('attempted');
           try {
@@ -521,7 +536,7 @@ export class FeishuBot {
           ? candidateTarget
           : undefined);
         try {
-          await this.enqueueAndDispatchDelivery(
+          const outcome = await this.enqueueAndDispatchDelivery(
             chatId,
             sourceType,
             this.deliverySourceId(sourceType === "verbose_transcript" ? "verbose" : "proactive", `${Date.now()}:${Math.random()}:${parsed.text.trim()}|${JSON.stringify(parsed.attachments)}`),
@@ -532,7 +547,7 @@ export class FeishuBot {
             sourceType === "verbose_transcript" ? undefined : this.config.model,
             meta,
           );
-          if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
+          if (outcome.state === "delivered" && sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
             await activeTarget?.liveStatus?.complete().catch(() => {});
             if (meta?.runId && runTarget) this.releaseRunDeliveryTargetAfter(chatId, meta.runId, 30_000);
           }
@@ -545,6 +560,7 @@ export class FeishuBot {
       }
     },async meta=>{
       if(!meta.runId || this.store.isStoppedObservation(`agent:main:${sessionKey.replace(/^agent:[^:]+:/,'')}`,meta.runId))return;
+      if(this.store.hasUnconfirmedRunDelivery(this.config.name,chatId,meta.runId)) return;
       this.store.settleRunReactionIntents(this.config.name,chatId,meta.runId);
       void this.reconcileReactions(chatId).catch(()=>{});
       const target=this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId,meta.runId));
@@ -2015,8 +2031,7 @@ export class FeishuBot {
         };
         liveStatus = this.shouldUseLiveStatus(chatId, isNativeCommandTrigger)
           ? new LiveStatusController({
-              create: (view) => this.sendOrdered(chatId, () => this.replyLiveStatusCard(lastHuman.messageId || "", view, chatId)),
-              edit: (messageId, view) => this.sendOrdered(chatId, () => this.patchLiveStatusCard(messageId, view, chatId)),
+              ...this.liveStatusCallbacks(chatId, lastHuman.messageId || ""),
               warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
             }, {
               botName: this.config.name,
@@ -2158,19 +2173,12 @@ export class FeishuBot {
           if (answerAlreadyOwned) {
             console.log(`[${this.config.name}] Empty-final cleanup skipped; trigger ${triggerId} already has an answer delivery`);
           } else {
-            await liveStatus?.noReply().catch(() => {});
+            await liveStatus?.pauseForUnconfirmedResult("尚未确认最终回复，保留原运行结果观察").catch(() => {});
           }
           console.warn(`[${this.config.name}] Empty reply for ${chatId.slice(-8)} trigger=${triggerId}; not replaying submitted message(s)`);
-          const pendingAcks = this.pendingAckMessages.get(chatId) || [];
-          const remainingAcks: typeof pendingAcks = [];
-          for (const ack of pendingAcks) {
-            if (completedTriggerIdSet.has(ack.rowId)) {
-              await this.receiptReaction(chatId,ack.rowId,ack.messageId,'DONE',foregroundRunId || owner.runId);
-            } else {
-              remainingAcks.push(ack);
-            }
-          }
-          guard(); this.pendingAckMessages.set(chatId, remainingAcks);
+          // Bare empty text carries no attributable terminal disposition. Exact
+          // silent/empty outcomes use NO_REPLY or the exact settlement callback.
+          // Retain acceptance reactions; neither a timeout nor empty string is DONE.
           break;
         }
 
@@ -2192,6 +2200,9 @@ export class FeishuBot {
         const shouldReply = trimmedReply.length > 0 && !explicitNoReply;
         const isRuntimeFailure = shouldReply && this.isRuntimeFailureText(trimmedReply);
 
+        const ownedVisibleDelivery=this.store.getDeliveryByKey(this.config.name,chatId,`trigger:${triggerId}`);
+        let visibleOutcomeConfirmed = explicitNoReply && !hasAttachments && (!ownedVisibleDelivery ||
+          this.store.getDeliveryDispatchOutcome(this.config.name,chatId,`trigger:${triggerId}`).state==='delivered');
         // Receipt-aware dispatcher owns all shared assistant context rows.
 
         // Wait for all pending tool event messages to be delivered first
@@ -2207,13 +2218,14 @@ export class FeishuBot {
         if ((shouldReply || hasAttachments) && lastHuman.messageId && !isRuntimeFailure) {
           if (triggerId && this.store.hasDeliveredReply(this.config.name, chatId, triggerId)) {
             console.warn(`[${this.config.name}] Reply already delivered, skip duplicate for ${chatId.slice(-8)} msgId=${triggerId}`);
+            visibleOutcomeConfirmed = true;
             await liveStatus?.complete().catch(() => {});
           } else {
             try {
               // Keep live status and final answer as separate messages. The final
               // answer is created at completion time so it remains at the bottom
               // even when the user inserted more messages during the run.
-              await this.enqueueAndDispatchDelivery(
+              const outcome = await this.enqueueAndDispatchDelivery(
                 chatId,
                 "assistant_visible",
                 this.deliverySourceId("visible", `${triggerId}|${(shouldReply ? visibleReply : "").trim()}|${JSON.stringify(parsedReply.attachments)}`),
@@ -2223,13 +2235,18 @@ export class FeishuBot {
                 `trigger:${triggerId}`,
                 this.config.model,
                 foregroundRunId ? {runId:foregroundRunId,sessionKey,...(foregroundSessionId ? {sessionId:foregroundSessionId} : {}),final:true} as ProactiveMessageMeta : undefined,
+                undefined,
+                mergedTriggerIds,
               );
-              await liveStatus?.complete();
-              // Mark every merged trigger as delivered so retries/restarts do
-              // not re-process any of them.
-              for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
-              // After a successful reply, warn the user once if context is high.
-              void this.maybeAlertHighContext(chatId);
+              visibleOutcomeConfirmed = outcome.state === 'delivered';
+              if (!visibleOutcomeConfirmed) {
+                await liveStatus?.pauseForUnconfirmedResult("飞书投递回执尚未确认；保留原投递保管，不重复发送").catch(() => {});
+              } else {
+                await liveStatus?.complete();
+                // Mark every merged trigger only after receipt confirmation.
+                for (const id of mergedTriggerIds) this.store.markDeliveredReply(this.config.name, chatId, id, lastHuman.messageId);
+                void this.maybeAlertHighContext(chatId);
+              }
               // Go supervision: record the delivered final reply as evidence and
               // arm a debounced checker round (busy gates apply inside).
               // Actual body/attachment receipts are recorded by dispatchPendingDeliveries.
@@ -2296,7 +2313,7 @@ export class FeishuBot {
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
         const remainingAcks: typeof pendingAcks = [];
         for (const ack of pendingAcks) {
-          if (completedTriggerIdSet.has(ack.rowId)) {
+          if (visibleOutcomeConfirmed && completedTriggerIdSet.has(ack.rowId)) {
             guard();
             await this.receiptReaction(chatId,ack.rowId,ack.messageId,'DONE',foregroundRunId || owner.runId);
           } else {
@@ -2314,7 +2331,7 @@ export class FeishuBot {
         if (allSteers.length > 0) {
           this.admittedSteerAcks.set(chatId, allSteers.filter((s) => s.batch !== batchToken));
         }
-        if (admittedSteers.length > 0) {
+        if (visibleOutcomeConfirmed && admittedSteers.length > 0) {
           for (const s of admittedSteers) {
             guard();
             const custody=this.store.getInsertion(this.config.name,chatId,s.insertedId);
@@ -2382,12 +2399,14 @@ export class FeishuBot {
         console.error(`[${this.config.name}] processQueue error:`, safeErrorSummary(err));
         this.fireRunFailureObservers(chatId);
         const errorText = this.formatUserVisibleError(err, chatId);
+        let errorOutcomeConfirmed = false;
         if (lastHuman.messageId) {
           // Error message goes through the normal delivery path; the live status
           // is a separate message that we mark interrupted afterwards.
           await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
-            .then(() => {
-              if (current() && triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
+            .then(outcome => {
+              errorOutcomeConfirmed = outcome.state === 'delivered';
+              if (errorOutcomeConfirmed && current() && triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
             })
             .catch(() => {});
           await liveStatus?.fail().catch(() => {});
@@ -2407,7 +2426,7 @@ export class FeishuBot {
         const pendingAcks = this.pendingAckMessages.get(chatId) || [];
         const remainingAcks: typeof pendingAcks = [];
         for (const ack of pendingAcks) {
-          if (completedTriggerIdSet.has(ack.rowId) && runAcceptedByOpenClaw) {
+          if (errorOutcomeConfirmed && completedTriggerIdSet.has(ack.rowId) && runAcceptedByOpenClaw) {
             guard();
             await this.receiptReaction(chatId,ack.rowId,ack.messageId,'DONE',foregroundRunId || owner.runId);
           } else {
@@ -2981,8 +3000,8 @@ export class FeishuBot {
           if (Date.now() - (this.lastRealDeliveryAt.get(chatId) || 0) < 90_000) return;
           if (status.running) { await this.sendWaitPaused(chatId, triggerId, replyToMessageId, new SessionWaitPaused(status, true)); return; }
         }
-        await this.enqueueAndDispatchDelivery(chatId, "delayed_error", `trigger:${triggerId}:delayed-error`, text, [], replyToMessageId, `trigger:${triggerId}:delayed-error`);
-        if (triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
+        const outcome = await this.enqueueAndDispatchDelivery(chatId, "delayed_error", `trigger:${triggerId}:delayed-error`, text, [], replyToMessageId, `trigger:${triggerId}:delayed-error`);
+        if (outcome.state === "delivered" && triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, replyToMessageId);
       })()
         .catch((err) => {
           console.warn(`[${this.config.name}] delayed failure delivery failed:`, (err as Error).message);
@@ -3024,17 +3043,19 @@ export class FeishuBot {
     finalReplyModel?: string,
     provenance?: ProactiveMessageMeta,
     errorNoticeId?: string,
-  ): Promise<void> {
+    completionTriggerIds?: number[],
+  ): Promise<DeliveryDispatchOutcome> {
     if(provenance?.sessionKey && !/^agent:/.test(provenance.sessionKey)) provenance={...provenance,sessionKey:`agent:main:${provenance.sessionKey}`};
-    if(provenance?.sessionKey && provenance.runId && this.store.isStoppedObservation(provenance.sessionKey,provenance.runId))return;
+    if(provenance?.sessionKey && provenance.runId && this.store.isStoppedObservation(provenance.sessionKey,provenance.runId))return {state:"suppressed",outboxIds:[]};
     if(text.trim().toUpperCase()==='NO_REPLY') text='';
-    if (!text.trim() && attachments.length === 0) return;
+    if (!text.trim() && attachments.length === 0) return {state:"suppressed",outboxIds:[]};
     const attachmentsJson = JSON.stringify(attachments);
     const normalizedPayload = `${text.trim()}|${attachmentsJson}`;
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
     const deliveryMetaJson = JSON.stringify({
       botIdentity:this.config.appId,
+      ...(completionTriggerIds?.length ? {completionTriggerIds} : {}),
       deliveryStopEpoch:this.stopGeneration(chatId),
       ...(finalReplyModel?.trim() ? { model: finalReplyModel.trim() } : {}),
       ...(provenance ? { provenance } : {}), ...(errorNoticeId ? { errorNoticeId } : {}),
@@ -3045,12 +3066,12 @@ export class FeishuBot {
       this.store.promoteExactRunFinal(this.config.name, chatId, identity.sessionKey, identity.runId, contentHash, text, attachmentsJson);
       if (!deliveryKey && this.store.hasExactRunFinalPayload(this.config.name, chatId, identity, text, attachmentsJson)) {
         await this.dispatchPendingDeliveries(chatId);
-        return;
+        return this.store.getDeliveryDispatchOutcome(this.config.name,chatId,finalDeliveryKey);
       }
     }
     if (sourceType === "verbose_transcript") {
-      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return;
-      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return;
+      if (this.store.hasRecentSimilarDelivery(this.config.name, chatId, contentHash, 60_000, ["verbose_transcript"])) return {state:"suppressed",outboxIds:[]};
+      if (this.store.hasRecentOverlappingDelivery(this.config.name, chatId, text, attachmentsJson, 60_000, 8, ["verbose_transcript"])) return {state:"suppressed",outboxIds:[]};
     }
     const deliveryId = this.store.enqueueDelivery({
       sessionKey: this.deliverySessionKey(chatId),
@@ -3067,6 +3088,7 @@ export class FeishuBot {
       targetMessageId: "",
       deliveryMetaJson,
     });
+    if(completionTriggerIds?.length) this.store.bindDeliveryCompletionTriggers(this.config.name,chatId,finalDeliveryKey,completionTriggerIds);
     if (deliveryId === null) {
       // Another path already owns this stable logical delivery (commonly the
       // proactive callback racing the chat-final path). Never show the full
@@ -3081,7 +3103,7 @@ export class FeishuBot {
           this.store.renewUnsentErrorDelivery(existing.id!, text, contentHash, deliveryMetaJson);
         }
         await this.dispatchPendingDeliveries(chatId);
-        return;
+        return this.store.getDeliveryDispatchOutcome(this.config.name,chatId,finalDeliveryKey);
       }
 
       // A failed owner must not permanently poison a logical trigger. Re-enqueue
@@ -3174,12 +3196,13 @@ export class FeishuBot {
 
       // Dispatch recovery/correction/supplement rows together in creation order.
       await this.dispatchPendingDeliveries(chatId, replyToMessageId);
-      return;
+      return this.store.getDeliveryDispatchOutcome(this.config.name,chatId,finalDeliveryKey);
     }
     await this.dispatchPendingDeliveries(chatId, replyToMessageId);
     if (sourceType === "assistant_visible" && (text.trim() || attachments.length > 0) && text.trim().toUpperCase() !== "NO_REPLY" && !this.isRuntimeFailureText(text.trim())) {
-      this.lastRealDeliveryAt.set(chatId, Date.now());
+      if(this.store.getDeliveryDispatchOutcome(this.config.name,chatId,finalDeliveryKey).state === "delivered") this.lastRealDeliveryAt.set(chatId, Date.now());
     }
+    return this.store.getDeliveryDispatchOutcome(this.config.name,chatId,finalDeliveryKey);
   }
 
   private async inspectErrorNotice(record: PendingErrorNotice): Promise<ErrorVerdict> {
@@ -3337,6 +3360,52 @@ export class FeishuBot {
       Number.isFinite(current.unknownSince) && Date.now()-current.unknownSince>=45_000;
   }
 
+  private deliveryDeadlineReason(id:number):string {
+    try {
+      const effect=this.store.getDeliveryEffectState(id);
+      return effect==='unknown' ? 'deadline_attempted_unknown' : effect==='accepted' ? 'deadline_after_acceptance' :
+        effect==='rejected' ? 'deadline_rejected' : 'deadline_before_attempt';
+    } catch {return 'deadline_local_checkpoint';}
+  }
+
+  /** Durable local obligation, separate from the platform retry budget. */
+  private retainLocalDelivery(chatId:string,id:number,reason:string):void {
+    let custody=this.localDeliveryRetryCustody.get(chatId);
+    if(!custody){custody=new Set();this.localDeliveryRetryCustody.set(chatId,custody);}
+    custody.add(id);
+    let failures=10;
+    try {failures=this.store.deferLocalDelivery(id,reason);custody.delete(id);}
+    catch { /* Process-local custody remains until SQLite is writable again. */ }
+    this.scheduleDeliveryRetry(chatId,failures,true);
+  }
+
+  private isDeliverySettlementRevoked(chatId:string,metadata?:string):boolean {
+    const meta=JSON.parse(metadata || '{}'),p=meta.provenance;
+    return typeof meta.deliveryStopEpoch==='number' && meta.deliveryStopEpoch!==this.stopGeneration(chatId) ||
+      !!(p?.sessionKey && p.runId && this.store.isStoppedObservation(p.sessionKey,p.runId));
+  }
+
+  /** Also runs for a late accepted SDK receipt, without replaying the final. */
+  private settleConfirmedDelivery(chatId:string,item:{deliveryKey:string;deliveryMetaJson?:string;replyToMessageId:string}):void {
+    const meta=JSON.parse(item.deliveryMetaJson || '{}'),p=meta.provenance;
+    if(this.isDeliverySettlementRevoked(chatId,item.deliveryMetaJson)) return;
+    const triggerKey=/^trigger:\d+(?=$|:authoritative:|:attachments:|:recovery:)/.exec(item.deliveryKey)?.[0];
+    if(!triggerKey && !meta.completionTriggerIds?.length) return;
+    const key=triggerKey || item.deliveryKey;
+    if(this.store.getDeliveryDispatchOutcome(this.config.name,chatId,key).state!=='delivered') return;
+    const root=this.store.getDeliveryByKey(this.config.name,chatId,key);
+    const rootMeta=JSON.parse(root?.deliveryMetaJson || '{}');
+    const triggerIds=rootMeta.completionTriggerIds || (triggerKey ? [Number(triggerKey.slice(8))] : []);
+    for(const id of triggerIds) this.store.markDeliveredReply(this.config.name,chatId,id,item.replyToMessageId);
+    if(p?.runId) {
+      this.store.settleRunReactionIntents(this.config.name,chatId,p.runId);
+      void this.reconcileReactions(chatId).catch(()=>{});
+      const target=this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId,p.runId));
+      // Never await the card's own sendOrdered link from inside this send link.
+      void target?.liveStatus?.complete().catch(()=>{});
+    }
+  }
+
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
     this.installGoReceiptCapture();
     for(const id of this.localDeliveryRetryCustody.get(chatId) || []) {
@@ -3348,6 +3417,9 @@ export class FeishuBot {
       const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
       if (pending.length === 0) break;
       for (const item of pending) {
+        if(this.inFlightDeliveryWork.has(item.id!)) {
+          retryScheduled=true;this.scheduleDeliveryRetry(chatId,10,true);continue;
+        }
         const notice=JSON.parse(item.deliveryMetaJson || '{}').insertionNotice;
         if(notice) {
           const info=await this.openclawClient.getSessionInfo(this.getSessionKey(chatId),1500).catch(()=>null);
@@ -3361,7 +3433,10 @@ export class FeishuBot {
           ...this.store.listDeliveryReceipts(item.id!),
           ...(deliveryJob ? this.store.listGoVisibleEvidence(deliveryJob.id).find(e=>e.sourceKey===`outbox:${item.id}`)?.receipt?.messages ?? [] : []),
         ];
-        await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,chatId,stage:"body",ordinals:new Map(),effectGuard:()=>{
+        this.inFlightDeliveryWork.add(item.id!);
+        try {
+        await this.sendOrdered(chatId, () => {
+        const work = this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,chatId,stage:"body",ordinals:new Map(),effectGuard:()=>{
           const meta=JSON.parse(item.deliveryMetaJson || '{}'),p=meta.provenance;
           if(!this.insertionNoticeCurrent(chatId,meta.insertionNotice))throw Object.assign(new Error('Insertion notice no longer current'),{deliveryStopped:true});
           if((p?.final || item.sourceType==='run_error') &&
@@ -3471,6 +3546,8 @@ export class FeishuBot {
           if (needsCleanup && item.targetMessageId) {
             failureStage = "cleanup";
             const meta = JSON.parse(item.deliveryMetaJson || "{}") as LiveStatusFinalMeta;
+            this.assertSendEffectLease(chatId);
+            this.goDeliveryReceipts.getStore()?.effectGuard?.();
             await this.patchLiveStatusDoneSummary(item.targetMessageId, meta, chatId);
             this.store.markDeliveryCleanupPending(item.id, false);
           }
@@ -3485,12 +3562,14 @@ export class FeishuBot {
             }
           }
           this.store.markDeliveryDelivered(item.id);
-          if(item.sourceType==='run_error' && provenance?.terminalEvidence?.state==='terminal' && provenance.runId && !provenance.runId.startsWith('announce:')) {
+          this.settleConfirmedDelivery(chatId,item);
+          const settlementCurrent = !this.isDeliverySettlementRevoked(chatId,item.deliveryMetaJson);
+          if(settlementCurrent && item.sourceType==='run_error' && provenance?.terminalEvidence?.state==='terminal' && provenance.runId && !provenance.runId.startsWith('announce:')) {
             this.store.settleRunReactionIntents(this.config.name,chatId,provenance.runId);
             if(provenance.sessionKey)this.store.finishRunObservation(provenance.sessionKey,provenance.runId);
             void this.reconcileReactions(chatId).catch(()=>{});
           }
-          if(provenance?.final && provenance.runId) {
+          if(settlementCurrent && provenance?.final && provenance.runId) {
             this.store.settleRunReactionIntents(this.config.name,chatId,provenance.runId);
             void this.reconcileReactions(chatId).catch(()=>{});
           }
@@ -3503,16 +3582,13 @@ export class FeishuBot {
           if (activeJob && receipts.length) this.store.recordGoDeliveryReceipt(activeJob.id,`outbox:${item.id}`,{messages:receipts,partial:true});
           if (this.isOutOfChatError(err)) this.markCurrentBotUnavailable(chatId, err);
           if((err as any)?.deliveryStopped){this.store.markDeliveryFailed(item.id!);return;}
-          const localFailure=String((err as any)?.code || '').startsWith('SQLITE_');
+          const localFailure=String((err as any)?.code || '').startsWith('SQLITE_') || this.goDeliveryReceipts.getStore()?.persistenceError === err;
+          if(err instanceof SendDeadlineError) {
+            this.retainLocalDelivery(chatId,item.id!,this.deliveryDeadlineReason(item.id!));retryScheduled=true;return;
+          }
           if(localFailure || this.store.hasUnknownDeliveryOperation(item.id!)) {
-            let custody=this.localDeliveryRetryCustody.get(chatId);
-            if(!custody){custody=new Set();this.localDeliveryRetryCustody.set(chatId,custody);}
-            custody.add(item.id!);
-            let failures=10;
-            try {failures=this.store.deferLocalDelivery(item.id!,localFailure ? 'local_checkpoint' : 'unknown_requires_audit');custody.delete(item.id!);}
-            catch {/* Retry custody remains live even if SQLite cannot record it yet. */}
+            this.retainLocalDelivery(chatId,item.id!,localFailure ? 'local_checkpoint' : 'unknown_requires_audit');
             retryScheduled=true;
-            this.scheduleDeliveryRetry(chatId,failures,true);
             return;
           }
           const willRetry = this.store.retryDelivery(item.id, DELIVERY_MAX_ATTEMPTS);
@@ -3547,7 +3623,16 @@ export class FeishuBot {
             console.warn(`[${this.config.name}] Failed to notify terminal delivery error:`, this.errorSummary(notifyErr));
           }
         }
-        }));
+        });
+        return work.finally(() => { this.inFlightDeliveryWork.delete(item.id!); });
+        });
+        } catch(err) {
+          if(!(err instanceof SendDeadlineError)) {this.inFlightDeliveryWork.delete(item.id!);throw err;}
+          // The old promise is still alive. Reconciliation must not claim this
+          // outbox again until it settles; attempted unknown stays no-resend.
+          this.retainLocalDelivery(chatId,item.id!,this.deliveryDeadlineReason(item.id!));
+          retryScheduled=true;
+        }
       }
       // Drain subsequent pages immediately after successful batches. If any row
       // was returned to pending, honor its backoff timer instead of hot-looping.
@@ -3658,8 +3743,7 @@ export class FeishuBot {
     const liveStatusEnabled = this.store.getBotLiveStatus(this.config.name, chatId) && !this.store.getBotVerbose(this.config.name, chatId);
     const liveStatus = liveStatusEnabled
       ? new LiveStatusController({
-          create: (view) => this.sendOrdered(chatId, () => this.sendLiveStatusCard(chatId, view)),
-          edit: (messageId, view) => this.sendOrdered(chatId, () => this.patchLiveStatusCard(messageId, view, chatId)),
+          ...this.liveStatusCallbacks(chatId),
           warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, err instanceof Error ? err.message : err),
         }, {
           botName: this.config.name,
@@ -3718,12 +3802,13 @@ export class FeishuBot {
       const roundMarker = `—— 第 ${meta.round}/${meta.maxRounds} 轮 · ${this.config.name}`;
       displayReply = `${displayReply}\n\n${roundMarker}`;
     }
+    let discussionDeliveryConfirmed = false;
     if (isVisible || parsedReply.attachments.length > 0) {
       const storedContent = [displayReply, ...parsedReply.attachments.map((a: BridgeAttachment) => `[Attachment: ${a.type || "file"} ${a.path}]`)]
         .filter(Boolean)
         .join("\n");
       try {
-        await this.enqueueAndDispatchDelivery(
+        const outcome = await this.enqueueAndDispatchDelivery(
           chatId,
           "discussion",
           `discussion:${Date.now()}:${Math.random().toString(36).slice(2)}`,
@@ -3733,6 +3818,8 @@ export class FeishuBot {
           undefined,
           this.config.model,
         );
+        discussionDeliveryConfirmed=outcome.state==='delivered';
+        if(!discussionDeliveryConfirmed) await liveStatus?.pauseForUnconfirmedResult("飞书投递回执尚未确认；原投递仍受保管").catch(()=>{});
       } catch (err) {
         await liveStatus?.fail().catch(() => {});
         throw err;
@@ -3741,11 +3828,12 @@ export class FeishuBot {
     // Mirror the normal path: a NO_REPLY/empty discussion turn should finish the
     // status card with a "no content" summary, not a plain done summary.
     if (!isVisible && parsedReply.attachments.length === 0) {
-      await liveStatus?.noReply().catch(() => {});
-    } else {
+      if(rawVisibleReply.toUpperCase()==='NO_REPLY') await liveStatus?.noReply().catch(() => {});
+      else await liveStatus?.pauseForUnconfirmedResult("尚未确认最终回复").catch(()=>{});
+    } else if(discussionDeliveryConfirmed) {
       await liveStatus?.complete().catch(() => {});
     }
-    return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible };
+    return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible && discussionDeliveryConfirmed };
   }
 
   private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
@@ -3821,6 +3909,28 @@ export class FeishuBot {
     return String(text || "").replace(/</g, "\uff1c").replace(/>/g, "\uff1e");
   }
 
+  /** Keep receipt ownership below sendOrdered's Promise.race. Nothing here
+   * changes business-message/outbox ordering or retries. */
+  private liveStatusCallbacks(chatId: string, replyTo?: string): LiveStatusCallbacks {
+    const send = async <T>(fn: () => Promise<T>): Promise<T> => {
+      try { return await fn(); }
+      catch (err) {
+        if (err instanceof LiveStatusEffectRejectedError) throw err;
+        const code = (err as any)?.response?.data?.code ?? (err as any)?.data?.code;
+        if (typeof code === "number" && code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${code}`);
+        // Network/SDK failures may follow an accepted effect. They are NOT
+        // eligible for automatic retry, unlike a definitive platform rejection.
+        throw new LiveStatusEffectUnknownError(err);
+      }
+    };
+    return {
+      create: (view, effect) => this.sendOrdered(chatId, () => effect.run(() => send(() => replyTo !== undefined
+        ? this.replyLiveStatusCard(replyTo, view, chatId)
+        : this.sendLiveStatusCard(chatId, view)))),
+      edit: (id, view, effect) => this.sendOrdered(chatId, () => effect.run(() => send(() => this.patchLiveStatusCard(id, view, chatId)))),
+    };
+  }
+
   private async sendLiveStatusCard(chatId: string, view: LiveStatusView): Promise<string | undefined> {
     try {
       const res = await this.client.im.message.create({
@@ -3831,6 +3941,8 @@ export class FeishuBot {
           msg_type: "interactive",
         },
       });
+      if (typeof res.code === "number" && res.code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${res.code}`);
+      if (res.code !== 0) throw new LiveStatusEffectUnknownError(new Error("Feishu card receipt missing code"));
       this.store.clearBotUnavailableInChat(this.config.name, chatId);
       return (res as any)?.data?.message_id || (res as any)?.message_id;
     } catch (err) {
@@ -3847,14 +3959,18 @@ export class FeishuBot {
         msg_type: "interactive",
       },
     } as any);
+    if (typeof res.code === "number" && res.code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${res.code}`);
+    if (res.code !== 0) throw new LiveStatusEffectUnknownError(new Error("Feishu card receipt missing code"));
     return (res as any)?.data?.message_id || (res as any)?.message_id;
   }
 
   private async patchLiveStatusCard(messageId: string, view: LiveStatusView, chatId?: string): Promise<void> {
-    await this.client.im.message.patch({
+    const res = await this.client.im.message.patch({
       path: { message_id: messageId },
       data: { content: JSON.stringify(this.buildLiveStatusCard(view, chatId)) },
     } as any);
+    if (typeof res.code === "number" && res.code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${res.code}`);
+    if (res.code !== 0) throw new LiveStatusEffectUnknownError(new Error("Feishu card receipt missing code"));
   }
 
   /**
@@ -4483,8 +4599,10 @@ export class FeishuBot {
    * The chain must never wedge: a single hung Feishu call used to block every
    * later send in that chat forever (live-status patches fire per tool event),
    * which froze cards and stranded /stop confirmations. Each link is therefore
-   * raced against a deadline, so a stuck send is abandoned and ordering resumes.
-   * Prefer a larger OPENCLAW_LARK_MULTI_AGENT_SEND_TIMEOUT_MS on slow links.
+   * raced against an observation deadline. The queue advances, but an already
+   * attempted SDK request is NOT cancelled and can settle late. Its outbox keeps
+   * custody; the expired lease forbids any subsequent new SDK effect. This is
+   * not a strict platform-order guarantee for uncancellable in-flight requests.
    */
   private sendOrdered<T = void>(chatId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.sendQueue.get(chatId) || Promise.resolve();
@@ -4497,9 +4615,10 @@ export class FeishuBot {
   /** One send link: resolve with fn(), or reject at the deadline so the chain advances. */
   private async withSendDeadline<T>(fn: () => Promise<T>, chatId: string): Promise<T> {
     const limit = SEND_DEADLINE_MS;
+    const lease={expired:false};
     let work: Promise<T>;
     try {
-      work = Promise.resolve(fn());
+      work = this.sendEffectLeases.run(lease,()=>Promise.resolve(fn()));
     } catch (err) {
       return Promise.reject(err);
     }
@@ -4508,7 +4627,7 @@ export class FeishuBot {
     work.catch(() => {});
     let timer: ReturnType<typeof setTimeout> | undefined;
     const deadline = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`send deadline ${limit}ms exceeded for ${chatId.slice(-8)}`)), limit);
+      timer = setTimeout(() => {lease.expired=true;reject(new SendDeadlineError(chatId,limit));}, limit);
       timer.unref?.();
     });
     try {
