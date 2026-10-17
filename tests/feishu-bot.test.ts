@@ -3975,3 +3975,53 @@ describe("rich-post chairman commands", () => {
     } finally { target.cleanup(); h.cleanup(); }
   });
 });
+
+describe("FeishuBot per-chat send chain deadline", () => {
+  it("advances the chain when one link never settles", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("GPT");
+    try {
+      const bot = h.bot as any;
+      const ran: string[] = [];
+      // First link simulates a hung Feishu call that never settles.
+      const hung = bot.sendOrdered("chat1", () => new Promise<string>(() => {}));
+      const following = bot.sendOrdered("chat1", async () => { ran.push("second"); return "ok"; });
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(hung).rejects.toThrow(/send deadline/);
+      await expect(following).resolves.toBe("ok");
+      expect(ran).toEqual(["second"]);
+    } finally { vi.useRealTimers(); h.cleanup(); }
+  });
+
+  it("keeps running after an abandoned link rejects late (no unhandled rejection)", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("GPT");
+    try {
+      const bot = h.bot as any;
+      let rejectLate!: (e: Error) => void;
+      const slow = bot.sendOrdered("chat1", () => new Promise<string>((_a, b) => { rejectLate = b; }));
+      const next = bot.sendOrdered("chat1", async () => "ok");
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(slow).rejects.toThrow(/send deadline/);
+      rejectLate(new Error("late failure"));
+      await vi.advanceTimersByTimeAsync(10);
+      await expect(next).resolves.toBe("ok");
+    } finally { vi.useRealTimers(); h.cleanup(); }
+  });
+
+  it("does not serialize across different chats", async () => {
+    vi.useFakeTimers();
+    const h = makeHarness("GPT");
+    try {
+      const bot = h.bot as any;
+      const ran: string[] = [];
+      const hungA = bot.sendOrdered("chatA", () => new Promise<string>(() => {}));
+      const okB = bot.sendOrdered("chatB", async () => { ran.push("B"); return "b"; });
+      await vi.advanceTimersByTimeAsync(1_000);
+      await expect(okB).resolves.toBe("b");
+      expect(ran).toEqual(["B"]);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await expect(hungA).rejects.toThrow(/send deadline/);
+    } finally { vi.useRealTimers(); h.cleanup(); }
+  });
+});

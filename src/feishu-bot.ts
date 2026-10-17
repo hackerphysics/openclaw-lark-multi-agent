@@ -35,6 +35,9 @@ const SESSION_HEALTH_POLL_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESS
 const SESSION_HEALTH_CONFIRM_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SESSION_HEALTH_CONFIRM_MS || 2_000);
 const DELIVERY_MAX_ATTEMPTS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_DELIVERY_MAX_ATTEMPTS || 5);
 const DELIVERY_RETRY_BASE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_DELIVERY_RETRY_BASE_MS || 1_000);
+// Per-chat send serialization deadline. A hung Feishu call must not block the
+// chain forever, otherwise live-status patches and /stop confirmations strand.
+const SEND_DEADLINE_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_SEND_TIMEOUT_MS || 30_000);
 // Auto-retry: when a reply looks truncated/incomplete, ask the same session
 // whether it finished. If it did not, let it continue; loop until it confirms
 // completion or the retry budget is spent. Off by setting AUTO_RETRY=0.
@@ -4451,12 +4454,43 @@ export class FeishuBot {
   /**
    * Enqueue a message send to guarantee ordering per chat.
    * All sends for a chat are serialized through this.
+   *
+   * The chain must never wedge: a single hung Feishu call used to block every
+   * later send in that chat forever (live-status patches fire per tool event),
+   * which froze cards and stranded /stop confirmations. Each link is therefore
+   * raced against a deadline, so a stuck send is abandoned and ordering resumes.
+   * Prefer a larger OPENCLAW_LARK_MULTI_AGENT_SEND_TIMEOUT_MS on slow links.
    */
   private sendOrdered<T = void>(chatId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.sendQueue.get(chatId) || Promise.resolve();
-    const next = prev.then(fn, fn); // run even if previous failed
+    const run = () => this.withSendDeadline(fn, chatId);
+    const next = prev.then(run, run); // run even if previous failed
     this.sendQueue.set(chatId, next.then(() => undefined, () => undefined));
     return next;
+  }
+
+  /** One send link: resolve with fn(), or reject at the deadline so the chain advances. */
+  private async withSendDeadline<T>(fn: () => Promise<T>, chatId: string): Promise<T> {
+    const limit = SEND_DEADLINE_MS;
+    let work: Promise<T>;
+    try {
+      work = Promise.resolve(fn());
+    } catch (err) {
+      return Promise.reject(err);
+    }
+    // A late rejection from an abandoned send must never become an unhandled
+    // rejection; the caller already moved on with the timeout error.
+    work.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`send deadline ${limit}ms exceeded for ${chatId.slice(-8)}`)), limit);
+      timer.unref?.();
+    });
+    try {
+      return await Promise.race([work, deadline]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   /**
