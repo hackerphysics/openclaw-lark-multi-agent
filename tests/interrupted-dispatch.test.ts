@@ -149,10 +149,10 @@ describe('bounded scan and automatic recovery controls',()=>{
    snapshot(pending([input('head',++n===1?'interrupted':'queued')],{total:2,nextBefore:40}));
   const status=await metadataStatus();expect(status.idleConfirmed).toBe(false);expect(status.busyConfirmed).toBe(true);
  });
- it('one 1500ms budget applies to pagination and a late page cannot start further queries',async()=>{
+ it('one 8000ms budget applies to pagination and a late page cannot start further queries',async()=>{
   let resolvePage:any,n=0;
   history=()=>++n===1?snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40})):new Promise(r=>resolvePage=r);
-  const result=metadataStatus();await tick(1501);expect((await result).idleConfirmed).toBe(false);
+  const result=metadataStatus();await tick(8001);expect((await result).idleConfirmed).toBe(false);
   resolvePage(snapshot(pending([input('tail','interrupted')],{total:2,nextBefore:20})));await tick(10);expect(n).toBe(2);
  });
  it('finite page cap refuses an unbounded/filtered retained scan',async()=>{

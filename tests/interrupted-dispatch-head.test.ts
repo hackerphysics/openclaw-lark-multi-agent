@@ -79,7 +79,7 @@ describe('independent parent head and deadline correctness probes',()=>{
  });
  it('head response observed beyond absolute 1500ms deadline cannot authorize idle',async()=>{
   let n=0;const started=Date.now();history=(p:any)=>{
-   n++;if(n===3)vi.setSystemTime(started+1501);
+   n++;if(n===3)vi.setSystemTime(started+8001);
    return p.pendingBefore===40?snapshot(pending([input('tail','cancelled')],{total:2})):
     snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40}));
   };

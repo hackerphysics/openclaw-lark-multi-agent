@@ -38,7 +38,7 @@ describe('session status and paused waits',()=>{
  it('bounds an unavailable status query without stopping execution',async()=>{
   c.rpc=vi.fn(()=>new Promise(()=>{}));
   const p=c.getSessionRuntimeStatus(key);
-  await vi.advanceTimersByTimeAsync(1500);
+  await vi.advanceTimersByTimeAsync(5000);
   expect((await p).status).toBe('unknown');
   expect(c.rpc.mock.calls.map((v:any[])=>v[0])).toEqual(['sessions.describe']);
   expect(vi.getTimerCount()).toBe(0);

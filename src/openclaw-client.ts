@@ -1998,8 +1998,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const value = await Promise.race([
-        this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) }, 1500),
-        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("status lookup timeout")), 1500); }),
+        this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) }, 5000),
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("status lookup timeout")), 5000); }),
       ]);
       return normalizeSessionRuntimeStatus(value);
     } catch { return normalizeSessionRuntimeStatus(undefined); }
@@ -2010,7 +2010,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    * terminal caches. Unknown/missing fields never authorize scheduling. */
   async getSessionDispatchStatus(sessionKey:string):Promise<{idleConfirmed:boolean;sessionId?:string;archived?:boolean;activeRunId?:string;busyConfirmed?:boolean}> {
     let timer:ReturnType<typeof setTimeout>|undefined;
-    const key=this.canonicalSessionKey(sessionKey),deadline=Date.now()+1500;
+    const key=this.canonicalSessionKey(sessionKey),deadline=Date.now()+8000;
     // One budget covers the entire public pending scan, not 1500ms per page.
     // Retained interrupted/cancelled inputs are recovery records, NOT runnable
     // queue entries. Never delete, mutate or replay them to prove schedulability.

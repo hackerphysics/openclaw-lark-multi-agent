@@ -1355,10 +1355,21 @@ export class FeishuBot {
       return;
     }
     const identified=compatible && !!activity.activeRunId && !!activity.sessionId && !activity.archived && !status.archived;
+    // Bounded retention (2026-10-17 deadlock): an input that has stayed
+    // activity-unbound for over 60s despite re-checks must not be held forever.
+    // Hand it to the ordinary queue — the gateway's own chat.send admission is
+    // the authoritative answer and admission custody already dedups.
+    const unboundSince=current?.activityUnbound ? (current.unboundSince || 0) : 0;
+    if(!identified && unboundSince && Date.now()-unboundSince>60_000) {
+      this.store.saveInsertion(this.config.name,chatId,rowId,current!.insertionId,'ordinary',
+        {...current!,activityUnbound:false,reason:'gateway state unconfirmable over 60s; ordinary admission is authoritative'});
+      return;
+    }
     this.store.saveInsertion(this.config.name,chatId,rowId,current?.insertionId || JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
       messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:identified ? activity!.sessionId : status.sessionId,
       expectedRunId:identified ? activity!.activeRunId : '',ownerId:identified ? `external:${activity!.activeRunId}` : undefined,
       batchId:identified ? activity!.activeRunId : undefined,activityUnbound:!identified,attempted:false,
+      ...(identified ? {} : {unboundSince: unboundSince || Date.now()}),
       reason:identified?'current Gateway run observed; insertion custody only':'current Gateway activity/run identity unavailable; retained without admission',
     },Date.now()+(identified?0:5000));
   }
