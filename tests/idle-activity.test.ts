@@ -119,6 +119,44 @@ describe("audit 2026-10-16 fixes: B5 double-splice / B6 empty terminal", () => {
   });
 });
 
+describe("empty root final never promotes drafts (output-audit P1-4)", () => {
+  it("exact terminalReply empty resolves NO_REPLY; the streamed draft is not delivered", async () => {
+    c.rpc = vi.fn(async (method: string) => {
+      if (method === "agent.wait") return { runId: "r", status: "ok", endedAt: Date.now(), yielded: false,
+        terminalReply: { disposition: "empty", text: "" } };
+      return { session: { status: "running" } };
+    });
+    const run = start();
+    emit("assistant", { delta: "interim draft that must never become the answer." });
+    emit("chatFinal", { text: "" });
+    emit("lifecycle", { phase: "end", livenessState: "working" });
+    await vi.advanceTimersByTimeAsync(2_000);
+    const text = await run;
+    expect(text).toBe("NO_REPLY");
+    expect(text).not.toContain("draft");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.todo("an empty final with the root still pending keeps observing; the later real final delivers once (needs the 5s chatFinal fallback + N-path entry points from the client-fix candidate)");
+  it.skip("an empty final with the root still pending keeps observing; the later real final delivers once (QUARANTINED: entry points 2+3 pending from client-fix candidate)", async () => {
+    c.rpc = vi.fn(async (method: string) => {
+      if (method === "agent.wait") return { runId: "r", status: "pending", pendingError: false };
+      return { session: { hasActiveRun: true, status: "running" } };
+    });
+    let settled: string | undefined;
+    const run = start().then(t => { settled = t; return t; });
+    emit("assistant", { delta: "preface text." });
+    emit("chatFinal", { text: "" });
+    emit("lifecycle", { phase: "end", livenessState: "working" });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(settled).toBeUndefined();
+    emit("chatFinal", { text: "the real final answer." });
+    await vi.advanceTimersByTimeAsync(100);
+    await expect(run).resolves.toBe("the real final answer.");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("stale collector fencing (2026-10-16 regression)", () => {
   it("revoking a stale collector stops frame theft; the replacement sees its own activity and final", async () => {
     // Old batch's collector: would otherwise stay alive up to 24h and
