@@ -202,7 +202,7 @@ describe("client → bot → persistent notice → guarded outbox", () => {
   it("a notice cannot claim the active trigger key or complete its pending card", async () => {
     const h = await harness([task({ deliveryStatus: "failed", terminalOutcome: "blocked" })]);
     const liveStatus = { complete: vi.fn(async () => {}), fail: vi.fn(async () => {}) };
-    h.bot.activeDeliveryTargets.set("chat1", { triggerId: 7, messageId: "human-7", token: Symbol(), liveStatus });
+    h.bot.activeDeliveryTargets.set("chat1", { triggerId: 7, messageId: "human-7", runId: "real-main-run", token: Symbol(), liveStatus });
     await h.event(directRun);
     expect(h.store.getDeliveryByKey("GPT", "chat1", "trigger:7")).toBeNull(); expect(liveStatus.complete).not.toHaveBeenCalled();
     await h.event("real-main-run", "final", { message: { content: [{ type: "text", text: "真正主答案" }] } });

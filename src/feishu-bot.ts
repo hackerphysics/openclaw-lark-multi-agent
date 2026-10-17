@@ -532,7 +532,7 @@ export class FeishuBot {
         const persistedTarget=meta?.runId ? this.store.getDeliveryRunTarget(this.config.name,chatId,meta.runId) : null;
         const runTarget = meta?.runId ? this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId, meta.runId)) || (persistedTarget ? {...persistedTarget,token:Symbol(meta.runId)} : undefined) : undefined;
         const candidateTarget = this.activeDeliveryTargets.get(chatId);
-        const activeTarget = runTarget || (candidateTarget && (!candidateTarget.runId || !meta?.runId || candidateTarget.runId === meta.runId)
+        const activeTarget = runTarget || (candidateTarget && !!candidateTarget.runId && !!meta?.runId && candidateTarget.runId === meta.runId
           ? candidateTarget
           : undefined);
         try {

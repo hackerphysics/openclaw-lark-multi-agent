@@ -1882,8 +1882,9 @@ describe("FeishuBot routing and queue behavior", () => {
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
+        await params.onSubmitted?.("r-noreply-race");
         await new Promise((resolve) => setTimeout(resolve, 1_250));
-        await cb("proactive final answer");
+        await cb("proactive final answer", { runId: "r-noreply-race" });
         return "NO_REPLY";
       });
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "noreply-race" }));
@@ -1904,8 +1905,9 @@ describe("FeishuBot routing and queue behavior", () => {
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
+        await params.onSubmitted?.("r-empty-race");
         await new Promise((resolve) => setTimeout(resolve, 1_250));
-        await cb("proactive final answer");
+        await cb("proactive final answer", { runId: "r-empty-race" });
         return "";
       });
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "empty-race" }));
@@ -1928,7 +1930,8 @@ describe("FeishuBot routing and queue behavior", () => {
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         await new Promise((resolve) => setTimeout(resolve, 1_250));
-        await cb('<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"file","path":"/tmp/proactive.pdf"}]}</LMA_BRIDGE_ATTACHMENTS>');
+        await params.onSubmitted?.("r-attachment-race");
+        await cb('<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"file","path":"/tmp/proactive.pdf"}]}</LMA_BRIDGE_ATTACHMENTS>', { runId: "r-attachment-race" });
         return "NO_REPLY";
       });
       await (h.bot as any).handleMessage(event({ chatType: "p2p", text: "任务", messageId: "attachment-race" }));
@@ -1992,7 +1995,8 @@ describe("FeishuBot routing and queue behavior", () => {
         fail: vi.fn(async () => {}),
       };
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
-      await cb("proactive answer");
+      activeTarget.runId = "r-live-proactive";
+      await cb("proactive answer", { runId: "r-live-proactive" });
       release();
       expect((h.bot as any).replyMessage).toHaveBeenCalledWith("reply-42", "proactive answer");
       expect(h.store.getDeliveryByKey("GPT", "chat1", "trigger:42")).toMatchObject({ status: "delivered" });
