@@ -2047,6 +2047,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           if(item.state==='queued')return {...base,idleConfirmed:false,busyConfirmed:true};
         }
         if(seen.size>total!)return unknown();
+        // Every page must positively confirm inactivity. Otherwise a malformed
+        // head/middle page could be laundered by a valid final page.
+        if(info?.hasActiveRun!==false)return unknown();
         const next=pending.nextBefore;
         if(next!==undefined && (!Number.isSafeInteger(next) || next<=0 || cursors.has(next) || before!==undefined && next>=before))return unknown();
         const signature=JSON.stringify([id,total,info?.hasActiveRun,items.map((item:any)=>[item.id,item.state]),next]);
@@ -2057,11 +2060,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // Pagination is not an atomic snapshot. Re-read the current head and
           // identity/activity before returning positive evidence to local CAS.
           const head:any=await this.rpc('chat.history',{sessionKey:key,limit:20},1500);
+          if(Date.now()>=deadline)return unknown();
           const hi=head?.sessionInfo,hp=head?.pendingInputs,hid=hi?.sessionId || head?.sessionId;
           if(!validId(hi?.sessionId) || !validId(head?.sessionId) || head?.sessionKey!==key || hid!==id || hi?.sessionId && head?.sessionId && hi.sessionId!==head.sessionId)return unknown();
           if(hi?.archived===true)return {...base,archived:true,idleConfirmed:false};
           if(hi?.hasActiveRun===true || head?.inFlightRun || Number.isSafeInteger(hp?.queuedCount) && hp.queuedCount>0)
             return {...base,idleConfirmed:false,busyConfirmed:true,activeRunId:typeof head?.inFlightRun?.runId==='string'?head.inFlightRun.runId:undefined};
+          if(hi?.hasActiveRun!==false)return unknown();
           if(hp?.total!==total || hp?.queuedCount!==undefined && (!Number.isSafeInteger(hp.queuedCount) || hp.queuedCount<0))return unknown();
           if(Array.isArray(hp?.items) && hp.items.some((item:any)=>typeof item?.id==='string' && item.id && item.state==='queued'))return {...base,idleConfirmed:false,busyConfirmed:true};
           if(!Array.isArray(hp?.items) || JSON.stringify([hid,hp.total,hi?.hasActiveRun,hp.items.map((item:any)=>[item?.id,item?.state]),hp.nextBefore])!==headSignature)return unknown();
