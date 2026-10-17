@@ -844,7 +844,7 @@ export class OpenClawClient {
    * reconcile the original run instead of aborting or treating a draft as final.
    * Explicit terminal/error/disconnect paths keep their existing behavior.
    */
-private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { exactRunIdentity?: boolean; emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void> }): Promise<string> {
+private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { exactRunIdentity?: boolean; emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>; onYieldHandoff?: (runId:string)=>void }): Promise<string> {
     let cleanupObservation = () => {};
     return new Promise<string>((resolveResult, rejectResult) => {
       // Whether we were connected when the run started. We only treat a later
@@ -1309,6 +1309,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               }
             }
             if (ev.stream === "chatFinal") {
+              // Only the exact admitted root's public chat envelope can yield
+              // scheduling custody. Session fallback/foreign/tool flags cannot.
+              if(ev.data?.gatewayYielded===true && (evRunId!==runId || !eventSessionMatches)) continue;
               chatFinalSeen = true;
               if (ev.data?.gatewayYielded === true) {
                 // A yielded turn is not a terminal answer, even if its buffered
@@ -1323,9 +1326,19 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 // Finish scanning this batch first so an already-arrived real
                 // final/error wins over a stale waiting notice. No status RPC
                 // (or ten-minute silence) is needed to confirm this wire fact.
-                void Promise.resolve().then(() => handleTimeoutResult(
-                  new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined), false, "yield")
-                ));
+                void Promise.resolve().then(() => {
+                  if(observationClosed || chatFinalText.trim())return;
+                  void handleTimeoutResult(new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined),false,"yield"));
+                  if(options?.onYieldHandoff) {
+                    try {
+                      // Commit recoverable exact observation BEFORE opening
+                      // proactive delivery and fencing this destructive consumer.
+                      this.recoveryStore?.saveRunObservation(sessionKey,runId,{yielded:true});
+                      options.onYieldHandoff(runId);
+                      fenceSuperseded();
+                    } catch(error) { console.warn('[OpenClaw] yield handoff retained by collector:',safeErrorSummary(error)); }
+                  }
+                });
                 continue;
               }
               chatFinalText = ev.data?.text || "";
@@ -1728,6 +1741,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }> {
     if(!identity?.insertionId || !identity.expectedRunId) return {status:'pending',attempted:false,reason:'exact target not admitted yet'};
     let attempted=false;
+    let stage='capabilities';
     const base={insertionId:identity.insertionId,expectedRunId:identity.expectedRunId,sessionId:identity.expectedSessionId};
     try {
       const capability=await this.rpc('lma.steer.capabilities',{},2500);
@@ -1735,13 +1749,14 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // requirement. Builtin callbacks can be used with atomicRunBound=false.
       if(capability?.protocol!==2 || capability?.durableAttempts!==true || capability?.acceptanceCallback!==true)
         return {...base,status:'unavailable',attempted:identity.queryOnly===true,reason:'Update the coordinated LMA plugin; legacy booleans are not acceptance receipts'};
+      stage='sessions.describe';
       const info=await this.getSessionStatus(sessionKey);
       const currentId=info?.session?.sessionId;
       if(info?.session?.archived===true || (identity.expectedSessionId && currentId && currentId!==identity.expectedSessionId))
         return {...base,status:'target_changed',attempted:identity.queryOnly===true,reason:'session archived or generation changed; no automatic migration'};
       if(!currentId) return {...base,status:'pending',attempted:identity.queryOnly===true,reason:'session generation observation unavailable'};
       base.sessionId=currentId;
-      attempted=true;
+      attempted=true;stage='lma.steer';
       const result=await this.rpc('lma.steer',{sessionKey:this.canonicalSessionKey(sessionKey),text,...identity,
         expectedSessionId:identity.expectedSessionId || currentId,stopEpoch:identity.stopEpoch ?? 0},2500);
       if(result?.insertionId!==identity.insertionId || result?.expectedRunId!==identity.expectedRunId || result?.sessionId!==currentId ||
@@ -1751,7 +1766,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       return result;
     } catch(error) {
       return {...base,status:attempted?'unknown':'pending',attempted:attempted || identity.queryOnly===true,
-        reason:attempted?'Insertion receipt unknown; query stable identity only':'Readiness observation unavailable; retained for paced recovery'};
+        reason:`${attempted?'Insertion receipt unknown; query stable identity only':'Readiness observation unavailable; retained for paced recovery'} [${stage}: ${safeErrorSummary(error)}]`};
     }
   }
 
@@ -1912,6 +1927,19 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       return normalizeSessionRuntimeStatus(value);
     } catch { return normalizeSessionRuntimeStatus(undefined); }
     finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Strong public current-session activity, independent of expired root
+   * terminal caches. Unknown/missing fields never authorize scheduling. */
+  async getSessionDispatchStatus(sessionKey:string):Promise<{idleConfirmed:boolean;sessionId?:string;archived?:boolean}> {
+    try {
+      const key=this.canonicalSessionKey(sessionKey);
+      const history=await this.rpc('chat.history',{sessionKey:key,limit:1},1500);
+      const info=history?.sessionInfo;
+      return {idleConfirmed:history?.sessionKey===key && info?.hasActiveRun===false &&
+        history?.pendingInputs?.total===0 && !history?.inFlightRun && info?.archived!==true,
+        sessionId:info?.sessionId || history?.sessionId,archived:info?.archived===true};
+    } catch {return {idleConfirmed:false};}
   }
 
   private async classifyWaitTimeout(text: string, sessionKey: string): Promise<Error> {
@@ -2171,6 +2199,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     } else if (state === "delta") {
       this.suppressSessionKeys(keys);
     } else if (state === "final") {
+      // A yielded acknowledgment is presentation, never a final delivery key,
+      // including repeats after foreground collector custody was handed off.
+      if(payload?.yielded===true)return;
       const text = this.extractTextFromChatMessage(payload?.message);
       if (text) this.emitProactiveForSession(sessionKey, text, {
         runId, sessionKey: this.canonicalSessionKey(sessionKey), final: payload?.yielded !== true,
@@ -2459,6 +2490,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     onRunIdentified?: (runId:string)=>void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
     onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
+    /** Synchronous durable scheduling handoff; never a task settlement. */
+    onYieldHandoff?: (runId:string)=>void;
   }): Promise<string> {
     const sk = this.shortKey(params.sessionKey);
     const fullSessionKey = this.canonicalSessionKey(params.sessionKey);
@@ -2545,7 +2578,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         this.progressGenerations.set(fullSessionKey,generation);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      const reply=await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused });
+      const reply=await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
       if(reply.trim().toUpperCase()==='NO_REPLY') this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
       else this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId,terminalText:reply,terminalObserved:true},Date.now()+30_000);
       return reply;
@@ -2618,6 +2651,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     onRunIdentified?: (runId:string)=>void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
     onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
+    /** Synchronous durable scheduling handoff; never a task settlement. */
+    onYieldHandoff?: (runId:string)=>void;
   }): Promise<string> {
     const includeContext = params.includeContext !== false;
     const includeBridgeAttachmentHint = params.includeBridgeAttachmentHint !== false;
@@ -2642,6 +2677,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         onRunIdentified: params.onRunIdentified,
         onProgress: params.onProgress,
         onWaitPaused: params.onWaitPaused,
+        onYieldHandoff: params.onYieldHandoff,
       });
     }
 
@@ -2682,6 +2718,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       onRunIdentified: params.onRunIdentified,
       onProgress: params.onProgress,
       onWaitPaused: params.onWaitPaused,
+      onYieldHandoff: params.onYieldHandoff,
     });
   }
 

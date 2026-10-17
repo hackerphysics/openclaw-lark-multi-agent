@@ -21,7 +21,7 @@ import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
 const nonemptyReceipt=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
-type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string };
+type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; yielded?:boolean };
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -1225,11 +1225,11 @@ export class FeishuBot {
         // Reserve BEFORE the first health/reaction await. Otherwise an ending
         // owner can ordinary-drain this row while its handler is still waiting,
         // and the later steer would submit the same message a second time.
-        const ingressOwner=this.queueOwners.get(chatId);
-        if(this.queueRuns.has(chatId) && !ingressOwner?.triggerIds?.has(insertedId)) {
+        const ingressOwner=this.queueOwners.get(chatId) || this.store.getDispatchCustody(this.config.name,chatId);
+        if((this.queueRuns.has(chatId) || ingressOwner) && !ingressOwner?.triggerIds?.has(insertedId)) {
           this.store.saveInsertion(this.config.name,chatId,insertedId,JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
             messageId,text:cleanText,stopEpoch:this.stopGeneration(chatId),expectedRunId:ingressOwner?.runId || '',
-            ownerId:ingressOwner?.id,batchId:ingressOwner?.batchId,sessionKey:this.getSessionKey(chatId)});
+            ownerId:ingressOwner?.id,batchId:ingressOwner?.batchId,sessionId:ingressOwner?.sessionId,sessionKey:this.getSessionKey(chatId)});
           reservedAtIngress=true;
         }
         // Received/queued is not accepted by Gateway. Keep Typing until an
@@ -1250,6 +1250,13 @@ export class FeishuBot {
         await this.warnUnhealthySessionAndContinue(chatId, messageId, unhealthy);
       }
 
+      // Inspect current public activity, not just the local promise. A yielded
+      // task (or a settled/uncached old root with authoritative idle history)
+      // keeps its result observer but cannot monopolize independent new input.
+      await this.reconcileDispatchCustody(chatId);
+      if(this.stopGeneration(chatId)!==inputStopEpoch)return;
+      if(reservedAtIngress && !this.store.isInsertionReserved(this.config.name,chatId,insertedId)) reservedAtIngress=false;
+
       // Another ingress handler may already have selected/admitted this row
       // as an ordinary batch while this handler awaited health. Do not re-steer
       // a message that already belongs to that batch.
@@ -1269,12 +1276,12 @@ export class FeishuBot {
       // --- Queue-based sending: if agent is busy, just accumulate ---
       // The actual queue owner, not elapsed wall time, decides whether input
       // should steer/queue. Long healthy runs must not lose their busy ownership.
-      const isBusy = reservedAtIngress || this.queueRuns.has(chatId);
+      const isBusy = reservedAtIngress || this.queueRuns.has(chatId) || !!this.store.getDispatchCustody(this.config.name,chatId);
 
       if (isBusy) {
-        const owner=this.queueOwners.get(chatId);
+        const owner=this.queueOwners.get(chatId) || this.store.getDispatchCustody(this.config.name,chatId);
         const record={messageId,text:cleanText,stopEpoch:this.stopGeneration(chatId),
-          expectedRunId:owner?.runId || '',ownerId:owner?.id,batchId:owner?.batchId,sessionKey:this.getSessionKey(chatId)};
+          expectedRunId:owner?.runId || '',ownerId:owner?.id,batchId:owner?.batchId,sessionId:owner?.sessionId,sessionKey:this.getSessionKey(chatId)};
         if(insertedId>0 && !this.store.getInsertion(this.config.name,chatId,insertedId)) this.store.saveInsertion(this.config.name,chatId,insertedId,
           JSON.stringify([this.config.appId,chatId,messageId]),'pending',record);
         // Reservation is durable BEFORE any RPC. Ordinary drain cannot race a
@@ -1289,6 +1296,32 @@ export class FeishuBot {
     } catch (err) {
       console.error(`[${this.config.name}] Error:`, safeErrorSummary(err));
     }
+  }
+
+  /** CAS includes the actual batch, not merely the queue Promise, and excludes
+   * local admission/RPC windows even if the host briefly reports idle. */
+  private async reconcileDispatchCustody(chatId:string):Promise<boolean> {
+    const local=this.queueOwners.get(chatId);
+    const saved=this.store.getDispatchCustody(this.config.name,chatId);
+    if(!saved?.runId || !saved.batchId || !saved.sessionId || !saved.admitted)return false;
+    if(local && (local.id!==saved.id || local.batchId!==saved.batchId || !local.admitted))return false;
+    const batch=local?.batch,runId=local?.runId,epoch=this.stopGeneration(chatId);
+    const unchanged=()=>{
+      const now=this.store.getDispatchCustody(this.config.name,chatId);
+      return this.stopGeneration(chatId)===epoch && now?.id===saved.id && now?.batchId===saved.batchId && now?.runId===saved.runId &&
+        this.queueOwners.get(chatId)===local && (!local || local.batch===batch && local.runId===runId && local.admitted===true);
+    };
+    if(!saved.yielded) {
+      const activity=await this.openclawClient.getSessionDispatchStatus(this.getSessionKey(chatId));
+      if(!unchanged() || !activity.idleConfirmed || activity.archived || activity.sessionId!==saved.sessionId)return false;
+    }
+    const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId)).catch(()=>null);
+    if(!unchanged() || !status?.idleConfirmed || status.archived || status.sessionId!==saved.sessionId)return false;
+    if(!this.store.releaseDispatchCustody(this.config.name,chatId,saved.id,saved.batchId))return false;
+    // The target was committed on admission and survives this local cleanup.
+    // Only this exact old owner can be revoked; never a replacement batch.
+    if(local)this.forceExpireQueueOwner(chatId,'current session confirmed schedulable; exact result observation retained');
+    return true;
   }
 
   private stopGeneration(chatId:string):number {
@@ -1344,7 +1377,7 @@ export class FeishuBot {
     this.insertionTimer=setTimeout(()=>{
       this.insertionTimer=undefined;
       const chats=[...new Set([...this.store.listInsertions(this.config.name),...this.store.listReactionIntents(this.config.name)].map(x=>x.chatId))];
-      void Promise.allSettled(chats.map(async chat=>{await this.reconcileReactions(chat);await this.reconcileInsertions(chat);})).finally(()=>this.scheduleInsertionRecovery());
+      void Promise.allSettled(chats.flatMap(chat=>[this.reconcileReactions(chat),this.reconcileInsertions(chat)])).finally(()=>this.scheduleInsertionRecovery());
     },5000);
     this.insertionTimer.unref?.();
   }
@@ -1352,10 +1385,12 @@ export class FeishuBot {
     if(this.insertionChecks.has(chatId)) return;
     this.insertionChecks.add(chatId);
     try {
+      const released=await this.reconcileDispatchCustody(chatId);
+      if(released)void this.processQueue(chatId).catch(()=>{});
       for(const item of this.store.listInsertions(this.config.name,chatId)) {
         if(item.nextCheckAt>Date.now()) continue;
-        const stillCurrent=()=>this.stopGeneration(chatId)===item.stopEpoch && this.store.getInsertion(this.config.name,chatId,item.rowId)?.state!=='stopped';
-        if(!stillCurrent()) {this.store.stopInsertions(this.config.name,chatId);continue;}
+        const stillCurrent=()=>this.stopGeneration(chatId)===item.stopEpoch && !['stopped','ordinary','committed'].includes(this.store.getInsertion(this.config.name,chatId,item.rowId)?.state);
+        if(!stillCurrent()) {if(this.stopGeneration(chatId)!==item.stopEpoch)this.store.stopInsertions(this.config.name,chatId);continue;}
         const owner=this.queueOwners.get(chatId);
         if(!item.expectedRunId && owner?.id===item.ownerId && owner?.batchId===item.batchId && owner?.runId) item.expectedRunId=owner.runId;
         if(!item.expectedRunId) {
@@ -1417,7 +1452,10 @@ export class FeishuBot {
           const rootSettled=await this.openclawClient.exactRunSettled?.(item.expectedRunId);
           if(!stillCurrent()) continue;
           const unchanged=this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck;
-          if(rootSettled===true && status?.idleConfirmed===true && unchanged) {
+          const target=this.store.getDeliveryRunTarget(this.config.name,chatId,item.expectedRunId);
+          const dispatchReleased=target?.dispatchReleased===true && target.dispatchOwnerId===item.ownerId && target.dispatchBatchId===item.batchId &&
+            target.sessionId===item.sessionId && status?.sessionId===item.sessionId && !status?.archived;
+          if((rootSettled===true || dispatchReleased) && status?.idleConfirmed===true && unchanged) {
             state='ordinary';
             // Never expire a successor merely to schedule the old input.
             if(runAtCheck===item.expectedRunId) this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never accepted/unknown');
@@ -1431,12 +1469,13 @@ export class FeishuBot {
         // 息都发个这个"). Stay silent until it persists through several
         // re-checks (~45s), then notify exactly once.
         const unknownChecks = state === 'unknown' ? (Number(item.unknownChecks) || 0) + 1 : 0;
-        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks};
+        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks,
+          unknownSince:state==='unknown' ? (item.state==='unknown' && Number.isFinite(item.unknownSince) ? item.unknownSince : Date.now()) : undefined};
         this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,state,record,Date.now()+(state==='unknown'?15_000:5000));
         if(state==='ordinary') {
           this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
           void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:ordinary`,
-            'ℹ️ 原 run 已明确结束，且这条消息确定未被插入；现已交回普通队列，只执行一次。',[],item.messageId,`insertion:${item.insertionId}:ordinary`).catch(()=>{});
+            'ℹ️ 当前会话已确认可接收新轮次，且这条消息确定未被插入；现已交回普通队列，只执行一次。',[],item.messageId,`insertion:${item.insertionId}:ordinary`).catch(()=>{});
           void this.processQueue(chatId).catch(()=>{});
         } else if(state==='accepted') {
           this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
@@ -1456,19 +1495,14 @@ export class FeishuBot {
           if(item.state!==state) void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:${state}`,
             `ℹ️ 这条插入消息的状态为 ${state}，仍保留本地记录，未确认接收前不会显示 Get，也不会自动重复执行。${receipt.reason || ''}`,
             [],item.messageId,`insertion:${item.insertionId}:${state}`).catch(()=>{});
-        } else if(state==='unknown' && unknownChecks >= 4 && !item.unknownNotified) {
-          // ~45s (attempt + 3 re-checks). Mark unknownNotified ONLY after the
-          // outbox insert succeeds, so a failed enqueue retries next check
-          // instead of silencing the notice forever.
-          void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:unknown-prolonged`,
-            `ℹ️ 这条插入消息约 45 秒仍未确认接收：本地记录保留中，不会自动重复执行；确认后会自动显示 Get。`,
-            [],item.messageId,`insertion:${item.insertionId}:unknown-prolonged`)
-            .then(() => {
-              const cur = this.store.getInsertion(this.config.name, chatId, item.rowId);
-              const curRecord = (cur && cur.record) || record;
-              this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,(cur && cur.state) || state,{...curRecord,unknownNotified:true},Date.now()+15_000);
-            })
-            .catch(() => { /* enqueue failed: retry on next check */ });
+        } else if(state==='unknown' && Date.now()-record.unknownSince>=45_000 && !item.unknownNotified) {
+          const text='ℹ️ 这条插入消息约 45 秒仍未确认接收：本地记录保留中，不会自动重复执行；确认后会自动显示 Get。';
+          const key=`insertion:${item.insertionId}:unknown-prolonged`;
+          if(this.store.queueInsertionUnknownNotice(this.config.name,chatId,item.rowId,{
+            sessionKey:this.getSessionKey(chatId),chatId,botName:this.config.name,sourceType:'insertion_status',sourceId:key,deliveryKey:key,
+            contentHash:this.stableHash(`${text}|[]`),content:text,attachmentsJson:'[]',replyToMessageId:item.messageId,
+            deliveryMetaJson:JSON.stringify({botIdentity:this.config.appId,insertionNotice:{rowId:item.rowId,insertionId:item.insertionId,sessionId:item.sessionId,stopEpoch:item.stopEpoch}}),
+          }))void this.dispatchPendingDeliveries(chatId).catch(()=>{});
         }
       }
     } finally {this.insertionChecks.delete(chatId);}
@@ -1646,6 +1680,7 @@ export class FeishuBot {
       owner.batchId=randomUUID();
       owner.triggerIds=undefined;
       owner.runId=undefined;
+      owner.admitted=false;owner.yielded=false;owner.sessionId=undefined;
       this.queueRunTokens.set(chatId,batchToken);
       // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
       // completed with it (consumed or not); their failure observers are stale.
@@ -1806,6 +1841,8 @@ export class FeishuBot {
       try {
         sessionKey = await this.ensureSession(chatId);
         guard();
+        const generation=await this.openclawClient.getSessionInfo(sessionKey).catch(()=>null);
+        guard();owner.sessionId=generation?.session?.sessionId;
       } catch (err) {
         if(!current()) break;
         // Model policy/capability failures happen before chat.send. Clear the
@@ -1899,8 +1936,10 @@ export class FeishuBot {
             onRunIdentified: (runId:string)=>{guard();owner.runId=runId;foregroundRunId=runId;},
             onSubmitted: async (runId: string) => {
               guard();
-              owner.runId=runId;
+              owner.runId=runId;owner.admitted=true;
+              this.store.saveDispatchCustody(this.config.name,chatId,{id:owner.id,batchId:owner.batchId,runId,sessionId:owner.sessionId,admitted:true,stopEpoch:owner.stopEpoch,sessionKey});
               void this.reconcileInsertions(chatId).catch(()=>{});
+              this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || '',liveStatus});
               for(const ack of this.pendingAckMessages.get(chatId)||[]) {
                 if(!mergedTriggerIdSet.has(ack.rowId)) continue;
                 guard();
@@ -1921,6 +1960,18 @@ export class FeishuBot {
               markSubmittedBatch(`submitted:${runId}`);
             },
             onProgress: (event) => current() ? liveStatus?.progress(event) : undefined,
+            onYieldHandoff: runId=>{
+              guard();
+              if(owner.runId!==runId || !owner.admitted || !owner.batchId)throw new Error('Yield root/admission mismatch');
+              // All durable result routing commits synchronously before the
+              // collector is fenced and before another input may take custody.
+              this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || '',liveStatus});
+              owner.yielded=true;
+              this.store.saveDispatchCustody(this.config.name,chatId,{id:owner.id,batchId:owner.batchId,runId,sessionId:owner.sessionId,admitted:true,yielded:true,stopEpoch:owner.stopEpoch,sessionKey});
+              this.forceExpireQueueOwner(chatId,'trusted exact-root yield; background result custody retained');
+              void this.reconcileInsertions(chatId).catch(()=>{});
+              this.scheduleInsertionRecovery();
+            },
             onWaitPaused: async notice => {
               guard();
               await liveStatus?.showWaitingForResult(notice.message);
@@ -2245,7 +2296,10 @@ export class FeishuBot {
         guard(); this.pendingAckMessages.set(chatId, remainingAcks);
         break;
       } finally {
-        if(current()) this.busyChats.set(chatId, 0);
+        if(current()) {
+          this.busyChats.set(chatId, 0);
+          if(owner.batchId && !owner.yielded)this.store.clearDispatchCustody(this.config.name,chatId,owner.id,owner.batchId);
+        }
       }
 
       // Check if more messages arrived while we were busy
@@ -2756,7 +2810,7 @@ export class FeishuBot {
     const key = this.deliveryRunTargetKey(chatId, runId);
     const previous = this.deliveryTargetsByRun.get(key);
     if (previous?.timer) clearTimeout(previous.timer);
-    this.store.bindDeliveryRun(this.config.name,chatId,runId,{triggerId:target.triggerId,messageId:target.messageId,runId,sessionKey:`agent:main:${this.getSessionKey(chatId).replace(/^agent:[^:]+:/,'')}`});
+    this.store.bindDeliveryRun(this.config.name,chatId,runId,{...this.store.getDeliveryRunTarget(this.config.name,chatId,runId),triggerId:target.triggerId,messageId:target.messageId,runId,stopGeneration:this.stopGeneration(chatId),sessionKey:`agent:main:${this.getSessionKey(chatId).replace(/^agent:[^:]+:/,'')}`});
     this.deliveryTargetsByRun.set(key, {
       triggerId: target.triggerId,
       messageId: target.messageId,
@@ -3154,6 +3208,14 @@ export class FeishuBot {
     if(this.store.getDeliveryByKey(this.config.name,chatId,source)?.status!=="delivered") throw new Error("Go executor outbox delivery pending/unconfirmed");
   }
 
+  private insertionNoticeCurrent(chatId:string,notice:any):boolean {
+    if(!notice)return true;
+    const current=this.store.getInsertion(this.config.name,chatId,notice.rowId);
+    return current?.insertionId===notice.insertionId && current.state==='unknown' && current.stopEpoch===notice.stopEpoch &&
+      this.stopGeneration(chatId)===notice.stopEpoch && current.sessionId===notice.sessionId &&
+      Number.isFinite(current.unknownSince) && Date.now()-current.unknownSince>=45_000;
+  }
+
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
     this.installGoReceiptCapture();
     for(const id of this.localDeliveryRetryCustody.get(chatId) || []) {
@@ -3165,6 +3227,13 @@ export class FeishuBot {
       const pending = this.store.getPendingDeliveries(chatId, this.config.name, 50);
       if (pending.length === 0) break;
       for (const item of pending) {
+        const notice=JSON.parse(item.deliveryMetaJson || '{}').insertionNotice;
+        if(notice) {
+          const info=await this.openclawClient.getSessionInfo(this.getSessionKey(chatId)).catch(()=>null);
+          if(!this.insertionNoticeCurrent(chatId,notice) || info?.session?.archived===true ||
+            info?.session?.sessionId && info.session.sessionId!==notice.sessionId) {this.store.markDeliveryFailed(item.id!);continue;}
+          if(!info?.session?.sessionId) {this.scheduleDeliveryRetry(chatId,1);retryScheduled=true;continue;}
+        }
         const ownerId=JSON.parse(item.deliveryMetaJson || "{}").provenance?.goJobId;
         const deliveryJob=ownerId ? this.store.getGoJobById(ownerId) : this.store.getActiveGoJob(this.config.name,chatId);
         const receipts: Array<{messageId:string;operation:string;payload:unknown}> = [
@@ -3173,6 +3242,7 @@ export class FeishuBot {
         ];
         await this.sendOrdered(chatId, () => this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,chatId,stage:"body",ordinals:new Map(),effectGuard:()=>{
           const meta=JSON.parse(item.deliveryMetaJson || '{}'),p=meta.provenance;
+          if(!this.insertionNoticeCurrent(chatId,meta.insertionNotice))throw Object.assign(new Error('Insertion notice no longer current'),{deliveryStopped:true});
           if((p?.final || item.sourceType==='run_error') &&
             (typeof meta.deliveryStopEpoch==='number' && meta.deliveryStopEpoch!==this.stopGeneration(chatId) ||
              p?.sessionKey && p.runId && this.store.isStoppedObservation(p.sessionKey,p.runId))) {

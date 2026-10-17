@@ -135,6 +135,7 @@ export class MessageStore {
       CREATE TABLE IF NOT EXISTS reaction_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,row_id INTEGER NOT NULL,record_json TEXT NOT NULL,
         PRIMARY KEY(bot_name,chat_id,row_id));
       CREATE TABLE IF NOT EXISTS run_delivery_targets(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,run_id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(bot_name,chat_id,run_id));
+      CREATE TABLE IF NOT EXISTS dispatch_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(bot_name,chat_id));
       CREATE TABLE IF NOT EXISTS admission_custody(session_key TEXT NOT NULL,submission_id TEXT PRIMARY KEY,state TEXT NOT NULL,record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS run_observations (
         session_key TEXT NOT NULL, run_id TEXT NOT NULL, record_json TEXT NOT NULL,
@@ -188,6 +189,37 @@ export class MessageStore {
   getDeliveryRunTarget(bot:string,chat:string,runId:string):any {
     const row=this.db.prepare('SELECT record_json FROM run_delivery_targets WHERE bot_name=? AND chat_id=? AND run_id=?').get(bot,chat,runId) as any;
     return row ? JSON.parse(row.record_json) : null;
+  }
+  /** Scheduling custody is independent of exact-run result custody. */
+  saveDispatchCustody(bot:string,chat:string,record:object):void {
+    this.db.prepare('INSERT OR REPLACE INTO dispatch_custody VALUES(?,?,?)').run(bot,chat,JSON.stringify(record));
+  }
+  getDispatchCustody(bot:string,chat:string):any {
+    const row=this.db.prepare('SELECT record_json FROM dispatch_custody WHERE bot_name=? AND chat_id=?').get(bot,chat) as any;
+    const item=row ? JSON.parse(row.record_json) : null;
+    return item?.stopEpoch===this.getStopGeneration(bot,chat) ? item : null;
+  }
+  clearDispatchCustody(bot:string,chat:string,ownerId:string,batchId:string):boolean {
+    return this.db.prepare(`DELETE FROM dispatch_custody WHERE bot_name=? AND chat_id=?
+      AND json_extract(record_json,'$.id')=? AND json_extract(record_json,'$.batchId')=?`).run(bot,chat,ownerId,batchId).changes===1;
+  }
+  /** Atomic release of proven never-attempted reservations only. Unknown and
+   * accepted inputs retain their exact target and never enter ordinary drain. */
+  releaseDispatchCustody(bot:string,chat:string,ownerId:string,batchId:string):boolean {
+    return this.db.transaction(()=>{
+      const custody=this.getDispatchCustody(bot,chat);
+      if(!custody || !this.clearDispatchCustody(bot,chat,ownerId,batchId))return false;
+      this.db.prepare(`UPDATE run_delivery_targets SET record_json=json_set(record_json,'$.dispatchReleased',json('true'),
+        '$.dispatchOwnerId',?,'$.dispatchBatchId',?,'$.sessionId',?) WHERE bot_name=? AND chat_id=? AND run_id=?`)
+        .run(ownerId,batchId,custody.sessionId,bot,chat,custody.runId);
+      this.db.prepare(`UPDATE insertion_custody SET state='ordinary',next_check_at=0,
+        record_json=json_set(record_json,'$.reason','current session confirmed schedulable; no backend attempt')
+        WHERE bot_name=? AND chat_id=? AND state='pending'
+        AND COALESCE(json_extract(record_json,'$.attempted'),0)=0
+        AND json_extract(record_json,'$.ownerId')=? AND json_extract(record_json,'$.batchId')=?
+        AND json_extract(record_json,'$.stopEpoch')=?`).run(bot,chat,ownerId,batchId,this.getStopGeneration(bot,chat));
+      return true;
+    })();
   }
   /** Reserved is persisted before the send-attempt callback; dispatching is
    * persisted before the RPC. Only reserved + unchanged stop generation proves
@@ -268,6 +300,18 @@ export class MessageStore {
     const r = this.db.prepare(`DELETE FROM delivery_outbox WHERE bot_name=? AND chat_id=? AND delivery_key LIKE ? AND status='pending'`)
       .run(bot, chat, `insertion:${insertionId}:%`);
     return r.changes;
+  }
+  /** Reminder intent and its outbox row commit together. Never write a stale
+   * reconciliation snapshot over a later accepted/stopped insertion. */
+  queueInsertionUnknownNotice(bot:string,chat:string,row:number,delivery:Omit<DeliveryOutboxItem,'id'|'status'|'attempts'|'createdAt'|'updatedAt'>):boolean {
+    return this.db.transaction(()=>{
+      const current=this.getInsertion(bot,chat,row);
+      if(current?.state!=='unknown' || current.stopEpoch!==this.getStopGeneration(bot,chat) || current.unknownNotified ||
+        !Number.isFinite(current.unknownSince) || Date.now()-current.unknownSince<45_000)return false;
+      this.enqueueDelivery(delivery);
+      this.saveInsertion(bot,chat,row,current.insertionId,'unknown',{...current,unknownNotified:true},Date.now()+15_000);
+      return true;
+    })();
   }
   claimInsertionAttempt(bot:string,chat:string,row:number):boolean {
     return this.db.prepare(`UPDATE insertion_custody SET state='dispatching',record_json=json_set(record_json,'$.attempted',json('true'))
