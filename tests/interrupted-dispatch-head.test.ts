@@ -77,13 +77,18 @@ describe('independent parent head and deadline correctness probes',()=>{
    snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40}));
   expect((await metadataStatus()).idleConfirmed).toBe(true);
  });
- it('a real multi-page scan finishing between 1.5s and 8s succeeds (audit P1: outer race was still 1500ms)',async()=>{
-  const started=Date.now();let n=0;
-  history=(p:any)=>{n++;vi.setSystemTime(started+n*650);
-    return p.pendingBefore===40?snapshot(pending([input('tail','cancelled')],{total:2})):
-     snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40}));};
-  const s=await metadataStatus();
-  expect(n).toBe(3);
+ it('real async pages at 650ms RPC latency complete under the 8s budget (the old 1500ms outer race kills this scan)',async()=>{
+  // Real awaited timers, not setSystemTime: the outer Promise.race timer must
+  // actually fire (or not) for this regression to mean anything. Three 650ms
+  // pages finish at 1950ms — inside 8000ms, outside the old 1500ms race.
+  const page=(p:any)=>p.pendingBefore===40?snapshot(pending([input('tail','cancelled')],{total:2})):snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40}));
+  history=(p:any)=>new Promise(r=>{setTimeout(()=>r(page(p)),650);});
+  const sPromise=metadataStatus();
+  await vi.advanceTimersByTimeAsync(650);
+  await vi.advanceTimersByTimeAsync(650);
+  await vi.advanceTimersByTimeAsync(650);
+  await vi.advanceTimersByTimeAsync(100);
+  const s=await sPromise;
   expect(s.idleConfirmed).toBe(true);
  });
  it('head response observed beyond absolute 1500ms deadline cannot authorize idle',async()=>{
