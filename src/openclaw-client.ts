@@ -107,6 +107,7 @@ export class OpenClawClient {
   /** Deduplicates 2026.8 canonical `agent.stream=tool` events against legacy
    * `stream=item` mirrors when a runtime emits both representations. */
   private recentToolEventKeys: Map<string, number> = new Map();
+  private privateInputToolCalls = new Set<string>();
   private sessionSettlementCallbacks=new Map<string,(meta:ProactiveMessageMeta)=>void|Promise<void>>();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: ProactiveMessageMeta) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
@@ -344,6 +345,16 @@ export class OpenClawClient {
           }
         }
 
+        if(frame.event==='agent' && ['tool','item'].includes(frame.payload?.stream))this.redactPrivateInputTool(frame.payload);
+
+        // Public transcript projections can render an INPUT as role=assistant
+        // (forwarded sessions_send / internal receipts). Reject its structured
+        // identity before any collector, proactive callback or progress buffer.
+        // Do not classify by text, run ownership, or a wrapping prompt prefix:
+        // genuine replies/quotes and external Cron/child outputs remain valid.
+        if ((frame.event==='chat' ||
+          frame.event==='agent' && ['assistant','chatDelta'].includes(frame.payload?.stream)) && this.isInputRecord(frame.payload)) return;
+
         // Agent events — store per session key
         if (frame.event === "agent" || frame.event === "chat") {
           const sk = frame.payload?.sessionKey || "__default__";
@@ -405,7 +416,8 @@ export class OpenClawClient {
           // exact public agent.wait, never an unbounded transcript cache.
           for(const [key,bucket] of this.agentEvents) if(bucket.length>2048) bucket.splice(0,bucket.length-2048);
         }
-        if (frame.type === "event" && ["agent", "chat", "session.message"].includes(frame.event)) {
+        if (frame.type === "event" && ["agent", "chat", "session.message"].includes(frame.event) &&
+          !(frame.event==='session.message' && this.isInputRecord(frame.payload))) {
           for (const observer of this.goEvidenceObservers) {
             try { observer({ channel: frame.event, payload: frame.payload }); }
             catch (error) { console.warn("[OpenClaw] Go evidence observer failed:", (error as Error).message); }
@@ -437,7 +449,8 @@ export class OpenClawClient {
             // in correct time order and flip the reaction to Get.
             this.handleSteerConsumption(rawKey, visibleUserText);
           }
-          const visibleAssistantText = this.extractVisibleAssistantText(msg);
+          const inputRecord=this.isInputRecord(frame.payload);
+          const visibleAssistantText = inputRecord ? "" : this.extractVisibleAssistantText(msg);
           if (visibleAssistantText) {
             if (!this.agentEvents.has(rawKey)) this.agentEvents.set(rawKey, []);
             this.bufferEvent(rawKey,{
@@ -447,7 +460,7 @@ export class OpenClawClient {
               data: { deltaText: visibleAssistantText, delta: visibleAssistantText, replace: true },
             });
           }
-          this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId, frame.payload.sessionId);
+          if(!inputRecord)this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId, frame.payload.sessionId);
           for(const wake of this.eventCollectors) wake();
 
           // Tool calls in assistant messages — skip, using agent item events instead
@@ -582,8 +595,22 @@ export class OpenClawClient {
       .trim();
   }
 
+  /** Role is presentation, not authorship. Core's public forwarded-message
+   * projection preserves these input markers even when it changes user to
+   * assistant. Stream events without a message/role remain supported; never
+   * inspect run-level inputProvenance (a real reply may answer such an input). */
+  private isInputRecord(record:any):boolean {
+    if(!record || typeof record!=='object')return false;
+    if(typeof record.role==='string' && record.role!=='assistant')return true;
+    if(['external_user','inter_session','internal_system'].includes(record.provenance?.kind))return true;
+    if(record.senderSession && typeof record.senderSession==='object')return true;
+    const inputKey=record.idempotencyKey ?? record.__openclaw?.idempotencyKey;
+    if(typeof inputKey==='string' && inputKey.endsWith(':user'))return true;
+    return this.isInputRecord(record.message) || this.isInputRecord(record.data);
+  }
+
   private extractVisibleAssistantText(msg: any, options: { allowMixedToolText?: boolean } = {}): string {
-    if (msg?.role !== "assistant") return "";
+    if (msg?.role !== "assistant" || this.isInputRecord(msg)) return "";
     const content = msg.content;
 
     // Extract only visible text parts and ignore thinking/tool blocks.
@@ -623,13 +650,38 @@ export class OpenClawClient {
     }
   }
 
+  /** Internal message tools carry private input, not assistant narration.
+   * Redact before buffering as well as progress callbacks (including failure
+   * summaries). Preserve tool identity/phase for activity and acceptance logic. */
+  private redactPrivateInputTool(payload:any):void {
+    const data=payload?.data;
+    if(!data || payload.stream==='item' && data.kind!=='tool')return;
+    const name=String(data.name || data.toolName || '').split('.').pop();
+    const eventId=String(data.toolCallId || data.itemId || data.id || '').replace(/^(?:tool|command):/,'');
+    const key=JSON.stringify([this.canonicalSessionKey(payload.sessionKey || ''),payload.runId || '',eventId]);
+    let args=data.input ?? data.args ?? data.meta;
+    if(typeof args==='string') {try {args=JSON.parse(args);} catch {args=undefined;}}
+    const wrapped=name==='tool_call' && /(?:^|[.:])sessions_(?:send|yield)$/.test(String(args?.id || ''));
+    const privateBody=name==='sessions_send' || name==='sessions_yield' || wrapped;
+    if(privateBody && eventId) {
+      this.privateInputToolCalls.add(key);
+      if(this.privateInputToolCalls.size>2048)this.privateInputToolCalls.delete(this.privateInputToolCalls.values().next().value!);
+    }
+    if(!privateBody && !this.privateInputToolCalls.has(key))return;
+    payload.data=Object.fromEntries(['kind','phase','name','toolName','toolCallId','itemId','id','isError'].filter(k=>data[k]!==undefined).map(k=>[k,data[k]]));
+  }
+
   /** Render protocol-4 structured tool args/results without `[object Object]`.
    * Prefer useful, non-secret fields and keep the fallback bounded. */
   private formatToolValue(value: unknown, toolName: string, phase: "start" | "end" | "error"): string {
     // sessions_yield.message is private resumed context. Do not mirror its
     // arguments/results (including JSON strings) into process cards or verbose
     // tool replies. This is redaction only, never evidence of a handoff.
-    if (toolName === "sessions_yield") return "";
+    if (toolName === "sessions_yield" || toolName === "sessions_send") return "";
+    // Generic public-tool wrapper: redact only the internal send operation,
+    // not all tool bodies or outputs. Its returned body can echo the input.
+    if(toolName === 'tool_call' && value && typeof value==='object' &&
+      /(?:^|[.:])sessions_send$/.test(String((value as any).id || '')))return "";
     if (value === null || value === undefined || value === "") return "";
     if (typeof value === "string") return value.trim();
     if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
@@ -746,6 +798,7 @@ export class OpenClawClient {
   }
 
   private handleVerboseAssistantStream(payload: any): void {
+    if(this.isInputRecord(payload))return;
     const rawKey = payload?.sessionKey || "";
     if (!rawKey) return;
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
@@ -770,6 +823,7 @@ export class OpenClawClient {
   }
 
   private handleProactiveSessionMessage(rawKey: string, msg: any, runId?: string, sessionId?: string): boolean {
+    if(this.isInputRecord(msg))return false;
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
 
     // Proactive assistant text messages. Cron/session-targeted runs often emit
@@ -1956,16 +2010,70 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    * terminal caches. Unknown/missing fields never authorize scheduling. */
   async getSessionDispatchStatus(sessionKey:string):Promise<{idleConfirmed:boolean;sessionId?:string;archived?:boolean;activeRunId?:string;busyConfirmed?:boolean}> {
     let timer:ReturnType<typeof setTimeout>|undefined;
+    const key=this.canonicalSessionKey(sessionKey),deadline=Date.now()+1500;
+    // One budget covers the entire public pending scan, not 1500ms per page.
+    // Retained interrupted/cancelled inputs are recovery records, NOT runnable
+    // queue entries. Never delete, mutate or replay them to prove schedulability.
+    const scan=async()=>{
+      let sessionId:string|undefined,total:number|undefined,before:number|undefined;
+      const seen=new Set<string>(),cursors=new Set<number>();
+      let headSignature='';
+      const unknown=()=>({idleConfirmed:false,sessionId});
+      const validId=(value:any)=>value===undefined || typeof value==='string' && !!value.trim();
+      for(let page=0;page<32;page++) {
+        const history:any=await this.rpc('chat.history',{sessionKey:key,limit:20,...(before?{pendingBefore:before}:{})},1500);
+        if(Date.now()>=deadline)return unknown();
+        const info=history?.sessionInfo;
+        const id=info?.sessionId || history?.sessionId;
+        if(!validId(info?.sessionId) || !validId(history?.sessionId) || history?.sessionKey!==key || typeof id!=='string' || !id.trim() ||
+          info?.sessionId && history?.sessionId && info.sessionId!==history.sessionId || sessionId && sessionId!==id)return unknown();
+        sessionId=id;
+        const base={sessionId,archived:info?.archived===true};
+        if(base.archived)return {...base,idleConfirmed:false};
+        if(info?.hasActiveRun===true || history?.inFlightRun)return {...base,idleConfirmed:false,busyConfirmed:true,
+          activeRunId:typeof history?.inFlightRun?.runId==='string'?history.inFlightRun.runId:undefined};
+        const pending=history?.pendingInputs;
+        if(!Number.isSafeInteger(pending?.total) || pending.total<0 || total!==undefined && total!==pending.total)return unknown();
+        total=pending.total;
+        if(pending.queuedCount!==undefined && (!Number.isSafeInteger(pending.queuedCount) || pending.queuedCount<0))return unknown();
+        if(pending.queuedCount>0)return {...base,idleConfirmed:false,busyConfirmed:true};
+        // Legacy empty pending responses omit items. Only total=0 can safely
+        // support that shape; a hidden/nonempty retained set is never guessed.
+        const items=pending.items===undefined && total===0?[]:pending.items;
+        if(!Array.isArray(items))return unknown();
+        for(const item of items) {
+          if(typeof item?.id!=='string' || !item.id || !['queued','cancelled','interrupted'].includes(item.state) || seen.has(item.id))return unknown();
+          seen.add(item.id);
+          if(item.state==='queued')return {...base,idleConfirmed:false,busyConfirmed:true};
+        }
+        if(seen.size>total!)return unknown();
+        const next=pending.nextBefore;
+        if(next!==undefined && (!Number.isSafeInteger(next) || next<=0 || cursors.has(next) || before!==undefined && next>=before))return unknown();
+        const signature=JSON.stringify([id,total,info?.hasActiveRun,items.map((item:any)=>[item.id,item.state]),next]);
+        if(page===0)headSignature=signature;
+        if(next!==undefined) {cursors.add(next);before=next;continue;}
+        if(info?.hasActiveRun!==false || seen.size!==total)return unknown();
+        if(page>0) {
+          // Pagination is not an atomic snapshot. Re-read the current head and
+          // identity/activity before returning positive evidence to local CAS.
+          const head:any=await this.rpc('chat.history',{sessionKey:key,limit:20},1500);
+          const hi=head?.sessionInfo,hp=head?.pendingInputs,hid=hi?.sessionId || head?.sessionId;
+          if(!validId(hi?.sessionId) || !validId(head?.sessionId) || head?.sessionKey!==key || hid!==id || hi?.sessionId && head?.sessionId && hi.sessionId!==head.sessionId)return unknown();
+          if(hi?.archived===true)return {...base,archived:true,idleConfirmed:false};
+          if(hi?.hasActiveRun===true || head?.inFlightRun || Number.isSafeInteger(hp?.queuedCount) && hp.queuedCount>0)
+            return {...base,idleConfirmed:false,busyConfirmed:true,activeRunId:typeof head?.inFlightRun?.runId==='string'?head.inFlightRun.runId:undefined};
+          if(hp?.total!==total || hp?.queuedCount!==undefined && (!Number.isSafeInteger(hp.queuedCount) || hp.queuedCount<0))return unknown();
+          if(Array.isArray(hp?.items) && hp.items.some((item:any)=>typeof item?.id==='string' && item.id && item.state==='queued'))return {...base,idleConfirmed:false,busyConfirmed:true};
+          if(!Array.isArray(hp?.items) || JSON.stringify([hid,hp.total,hi?.hasActiveRun,hp.items.map((item:any)=>[item?.id,item?.state]),hp.nextBefore])!==headSignature)return unknown();
+        }
+        return {...base,idleConfirmed:true,busyConfirmed:false};
+      }
+      return unknown();
+    };
     try {
-      const key=this.canonicalSessionKey(sessionKey);
-      const history:any=await Promise.race([this.rpc('chat.history',{sessionKey:key,limit:1},1500),
-        new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('activity lookup timeout')),1500);})]);
-      const info=history?.sessionInfo;
-      return {idleConfirmed:history?.sessionKey===key && info?.hasActiveRun===false &&
-        history?.pendingInputs?.total===0 && !history?.inFlightRun && info?.archived!==true,
-        sessionId:info?.sessionId || history?.sessionId,archived:info?.archived===true,
-        activeRunId:history?.sessionKey===key && typeof history?.inFlightRun?.runId==='string' ? history.inFlightRun.runId : undefined,
-        busyConfirmed:history?.sessionKey===key && (info?.hasActiveRun===true || !!history?.inFlightRun || history?.pendingInputs?.total>0)};
+      return await Promise.race([scan(),new Promise<never>((_,reject)=>{
+        timer=setTimeout(()=>reject(new Error('activity lookup timeout')),1500);
+      })]);
     } catch {return {idleConfirmed:false};}
     finally {if(timer)clearTimeout(timer);}
   }
@@ -2261,6 +2369,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }
 
   private extractTextFromChatMessage(message: any): string {
+    if(this.isInputRecord(message))return "";
     const parts = Array.isArray(message?.content) ? message.content : [];
     return parts.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
   }
@@ -2929,6 +3038,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     this.verboseAssistantSent.clear();
     this.verboseAssistantLastTouched.clear();
     this.lastToolNamesByItemId.clear();
+    this.privateInputToolCalls.clear();
     this.recentToolEventKeys.clear();
     this.pendingSteerTexts.clear();
     this.steerConsumedCallbacks.clear();

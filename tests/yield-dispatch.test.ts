@@ -73,7 +73,10 @@ describe('dispatch handoff fences and long-running controls',()=>{
   await h.bot.handleMessage(event('B'));await tick(100);expect(h.sends).toHaveLength(1);expect(h.bot.queueRuns.has('chat')).toBe(true);
  });
  it.each(['foreign','missing','tool'])('untrusted %s yielded data cannot hand off foreground custody',async(mode)=>{
-  await start();if(mode==='tool')wire('agent',{runId:'r1',stream:'tool',data:{name:'sessions_yield',phase:'result',output:{yielded:true}}});
+  await start();const base=h.client.rpc;
+  // No independent current-session idle proof: only the untrusted yield hint.
+  h.client.rpc=vi.fn(async(m:string,p:any)=>m==='chat.history'?{}:base(m,p));
+  if(mode==='tool')wire('agent',{runId:'r1',stream:'tool',data:{name:'sessions_yield',phase:'result',output:{yielded:true}}});
   else yieldRoot(mode==='foreign'?'foreign':undefined,{...(mode==='missing'?{runId:undefined}:{})});
   await tick(100);activity={status:'done',hasActiveRun:false};await h.bot.handleMessage(event('B'));await tick(100);
   expect(h.sends).toHaveLength(1);expect(h.bot.queueRuns.has('chat')).toBe(true);expect(h.client.eventCollectors.size).toBe(1);

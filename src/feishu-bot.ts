@@ -1319,8 +1319,19 @@ export class FeishuBot {
     if(!unsubmitted())return;
     // Session creation/model setup is not agent admission. Initialize a truly
     // new chat before asking for its live activity; never infer idle from a
-    // missing describe response. Setup errors keep the existing queue error path.
-    try {await this.ensureSession(chatId);} catch {return;}
+    // missing describe response. A failed setup is not dispatch-idle evidence;
+    // retain this never-attempted input for paced reconciliation as well.
+    try {await this.ensureSession(chatId);} catch {
+      if(unsubmitted() && !this.queueRuns.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId)) {
+        const row=this.store.getInsertion(this.config.name,chatId,rowId);
+        if(!row || row.state==='pending' && row.activityUnbound && !row.attempted && !row.expectedRunId)
+          this.store.saveInsertion(this.config.name,chatId,rowId,row?.insertionId || JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
+            messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),activityUnbound:true,attempted:false,expectedRunId:'',
+            reason:'session setup unavailable; retained without dispatch-idle proof',
+          },Date.now()+5000);
+      }
+      return;
+    }
     if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
     const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId));
     if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
@@ -1334,8 +1345,8 @@ export class FeishuBot {
     const fresh=this.store.getInsertion(this.config.name,chatId,rowId);
     if(current ? fresh?.insertionId!==current.insertionId || fresh.state!=='pending' || fresh.attempted===true || !fresh.activityUnbound || !!fresh.expectedRunId : !!fresh)return;
     const compatible=!activity.sessionId || !status.sessionId || activity.sessionId===status.sessionId;
-    const idle=compatible && !status.archived && !activity.archived && !activity.busyConfirmed &&
-      (status.idleConfirmed && !!status.sessionId || activity.idleConfirmed && !!activity.sessionId);
+    const idle=compatible && !status.running && !status.archived && !activity.archived && !activity.busyConfirmed &&
+      activity.idleConfirmed===true && !!activity.sessionId;
     if(idle) {
       if(current)this.store.saveInsertion(this.config.name,chatId,rowId,current.insertionId,'ordinary',{...current,activityUnbound:false});
       return;
@@ -1362,10 +1373,8 @@ export class FeishuBot {
       return this.stopGeneration(chatId)===epoch && now?.id===saved.id && now?.batchId===saved.batchId && now?.runId===saved.runId &&
         this.queueOwners.get(chatId)===local && (!local || local.batch===batch && local.runId===runId && (local.admitted===true || local.yielded===true) && local.collecting===true);
     };
-    if(!saved.yielded) {
-      const activity=await this.openclawClient.getSessionDispatchStatus?.(this.getSessionKey(chatId)).catch(()=>null);
-      if(!unchanged() || !activity?.idleConfirmed || activity.archived || activity.sessionId!==saved.sessionId)return false;
-    }
+    const activity=await this.openclawClient.getSessionDispatchStatus?.(this.getSessionKey(chatId)).catch(()=>null);
+    if(!unchanged() || !activity?.idleConfirmed || activity.busyConfirmed || activity.archived || activity.sessionId!==saved.sessionId)return false;
     const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId)).catch(()=>null);
     if(!unchanged() || !status?.idleConfirmed || status.archived || status.sessionId!==saved.sessionId)return false;
     if(!this.store.releaseDispatchCustody(this.config.name,chatId,saved.id,saved.batchId))return false;
@@ -1507,16 +1516,11 @@ export class FeishuBot {
           ['target_not_ready','backend_rejected_no_effect','original run ended without an insertion attempt'].includes(receipt.reason || '')) {
           const status=await this.openclawClient.getSessionRuntimeStatus(item.sessionKey).catch(()=>null);
           if(!stillCurrent()) continue;
-          const rootSettled=await this.openclawClient.exactRunSettled?.(item.expectedRunId);
-          if(!stillCurrent()) continue;
-          const activity=!owner && !rootSettled && status?.idleConfirmed ? await this.openclawClient.getSessionDispatchStatus?.(item.sessionKey).catch(()=>null) : null;
+          const activity=status?.idleConfirmed ? await this.openclawClient.getSessionDispatchStatus?.(item.sessionKey).catch(()=>null) : null;
           if(!stillCurrent())continue;
-          const currentIdle=activity?.idleConfirmed===true && activity.sessionId===item.sessionId && !activity.archived && status?.sessionId===item.sessionId;
+          const currentIdle=activity?.idleConfirmed===true && !activity.busyConfirmed && activity.sessionId===item.sessionId && !activity.archived && status?.sessionId===item.sessionId;
           const unchanged=this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck;
-          const target=this.store.getDeliveryRunTarget(this.config.name,chatId,item.expectedRunId);
-          const dispatchReleased=target?.dispatchReleased===true && target.dispatchOwnerId===item.ownerId && target.dispatchBatchId===item.batchId &&
-            target.sessionId===item.sessionId && status?.sessionId===item.sessionId && !status?.archived;
-          if((rootSettled===true || dispatchReleased || currentIdle) && status?.idleConfirmed===true && unchanged) {
+          if(currentIdle && status?.idleConfirmed===true && unchanged) {
             state='ordinary';
             // Never expire a successor merely to schedule the old input.
             if(runAtCheck===item.expectedRunId) this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never accepted/unknown');

@@ -13,6 +13,9 @@ export function harness(dbPath?:string) {
  const client:any=new OpenClawClient({baseUrl:'ws://offline',token:'offline'});
  let n=0;const sends:any[]=[];
  client.rpc=vi.fn(async(method:string,p:any)=>{
+   // Explicit public dispatch evidence: describe-only idle is intentionally
+   // insufficient in production. Follow this fixture's current describe edge.
+   if(method==='chat.history'){const {session}=await client.rpc('sessions.describe',{key:p.sessionKey});return {sessionKey:p.sessionKey,sessionInfo:session,pendingInputs:{total:0,items:[]}};}
    if(method==='chat.send'){sends.push(p);return {runId:`r${++n}`,status:'started'};}
    if(method==='agent.wait')return {runId:p.runId,status:'timeout'};
    if(method==='chat.abort')return {aborted:true,runIds:['r1']};

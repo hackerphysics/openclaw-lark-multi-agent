@@ -42,6 +42,7 @@ async function harness() {
   let admitted=false;
   client.rpc = vi.fn(async (method: string) => {
     if (method === "sessions.describe") return { session: { model: "gemini-3.8-flash", modelProvider: "x", sessionId:"offline-generation", status:admitted?"running":"idle", hasActiveRun:admitted, totalTokens: 0 } };
+    if (method === "chat.history") return {sessionKey,sessionInfo:{sessionId:"offline-generation",hasActiveRun:admitted},pendingInputs:{total:0,items:[]}};
     if (method === "agent.wait") return { runId, status: "timeout" }; // actual current read; cannot reconstruct old terminal details
     if (method === "chat.send") {admitted=true;return {runId};}
     if (method === "chat.abort") return { aborted: true, runIds: [] };
