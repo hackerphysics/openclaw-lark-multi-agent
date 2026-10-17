@@ -1539,6 +1539,20 @@ export class FeishuBot {
             // Never expire a successor merely to schedule the old input.
             if(runAtCheck===item.expectedRunId) this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never accepted/unknown');
           } else if(state==='target_ended') state='pending';
+          else if(state==='pending') {
+            // Safe recovery for a NON-INSERTABLE target (audit P1 #2
+            // 2026-10-17): this branch only runs for EXPLICIT no-effect
+            // receipts (attempted===false, definitively not inserted — the
+            // outer guard). If the exact target run has settled, or the
+            // target has refused insertion for over 60s (e.g. a long-lived
+            // maintenance run), hand the input to the ordinary queue: the
+            // gateway queues it behind whatever currently holds the session
+            // instead of parking it in bridge-side limbo forever. Unknown
+            // receipts never enter this branch and are never replayed.
+            const boundSince=Number.isFinite(item.boundSince)?item.boundSince:Date.now();
+            item.boundSince=boundSince;
+            if(originalRunEnded || Date.now()-boundSince>60_000) state='ordinary';
+          }
         }
         if(state==='target_ended') state='rejected'; // prior explicit backend refusal; never silently move it to a successor
         if(state==='unavailable' || state==='capability_blocked') state='pending';

@@ -2076,8 +2076,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       return unknown();
     };
     try {
+      // The outer race must honor the SAME total budget as the scan itself
+      // (audit P1 2026-10-17: an 8000ms scan raced against a 1500ms timer was
+      // still killed at 1500ms — three real 650ms pages never got to finish).
       return await Promise.race([scan(),new Promise<never>((_,reject)=>{
-        timer=setTimeout(()=>reject(new Error('activity lookup timeout')),1500);
+        timer=setTimeout(()=>reject(new Error('activity lookup timeout')),8000);
       })]);
     } catch {return {idleConfirmed:false};}
     finally {if(timer)clearTimeout(timer);}

@@ -77,6 +77,15 @@ describe('independent parent head and deadline correctness probes',()=>{
    snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40}));
   expect((await metadataStatus()).idleConfirmed).toBe(true);
  });
+ it('a real multi-page scan finishing between 1.5s and 8s succeeds (audit P1: outer race was still 1500ms)',async()=>{
+  const started=Date.now();let n=0;
+  history=(p:any)=>{n++;vi.setSystemTime(started+n*650);
+    return p.pendingBefore===40?snapshot(pending([input('tail','cancelled')],{total:2})):
+     snapshot(pending([input('head','interrupted')],{total:2,nextBefore:40}));};
+  const s=await metadataStatus();
+  expect(n).toBe(3);
+  expect(s.idleConfirmed).toBe(true);
+ });
  it('head response observed beyond absolute 1500ms deadline cannot authorize idle',async()=>{
   let n=0;const started=Date.now();history=(p:any)=>{
    n++;if(n===3)vi.setSystemTime(started+8001);

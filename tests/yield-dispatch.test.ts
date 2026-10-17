@@ -152,7 +152,7 @@ describe('admission and asynchronous identity races',()=>{
  });
  it('a timed-out activity lookup is unknown and a later idle result cannot release custody',async()=>{
   await start();const base=h.client.rpc;const late:any[]=[];h.client.rpc=vi.fn(async(m:string,p:any)=>m==='chat.history'?await new Promise(r=>late.push(r)):base(m,p));
-  const b=h.bot.handleMessage(event('B'));await tick(1501);await b;expect(h.sends).toHaveLength(1);
+  const b=h.bot.handleMessage(event('B'));await tick(8001);await b;expect(h.sends).toHaveLength(1);
   activity={status:'done',hasActiveRun:false};late[0]({sessionKey:h.key,sessionInfo:{sessionId:'generation-1',hasActiveRun:false},pendingInputs:{total:0}});await tick(100);
   expect(h.sends).toHaveLength(1);expect(h.bot.queueRuns.has('chat')).toBe(true);
  });
