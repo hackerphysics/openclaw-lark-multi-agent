@@ -1328,6 +1328,11 @@ export class FeishuBot {
     if(current && (!current.activityUnbound || current.attempted))return;
     const activity=await this.openclawClient.getSessionDispatchStatus(this.getSessionKey(chatId));
     if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    // Another recovery/ingress lookup may have identified the root and begun
+    // dispatch while this one awaited history. Never restore its older
+    // never-attempted snapshot over an attempted/unknown/accepted journal.
+    const fresh=this.store.getInsertion(this.config.name,chatId,rowId);
+    if(current ? fresh?.insertionId!==current.insertionId || fresh.state!=='pending' || fresh.attempted===true || !fresh.activityUnbound || !!fresh.expectedRunId : !!fresh)return;
     const compatible=!activity.sessionId || !status.sessionId || activity.sessionId===status.sessionId;
     const idle=compatible && !status.archived && !activity.archived && !activity.busyConfirmed &&
       (status.idleConfirmed && !!status.sessionId || activity.idleConfirmed && !!activity.sessionId);
