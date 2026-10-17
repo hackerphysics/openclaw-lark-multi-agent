@@ -847,8 +847,8 @@ export class OpenClawClient {
    * Collect agent reply by polling accumulated events.
    * Matches by initial runId OR sessionKey to handle multi-turn tool calling
    * where OpenClaw creates new runIds for each tool-call round.
-   * Existing event/anchor matching is retained. After 30 minutes of silence,
-   * reconcile the original run instead of aborting or treating a draft as final.
+   * Existing event/anchor matching is retained. Foreground effective silence
+   * triggers read-only reconciliation, never a task-lifetime cutoff or draft final.
    * Explicit terminal/error/disconnect paths keep their existing behavior.
    */
 private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { exactRunIdentity?: boolean; emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>; onYieldHandoff?: (runId:string)=>void }): Promise<string> {
@@ -914,8 +914,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (observationClosed) return;
         if (chatFinalText.trim()) { finish(chatFinalText); return; }
         if (error instanceof SessionWaitPaused) {
-          // Foreground notice, background observation. Keep the original queue
-          // owner/progress path so later input still steers into the same run.
+          // Presentation only. A separate trusted-yield callback may transfer
+          // scheduling custody; an ordinary timeout never authorizes that handoff.
           foregroundPaused = true;
           if (!waitNoticeSent) {
             waitNoticeSent = true;
@@ -1322,8 +1322,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               chatFinalSeen = true;
               if (ev.data?.gatewayYielded === true) {
                 // A yielded turn is not a terminal answer, even if its buffered
-                // message contains a preface. Preserve the collector/queue owner
-                // and final-delivery key; only pause foreground presentation.
+                // message contains a preface. Keep the final key unclaimed;
+                // opt-in durable handoff can retire only foreground observation.
                 if (chatFinalText.trim()) continue; // an actual final wins
                 foregroundYielded = true;
                 turnYielded = true;

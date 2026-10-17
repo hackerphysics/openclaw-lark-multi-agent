@@ -1308,19 +1308,26 @@ export class FeishuBot {
   private async reconcileCurrentInputActivity(chatId:string,rowId:number,messageId:string,text:string):Promise<void> {
     if(!this.openclawClient.getSessionRuntimeStatus || !this.openclawClient.getSessionDispatchStatus)return;
     const epoch=this.stopGeneration(chatId);
+    // A different ingress handler can ordinary-admit AND finish this row while
+    // a public lookup is in flight. Check message custody, not just an empty
+    // owner map, at every boundary so a late lookup can never reinsert it.
+    const unsubmitted=()=>this.stopGeneration(chatId)===epoch &&
+      this.store.getPendingTriggerIds(this.config.name,chatId).has(rowId) &&
+      !this.queueOwners.get(chatId)?.triggerIds?.has(rowId);
+    if(!unsubmitted())return;
     await this.openclawClient.waitForSessionStop?.(this.getSessionKey(chatId));
-    if(this.stopGeneration(chatId)!==epoch)return;
+    if(!unsubmitted())return;
     // Session creation/model setup is not agent admission. Initialize a truly
     // new chat before asking for its live activity; never infer idle from a
     // missing describe response. Setup errors keep the existing queue error path.
     try {await this.ensureSession(chatId);} catch {return;}
-    if(this.stopGeneration(chatId)!==epoch || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
     const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId));
-    if(this.stopGeneration(chatId)!==epoch || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
     const current=this.store.getInsertion(this.config.name,chatId,rowId);
     if(current && (!current.activityUnbound || current.attempted))return;
     const activity=await this.openclawClient.getSessionDispatchStatus(this.getSessionKey(chatId));
-    if(this.stopGeneration(chatId)!==epoch || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
     const compatible=!activity.sessionId || !status.sessionId || activity.sessionId===status.sessionId;
     const idle=compatible && !status.archived && !activity.archived && !activity.busyConfirmed &&
       (status.idleConfirmed && !!status.sessionId || activity.idleConfirmed && !!activity.sessionId);
@@ -1488,9 +1495,9 @@ export class FeishuBot {
         if(!stillCurrent()) continue;
         const valid=receipt.insertionId===item.insertionId && receipt.expectedRunId===item.expectedRunId && (!receipt.sessionId || receipt.sessionId===item.sessionId);
         let state:string=valid ? receipt.status : 'unknown';
-        // Explicit no-effect means a real old-run terminal can hand this SAME
-        // input back to the ordinary queue once. Time elapsed never authorizes
-        // this handoff. An attempted unknown can never take this branch.
+        // Explicit no-effect plus confirmed current schedulability can hand
+        // this SAME input back once without claiming old task settlement.
+        // Time elapsed and attempted-unknown receipts never authorize replay.
         if(valid && receipt.attempted===false && receipt.ordinaryEligible!==false && ['pending','target_ended'].includes(state) &&
           ['target_not_ready','backend_rejected_no_effect','original run ended without an insertion attempt'].includes(receipt.reason || '')) {
           const status=await this.openclawClient.getSessionRuntimeStatus(item.sessionKey).catch(()=>null);
@@ -1514,9 +1521,8 @@ export class FeishuBot {
         if(state==='unavailable' || state==='capability_blocked') state='pending';
         // Unknown is the NORMAL transient state right after a steer attempt
         // (the backend acceptance receipt has not landed yet); surfacing it on
-        // every insertion spams the chat (user report 2026-10-16: "每次插入消
-        // 息都发个这个"). Stay silent until it persists through several
-        // re-checks (~45s), then notify exactly once.
+        // every insertion spams the chat. Use real elapsed time from the first
+        // unknown observation, not query count, and commit one reminder intent.
         const unknownChecks = state === 'unknown' ? (Number(item.unknownChecks) || 0) + 1 : 0;
         const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks,
           unknownSince:state==='unknown' ? (item.state==='unknown' && Number.isFinite(item.unknownSince) ? item.unknownSince : Date.now()) : undefined};
