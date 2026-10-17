@@ -1441,17 +1441,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                   finish("NO_REPLY");
                   return;
                 }
-                if (!chatFinalText) {
-                  // (output-audit P1-4) An empty/missing root chat final must NOT
-                  // promote collected draft/transcript text into an authoritative
-                  // final. Drafts are display/progress candidates only. Nudge the
-                  // exact-run reconciliation: agent.wait's committed
-                  // terminalReply (visible/silent/empty) authorizes the outcome;
-                  // a pending run keeps observing. Never resurrect a draft here.
-                  void checkRunState(() => true, true);
-                  if (!observationClosed) resetIdleTimer(15_000, false);
-                  return;
-                }
                 if (!latestFinalText && options?.emptyFinalAsNoReply) {
                   finish("NO_REPLY");
                   return;
