@@ -21,7 +21,7 @@ import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
 
 const nonemptyReceipt=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
-type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; yielded?:boolean };
+type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; collecting?:boolean; yielded?:boolean };
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -1253,8 +1253,12 @@ export class FeishuBot {
       // Inspect current public activity, not just the local promise. A yielded
       // task (or a settled/uncached old root with authoritative idle history)
       // keeps its result observer but cannot monopolize independent new input.
-      await this.reconcileDispatchCustody(chatId);
+      const dispatchReleased=await this.reconcileDispatchCustody(chatId);
       if(this.stopGeneration(chatId)!==inputStopEpoch)return;
+      if(!isBot && insertedId>0 && !dispatchReleased && !this.queueRuns.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId))
+        await this.reconcileCurrentInputActivity(chatId,insertedId,messageId,cleanText);
+      if(this.stopGeneration(chatId)!==inputStopEpoch)return;
+      if(this.store.isInsertionReserved(this.config.name,chatId,insertedId))reservedAtIngress=true;
       if(reservedAtIngress && !this.store.isInsertionReserved(this.config.name,chatId,insertedId)) reservedAtIngress=false;
 
       // Another ingress handler may already have selected/admitted this row
@@ -1292,10 +1296,45 @@ export class FeishuBot {
       }
 
       // Not busy: admission callback, not local queueing, flips Typing -> Get.
-      await this.processQueue(chatId);
+      await this.processQueue(chatId,true);
     } catch (err) {
       console.error(`[${this.config.name}] Error:`, safeErrorSummary(err));
     }
+  }
+
+  /** With no local owner, the Gateway can still have externally admitted work.
+   * Read public activity and pin its exact root before choosing insertion. Missing
+   * identity is durable unbound custody, never a fabricated run or blind send. */
+  private async reconcileCurrentInputActivity(chatId:string,rowId:number,messageId:string,text:string):Promise<void> {
+    if(!this.openclawClient.getSessionRuntimeStatus || !this.openclawClient.getSessionDispatchStatus)return;
+    const epoch=this.stopGeneration(chatId);
+    await this.openclawClient.waitForSessionStop?.(this.getSessionKey(chatId));
+    if(this.stopGeneration(chatId)!==epoch)return;
+    // Session creation/model setup is not agent admission. Initialize a truly
+    // new chat before asking for its live activity; never infer idle from a
+    // missing describe response. Setup errors keep the existing queue error path.
+    try {await this.ensureSession(chatId);} catch {return;}
+    if(this.stopGeneration(chatId)!==epoch || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId));
+    if(this.stopGeneration(chatId)!==epoch || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    const current=this.store.getInsertion(this.config.name,chatId,rowId);
+    if(current && (!current.activityUnbound || current.attempted))return;
+    const activity=await this.openclawClient.getSessionDispatchStatus(this.getSessionKey(chatId));
+    if(this.stopGeneration(chatId)!==epoch || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
+    const compatible=!activity.sessionId || !status.sessionId || activity.sessionId===status.sessionId;
+    const idle=compatible && !status.archived && !activity.archived && !activity.busyConfirmed &&
+      (status.idleConfirmed && !!status.sessionId || activity.idleConfirmed && !!activity.sessionId);
+    if(idle) {
+      if(current)this.store.saveInsertion(this.config.name,chatId,rowId,current.insertionId,'ordinary',{...current,activityUnbound:false});
+      return;
+    }
+    const identified=compatible && !!activity.activeRunId && !!activity.sessionId && !activity.archived && !status.archived;
+    this.store.saveInsertion(this.config.name,chatId,rowId,current?.insertionId || JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
+      messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:identified ? activity!.sessionId : status.sessionId,
+      expectedRunId:identified ? activity!.activeRunId : '',ownerId:identified ? `external:${activity!.activeRunId}` : undefined,
+      batchId:identified ? activity!.activeRunId : undefined,activityUnbound:!identified,attempted:false,
+      reason:identified?'current Gateway run observed; insertion custody only':'current Gateway activity/run identity unavailable; retained without admission',
+    },Date.now()+(identified?0:5000));
   }
 
   /** CAS includes the actual batch, not merely the queue Promise, and excludes
@@ -1303,17 +1342,17 @@ export class FeishuBot {
   private async reconcileDispatchCustody(chatId:string):Promise<boolean> {
     const local=this.queueOwners.get(chatId);
     const saved=this.store.getDispatchCustody(this.config.name,chatId);
-    if(!saved?.runId || !saved.batchId || !saved.sessionId || !saved.admitted)return false;
-    if(local && (local.id!==saved.id || local.batchId!==saved.batchId || !local.admitted))return false;
+    if(!saved?.runId || !saved.batchId || !saved.sessionId || !saved.admitted && !saved.yielded)return false;
+    if(local && (local.id!==saved.id || local.batchId!==saved.batchId || !local.admitted && !local.yielded || !local.collecting))return false;
     const batch=local?.batch,runId=local?.runId,epoch=this.stopGeneration(chatId);
     const unchanged=()=>{
       const now=this.store.getDispatchCustody(this.config.name,chatId);
       return this.stopGeneration(chatId)===epoch && now?.id===saved.id && now?.batchId===saved.batchId && now?.runId===saved.runId &&
-        this.queueOwners.get(chatId)===local && (!local || local.batch===batch && local.runId===runId && local.admitted===true);
+        this.queueOwners.get(chatId)===local && (!local || local.batch===batch && local.runId===runId && (local.admitted===true || local.yielded===true) && local.collecting===true);
     };
     if(!saved.yielded) {
-      const activity=await this.openclawClient.getSessionDispatchStatus(this.getSessionKey(chatId));
-      if(!unchanged() || !activity.idleConfirmed || activity.archived || activity.sessionId!==saved.sessionId)return false;
+      const activity=await this.openclawClient.getSessionDispatchStatus?.(this.getSessionKey(chatId)).catch(()=>null);
+      if(!unchanged() || !activity?.idleConfirmed || activity.archived || activity.sessionId!==saved.sessionId)return false;
     }
     const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId)).catch(()=>null);
     if(!unchanged() || !status?.idleConfirmed || status.archived || status.sessionId!==saved.sessionId)return false;
@@ -1386,11 +1425,18 @@ export class FeishuBot {
     this.insertionChecks.add(chatId);
     try {
       const released=await this.reconcileDispatchCustody(chatId);
-      if(released)void this.processQueue(chatId).catch(()=>{});
+      if(released)void this.processQueue(chatId,true).catch(()=>{});
       for(const item of this.store.listInsertions(this.config.name,chatId)) {
         if(item.nextCheckAt>Date.now()) continue;
         const stillCurrent=()=>this.stopGeneration(chatId)===item.stopEpoch && !['stopped','ordinary','committed'].includes(this.store.getInsertion(this.config.name,chatId,item.rowId)?.state);
-        if(!stillCurrent()) {if(this.stopGeneration(chatId)!==item.stopEpoch)this.store.stopInsertions(this.config.name,chatId);continue;}
+        if(!stillCurrent()) {if(this.stopGeneration(chatId)!==item.stopEpoch)this.store.stopInsertionAtEpoch(this.config.name,chatId,item.rowId,item.stopEpoch);continue;}
+        if(item.activityUnbound) {
+          await this.reconcileCurrentInputActivity(chatId,item.rowId,item.messageId,item.text);
+          if(!stillCurrent()) {if(this.store.getInsertion(this.config.name,chatId,item.rowId)?.state==='ordinary')void this.processQueue(chatId,true).catch(()=>{});continue;}
+          const refreshed=this.store.getInsertion(this.config.name,chatId,item.rowId);
+          if(!refreshed?.expectedRunId)continue;
+          Object.assign(item,refreshed);
+        }
         const owner=this.queueOwners.get(chatId);
         if(!item.expectedRunId && owner?.id===item.ownerId && owner?.batchId===item.batchId && owner?.runId) item.expectedRunId=owner.runId;
         if(!item.expectedRunId) {
@@ -1401,7 +1447,7 @@ export class FeishuBot {
         }
         // Pin the real session generation BEFORE the dispatching journal. A
         // crash/lost response can then query using precisely the same identity.
-        const info=await this.openclawClient.getSessionInfo(item.sessionKey).catch(()=>null);
+        const info=await this.openclawClient.getSessionInfo(item.sessionKey,1500).catch(()=>null);
         if(!stillCurrent()) continue;
         const sessionId=info?.session?.sessionId;
         if(info?.session?.archived===true || (item.sessionId && sessionId && item.sessionId!==sessionId)) {
@@ -1451,11 +1497,14 @@ export class FeishuBot {
           if(!stillCurrent()) continue;
           const rootSettled=await this.openclawClient.exactRunSettled?.(item.expectedRunId);
           if(!stillCurrent()) continue;
+          const activity=!owner && !rootSettled && status?.idleConfirmed ? await this.openclawClient.getSessionDispatchStatus?.(item.sessionKey).catch(()=>null) : null;
+          if(!stillCurrent())continue;
+          const currentIdle=activity?.idleConfirmed===true && activity.sessionId===item.sessionId && !activity.archived && status?.sessionId===item.sessionId;
           const unchanged=this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck;
           const target=this.store.getDeliveryRunTarget(this.config.name,chatId,item.expectedRunId);
           const dispatchReleased=target?.dispatchReleased===true && target.dispatchOwnerId===item.ownerId && target.dispatchBatchId===item.batchId &&
             target.sessionId===item.sessionId && status?.sessionId===item.sessionId && !status?.archived;
-          if((rootSettled===true || dispatchReleased) && status?.idleConfirmed===true && unchanged) {
+          if((rootSettled===true || dispatchReleased || currentIdle) && status?.idleConfirmed===true && unchanged) {
             state='ordinary';
             // Never expire a successor merely to schedule the old input.
             if(runAtCheck===item.expectedRunId) this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never accepted/unknown');
@@ -1476,7 +1525,7 @@ export class FeishuBot {
           this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
           void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:ordinary`,
             'ℹ️ 当前会话已确认可接收新轮次，且这条消息确定未被插入；现已交回普通队列，只执行一次。',[],item.messageId,`insertion:${item.insertionId}:ordinary`).catch(()=>{});
-          void this.processQueue(chatId).catch(()=>{});
+          void this.processQueue(chatId,true).catch(()=>{});
         } else if(state==='accepted') {
           this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
           this.store.clearPendingTrigger(this.config.name,chatId,item.rowId);
@@ -1621,11 +1670,36 @@ export class FeishuBot {
     }
   }
 
-  private async processQueue(chatId: string): Promise<void> {
+  private async processQueue(chatId: string,activityChecked=false): Promise<void> {
     const existing = this.queueRuns.get(chatId);
     if (existing) {
       console.log(`[${this.config.name}] processQueue already running for ${chatId.slice(-8)}, joining existing run`);
       return existing;
+    }
+    const detached=this.store.getDispatchCustody(this.config.name,chatId);
+    if(detached) {
+      // Startup/recovery can reach the queue without an ingress handler. Pin
+      // unsent triggers synchronously before consulting live host activity.
+      for(const message of this.store.getPendingTriggerMessages(this.config.name,chatId)) {
+        if(!message.id || message.senderType!=='human' || this.store.getInsertion(this.config.name,chatId,message.id))continue;
+        this.store.saveInsertion(this.config.name,chatId,message.id,JSON.stringify([this.config.appId,chatId,message.messageId]),'pending',{
+          messageId:message.messageId,text:message.content,stopEpoch:this.stopGeneration(chatId),expectedRunId:detached.runId,
+          ownerId:detached.id,batchId:detached.batchId,sessionId:detached.sessionId,sessionKey:this.getSessionKey(chatId),
+        });
+      }
+      if(await this.reconcileDispatchCustody(chatId))return this.processQueue(chatId,true);
+      void this.reconcileInsertions(chatId).catch(()=>{});this.scheduleInsertionRecovery();return;
+    }
+    if(!activityChecked && typeof this.openclawClient.getSessionRuntimeStatus==='function' && typeof this.openclawClient.getSessionDispatchStatus==='function') {
+      const candidates=this.store.getPendingTriggerMessages(this.config.name,chatId)
+        .filter(message=>message.id && message.senderType==='human' && !this.store.isInsertionReserved(this.config.name,chatId,message.id));
+      if(!candidates.length)return;
+      for(const message of candidates)await this.reconcileCurrentInputActivity(chatId,message.id!,message.messageId,message.content);
+      // Re-enter through the ordinary owner CAS after all awaits. Any concurrent
+      // admission now owns its batch; never submit in parallel with that owner.
+      const eligible=this.store.getPendingTriggerMessages(this.config.name,chatId).some(message=>message.id && message.senderType==='human' && !this.store.isInsertionReserved(this.config.name,chatId,message.id));
+      if(eligible)return this.processQueue(chatId,true);
+      void this.reconcileInsertions(chatId).catch(()=>{});this.scheduleInsertionRecovery();return;
     }
     const owner: QueueOwner={id:randomUUID(),token:{},revoked:false,stopEpoch:this.stopGeneration(chatId)};
     this.queueOwners.set(chatId,owner);
@@ -1652,11 +1726,13 @@ export class FeishuBot {
    * the proactive path are invisible to them. Steer-fallback triggers are
    * restored via the failure observers so their input drains normally.
    */
-  private forceExpireQueueOwner(chatId: string, reason: string): boolean {
+  private forceExpireQueueOwner(chatId: string, reason: string,preserveDispatch=false): boolean {
     const owner = this.queueRuns.get(chatId);
     if (!owner) return false;
     const context=this.queueOwners.get(chatId);
+    if(context?.batchId && !preserveDispatch)this.store.clearDispatchCustody(this.config.name,chatId,context.id,context.batchId);
     if(context) context.revoked=true;
+    this.busyChats.set(chatId,0);
     console.warn(`[${this.config.name}] force-expiring zombie queue owner for ${chatId.slice(-8)}: ${reason}`);
     // Fence the stale batch's local observation BEFORE releasing custody: an
     // alive old poller would keep destructively consuming the replacement
@@ -1680,7 +1756,7 @@ export class FeishuBot {
       owner.batchId=randomUUID();
       owner.triggerIds=undefined;
       owner.runId=undefined;
-      owner.admitted=false;owner.yielded=false;owner.sessionId=undefined;
+      owner.admitted=false;owner.collecting=false;owner.yielded=false;owner.sessionId=undefined;
       this.queueRunTokens.set(chatId,batchToken);
       // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
       // completed with it (consumed or not); their failure observers are stale.
@@ -1841,7 +1917,7 @@ export class FeishuBot {
       try {
         sessionKey = await this.ensureSession(chatId);
         guard();
-        const generation=await this.openclawClient.getSessionInfo(sessionKey).catch(()=>null);
+        const generation=await this.openclawClient.getSessionInfo(sessionKey,1500).catch(()=>null);
         guard();owner.sessionId=generation?.session?.sessionId;
       } catch (err) {
         if(!current()) break;
@@ -1933,7 +2009,7 @@ export class FeishuBot {
               // OpenClaw accepts it, retrying would duplicate the same message.
               markSubmittedBatch("send-attempt");
             },
-            onRunIdentified: (runId:string)=>{guard();owner.runId=runId;foregroundRunId=runId;},
+            onRunIdentified: (runId:string,identity?:{sessionId?:string})=>{guard();owner.runId=runId;owner.sessionId=identity?.sessionId || owner.sessionId;foregroundRunId=runId;},
             onSubmitted: async (runId: string) => {
               guard();
               owner.runId=runId;owner.admitted=true;
@@ -1960,15 +2036,16 @@ export class FeishuBot {
               markSubmittedBatch(`submitted:${runId}`);
             },
             onProgress: (event) => current() ? liveStatus?.progress(event) : undefined,
+            onCollectionStarted:runId=>{guard();if(owner.runId===runId)owner.collecting=true;},
             onYieldHandoff: runId=>{
               guard();
-              if(owner.runId!==runId || !owner.admitted || !owner.batchId)throw new Error('Yield root/admission mismatch');
+              if(owner.runId!==runId || !owner.batchId)throw new Error('Yield root/batch identity mismatch');
               // All durable result routing commits synchronously before the
               // collector is fenced and before another input may take custody.
               this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || '',liveStatus});
               owner.yielded=true;
-              this.store.saveDispatchCustody(this.config.name,chatId,{id:owner.id,batchId:owner.batchId,runId,sessionId:owner.sessionId,admitted:true,yielded:true,stopEpoch:owner.stopEpoch,sessionKey});
-              this.forceExpireQueueOwner(chatId,'trusted exact-root yield; background result custody retained');
+              this.store.saveDispatchCustody(this.config.name,chatId,{id:owner.id,batchId:owner.batchId,runId,sessionId:owner.sessionId,admitted:owner.admitted===true,yielded:true,stopEpoch:owner.stopEpoch,sessionKey});
+              this.forceExpireQueueOwner(chatId,'trusted exact-root yield; background result custody retained',true);
               void this.reconcileInsertions(chatId).catch(()=>{});
               this.scheduleInsertionRecovery();
             },
@@ -2207,6 +2284,7 @@ export class FeishuBot {
         }
       } catch (err) {
         if (!current() || err instanceof SupersededObservation) {
+          if(current()) {this.busyChats.set(chatId,0);owner.revoked=true;}
           // This batch's local observation was fenced by a newer batch (or a
           // custody revocation). The new owner handles delivery from here; end
           // quietly — no error notice, no replay, no Gateway abort. The old
@@ -3157,7 +3235,7 @@ export class FeishuBot {
           // Independent identity: never take the result's trigger/final key.
           await this.enqueueAndDispatchDelivery(chatId, "run_error", verdict.terminalKey, verdict.text,
             [], undefined, verdict.terminalKey, undefined,
-            { sourceType: "run_error", runId: record.provenance.runId, error: record.provenance, terminalEvidence: verdict }, record.noticeId);
+            { sourceType: "run_error", sessionKey:record.provenance.sessionKey, runId: record.provenance.runId, error: record.provenance, terminalEvidence: verdict }, record.noticeId);
           // The send-time recheck may have parked or suppressed the observation.
           const refreshed = this.store.getErrorNotice(this.config.name, chatId, record.noticeId);
           if (refreshed?.verdict && ["pending", "suppressed", "stopped"].includes(refreshed.verdict.state)) continue;
@@ -3229,7 +3307,7 @@ export class FeishuBot {
       for (const item of pending) {
         const notice=JSON.parse(item.deliveryMetaJson || '{}').insertionNotice;
         if(notice) {
-          const info=await this.openclawClient.getSessionInfo(this.getSessionKey(chatId)).catch(()=>null);
+          const info=await this.openclawClient.getSessionInfo(this.getSessionKey(chatId),1500).catch(()=>null);
           if(!this.insertionNoticeCurrent(chatId,notice) || info?.session?.archived===true ||
             info?.session?.sessionId && info.session.sessionId!==notice.sessionId) {this.store.markDeliveryFailed(item.id!);continue;}
           if(!info?.session?.sessionId) {this.scheduleDeliveryRetry(chatId,1);retryScheduled=true;continue;}
@@ -3364,6 +3442,11 @@ export class FeishuBot {
             }
           }
           this.store.markDeliveryDelivered(item.id);
+          if(item.sourceType==='run_error' && provenance?.terminalEvidence?.state==='terminal' && provenance.runId && !provenance.runId.startsWith('announce:')) {
+            this.store.settleRunReactionIntents(this.config.name,chatId,provenance.runId);
+            if(provenance.sessionKey)this.store.finishRunObservation(provenance.sessionKey,provenance.runId);
+            void this.reconcileReactions(chatId).catch(()=>{});
+          }
           if(provenance?.final && provenance.runId) {
             this.store.settleRunReactionIntents(this.config.name,chatId,provenance.runId);
             void this.reconcileReactions(chatId).catch(()=>{});
@@ -4837,7 +4920,10 @@ export class FeishuBot {
       this.store.stopInsertions(this.config.name,chatId);
       this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
       void this.openclawClient.cancelSteerSession?.(sessionKey,this.stopGeneration(chatId)).catch(()=>{});
-      // Fire reset (no response expected)
+      this.forceExpireQueueOwner(chatId,'explicit session reset');
+      this.store.clearAllPendingTriggers(this.config.name,chatId);
+      // Fire reset (no response expected). Client fences old exact observations
+      // and exposes its reset barrier to new post-cutoff human inputs.
       this.openclawClient.resetSession(sessionKey).catch(() => {});
       // Wait a moment for it to take effect
       await new Promise((r) => setTimeout(r, 2000));

@@ -1,7 +1,7 @@
 import type { GoExecutorResult } from "./go-execution.js";
 import WebSocket from "ws";
-import { safeErrorSummary } from "./provider-errors.js";
-import { inspectError, genericFailure, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
+import { safeErrorSummary, rawErrorExcerpt } from "./provider-errors.js";
+import { inspectError, genericFailure, announceCandidate, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -175,7 +175,11 @@ export class OpenClawClient {
   private forwardedFinals = new Map<string,string>();
   /** One paced recovery scheduler for all persisted exact runs. No business
    * replay, no per-run infinite timers, and each query has its own deadline. */
-  bindRecoveryStore(store: MessageStore): void { this.recoveryStore=store; this.scheduleRecovery(); }
+  bindRecoveryStore(store: MessageStore): void {
+    this.recoveryStore=store;
+    store.onClose(()=>{if(this.recoveryStore===store){this.recoveryStore=undefined;if(this.recoveryTimer)clearTimeout(this.recoveryTimer);this.recoveryTimer=undefined;}});
+    this.scheduleRecovery();
+  }
   private scheduleRecovery(): void {
     if(this.recoveryTimer || !this.shouldReconnect || !this.recoveryStore) return;
     this.recoveryTimer=setTimeout(()=>{this.recoveryTimer=undefined;void this.recoverExactRuns().finally(()=>this.scheduleRecovery());},30_000);
@@ -186,13 +190,14 @@ export class OpenClawClient {
     this.recoveryChecking=true;
     try {
       for(const item of this.recoveryStore.listRunObservations(undefined,Date.now(),20)) {
+        if(!this.recoveryStore)return;
         // Advance every selected row, including temporarily unsubscribed/owned
         // ones, so a due page cannot starve recoverable runs behind it.
         this.recoveryStore.saveRunObservation(item.sessionKey,item.runId,item,Date.now()+60_000);
         if(!this.sessionMessageCallbacks.has(item.sessionKey) && !this.sessionMessageCallbacks.has(this.shortKey(item.sessionKey))) continue;
         if(this.ownedDeliveryRuns.has(item.runId)) continue;
         try {
-          const snapshot=item.terminalObserved ? {runId:item.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:item.terminalText}} : await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
+          const snapshot=item.terminalObserved ? {runId:item.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:item.terminalDisposition || (String(item.terminalText).trim().toUpperCase()==='NO_REPLY'?'silent':'visible'),text:item.terminalText}} : await this.rpc('agent.wait',{runId:item.runId,timeoutMs:1},2500);
           if(this.recoveryStore.runObservationState(item.sessionKey,item.runId)!=='observing' || this.isExplicitlyStoppedRun(item.sessionKey,item.runId) || this.ownedDeliveryRuns.has(item.runId)) continue;
           if(snapshot?.runId!==item.runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError || ['queue','gateway_draining'].includes(snapshot.timeoutPhase) || typeof snapshot.startedAt==='number' && snapshot.endedAt<snapshot.startedAt) continue;
           const terminal=snapshot.terminalReply;
@@ -201,7 +206,9 @@ export class OpenClawClient {
             // endedAt + exact run is terminal evidence; bare query timeouts never get here.
             await callback?.(String(snapshot.error || snapshot.status),{sourceType:'run_error',sessionKey:item.sessionKey,runId:item.runId,
               error:{sessionKey:item.sessionKey,runId:item.runId,source:'chat',state:'error',detail:String(snapshot.error || snapshot.status)}});
+            this.recoveryStore.settleExactRunReactions(item.sessionKey,item.runId);
             this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
+            await this.sessionSettlementCallbacks.get(this.canonicalSessionKey(item.sessionKey))?.({sessionKey:item.sessionKey,runId:item.runId,sessionId:item.sessionId,final:true});
             continue;
           }
           if(snapshot.status!=='ok' || !['visible','silent','empty'].includes(terminal?.disposition)) continue;
@@ -1711,8 +1718,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     }
   }
 
-  async getSessionStatus(key: string): Promise<any> {
-    return this.rpc("sessions.describe", { key: this.canonicalSessionKey(key) });
+  async getSessionStatus(key: string,timeoutMs=120000): Promise<any> {
+    return this.rpc("sessions.describe", { key: this.canonicalSessionKey(key) },timeoutMs);
   }
 
 
@@ -1733,6 +1740,18 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     await this.rpc('lma.steer.stop',{sessionKey:this.canonicalSessionKey(sessionKey),stopEpoch},2500);
   }
 
+  private readinessCause(error:unknown):string {
+    let detail=error instanceof Error ? error.message : '';
+    let code='';
+    if(detail.startsWith('RPC error:')) {
+      try {const value=JSON.parse(detail.slice('RPC error:'.length));
+        if(typeof value.code==='string' && /^[A-Z_]{1,48}$/.test(value.code))code=value.code;
+        detail=typeof value.message==='string' ? value.message : '';
+      } catch {detail='';}
+    }
+    return [code,rawErrorExcerpt(new Error(detail)) || safeErrorSummary(error)].filter(Boolean).join(': ');
+  }
+
   async steer(sessionKey: string,text: string,displayText?: string,identity?: {
     insertionId:string;expectedRunId:string;expectedSessionId?:string;stopEpoch?:number;cancel?:boolean;queryOnly?:boolean;originalRunEnded?:boolean;
   }): Promise<{
@@ -1750,7 +1769,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if(capability?.protocol!==2 || capability?.durableAttempts!==true || capability?.acceptanceCallback!==true)
         return {...base,status:'unavailable',attempted:identity.queryOnly===true,reason:'Update the coordinated LMA plugin; legacy booleans are not acceptance receipts'};
       stage='sessions.describe';
-      const info=await this.getSessionStatus(sessionKey);
+      const info=await this.getSessionStatus(sessionKey,1500);
       const currentId=info?.session?.sessionId;
       if(info?.session?.archived===true || (identity.expectedSessionId && currentId && currentId!==identity.expectedSessionId))
         return {...base,status:'target_changed',attempted:identity.queryOnly===true,reason:'session archived or generation changed; no automatic migration'};
@@ -1766,7 +1785,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       return result;
     } catch(error) {
       return {...base,status:attempted?'unknown':'pending',attempted:attempted || identity.queryOnly===true,
-        reason:`${attempted?'Insertion receipt unknown; query stable identity only':'Readiness observation unavailable; retained for paced recovery'} [${stage}: ${safeErrorSummary(error)}]`};
+        reason:`${attempted?'Insertion receipt unknown; query stable identity only':'Readiness observation unavailable; retained for paced recovery'} [${stage}: ${this.readinessCause(error)}]`};
     }
   }
 
@@ -1917,6 +1936,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return count;
   }
 
+  async waitForSessionStop(sessionKey:string):Promise<void> {
+    await this.pendingExplicitStops.get(this.canonicalSessionKey(sessionKey));
+  }
+
   async getSessionRuntimeStatus(sessionKey: string): Promise<SessionRuntimeStatus> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
@@ -1931,15 +1954,20 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
   /** Strong public current-session activity, independent of expired root
    * terminal caches. Unknown/missing fields never authorize scheduling. */
-  async getSessionDispatchStatus(sessionKey:string):Promise<{idleConfirmed:boolean;sessionId?:string;archived?:boolean}> {
+  async getSessionDispatchStatus(sessionKey:string):Promise<{idleConfirmed:boolean;sessionId?:string;archived?:boolean;activeRunId?:string;busyConfirmed?:boolean}> {
+    let timer:ReturnType<typeof setTimeout>|undefined;
     try {
       const key=this.canonicalSessionKey(sessionKey);
-      const history=await this.rpc('chat.history',{sessionKey:key,limit:1},1500);
+      const history:any=await Promise.race([this.rpc('chat.history',{sessionKey:key,limit:1},1500),
+        new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error('activity lookup timeout')),1500);})]);
       const info=history?.sessionInfo;
       return {idleConfirmed:history?.sessionKey===key && info?.hasActiveRun===false &&
         history?.pendingInputs?.total===0 && !history?.inFlightRun && info?.archived!==true,
-        sessionId:info?.sessionId || history?.sessionId,archived:info?.archived===true};
+        sessionId:info?.sessionId || history?.sessionId,archived:info?.archived===true,
+        activeRunId:history?.sessionKey===key && typeof history?.inFlightRun?.runId==='string' ? history.inFlightRun.runId : undefined,
+        busyConfirmed:history?.sessionKey===key && (info?.hasActiveRun===true || !!history?.inFlightRun || history?.pendingInputs?.total>0)};
     } catch {return {idleConfirmed:false};}
+    finally {if(timer)clearTimeout(timer);}
   }
 
   private async classifyWaitTimeout(text: string, sessionKey: string): Promise<Error> {
@@ -1947,8 +1975,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return status.running ? new SessionWaitPaused(status, true) : new Error(`Agent error: ${text}`);
   }
 
-  async getSessionInfo(sessionKey: string): Promise<any> {
-    return this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) });
+  async getSessionInfo(sessionKey: string,timeoutMs=120000): Promise<any> {
+    return this.rpc("sessions.describe", { key: this.canonicalSessionKey(sessionKey) },timeoutMs);
   }
 
   /**
@@ -1985,8 +2013,17 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   }
 
   async resetSession(key: string): Promise<any> {
-    // sessions.reset may not return a response; use short timeout
-    return this.rpc("sessions.reset", { key: this.canonicalSessionKey(key) }, 5000).catch(() => {});
+    const canonical=this.canonicalSessionKey(key);
+    this.stopGenerations.set(canonical,(this.stopGenerations.get(canonical)||0)+1);
+    this.revokeSessionCollectors(canonical,'explicit session reset');
+    this.recoveryStore?.stopSessionObservations(canonical);
+    let release!:()=>void;
+    const barrier=new Promise<void>(resolve=>release=resolve);
+    this.pendingExplicitStops.set(canonical,barrier);
+    try {
+      // sessions.reset may not return a response; this is only the RPC deadline.
+      return await this.rpc("sessions.reset", { key: canonical }, 5000).catch(() => {});
+    } finally {release();if(this.pendingExplicitStops.get(canonical)===barrier)this.pendingExplicitStops.delete(canonical);}
   }
 
   /** One-shot ToolTrim compaction: route the native semantic compaction
@@ -2228,10 +2265,57 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return parts.filter((part: any) => part?.type === "text" && typeof part.text === "string").map((part: any) => part.text).join("\n").trim();
   }
 
-  private emitProactiveForSession(sessionKey: string,text: string,meta?: ProactiveMessageMeta): boolean {
+  private continuationChecks=new Map<string,Promise<void>>();
+  /** A child/requester continuation is not automatically its parent's final.
+   * Public task parentage selects the original root; only that exact root's
+   * committed terminalReply may enter its old trigger/outbox. */
+  private async handoffLinkedContinuation(sessionKey:string,meta:ProactiveMessageMeta):Promise<boolean> {
+    if(!this.recoveryStore || !meta.runId)return false;
+    const key=this.canonicalSessionKey(sessionKey);
+    const candidate=announceCandidate({sessionKey:key,runId:meta.runId,source:'chat',state:'final',detail:''});
+    if(!candidate)return false;
+    try {
+      const matches=(task:any)=>task?.kind==='subagent' && task.runId===candidate.runId && task.sessionKey===key && task.ownerKey===key &&
+        typeof task.childSessionKey==='string' && (!candidate.childSessionKey || task.childSessionKey===candidate.childSessionKey);
+      const found=new Set<string>();let cursor:string|undefined;
+      for(let page=0;page<2;page++) {
+        const result=await this.rpc('tasks.list',{sessionKey:key,limit:100,...(cursor?{cursor}:{})},1500);
+        if(!Array.isArray(result?.tasks))return false;
+        for(const task of result.tasks)if(matches(task) && typeof task.id==='string')found.add(task.id);
+        cursor=typeof result.nextCursor==='string'?result.nextCursor:undefined;if(!cursor)break;
+      }
+      if(cursor || found.size!==1)return false;
+      const child=(await this.rpc('tasks.get',{taskId:[...found][0]},1500))?.task;
+      if(!matches(child) || !child.parentTaskId || child.id!==[...found][0])return false;
+      const parent=(await this.rpc('tasks.get',{taskId:child.parentTaskId},1500))?.task;
+      if(parent?.id!==child.parentTaskId || parent.sessionKey!==key || parent.ownerKey!==key || typeof parent.runId!=='string')return false;
+      if(!this.recoveryStore)return true;
+      const root=this.recoveryStore.getRunObservation(key,parent.runId);
+      if(!root?.yielded)return false;
+      if(root.state!=='observing' || this.isExplicitlyStoppedRun(key,parent.runId))return true;
+      this.recoveryStore.saveRunObservation(key,parent.runId,{...root,continuationRunId:meta.runId,continuationTaskId:child.id},0);
+      await this.recoverExactRuns();
+      return true;
+    } catch {return false;}
+  }
+
+  private emitProactiveForSession(sessionKey: string,text: string,meta?: ProactiveMessageMeta,lineageChecked=false): boolean {
     const keys=this.sessionKeyVariants(sessionKey);
     const callback=keys.map(k=>this.sessionMessageCallbacks.get(k)).find(Boolean);
     if(!callback) return false;
+    if(!lineageChecked && meta?.final && meta.runId?.startsWith('announce:') && this.recoveryStore?.hasYieldedObservation(this.canonicalSessionKey(sessionKey))) {
+      const candidate=announceCandidate({sessionKey:this.canonicalSessionKey(sessionKey),runId:meta.runId,source:'chat',state:'final',detail:''});
+      if(candidate) {
+        const identity=JSON.stringify([this.canonicalSessionKey(sessionKey),meta.runId]);
+        if(!this.continuationChecks.has(identity)) {
+          const store=this.recoveryStore;
+          const work=this.handoffLinkedContinuation(sessionKey,meta).then(handled=>{if(!handled && this.recoveryStore===store && this.shouldReconnect)this.emitProactiveForSession(sessionKey,text,meta,true);})
+            .catch(()=>{}).finally(()=>this.continuationChecks.delete(identity));
+          this.continuationChecks.set(identity,work);
+        }
+        return true;
+      }
+    }
     const identity=meta?.final && meta.runId ? JSON.stringify([this.canonicalSessionKey(sessionKey),meta.runId]) : '';
     const fingerprint=createHash('sha256').update(text).digest('hex');
     if(identity && this.forwardedFinals.get(identity)===fingerprint) return true;
@@ -2239,7 +2323,15 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       this.forwardedFinals.set(identity,fingerprint);
       if(this.forwardedFinals.size>2048) this.forwardedFinals.delete(this.forwardedFinals.keys().next().value!);
     }
-    if(identity) this.recoveryStore?.saveRunObservation(this.canonicalSessionKey(sessionKey),meta!.runId!,{sessionId:meta?.sessionId,terminalText:text,terminalObserved:true},Date.now()+60_000);
+    if(identity) this.recoveryStore?.saveRunObservation(this.canonicalSessionKey(sessionKey),meta!.runId!,{sessionId:meta?.sessionId,terminalText:text,terminalObserved:true,
+      ...(text.trim().toUpperCase()==='NO_REPLY'?{terminalDisposition:'silent'}:{})},Date.now()+60_000);
+    if(identity && text.trim().toUpperCase()==='NO_REPLY' && this.recoveryStore) {
+      const key=this.canonicalSessionKey(sessionKey),runId=meta!.runId!;
+      this.recoveryStore.settleExactRunReactions(key,runId);
+      this.recoveryStore.finishRunObservation(key,runId);
+      void Promise.resolve(this.sessionSettlementCallbacks.get(key)?.({...meta,sessionKey:key,runId,final:true})).catch(()=>{});
+      return true;
+    }
     try {
       const result=meta ? callback(text,meta) : callback(text);
       if(identity) void Promise.resolve(result).catch(()=>this.forwardedFinals.delete(identity));
@@ -2487,11 +2579,12 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the user message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
     /** Identifies collection target; not an acceptance receipt. */
-    onRunIdentified?: (runId:string)=>void | Promise<void>;
+    onRunIdentified?: (runId:string,identity?:{sessionId?:string})=>void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
     onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
     /** Synchronous durable scheduling handoff; never a task settlement. */
     onYieldHandoff?: (runId:string)=>void;
+    onCollectionStarted?: (runId:string)=>void;
   }): Promise<string> {
     const sk = this.shortKey(params.sessionKey);
     const fullSessionKey = this.canonicalSessionKey(params.sessionKey);
@@ -2565,7 +2658,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if(previous) for(const fence of [...previous]) fence();
       this.ownDeliveryRun(ownedRunId);
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
-      await params.onRunIdentified?.(result.runId);
+      await params.onRunIdentified?.(result.runId,{sessionId:result.sessionId});
       assertCurrent();
       // A reservation/in_flight reply is not confirmed acceptance. Keep UI
       // Typing while exact collection/read-only receipt reconciliation proceeds.
@@ -2578,7 +2671,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         this.progressGenerations.set(fullSessionKey,generation);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      const reply=await this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
+      const collecting=this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
+      params.onCollectionStarted?.(result.runId);
+      const reply=await collecting;
       if(reply.trim().toUpperCase()==='NO_REPLY') this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
       else this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId,terminalText:reply,terminalObserved:true},Date.now()+30_000);
       return reply;
@@ -2648,11 +2743,12 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the combined message. */
     onSubmitted?: (runId: string) => void | Promise<void>;
     /** Identifies collection target; not an acceptance receipt. */
-    onRunIdentified?: (runId:string)=>void | Promise<void>;
+    onRunIdentified?: (runId:string,identity?:{sessionId?:string})=>void | Promise<void>;
     onProgress?: (event: ProgressEvent) => void | Promise<void>;
     onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>;
     /** Synchronous durable scheduling handoff; never a task settlement. */
     onYieldHandoff?: (runId:string)=>void;
+    onCollectionStarted?: (runId:string)=>void;
   }): Promise<string> {
     const includeContext = params.includeContext !== false;
     const includeBridgeAttachmentHint = params.includeBridgeAttachmentHint !== false;
@@ -2678,6 +2774,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         onProgress: params.onProgress,
         onWaitPaused: params.onWaitPaused,
         onYieldHandoff: params.onYieldHandoff,
+        onCollectionStarted: params.onCollectionStarted,
       });
     }
 
@@ -2719,6 +2816,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       onProgress: params.onProgress,
       onWaitPaused: params.onWaitPaused,
       onYieldHandoff: params.onYieldHandoff,
+      onCollectionStarted: params.onCollectionStarted,
     });
   }
 

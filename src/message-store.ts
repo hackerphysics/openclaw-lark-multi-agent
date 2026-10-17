@@ -252,6 +252,9 @@ export class MessageStore {
     return !!this.db.prepare("SELECT 1 FROM run_observations WHERE session_key=? AND run_id=? AND state='stopped'").get(sessionKey,runId);
   }
   settleRunReactionIntents(bot:string,chat:string,runId:string):void {
+    this.db.prepare(`UPDATE insertion_custody SET state='committed' WHERE bot_name=? AND chat_id=? AND state='accepted'
+      AND json_extract(record_json,'$.expectedRunId')=? AND json_extract(record_json,'$.stopEpoch')=?`)
+      .run(bot,chat,runId,this.getStopGeneration(bot,chat));
     this.db.prepare(`UPDATE reaction_custody SET record_json=json_set(record_json,'$.desired','DONE')
       WHERE bot_name=? AND chat_id=? AND json_extract(record_json,'$.runId')=?
       AND json_extract(record_json,'$.desired') IN ('Get','Typing')
@@ -263,8 +266,15 @@ export class MessageStore {
   }
   saveRunObservation(sessionKey: string, runId: string, record: object, nextCheckAt = Date.now()): void {
     this.db.prepare(`INSERT INTO run_observations VALUES(?,?,?,'observing',?)
-      ON CONFLICT(session_key,run_id) DO UPDATE SET record_json=excluded.record_json,next_check_at=excluded.next_check_at
+      ON CONFLICT(session_key,run_id) DO UPDATE SET record_json=json_patch(run_observations.record_json,excluded.record_json),next_check_at=excluded.next_check_at
       WHERE run_observations.state='observing'`).run(sessionKey,runId,JSON.stringify(record),nextCheckAt);
+  }
+  hasYieldedObservation(sessionKey:string):boolean {
+    return !!this.db.prepare(`SELECT 1 FROM run_observations WHERE session_key=? AND json_extract(record_json,'$.yielded')=1 LIMIT 1`).get(sessionKey);
+  }
+  getRunObservation(sessionKey:string,runId:string):any {
+    const row=this.db.prepare('SELECT record_json,state FROM run_observations WHERE session_key=? AND run_id=?').get(sessionKey,runId) as any;
+    return row ? {...JSON.parse(row.record_json),state:row.state} : null;
   }
   runObservationState(sessionKey:string,runId:string):string|undefined {
     return (this.db.prepare('SELECT state FROM run_observations WHERE session_key=? AND run_id=?').get(sessionKey,runId) as any)?.state;
@@ -329,6 +339,10 @@ export class MessageStore {
   isInsertionReserved(bot: string,chat: string,row: number): boolean {
     const item=this.getInsertion(bot,chat,row);
     return !!item && !['ordinary','stopped'].includes(item.state);
+  }
+  stopInsertionAtEpoch(bot:string,chat:string,row:number,epoch:number):void {
+    this.db.prepare(`UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND message_row_id=?
+      AND json_extract(record_json,'$.stopEpoch')=? AND state NOT IN ('committed','ordinary')`).run(bot,chat,row,epoch);
   }
   stopInsertions(bot: string,chat: string): void {
     this.db.prepare("UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND state NOT IN ('committed','ordinary')").run(bot,chat);

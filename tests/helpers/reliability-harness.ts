@@ -16,7 +16,7 @@ export function harness(dbPath?:string) {
    if(method==='chat.send'){sends.push(p);return {runId:`r${++n}`,status:'started'};}
    if(method==='agent.wait')return {runId:p.runId,status:'timeout'};
    if(method==='chat.abort')return {aborted:true,runIds:['r1']};
-   if(method==='sessions.describe')return {session:{sessionId:'generation-1',status:'running',hasActiveRun:true,totalTokens:0}};
+   if(method==='sessions.describe')return {session:{sessionId:'generation-1',status:n>0?'running':'done',hasActiveRun:n>0,totalTokens:0}};
    if(method==='lma.steer.capabilities')return {protocol:1,atomicRunBound:false};
    return {};
  });

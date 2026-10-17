@@ -26,6 +26,7 @@ Usage:
   ${CLI_NAME} install-windows-service [--state-dir DIR] [--no-start]
   ${CLI_NAME} install-core-plugin [--no-force]
   ${CLI_NAME} install-steer-plugin [--no-force]  (compatibility alias)
+  ${CLI_NAME} check-core-plugin  (read-only runtime protocol check)
   ${CLI_NAME} doctor [--state-dir DIR]
   ${CLI_NAME} --help
 
@@ -250,7 +251,24 @@ function cmdInstallCorePlugin(args: string[]) {
   console.log(`Load/reload with the Gateway's supported plugin control path, then verify the read-only capability endpoint:`);
   console.log(`  openclaw gateway call lma.steer.capabilities --params '{}'`);
   console.log(`  (expect protocol:2, durableAttempts:true, acceptanceCallback:true, atomicRunBound:false)`);
+  console.log(`  ${CLI_NAME} check-core-plugin  (read-only validation; generic core capabilities alone are insufficient)`);
 
+}
+
+function cmdCheckCorePlugin(args:string[]) {
+  if(args.length)throw new Error(`Unknown check-core-plugin arguments: ${args.join(' ')}`);
+  const bin=process.env.OPENCLAW_BIN || 'openclaw';
+  let capability:any;
+  try {
+    const raw=execFileSync(bin,['gateway','call','lma.steer.capabilities','--params','{}','--json'],
+      {encoding:'utf8',shell:process.platform==='win32',timeout:15_000,stdio:['ignore','pipe','pipe']});
+    capability=JSON.parse(raw);
+  } catch {
+    throw new Error('lma.steer.capabilities unavailable or invalid: callback/durable insertion is NOT verified. Activate the coordinated lma-core plugin via supported Gateway controls, then recheck.');
+  }
+  if(capability?.protocol!==2 || capability?.durableAttempts!==true || capability?.acceptanceCallback!==true || capability?.sessionGenerationBound!==true)
+    throw new Error('lma.steer.capabilities incompatible: require protocol=2, durableAttempts=true, acceptanceCallback=true, sessionGenerationBound=true; generic lma.core.capabilities is not activation proof.');
+  console.log('OK: runtime lma.steer.capabilities protocol=2; callback acceptance, durable attempts and session generation binding verified (not model consumption or final-effect CAS).');
 }
 
 function cmdDoctor(args: string[]) {
@@ -273,6 +291,7 @@ async function main() {
   if (cmd === "install-windows-service") return cmdInstallWindowsService(args);
   if (cmd === "install-core-plugin" || cmd === "install-steer-plugin") return cmdInstallCorePlugin(args);
   if (cmd === "doctor") return cmdDoctor(args);
+  if (cmd === "check-core-plugin") return cmdCheckCorePlugin(args);
   if (cmd === "start") {
     const configPath = args[0] ? resolve(args[0]) : DEFAULT_CONFIG_PATH;
     return startApp(configPath);

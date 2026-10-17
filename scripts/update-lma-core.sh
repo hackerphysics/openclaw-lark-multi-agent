@@ -5,8 +5,8 @@
 #         bash scripts/update-lma-core.sh --check  (verify only, no changes)
 #
 # Requirements: repo at ~/openclaw-lark-multi-agent with the plugin sources
-# under plugins/lma-core/src. The gateway hot-reloads the plugin; no gateway
-# restart is needed for code updates (method names are stable).
+# under plugins/lma-core/src. Runtime activation must use the Gateway-supported
+# plugin control path. A generic core capability response is NOT steer activation proof.
 set -euo pipefail
 
 REPO="${LMA_REPO:-$HOME/openclaw-lark-multi-agent}"
@@ -21,6 +21,7 @@ if [[ "${1:-}" == "--check" ]]; then
     && say "OK: $PLUGIN_ID loaded in gateway" || { say "FAIL: $PLUGIN_ID not in loaded list"; exit 1; }
   openclaw gateway call lma.core.capabilities 2>/dev/null | grep -q '"lma-core"' \
     && say "OK: lma.core.capabilities responds" || { say "FAIL: capabilities RPC"; exit 1; }
+  node "$REPO/dist/cli.js" check-core-plugin || { say "FAIL: callback/durable insertion protocol not active"; exit 1; }
   say "all checks passed."
   exit 0
 fi

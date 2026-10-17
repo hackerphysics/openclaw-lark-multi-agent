@@ -39,10 +39,11 @@ async function harness(locale: "zh" | "en" = "zh") {
   const client: any = new OpenClawClient({ baseUrl: "ws://offline", token: "synthetic" } as any);
   await client.connect();
   const socket = sockets.at(-1);
+  let admitted=false;
   client.rpc = vi.fn(async (method: string) => {
-    if (method === "sessions.describe") return { session: { model: "gemini-3.8-flash", modelProvider: "x", status: "idle", totalTokens: 0 } };
+    if (method === "sessions.describe") return { session: { model: "gemini-3.8-flash", modelProvider: "x", sessionId:"offline-generation", status:admitted?"running":"idle", hasActiveRun:admitted, totalTokens: 0 } };
     if (method === "agent.wait") return { runId, status: "timeout" }; // actual current read; cannot reconstruct old terminal details
-    if (method === "chat.send") return { runId };
+    if (method === "chat.send") {admitted=true;return {runId};}
     if (method === "chat.abort") return { aborted: true, runIds: [] };
     if (method === "sessions.messages.subscribe") return {};
     throw new Error(`Unexpected offline RPC ${method}`);

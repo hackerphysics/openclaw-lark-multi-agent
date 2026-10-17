@@ -82,3 +82,16 @@ describe("CLI", () => {
     }
   });
 });
+
+describe('read-only runtime insertion activation, not generic plugin presence',()=>{
+ it.each(['correct','old','missing-callback','missing-method','not-json'])('check-core-plugin validates real dedicated endpoint: %s',mode=>{
+  const dir=mkdtempSync(join(tmpdir(),'lma-runtime-check-'));
+  try {
+   const fake=join(dir,'openclaw'),record=join(dir,'args.json');
+   writeFileSync(fake,`#!${process.execPath}\nrequire('node:fs').writeFileSync(process.env.CHECK_RECORD,JSON.stringify(process.argv.slice(2)));\nconst mode=process.env.CHECK_MODE;if(mode==='missing-method'){console.error('unknown method');process.exit(1);}if(mode==='not-json'){console.log('bad');process.exit(0);}console.log(JSON.stringify(mode==='old'?{plugin:'lma-core',protocol:1}:{protocol:2,durableAttempts:true,acceptanceCallback:mode!=='missing-callback',sessionGenerationBound:true}));\n`);chmodSync(fake,0o755);
+   const call=()=>run(['check-core-plugin'],{OPENCLAW_BIN:fake,CHECK_RECORD:record,CHECK_MODE:mode});
+   if(mode==='correct')expect(call()).toContain('protocol=2');else expect(call).toThrow();
+   expect(JSON.parse(readFileSync(record,'utf8'))).toEqual(['gateway','call','lma.steer.capabilities','--params','{}','--json']);
+  } finally {rmSync(dir,{recursive:true,force:true});}
+ });
+});
