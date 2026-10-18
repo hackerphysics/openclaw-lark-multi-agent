@@ -39,8 +39,9 @@ export type LiveStatusView = {
   toolCalls: number;
   /** True when finished via noReply(): the model produced no user-visible reply. */
   noReply: boolean;
-  /** Terminal state: running / done / failed (lets renderer pick color). */
-  state: "running" | "done" | "failed";
+  /** Presentation only: queued/admitted do not claim model execution. */
+  state: "queued" | "admitted" | "running" | "done" | "failed";
+  phase?: "queued" | "admitted" | "working" | "waiting" | "done" | "failed";
 };
 
 /** Persisted metadata needed to turn the live-status card into the final answer. */
@@ -79,6 +80,10 @@ export class LiveStatusEffectUnknownError extends Error {
 /** Only a definitive platform rejection is safe for the terminal retry loop. */
 export class LiveStatusEffectRejectedError extends Error {}
 
+/** Proven local no-effect suppression (settings/epoch/lease), not an unknown
+ * transport outcome and not permission to retry an attempted SDK operation. */
+export class LiveStatusEffectSuppressedError extends Error {}
+
 type EditRequest = {
   view: LiveStatusView;
   generation: number;
@@ -97,10 +102,16 @@ export type LiveStatusCallbacks = {
    * only for a definitive no-effect failure; all other rejection is unknown. */
   edit: (messageId: string, view: LiveStatusView, effect: LiveStatusEffect<void>) => Promise<void>;
   warn?: (message: string, err?: unknown) => void;
+  /** Synchronous journal checkpoint, before scheduling any new UI effect. */
+  desired?: (view: LiveStatusView) => void;
+  /** UI-only cohort completeness. A root outcome is not per-input proof. */
+  unconfirmedInputs?: (outcome: "done" | "failed") => { title: string; detail: string } | undefined;
 };
 
 export type LiveStatusOptions = {
   botName: string;
+  initialPhase?: "queued";
+  restore?: { messageId?: string; view?: LiveStatusView; startedAt: number; blockCreate: boolean; blockEdits: boolean };
   locale?: "zh" | "en";
   delayMs?: number;
   maxChars?: number;
@@ -123,6 +134,8 @@ export class LiveStatusController {
   private createTimer?: NodeJS.Timeout;
   private tickTimer?: NodeJS.Timeout;
   private createPromise?: Promise<void>;
+  private createSuppressed = false;
+  private waitingCreateAllowed = false;
   private finalized = false;
   private terminalOutcome = false;
   private disposed = false;
@@ -143,29 +156,113 @@ export class LiveStatusController {
    *  patch recovers it. Only after this many CONSECUTIVE failures do we give up.
    *  A success resets the counter. */
   private consecutiveEditFailures = 0;
-  private state: "running" | "done" | "failed" = "running";
+  private state: LiveStatusView["state"] = "running";
+  private blockedEdits = false;
   /** Total tool calls (tool_start events) seen during the run, for the summary. */
   private toolCallCount = 0;
   /** True when finished via noReply(): show a "no content" summary. */
   private noReplyResult = false;
 
-  constructor(private readonly callbacks: LiveStatusCallbacks, private readonly opts: LiveStatusOptions) {}
+  constructor(private readonly callbacks: LiveStatusCallbacks, private readonly opts: LiveStatusOptions) {
+    if (opts.initialPhase) this.state = opts.initialPhase;
+    const restored = opts.restore;
+    if (restored) {
+      this.messageId = restored.messageId;
+      this.startedAt = restored.startedAt;
+      this.blockedEdits = restored.blockEdits;
+      if (restored.view) {
+        this.state = restored.view.state;
+        this.lines = restored.view.lines.map(line => ({ ...line }));
+        this.toolCallCount = restored.view.toolCalls;
+        this.noReplyResult = restored.view.noReply;
+        this.waitingForResult = restored.view.phase === "waiting";
+        this.updatesFrozen = this.waitingForResult;
+      }
+      // Attempted/unknown create survives process loss as a no-create fence.
+      if (restored.blockCreate && !this.messageId) this.disabled = true;
+    }
+  }
+
+  /** Receipt is durable locally, NOT Gateway admission. */
+  received(detail: string): void {
+    if (this.finalized || this.disposed) return;
+    this.pushLine("lifecycle", detail);
+    this.callbacks.desired?.(this.buildView());
+    void this.safeEdit(this.buildView());
+  }
+
+  /** A proven never-attempted ordinary recovery may reuse its queued card.
+   * Merely observing an expected root never calls this method. */
+  resumeQueued(): void {
+    if (this.disposed || this.terminalOutcome) return;
+    this.finalized = false;
+    this.updatesFrozen = false;
+    this.waitingForResult = false;
+    this.waitingCreateAllowed = false;
+    this.state = "queued";
+    this.generation++;
+    this.pinnedView = undefined;
+    this.pendingEdit = undefined;
+    this.callbacks.desired?.(this.buildView());
+    if (this.messageId) { this.startTicker(); void this.safeEdit(this.buildView()); }
+    else this.start();
+  }
+
+  /** Enqueue/local receipt remains waiting, not actual-owner/model evidence.
+   * Keep one latest pinned view while allowing another input to coalesce. */
+  async showInputWaiting(detail: string, title?: string): Promise<void> {
+    if (this.disposed || this.terminalOutcome) return;
+    this.updatesFrozen = true;
+    this.waitingForResult = true;
+    this.waitingCreateAllowed = !this.messageId && !this.disabled;
+    this.pushLine("lifecycle", detail);
+    this.stopTimers();
+    const view = this.buildView();
+    if (title) view.title = title;
+    // A quick enqueue receipt must not cancel the only queued card before it
+    // ever existed. Still exactly one create flight, with the normal unknown
+    // fence and effect-time settings/lease checks, never a terminal retry.
+    if (!this.messageId && !this.createPromise && !this.disabled) {
+      this.pinView(view);
+      this.createPromise = this.ensureCreated();
+    }
+    await this.finishView(view);
+  }
+
+  /** Only the exact ACK owner calls this; admission is not model execution. */
+  async admitted(successor = false): Promise<void> {
+    if (this.finalized || this.disposed || (!successor && this.state !== "queued")) return;
+    this.waitingForResult = false;
+    this.state = "admitted";
+    this.pushLine("lifecycle", this.opts.locale === "en" ? "Gateway accepted; waiting for activity" : "Gateway 已接收，等待执行活动");
+    this.callbacks.desired?.(this.buildView());
+    await this.safeEdit(this.buildView());
+  }
 
   get id(): string | undefined { return this.messageId; }
 
   start(initialDetail?: string): void {
-    if (this.disabled || this.finalized || this.updatesFrozen || this.createTimer || this.createPromise || this.messageId) return;
-    this.startedAt = Date.now();
+    if (this.createSuppressed) { this.createPromise = undefined; this.createSuppressed = false; }
+    if (this.disabled || this.finalized || (this.updatesFrozen && !this.waitingCreateAllowed) || this.createTimer || this.createPromise || this.messageId) return;
+    if (!this.opts.restore) this.startedAt = Date.now();
     // Presentation may start before chat.send admission. Only the collector's
     // effective-activity idle decision (or confirmed yield) freezes this card;
     // elapsed ticks are presentation, never evidence of task progress.
     if (initialDetail && initialDetail.trim()) {
       this.pushLine("lifecycle", initialDetail.trim());
     }
+    this.callbacks.desired?.(this.buildView());
     this.createTimer = setTimeout(() => {
       this.createTimer = undefined;
       this.createPromise = this.ensureCreated();
     }, this.opts.delayMs ?? DEFAULT_DELAY_MS);
+  }
+
+  setMetadata(model?: string, thinkingLevel?: string): void {
+    if (this.disposed || this.finalized) return;
+    this.opts.model = model;
+    this.opts.thinkingLevel = thinkingLevel;
+    this.callbacks.desired?.(this.buildView());
   }
 
   async progress(event: ProgressEvent | string): Promise<void> {
@@ -204,6 +301,8 @@ export class LiveStatusController {
       return; // lifecycle ticks: ignore (footer timer already advances)
     }
     this.waitingForResult = false;
+    this.state = "running";
+    this.callbacks.desired?.(this.buildView());
     await this.ensureCreatedNow();
     await this.safeEdit(this.buildView());
   }
@@ -224,6 +323,7 @@ export class LiveStatusController {
   async pauseForUnconfirmedResult(detail: string, title?: string): Promise<void> {
     if (this.finalized) return;
     this.pushLine("lifecycle", detail);
+    this.waitingForResult = true;
     this.finalized = true;
     this.stopTimers();
     const view = this.buildView();
@@ -233,6 +333,8 @@ export class LiveStatusController {
 
   async complete(): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
+    const pending = this.callbacks.unconfirmedInputs?.("done");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return; }
     this.terminalOutcome = true;
     this.state = "done";
     this.finalized = true;
@@ -251,6 +353,8 @@ export class LiveStatusController {
    */
   async prepareTerminalDelivery(noReply = false, owner?: LiveStatusTerminalOwner): Promise<LiveStatusFinalMeta | undefined> {
     if (this.disposed || (this.terminalOutcome && this.state !== "done")) return undefined;
+    const pending = this.callbacks.unconfirmedInputs?.("done");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return undefined; }
     if (owner) {
       this.terminalOwner = owner;
       this.generation++; // retire any queued controller-owned terminal effect
@@ -287,6 +391,8 @@ export class LiveStatusController {
 
   async fail(): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
+    const pending = this.callbacks.unconfirmedInputs?.("failed");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return; }
     this.terminalOutcome = true;
     this.state = "failed";
     this.finalized = true;
@@ -301,6 +407,8 @@ export class LiveStatusController {
    */
   async noReply(): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
+    const pending = this.callbacks.unconfirmedInputs?.("done");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return; }
     this.terminalOutcome = true;
     this.state = "done";
     this.noReplyResult = true;
@@ -319,6 +427,7 @@ export class LiveStatusController {
 
   private pinView(view: LiveStatusView): void {
     this.generation++;
+    this.callbacks.desired?.(view);
     this.pinnedView = view;
     this.pendingEdit = undefined;
   }
@@ -402,7 +511,7 @@ export class LiveStatusController {
 
   private async ensureCreated(): Promise<void> {
     if (this.disabled || this.finalized || this.messageId) return;
-    const view = this.buildView();
+    const view = this.pinnedView || this.buildView();
     let started = false;
     let settled = false;
     const accept = (id: string | undefined) => {
@@ -419,7 +528,7 @@ export class LiveStatusController {
       run: async send => {
         // A create waiting behind another chat send is no longer needed once
         // the task finished. Do not create a stale running card at effect time.
-        if (this.finalized || this.updatesFrozen || this.disposed) { settled = true; return undefined; }
+        if (this.finalized || (this.updatesFrozen && !this.waitingCreateAllowed) || this.disposed) { settled = true; return undefined; }
         started = true;
         const id = await send();
         accept(id); // do not attach receipt ownership to the deadline promise
@@ -432,6 +541,12 @@ export class LiveStatusController {
     } catch (err) {
       // No duplicate create, including when the outer deadline expired. The
       // original effect context still adopts a late successful message ID.
+      if (err instanceof LiveStatusEffectSuppressedError) {
+        this.createSuppressed = true;
+        this.createPromise = undefined;
+        this.callbacks.warn?.("live status create locally suppressed before transport", err);
+        return;
+      }
       if (!started) this.disabled = true;
       this.callbacks.warn?.("live status create failed (not replayed)", err);
     }
@@ -439,7 +554,7 @@ export class LiveStatusController {
 
   /** Refresh the elapsed-time footer periodically even with no new activity. */
   private startTicker(): void {
-    if (this.tickTimer || this.disabled || this.finalized || this.updatesFrozen) return;
+    if (this.tickTimer || this.disabled || this.finalized || this.updatesFrozen || this.blockedEdits) return;
     const tickMs = this.opts.tickMs ?? DEFAULT_TICK_MS;
     this.tickTimer = setInterval(() => {
       if (this.finalized || this.disabled || this.updatesFrozen || !this.messageId) return;
@@ -455,6 +570,8 @@ export class LiveStatusController {
 
   /** One flight + one latest pending snapshot, regardless of tick/event rate. */
   private queueEdit(view: LiveStatusView, priority: boolean, force = false): Promise<void> {
+    this.callbacks.desired?.(view);
+    if (this.blockedEdits) return Promise.resolve();
     if (!this.messageId || this.disposed || (priority && view !== this.pinnedView)
       || (!priority && (this.disabled || this.finalized || this.updatesFrozen))) return Promise.resolve();
     if (!priority) this.generation++;
@@ -542,6 +659,7 @@ export class LiveStatusController {
         // already chose its deadline. Never retain "unknown" after acceptance.
         if (request.accepted) return;
         const failure = request.rejection ?? err;
+        if (failure instanceof LiveStatusEffectSuppressedError) return;
         const unknown = !(failure instanceof LiveStatusEffectRejectedError);
         if (unknown) {
           this.unknownEdits.add(request);
@@ -594,12 +712,14 @@ export class LiveStatusController {
     if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
     else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
     else if (this.waitingForResult) title = en ? `${this.opts.botName} waiting (card frozen)` : `${this.opts.botName} 等待后续结果（已停止刷新）`;
+    else if (this.state === "queued") title = en ? `${this.opts.botName} received · queued` : `${this.opts.botName} 已收件 · 排队等待`;
+    else if (this.state === "admitted") title = en ? `${this.opts.botName} accepted · waiting` : `${this.opts.botName} 已接收 · 等待活动`;
     else title = en ? `${this.opts.botName} is working` : `${this.opts.botName} \u6b63\u5728\u6267\u884c`;
     // On a clean finish (done / NO_REPLY) show only the compact summary. On a
     // failure (error / killed / timeout) keep the recent activity window too, so
     // the last few steps before the failure are visible for debugging.
     let lines: LiveStatusLine[];
-    if (this.state === "running") {
+    if (this.state !== "done" && this.state !== "failed") {
       lines = this.lines.map(line => ({ ...line }));
     } else if (this.state === "failed") {
       lines = [...this.lines.map(line => ({ ...line })), this.buildSummaryLine(en)];
@@ -615,6 +735,7 @@ export class LiveStatusController {
       toolCalls: this.toolCallCount,
       noReply: this.noReplyResult,
       state: this.state,
+      phase: this.state === "done" || this.state === "failed" ? this.state : this.waitingForResult ? "waiting" : this.state === "running" ? "working" : this.state,
     };
   }
 

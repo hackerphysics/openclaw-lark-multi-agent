@@ -70,21 +70,29 @@ describe('session status and paused waits',()=>{
   expect(error).not.toBeInstanceOf(SessionWaitPaused);
   expect(error.message).toContain('tool validation failed');
  });
- it('still reports a timeout when status is idle',async()=>{
+ it('retains a bare timeout when status is idle until an exact final arrives',async()=>{
   c.rpc=vi.fn(async()=>({session:{status:'idle'}}));
-  const p=c.collectReply('r',1000,key).catch((e:Error)=>e);
-  event('chatError',{error:'Request timeout'});
-  await vi.advanceTimersByTimeAsync(100);
-  expect(await p).not.toBeInstanceOf(SessionWaitPaused);
-  expect((await p).message).toContain('Request timeout');
+  const notice=vi.fn();let settled=false;
+  const p=c.collectReply('r',1000,key,{onWaitPaused:notice}).then((text:string)=>{settled=true;return text;});
+  event('chatError',{error:'Request timeout'});await vi.advanceTimersByTimeAsync(100);
+  expect(settled).toBe(false);expect(notice).toHaveBeenCalledOnce();
+  expect(notice.mock.calls[0][0]).toBeInstanceOf(SessionWaitPaused);expect(notice.mock.calls[0][0].snapshot.status).toBe('idle');
+  event('chatFinal',{text:'exact after idle observation'});event('lifecycle',{phase:'end'});await vi.advanceTimersByTimeAsync(100);
+  expect(await p).toBe('exact after idle observation');
  });
- it('reconciles a generic timeout into a running-session pause',async()=>{
-  c.rpc=vi.fn(async(method:string)=>method==='agent.wait'?{runId:'r',status:'timeout',endedAt:Date.now()}:{session:{status:'running'}});
-  const notice=vi.fn();const p=c.collectReply('r',1000,key,{onWaitPaused:notice}).catch((e:Error)=>e);
-  event('chatError',{error:'chat error'});
-  await vi.advanceTimersByTimeAsync(500);
-  expect(notice.mock.calls[0][0]).toBeInstanceOf(SessionWaitPaused);
+ it('reconciles a generic wait timeout into a running-session pause',async()=>{
+  c.rpc=vi.fn(async(method:string)=>method==='agent.wait'?{runId:'r',status:'timeout'}:{session:{status:'running'}});
+  const notice=vi.fn();let settled=false;const p=c.collectReply('r',1000,key,{onWaitPaused:notice}).then((text:string)=>{settled=true;return text;});
+  event('chatError',{error:'chat error'});await vi.advanceTimersByTimeAsync(500);
+  expect(settled).toBe(false);expect(notice).toHaveBeenCalledOnce();expect(notice.mock.calls[0][0]).toBeInstanceOf(SessionWaitPaused);
   event('chatFinal',{text:'late exact result'});event('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);expect(await p).toBe('late exact result');
+ });
+ it('a fresh exact root terminal timeout is not masked by an unrelated running successor',async()=>{
+  c.rpc=vi.fn(async(method:string)=>method==='agent.wait'?{runId:'r',status:'timeout',endedAt:Date.now(),error:'exact root deadline exhausted'}:{session:{status:'running'}});
+  const notice=vi.fn();const p=c.collectReply('r',1000,key,{onWaitPaused:notice}).catch((error:Error)=>error);
+  event('chatError',{error:'chat error'});await vi.advanceTimersByTimeAsync(500);
+  expect((await p).message).toContain('exact root deadline exhausted');expect(notice).not.toHaveBeenCalled();
+  expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
  });
  it('lets a real final beat a pending timeout classification',async()=>{
   let release:any;
@@ -108,7 +116,8 @@ describe('session status and paused waits',()=>{
   await vi.advanceTimersByTimeAsync(1000);
   expect(notice).toHaveBeenCalledOnce(); expect(settled).toBe(false); expect(c.ownedDeliveryRuns.has('r')).toBe(true);
   await vi.advanceTimersByTimeAsync(60000); expect(notice).toHaveBeenCalledOnce(); expect(settled).toBe(false);
-  event('assistant',{delta:'real result'}); event('lifecycle',{phase:'end',livenessState:'working'});
+  event('assistant',{delta:'real result'});await vi.advanceTimersByTimeAsync(50);expect(settled).toBe(false);expect(notice).toHaveBeenCalledOnce();expect(c.ownedDeliveryRuns.has('r')).toBe(true);
+  event('chatFinal',{text:'real result'}); event('lifecycle',{phase:'end',livenessState:'working'});
   await vi.advanceTimersByTimeAsync(100); expect(await p).toBe('real result');
   expect(c.rpc.mock.calls.some((v:any[])=>v[0]==='chat.abort')).toBe(false);
  });

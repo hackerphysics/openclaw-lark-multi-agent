@@ -36,7 +36,8 @@ describe('Gateway current run routing without local queue ownership',()=>{
   expect(h.store.getReactionIntent('Bot','chat',row).desired).toBe('Get');expect(h.store.getDeliveryRunTarget('Bot','chat','external-root')).toBeNull();
   h.client.ws.emit('message',Buffer.from(JSON.stringify({type:'event',event:'chat',payload:{sessionKey:h.key,runId:'external-root',state:'final',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:'external root existing result'}]}}})));
   await tick(100);expect(h.store.getDeliveryByKey('Bot','chat',`trigger:${row}`)).toBeNull();expect(h.store.getRecent('chat').filter(m=>m.senderType==='bot').map(m=>m.content)).toEqual(['external root existing result']);
-  expect(h.store.getReactionIntent('Bot','chat',row).desired).toBe('DONE');expect(h.sends).toHaveLength(0);expect(calls).toBe(1);
+  expect(h.store.getReactionIntent('Bot','chat',row).desired).toBe('Get');expect(h.store.getInsertion('Bot','chat',row).state).toBe('accepted');
+  expect(h.sends).toHaveLength(0);expect(calls).toBe(1);
  });
  it.each(['root-missing','lookup-unknown'])('live %s retains unbound input without fabricated root, Get or blind ordinary admission',async(mode)=>{
   if(mode==='root-missing')history={...history,inFlightRun:undefined};else {activity={sessionId:'generation-1',status:'future_state'};history={};}

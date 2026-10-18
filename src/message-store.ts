@@ -141,6 +141,10 @@ export class MessageStore {
       CREATE TABLE IF NOT EXISTS reaction_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,row_id INTEGER NOT NULL,record_json TEXT NOT NULL,
         PRIMARY KEY(bot_name,chat_id,row_id));
       CREATE TABLE IF NOT EXISTS run_delivery_targets(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,run_id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(bot_name,chat_id,run_id));
+      -- UI-only custody: never read by admission, dispatch or business replay.
+      CREATE TABLE IF NOT EXISTS presentation_custody (
+        bot_name TEXT NOT NULL,app_id TEXT NOT NULL,chat_id TEXT NOT NULL,cohort_id TEXT NOT NULL,
+        record_json TEXT NOT NULL,PRIMARY KEY(bot_name,app_id,chat_id,cohort_id));
       CREATE TABLE IF NOT EXISTS dispatch_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(bot_name,chat_id));
       CREATE TABLE IF NOT EXISTS admission_custody(session_key TEXT NOT NULL,submission_id TEXT PRIMARY KEY,state TEXT NOT NULL,record_json TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS run_observations (
@@ -168,6 +172,19 @@ export class MessageStore {
       UPDATE insertion_custody SET state='pending',next_check_at=0
         WHERE state='capability_blocked' AND json_extract(record_json,'$.attempted')=0;
     `);
+  }
+
+  savePresentation(bot:string,app:string,chat:string,cohort:string,record:object):void {
+    this.db.prepare(`INSERT OR REPLACE INTO presentation_custody VALUES(?,?,?,?,?)`).run(bot,app,chat,cohort,JSON.stringify(record));
+  }
+  getPresentation(bot:string,app:string,chat:string,cohort:string):any {
+    const row=this.db.prepare(`SELECT record_json FROM presentation_custody WHERE bot_name=? AND app_id=? AND chat_id=? AND cohort_id=?`)
+      .get(bot,app,chat,cohort) as any;
+    return row ? JSON.parse(row.record_json) : null;
+  }
+  listPresentations(bot:string,app:string,chat:string):any[] {
+    return (this.db.prepare(`SELECT record_json FROM presentation_custody WHERE bot_name=? AND app_id=? AND chat_id=?`)
+      .all(bot,app,chat) as any[]).map(row=>JSON.parse(row.record_json));
   }
 
   getStopGeneration(bot:string,chat:string):number {
@@ -265,13 +282,17 @@ export class MessageStore {
   }
   settleRunReactionIntents(bot:string,chat:string,runId:string):void {
     if(this.hasUnconfirmedRunDelivery(bot,chat,runId)) return;
-    this.db.prepare(`UPDATE insertion_custody SET state='committed' WHERE bot_name=? AND chat_id=? AND state='accepted'
-      AND json_extract(record_json,'$.expectedRunId')=? AND json_extract(record_json,'$.stopEpoch')=?`)
-      .run(bot,chat,runId,this.getStopGeneration(bot,chat));
+    // A root outcome/visible reply proves nothing about a legacy SDK queue
+    // item's commitment or consumption. Only ordinary inputs belong to this
+    // bulk completion cohort; even historical committed rows are not repaired
+    // or reinterpreted here. No exact host input identity is available for them.
     this.db.prepare(`UPDATE reaction_custody SET record_json=json_set(record_json,'$.desired','DONE')
       WHERE bot_name=? AND chat_id=? AND json_extract(record_json,'$.runId')=?
       AND json_extract(record_json,'$.desired') IN ('Get','Typing')
-      AND json_extract(record_json,'$.stopEpoch')=?`).run(bot,chat,runId,this.getStopGeneration(bot,chat));
+      AND json_extract(record_json,'$.stopEpoch')=?
+      AND NOT EXISTS (SELECT 1 FROM insertion_custody i WHERE i.bot_name=reaction_custody.bot_name
+        AND i.chat_id=reaction_custody.chat_id AND i.message_row_id=reaction_custody.row_id AND i.state!='ordinary')`)
+      .run(bot,chat,runId,this.getStopGeneration(bot,chat));
   }
   cancelReactionIntents(bot:string,chat:string,epoch:number):void {
     this.db.prepare(`UPDATE reaction_custody SET record_json=json_set(record_json,'$.desired','','$.stopEpoch',?)
@@ -348,6 +369,13 @@ export class MessageStore {
     return (this.db.prepare(`SELECT * FROM insertion_custody WHERE bot_name=? ${chat ? 'AND chat_id=?' : ''}
       AND state IN ('pending','accepted','unknown','dispatching') ORDER BY next_check_at LIMIT 100`).all(bot,...(chat ? [chat] : [])) as any[])
       .map(r=>({...JSON.parse(r.record_json),state:r.state,insertionId:r.insertion_id,rowId:r.message_row_id,chatId:r.chat_id,nextCheckAt:r.next_check_at}));
+  }
+  /** Legacy queue identities are not canonical host input receipts. Until a
+   * genuine host proof is supported, only an explicitly ordinary input may
+   * participate in ordinary completion/sync; never guess from text or root ID. */
+  isOrdinaryInput(bot:string,chat:string,row:number):boolean {
+    return !this.db.prepare(`SELECT 1 FROM insertion_custody WHERE bot_name=? AND chat_id=?
+      AND message_row_id=? AND state!='ordinary'`).get(bot,chat,row);
   }
   isInsertionReserved(bot: string,chat: string,row: number): boolean {
     const item=this.getInsertion(bot,chat,row);
@@ -1261,6 +1289,7 @@ export class MessageStore {
   }
 
   markDeliveredReply(botName: string, chatId: string, triggerMessageRowId: number, replyMessageId: string = ''): void {
+    if(!this.isOrdinaryInput(botName,chatId,triggerMessageRowId))return;
     this.db.prepare(`
       INSERT OR IGNORE INTO delivered_replies (bot_name, chat_id, trigger_message_row_id, delivered_at, reply_message_id)
       VALUES (?, ?, ?, ?, ?)
@@ -1611,8 +1640,12 @@ export class MessageStore {
         AND messages.id <= ?
         AND recalled_messages.message_id IS NULL
         AND message_sync.message_row_id IS NULL
+        -- A held insertion must not be replayed later as group catch-up simply
+        -- because acceptance removed its pending trigger. Custody is not sync.
+        AND NOT EXISTS (SELECT 1 FROM insertion_custody i WHERE i.bot_name=?
+          AND i.chat_id=messages.chat_id AND i.message_row_id=messages.id AND i.state!='ordinary')
       ORDER BY messages.timestamp ASC
-    `).all(botName, chatId, triggerRowId) as any[];
+    `).all(botName, chatId, triggerRowId, botName) as any[];
 
     return rows.map((r: any) => ({
       id: r.id,
@@ -1627,7 +1660,7 @@ export class MessageStore {
   }
 
   markMessagesSynced(botName: string, chatId: string, messageRowIds: number[], syncBatchId: string = ''): void {
-    const ids = Array.from(new Set(messageRowIds.filter((id) => Number.isFinite(id) && id > 0)));
+    const ids = Array.from(new Set(messageRowIds.filter((id) => Number.isFinite(id) && id > 0 && this.isOrdinaryInput(botName,chatId,id))));
     if (ids.length === 0) return;
     const now = Date.now();
     const stmt = this.db.prepare(`

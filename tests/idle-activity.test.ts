@@ -251,10 +251,10 @@ describe("collector effective activity (reply matching is unchanged)", () => {
         : start(mode === "short session key" ? {} : { expectedUserText: "question" }, mode === "short session key" ? "idle-activity" : KEY);
       if (mode === "anchored continuation") {
         emit("sessionUser", { text: "question" });
-        emit("lifecycle", { phase: "start" }, "continuation");
+        emit("lifecycle", { phase: "start" }, "r"); // public admitted clientRunId, not arbitrary foreign lifecycle
       }
       await vi.advanceTimersByTimeAsync(900);
-      emit("item", { kind: "tool", name: "write", itemId: "t", phase: "end" }, mode === "anchored continuation" ? "continuation" : "r");
+      emit("item", { kind: "tool", name: "write", itemId: "t", phase: "end" }, "r");
       await vi.advanceTimersByTimeAsync(150); expect(notice).not.toHaveBeenCalled();
       await vi.advanceTimersByTimeAsync(900); expect(notice).toHaveBeenCalledOnce(); await finish(p);
     },
@@ -314,14 +314,31 @@ describe("collector effective activity (reply matching is unchanged)", () => {
 
   it("does not pause on a stale terminal-timeout classification when new progress arrived", async () => {
     let release!: (value: any) => void;
-    c.rpc = vi.fn(async () => ({ runId: "r", status: "timeout", endedAt: Date.now() }));
-    c.getSessionRuntimeStatus = vi.fn(() => new Promise(resolve => { release = resolve; }));
-    const p = start(); await vi.advanceTimersByTimeAsync(1000);
-    emit("assistant", { delta: "new output" }); await vi.advanceTimersByTimeAsync(50);
-    release({ status: "running", running: true, checkedAt: Date.now() });
-    c.getSessionRuntimeStatus = vi.fn(async () => ({ status: "running", running: true, checkedAt: Date.now() }));
-    await vi.advanceTimersByTimeAsync(999); expect(notice).not.toHaveBeenCalled();
-    await vi.advanceTimersByTimeAsync(1); expect(notice).toHaveBeenCalledOnce(); await finish(p);
+    const normal=c.rpc;
+    c.rpc=vi.fn((method:string,...args:any[])=>method==='agent.wait'
+      ?new Promise(resolve=>{release=resolve}):normal(method,...args));
+    let settled=false;
+    const p=start().then((text:string)=>{settled=true;return text;});
+    await vi.advanceTimersByTimeAsync(1000);
+    const oldTerminalCut={runId:'r',status:'timeout',endedAt:Date.now()};
+    emit('assistant',{delta:'new output'});await vi.advanceTimersByTimeAsync(50);
+    // This is the real race: a terminal projection sampled before progress
+    // completes its RPC afterward. New root progress fences the old query cut.
+    release(oldTerminalCut);c.rpc=normal;await vi.advanceTimersByTimeAsync(0);
+    expect(settled).toBe(false);expect(notice).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(999);expect(notice).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);expect(notice).toHaveBeenCalledOnce();await finish(p);
+  });
+
+  it('new progress also fences a delayed bare-timeout status classification',async()=>{
+    let release!:(value:any)=>void;
+    c.getSessionRuntimeStatus=vi.fn(()=>new Promise(resolve=>release=resolve));
+    const p=start();emit('chatError',{error:'RPC timeout'});await vi.advanceTimersByTimeAsync(50);
+    emit('tool',{name:'read',toolCallId:'fresh-after-timeout',phase:'result'});await vi.advanceTimersByTimeAsync(50);
+    release({status:'unknown',running:false,checkedAt:Date.now()});await vi.advanceTimersByTimeAsync(0);
+    expect(notice).not.toHaveBeenCalled();
+    c.getSessionRuntimeStatus=vi.fn(async()=>({status:'unknown',running:false,checkedAt:Date.now()}));
+    await vi.advanceTimersByTimeAsync(1000);expect(notice).toHaveBeenCalledOnce();await finish(p);
   });
 
   it.each(["final", "error", "stop"])("cleans observation after %s while idle status is pending", async outcome => {

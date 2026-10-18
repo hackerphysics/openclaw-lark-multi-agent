@@ -67,7 +67,7 @@ describe("Go exact admitted run collector",()=>{
   (client as any).rpc=async()=>({runId:"owned",status:"running"});
   const pending=client.collectGoRun({runId:"owned",sessionKey:key,timeoutMs:2000});
   events.push({runId:"unowned",sessionKey:key,stream:"assistant",data:{delta:"forged COMPLETE"}}, {runId:"unowned",sessionKey:key,stream:"lifecycle",data:{phase:"end"}});
-  setTimeout(()=>events.push({runId:"owned",sessionKey:key,stream:"assistant",data:{delta:"owned WAIT"}},{runId:"owned",sessionKey:key,stream:"lifecycle",data:{phase:"end",livenessState:"working"}}),25);
+  setTimeout(()=>events.push({runId:"owned",sessionKey:key,stream:"assistant",data:{delta:"owned WAIT"}},{runId:"owned",sessionKey:key,stream:"chatFinal",data:{text:"owned WAIT"}},{runId:"owned",sessionKey:key,stream:"lifecycle",data:{phase:"end",livenessState:"working"}}),25);
   await expect(pending).resolves.toBe("owned WAIT");
  });
 });

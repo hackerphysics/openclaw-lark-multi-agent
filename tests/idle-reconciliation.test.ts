@@ -16,6 +16,7 @@ const start = () => {
 };
 const final = async () => {
   emit("assistant", { delta: "normal reply" });
+  emit("chatFinal", { text: "normal reply" });
   emit("lifecycle", { phase: "end", livenessState: "working" });
   await vi.advanceTimersByTimeAsync(1000);
 };
@@ -65,7 +66,7 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
     c.rpc = vi.fn(async (method: string) => {
       calls.push(method);
       if (method === "lma.steer") return { status: "no_active_run" };
-      if (method === "chat.history") return { sessionKey: KEY, sessionInfo: { hasActiveRun: false } };
+      if (method === "chat.history") return { sessionKey: KEY, sessionInfo: { sessionId:"generation-1",hasActiveRun: false },pendingInputs:{total:0,items:[]} };
       return { runId: "r", status: "timeout" };
     });
     await c.runStateChecks.get(KEY)();
@@ -103,14 +104,18 @@ describe("minimal idle reconciliation preserves ordinary collection", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("retains existing user-anchored continuation and live-status callback behavior", async () => {
+  it("retains public admitted-root continuation progress and live-status callback behavior", async () => {
     const progress = vi.fn(); c.progressCallbacks.set("s1", progress);
     const p = c.collectReply("r", 30 * 60_000, "s1", { expectedUserText: "original" });
-    snapshot={runId:'r',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'continued reply'}};
+    c.progressRuns.set(KEY,"r");
     emit("sessionUser", { text: "original" });
-    emit("lifecycle", { phase: "start" }, "continuation");
-    emit("assistant", { delta: "continued reply" }, "continuation");
-    emit("lifecycle", { phase: "end", livenessState: "working" }, "continuation");
+    emit("lifecycle", { phase: "start" }, "r"); // host public clientRunId alias
+    emit("assistant", { delta: "continued reply" }, "r");
+    c.handleVerboseAssistantStream({sessionKey:KEY,runId:"r",data:{delta:"continued reply"}});
+    c.flushVerboseAssistantState(KEY,"r");
+    expect(progress).toHaveBeenCalledWith({kind:"assistant_note",text:"continued reply"});
+    emit("chatFinal",{text:"continued reply"},"r");
+    emit("lifecycle", { phase: "end", livenessState: "working" }, "r");
     await vi.advanceTimersByTimeAsync(1000);
     expect(await p).toBe("continued reply");
     expect(c.progressCallbacks.get("s1")).toBe(progress);

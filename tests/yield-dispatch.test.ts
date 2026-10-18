@@ -192,12 +192,13 @@ describe('detached result settlement identity',()=>{
   final('r1','NO_REPLY');await tick(100);expect(h.store.getReactionIntent('Bot','chat',1).desired).toBe('DONE');expect(h.store.runObservationState(h.key,'r1')).toBe('settled');
   expect(h.store.getDeliveryByKey('Bot','chat','trigger:1')).toBeNull();expect(h.store.getReactionIntent('Bot','chat',h.store.getMessageId('B')!).desired).toBe('Get');final('r2','B result');await tick(350);await b;
  });
- it('real late root error uses durable error outbox and settles only its accepted original inputs',async()=>{
+ it('real late root error settles ordinary original inputs, not legacy queue-accepted insertions',async()=>{
   await start();h.client.steer=vi.fn(async(_s:any,_t:any,_d:any,id:any)=>({...id,status:'accepted',attempted:true,sessionId:'generation-1'}));
   await h.bot.handleMessage(event('B'));await tick(100);yieldRoot();await tick(100);activity={status:'done',hasActiveRun:false};const c=h.bot.handleMessage(event('C'));await tick(100);activity={status:'running',hasActiveRun:true};
   const base=h.client.rpc;h.client.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait'&&p.runId==='r1'?{runId:'r1',status:'error',endedAt:Date.now(),error:'provider authentication rejected'}:base(m,p));
   h.store['db'].prepare('UPDATE run_observations SET next_check_at=0').run();await h.client.recoverExactRuns();await tick(100);
-  expect(h.store.getReactionIntent('Bot','chat',1).desired).toBe('DONE');expect(h.store.getInsertion('Bot','chat',h.store.getMessageId('B')!).state).toBe('committed');
+  expect(h.store.getReactionIntent('Bot','chat',1).desired).toBe('DONE');expect(h.store.getInsertion('Bot','chat',h.store.getMessageId('B')!).state).toBe('accepted');
+  expect(h.store.getReactionIntent('Bot','chat',h.store.getMessageId('B')!).desired).toBe('Get');
   expect(h.store.getReactionIntent('Bot','chat',h.store.getMessageId('C')!).desired).toBe('Get');expect(h.store.getDeliveryByKey('Bot','chat','trigger:1')).toBeNull();
   expect(h.store.listDeliveriesByKeyPrefix('Bot','chat','run-error:').some(d=>d.status==='delivered')).toBe(true);final('r2','C result');await tick(350);await c;
  });

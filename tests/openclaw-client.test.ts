@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { GATEWAY_PROTOCOL_MAX, GATEWAY_PROTOCOL_MIN, OpenClawClient } from "../src/openclaw-client.js";
 import { tmpdir } from "node:os";
@@ -13,8 +13,16 @@ describe("OpenClawClient protocol compatibility", () => {
 });
 
 describe("OpenClawClient collectReply", () => {
+  const clients:any[]=[];
+  const offlineClient=()=>{
+    const client:any=new OpenClawClient({baseUrl:"ws://offline.invalid",token:"test"});
+    client.rpc=vi.fn(async(method:string,params:any)=>method==='sessions.describe'
+      ?{session:{status:'unknown'}}:{runId:params?.runId,status:'pending'});
+    clients.push(client);return client;
+  };
+  afterEach(async()=>{for(const client of clients.splice(0))await client.disconnect();vi.useRealTimers();});
   it("collects terminal events from short and full session key buckets", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const fullKey = "agent:main:s1";
@@ -35,13 +43,12 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("ignores empty lifecycle end and waits for later real text", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
     events.set(key, []);
 
-    (client as any).rpc=vi.fn(async()=>({runId:'chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'real reply'}}));
     const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
     events.get(key)!.push({
       runId: "other-runtime-run",
@@ -51,24 +58,25 @@ describe("OpenClawClient collectReply", () => {
     });
     setTimeout(() => {
       events.get(key)!.push({
-        runId: "real-agent-run",
+        runId: "chat-run",
         sessionKey: key,
         stream: "assistant",
         data: { delta: "real reply" },
       });
       events.get(key)!.push({
-        runId: "real-agent-run",
+        runId: "chat-run",
         sessionKey: key,
         stream: "lifecycle",
         data: { phase: "end", livenessState: "working" },
       });
+      events.get(key)!.push({runId:"chat-run",sessionKey:key,stream:"chatFinal",data:{text:"real reply"}});
     }, 50);
 
     await expect(replyPromise).resolves.toBe("real reply");
   });
 
   it("does not reject on a recoverable context-overflow error; a later final wins", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -92,7 +100,7 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("still rejects immediately on a non-recoverable agent error", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -109,26 +117,21 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).rejects.toThrow(/permission denied/);
   });
 
-  it("rejects on a chat-level error (request timeout) instead of surfacing mid-run delta text", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    const events = new Map<string, any[]>();
-    (client as any).agentEvents = events;
-    const key = "agent:main:s1";
-    events.set(key, []);
-
-    const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
-    // Agent produced some mid-run delta text (e.g. between tool calls)...
-    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatDelta", data: { deltaText: "让我查一下这个文件。", delta: "让我查一下这个文件。" } });
-    // ...then the run timed out at the chat level.
-    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "Request timed out before a response was received" } });
-
-    // Must reject (timeout), NOT resolve with the mid-run delta text.
-    await expect(replyPromise).rejects.toThrow(/timed out/i);
+  it("a chat-level wait timeout retains observation instead of surfacing mid-run delta text", async () => {
+    vi.useFakeTimers();const client=offlineClient(),key='agent:main:s1';client.agentEvents.set(key,[]);
+    const notice=vi.fn();let settled=false;
+    const reply=client.collectReply('chat-run',2000,'s1',{onWaitPaused:notice}).then((text:string)=>{settled=true;return text;});
+    client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'chatDelta',data:{deltaText:'让我查一下这个文件。'}});
+    client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'chatError',data:{error:'Request timed out before a response was received'}});
+    await vi.advanceTimersByTimeAsync(100);expect(settled).toBe(false);expect(notice).toHaveBeenCalledOnce();
+    client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'chatFinal',data:{text:'verified answer'}});
+    client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
+    await vi.advanceTimersByTimeAsync(50);expect(await reply).toBe('verified answer');
   });
 
   it("reconciles a generic chat error through agent.wait and reports the real timeout", async () => {
     vi.useFakeTimers();
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -156,7 +159,7 @@ describe("OpenClawClient collectReply", () => {
 
   it("waits briefly for a detailed chat error after a generic placeholder", async () => {
     vi.useFakeTimers();
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -177,7 +180,7 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("defers on a recoverable chat-level error and lets a later final win", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -193,28 +196,25 @@ describe("OpenClawClient collectReply", () => {
     await expect(replyPromise).resolves.toBe("recovered after overflow");
   });
 
-  it("treats empty final as NO_REPLY when requested", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
-    const events = new Map<string, any[]>();
-    (client as any).agentEvents = events;
-    const key = "agent:main:s1";
-    events.set(key, []);
-
-    const replyPromise = (client as any).collectReply("chat-run", 1000, "s1", { emptyFinalAsNoReply: true });
-    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatFinal", data: { text: "" } });
-    events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
-
-    await expect(replyPromise).resolves.toBe("NO_REPLY");
+  it("empty final becomes NO_REPLY only after exact empty terminal commitment", async () => {
+    vi.useFakeTimers();const client=offlineClient(),key='agent:main:s1';client.agentEvents.set(key,[]);
+    let committed=false;const rpc=client.rpc;client.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait' && committed
+      ?{runId:p.runId,status:'ok',endedAt:Date.now(),terminalReply:{disposition:'empty'}}:rpc(m,p));
+    let settled=false;const reply=client.collectReply('chat-run',1000,'s1',{emptyFinalAsNoReply:true}).then((text:string)=>{settled=true;return text;});
+    client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'chatFinal',data:{text:''}});
+    client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
+    await vi.advanceTimersByTimeAsync(5100);expect(settled).toBe(false);
+    committed=true;client.agentEvents.get(key).push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
+    await vi.advanceTimersByTimeAsync(50);expect(await reply).toBe('NO_REPLY');
   });
 
   it("ignores empty chatFinal fallback and waits for later real text", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
     events.set(key, []);
 
-    (client as any).rpc=vi.fn(async()=>({runId:'chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'later text'}}));
     const replyPromise = (client as any).collectReply("chat-run", 1000, "s1");
     events.get(key)!.push({
       runId: "other-runtime-run",
@@ -224,30 +224,30 @@ describe("OpenClawClient collectReply", () => {
     });
     setTimeout(() => {
       events.get(key)!.push({
-        runId: "real-agent-run",
+        runId: "chat-run",
         sessionKey: key,
         stream: "assistant",
         data: { delta: "later text" },
       });
       events.get(key)!.push({
-        runId: "real-agent-run",
+        runId: "chat-run",
         sessionKey: key,
         stream: "lifecycle",
         data: { phase: "end", livenessState: "working" },
       });
+      events.get(key)!.push({runId:"chat-run",sessionKey:key,stream:"chatFinal",data:{text:"later text"}});
     }, 50);
 
     await expect(replyPromise).resolves.toBe("later text");
   });
 
   it("ignores stale replay events before the expected user anchor", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
     events.set(key, []);
 
-    (client as any).rpc=vi.fn(async()=>({runId:'current-chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'current answer'}}));
     const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
     events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
     events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "sessionUser", data: { text: "Continue the OpenClaw runtime event." } });
@@ -255,16 +255,17 @@ describe("OpenClawClient collectReply", () => {
     events.get(key)!.push({ runId: "old-runtime", sessionKey: key, stream: "lifecycle", data: { phase: "end", replayInvalid: true, livenessState: "working" } });
     setTimeout(() => {
       events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "sessionUser", data: { text: "current question" } });
-      events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
-      events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "assistant", data: { delta: "current answer" } });
-      events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+      events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
+      events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "assistant", data: { delta: "current answer" } });
+      events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+      events.get(key)!.push({runId:"current-chat-run",sessionKey:key,stream:"chatFinal",data:{text:"current answer"}});
     }, 50);
 
     await expect(replyPromise).resolves.toBe("current answer");
   });
 
   it("trusts exact runId events even when the user anchor is missing", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -279,24 +280,24 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("buffers current run events that arrive just before the expected user anchor", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
     events.set(key, []);
 
-    (client as any).rpc=vi.fn(async()=>({runId:'current-chat-run',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'anchored answer'}}));
     const replyPromise = (client as any).collectReply("current-chat-run", 1000, "s1", { expectedUserText: "current question" });
-    events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "start" } });
     events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "sessionUser", data: { text: "current question" } });
-    events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "assistant", data: { delta: "anchored answer" } });
-    events.get(key)!.push({ runId: "real-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "assistant", data: { delta: "anchored answer" } });
+    events.get(key)!.push({ runId: "current-chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
 
+    events.get(key)!.push({runId:"current-chat-run",sessionKey:key,stream:"chatFinal",data:{text:"anchored answer"}});
     await expect(replyPromise).resolves.toBe("anchored answer");
   });
 
-  it("keeps visible transcript text when final is empty and replay later aborts", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+  it("retains transcript/replay observations without promoting them before exact root final", async () => {
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -322,11 +323,15 @@ describe("OpenClawClient collectReply", () => {
       data: { phase: "end", status: "cancelled", aborted: true, stopReason: "rpc" },
     });
 
+    let settled=false;void replyPromise.then(()=>settled=true);await new Promise(r=>setTimeout(r,100));expect(settled).toBe(false);
+    expect(events.get(key)!.some(e=>e.stream==='assistant' && !e.runId)).toBe(true);
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'chatFinal',data:{text:'real transcript reply'}});
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
     await expect(replyPromise).resolves.toBe("real transcript reply");
   });
 
   it("does not turn replayInvalid plus silence into failure while Gateway remains pending", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -354,12 +359,13 @@ describe("OpenClawClient collectReply", () => {
     expect(settled).toBe(false);
     expect(abort).not.toHaveBeenCalled();
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "late final" } });
+      events.get(key)!.push({runId:"chat-run",sessionKey:key,stream:"chatFinal",data:{text:"late final"}});
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
     await expect(replyPromise).resolves.toBe("late final");
   });
 
   it("clears a pending replayInvalid failure when later tool activity arrives", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -380,6 +386,7 @@ describe("OpenClawClient collectReply", () => {
         data: { kind: "tool", phase: "start", name: "exec", meta: "curl -C - retry" },
       });
       events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "download resumed" } });
+      events.get(key)!.push({runId:"chat-run",sessionKey:key,stream:"chatFinal",data:{text:"download resumed"}});
       events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
     }, 150);
 
@@ -387,7 +394,7 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("defers cancelled/rpc lifecycle failures until idle timeout and keeps later real text", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -402,6 +409,7 @@ describe("OpenClawClient collectReply", () => {
     });
     setTimeout(() => {
       events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: "late real reply" } });
+      events.get(key)!.push({runId:"chat-run",sessionKey:key,stream:"chatFinal",data:{text:"late real reply"}});
       events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end", livenessState: "working" } });
     }, 120);
 
@@ -409,7 +417,7 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("surfaces cancelled/rpc failure only after Gateway confirms a terminal error", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -428,14 +436,14 @@ describe("OpenClawClient collectReply", () => {
   });
 
   it("extracts visible assistant text from text-only transcript messages", () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "visible" }] })).toBe("visible");
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "text", text: "draft" }, { type: "toolCall", name: "read" }] })).toBe("");
     expect((client as any).extractVisibleAssistantText({ role: "assistant", content: [{ type: "text", text: "draft" }, { type: "toolCall", name: "read" }] }, { allowMixedToolText: true })).toBe("draft");
   });
 
   it("collects v4 chatDelta deltaText and respects replace semantics", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -467,11 +475,18 @@ describe("OpenClawClient collectReply", () => {
       data: { phase: "end" },
     });
 
+    const visible=vi.fn();client.sessionMessageCallbacks.set(key,visible);client.setVerboseTranscriptDelivery(key,true);
+    for(const ev of events.get(key)!)if(ev.stream==='chatDelta')client.handleVerboseAssistantStream(ev);
+    client.flushVerboseAssistantState(key,'chat-run');
+    expect(visible).toHaveBeenCalledWith('hello world',expect.objectContaining({sourceType:'verbose_transcript',runId:'chat-run'}));
+    let settled=false;void replyPromise.then(()=>settled=true);await new Promise(r=>setTimeout(r,100));expect(settled).toBe(false);
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'chatFinal',data:{text:'hello world'}});
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
     await expect(replyPromise).resolves.toBe("hello world");
   });
 
   it("does not double-count mirrored assistant and chatDelta streams", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -482,10 +497,13 @@ describe("OpenClawClient collectReply", () => {
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatDelta", data: { deltaText: "hello" } });
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
 
+    let settled=false;void replyPromise.then(()=>settled=true);await new Promise(r=>setTimeout(r,100));expect(settled).toBe(false);
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'chatFinal',data:{text:'hello'}});
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
     await expect(replyPromise).resolves.toBe("hello");
   });
   it("does not concatenate transcript mirrors with streaming deltas", async () => {
-    const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+    const client = offlineClient();
     const events = new Map<string, any[]>();
     (client as any).agentEvents = events;
     const key = "agent:main:s1";
@@ -497,6 +515,9 @@ describe("OpenClawClient collectReply", () => {
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "assistant", data: { delta: " full final" } });
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "lifecycle", data: { phase: "end" } });
 
+    let settled=false;void replyPromise.then(()=>settled=true);await new Promise(r=>setTimeout(r,100));expect(settled).toBe(false);
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'chatFinal',data:{text:'prefix full final'}});
+    events.get(key)!.push({runId:'chat-run',sessionKey:key,stream:'lifecycle',data:{phase:'end'}});
     await expect(replyPromise).resolves.toBe("prefix full final");
   });
 
@@ -505,7 +526,7 @@ describe("OpenClawClient collectReply", () => {
     const previous = process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY;
     process.env.OPENCLAW_LARK_MULTI_AGENT_MAINTENANCE_CONCURRENCY = "1";
     try {
-      const client = new OpenClawClient({ baseUrl: "ws://localhost", token: "test" } as any);
+      const client = offlineClient();
       let active = 0;
       let maxActive = 0;
       (client as any).rpc = vi.fn(async (method: string) => {

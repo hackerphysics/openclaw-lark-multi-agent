@@ -74,7 +74,7 @@ it.each(['final','error'])('P1 REAL FeishuBot preserves custody until an exact l
   }
   return;
  });
-it('P1 accepted insertion stays Get until exact root settlement',async()=>{
+it('P1 accepted insertion stays Get even after exact root settlement without per-input proof',async()=>{
  const p=h.bot.handleMessage(event('A')); await tick();
  h.client.steer=vi.fn(async(_s:any,_t:any,_d:any,id:any)=>({...id,status:'accepted',attempted:true,sessionId:'generation-1'}));
  await h.bot.handleMessage(event('B')); await tick(); const row=h.store.getMessageId('B');
@@ -86,8 +86,9 @@ it('P1 accepted insertion stays Get until exact root settlement',async()=>{
   expect(h.store.getReactionIntent('Bot','chat',row).desired).toBe('Get');
   expect(snapshotBot().queueOwner).toBe(true); expect(snapshotBot().context).toEqual([]);
   final('trusted root result for both inputs.'); await tick(350); await p;
-  expect(h.store.getInsertion('Bot','chat',row).state).toBe('committed');
-  expect(h.store.getReactionIntent('Bot','chat',row).desired).toBe('DONE');
+  expect(h.store.getInsertion('Bot','chat',row).state).toBe('accepted');
+  expect(h.store.getReactionIntent('Bot','chat',row).desired).toBe('Get');
+  expect(h.store.getReactionIntent('Bot','chat',h.store.getMessageId('A')).desired).toBe('DONE');
   expect(snapshotBot().context).toEqual(['trusted root result for both inputs.']); expect(h.sends).toHaveLength(1);return;
  });
 it('P1 SQLite restart retains unresolved root and recovers only its authoritative result',async()=>{

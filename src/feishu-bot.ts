@@ -5,10 +5,11 @@ import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
-import { OpenClawClient, InactiveRunObservation, AdmissionUnconfirmed } from "./openclaw-client.js";
+import { OpenClawClient, InactiveRunObservation, AdmissionUnconfirmed, CollectorStalledError } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { SupersededObservation } from "./openclaw-client.js";
 import { LiveStatusController, LiveStatusEffectRejectedError, LiveStatusEffectUnknownError, type LiveStatusCallbacks, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
+import { QueuedPresentations } from "./queued-presentation.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { GoController } from "./go-controller.js";
 import { MessageStore, type PendingErrorNotice, type DeliveryDispatchOutcome } from "./message-store.js";
@@ -29,7 +30,7 @@ export class SendDeadlineError extends Error {
 }
 
 const nonemptyReceipt=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
-type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; collecting?:boolean; yielded?:boolean };
+type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; collecting?:boolean; observationDetached?:boolean; yielded?:boolean };
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -188,14 +189,13 @@ export class FeishuBot {
    * fails restore their durable fallback. Fired in processQueueInner's
    * failure arms; dropped at each new batch top and on queue exit. */
   private runFailureObservers: Map<string, Array<() => void>> = new Map();
-  /** Steered messages admitted into the CURRENT batch (per chat). Flipped to
-   * DONE when that batch completes successfully; cleared (unflipped) when the
-   * batch scope ends any other way. */
+  /** Ephemeral batch-scoped acceptance bookkeeping, not commitment evidence.
+   * Ending the batch only drops these handles; durable insertion custody stays
+   * accepted and must not inherit the root's DONE. */
   private admittedSteerAcks: Map<string, Array<{ messageId: string; insertedId: number; batch?: object }>> = new Map();
-  /** Identity token of the CURRENT queue owner per chat. Steer acks carry
-   *  the token of the batch that admitted them; a completion path only flips
-   *  acks of its OWN batch, so a superseded inner can never DONE a newer
-   *  batch's steered inputs (2026-10-16 audit B9). */
+  /** Identity token of the CURRENT queue owner per chat. Acceptance bookkeeping
+   * carries its batch token so late old cleanup never takes a newer batch's
+   * handles (2026-10-16 audit B9); neither token proves input commitment. */
   private queueRunTokens: Map<string, object> = new Map();
   /** Go / Go-Checker supervision controller (per-bot instance). */
   private readonly goDeliveryReceipts = new AsyncLocalStorage<{receipts:Array<{messageId:string;operation:string;payload:unknown}>;onReceipt:()=>void;goId?:number;outboxId:number;chatId?:string;stage:string;ordinals:Map<string,number>;blocked?:boolean;persistenceError?:unknown;effectGuard?:()=>void}>();
@@ -313,6 +313,7 @@ export class FeishuBot {
   private adminOpenId: string | null;
   private locale: Locale;
   private configPath?: string;
+  private queuedPresentations: QueuedPresentations;
 
   private static allBots: Map<string, FeishuBot> = new Map();
   /** Chats where this bot app has actually received an event in this process. */
@@ -328,6 +329,10 @@ export class FeishuBot {
     this.config = config;
     this.openclawClient = openclawClient;
     this.store = store;
+    this.queuedPresentations = new QueuedPresentations(() => this.store, config.name, config.appId,
+      (chat, replyTo) => ({ ...this.liveStatusCallbacks(chat, replyTo), warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)) }),
+      chat => this.shouldUseLiveStatus(chat), chat => this.isEn(chat));
+    this.store.onClose(() => this.queuedPresentations.dispose());
     this.openclawClient.bindRecoveryStore?.(store);
     this.adminOpenId = adminOpenId || null;
     this.locale = normalizeLocale(config.locale);
@@ -530,7 +535,7 @@ export class FeishuBot {
         const parsed = this.extractBridgeAttachments(text);
         if (sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) this.cancelDelayedFailure(chatId);
         const persistedTarget=meta?.runId ? this.store.getDeliveryRunTarget(this.config.name,chatId,meta.runId) : null;
-        const runTarget = meta?.runId ? this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId, meta.runId)) || (persistedTarget ? {...persistedTarget,token:Symbol(meta.runId)} : undefined) : undefined;
+        const runTarget = meta?.runId ? this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId, meta.runId)) || (persistedTarget && persistedTarget.stopGeneration === this.stopGeneration(chatId) ? {...persistedTarget,liveStatus:this.presentation(()=>this.queuedPresentations.forRun(chatId,meta.runId!)),token:Symbol(meta.runId)} : undefined) : undefined;
         const candidateTarget = this.activeDeliveryTargets.get(chatId);
         const activeTarget = runTarget || (candidateTarget && !!candidateTarget.runId && !!meta?.runId && candidateTarget.runId === meta.runId
           ? candidateTarget
@@ -548,11 +553,12 @@ export class FeishuBot {
             meta,
           );
           if (outcome.state === "delivered" && sourceType !== "verbose_transcript" && (parsed.text.trim() || parsed.attachments.length > 0)) {
-            await activeTarget?.liveStatus?.complete().catch(() => {});
+            await (meta?.runId ? this.presentation(()=>this.queuedPresentations.forTarget(chatId,meta.runId!,activeTarget?.liveStatus)) : undefined)?.complete().catch(() => {});
+            if(meta?.runId) await this.queuedPresentations.settleRun(chatId,meta.runId).catch(()=>{});
             if (meta?.runId && runTarget) this.releaseRunDeliveryTargetAfter(chatId, meta.runId, 30_000);
           }
         } catch (err) {
-          if (sourceType !== "verbose_transcript") await activeTarget?.liveStatus?.fail().catch(() => {});
+          if (sourceType !== "verbose_transcript" && meta?.runId) await this.presentation(()=>this.queuedPresentations.forTarget(chatId,meta.runId!,activeTarget?.liveStatus))?.fail().catch(() => {});
           throw err;
         }
       } catch (err) {
@@ -564,7 +570,8 @@ export class FeishuBot {
       this.store.settleRunReactionIntents(this.config.name,chatId,meta.runId);
       void this.reconcileReactions(chatId).catch(()=>{});
       const target=this.deliveryTargetsByRun.get(this.deliveryRunTargetKey(chatId,meta.runId));
-      await target?.liveStatus?.complete().catch(()=>{});
+      await (target?.liveStatus || this.presentation(()=>this.queuedPresentations.forRun(chatId,meta.runId!)))?.complete().catch(()=>{});
+      await this.queuedPresentations.settleRun(chatId,meta.runId).catch(()=>{});
       this.releaseRunDeliveryTargetAfter(chatId,meta.runId,30_000);
     });
 
@@ -1241,6 +1248,10 @@ export class FeishuBot {
       if (!isBot && insertedId > 0) {
         this.goController?.onHumanInput(chatId);
         this.store.markPendingTrigger(this.config.name, chatId, insertedId);
+        // No health/setup/model/history await precedes this honest local receipt.
+        // UI custody cannot reserve dispatch or claim Gateway/model acceptance.
+        const presentationRoot = this.queueOwners.get(chatId)?.runId || this.store.getDispatchCustody(this.config.name,chatId)?.runId;
+        this.presentation(()=>this.queuedPresentations.receive(chatId,insertedId,messageId,isNativeOpenClawCommand,presentationRoot));
         // Reserve BEFORE the first health/reaction await. Otherwise an ending
         // owner can ordinary-drain this row while its handler is still waiting,
         // and the later steer would submit the same message a second time.
@@ -1427,11 +1438,17 @@ export class FeishuBot {
     return true;
   }
 
+  private presentation<T>(work: () => T): T | undefined {
+    try { return work(); }
+    catch (err) { console.warn(`[${this.config.name}] presentation unavailable; business custody unchanged:`, this.errorSummary(err)); return undefined; }
+  }
+
   private stopGeneration(chatId:string):number {
     return this.stopEpoch.get(chatId) ?? this.store.getStopGeneration(this.config.name,chatId);
   }
   private reactionChecks=new Set<string>();
   private async receiptReaction(chatId:string,rowId:number,messageId:string,desired:string,runId=''):Promise<void> {
+    if(desired==='DONE' && !this.store.isOrdinaryInput(this.config.name,chatId,rowId))return;
     const previous=this.store.getReactionIntent(this.config.name,chatId,rowId);
     const record={...previous,messageId,desired,shown:previous?.shown || '',runId:runId || previous?.runId || '',stopEpoch:this.stopGeneration(chatId)};
     this.store.setReactionIntent(this.config.name,chatId,rowId,record);
@@ -1525,15 +1542,17 @@ export class FeishuBot {
         item.sessionId=sessionId;
         if(item.state==='accepted') {
           this.store.clearPendingTrigger(this.config.name,chatId,item.rowId);
+          void this.queuedPresentations.insertionAccepted(chatId,item.rowId,item.expectedRunId).catch(()=>{});
           const reaction=this.store.getReactionIntent(this.config.name,chatId,item.rowId);
           if(!reaction || reaction.desired==='Typing') await this.receiptReaction(chatId,item.rowId,item.messageId,'Get',item.expectedRunId);
           if(!stillCurrent()) continue;
-          const settled=await this.openclawClient.exactRunSettled?.(item.expectedRunId);
+          await this.openclawClient.exactRunSettled?.(item.expectedRunId);
           if(!stillCurrent()) continue;
-          if(settled) {
-            this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'committed',item);
-            await this.receiptReaction(chatId,item.rowId,item.messageId,'DONE',item.expectedRunId);
-          } else this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'accepted',item,Date.now()+60_000);
+          // Boolean queue acceptance + expected root settlement (including
+          // error/timeout) cannot establish this exact input's commitment,
+          // actual receiver, consumption, or result. Keep Get and no-replay
+          // custody, with paced observation. Do not invent a host input ID.
+          this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'accepted',item,Date.now()+60_000);
           continue;
         }
         const batchAtCheck=owner?.batch,runAtCheck=owner?.runId;
@@ -1604,6 +1623,7 @@ export class FeishuBot {
           // Durable acceptance drives Get, including after bridge restart when
           // its ephemeral pendingAckMessages array no longer exists.
           await this.receiptReaction(chatId,item.rowId,item.messageId,'Get',item.expectedRunId);
+          void this.queuedPresentations.insertionAccepted(chatId,item.rowId,item.expectedRunId).catch(err=>console.warn('insertion presentation checkpoint failed',this.errorSummary(err)));
           if(!stillCurrent()) continue;
           const ack=(this.pendingAckMessages.get(chatId)||[]).find(a=>a.rowId===item.rowId);
           if(ack) ack.emoji='Get';
@@ -1828,10 +1848,10 @@ export class FeishuBot {
       owner.batchId=randomUUID();
       owner.triggerIds=undefined;
       owner.runId=undefined;
-      owner.admitted=false;owner.collecting=false;owner.yielded=false;owner.sessionId=undefined;
+      owner.admitted=false;owner.collecting=false;owner.observationDetached=false;owner.yielded=false;owner.sessionId=undefined;
       this.queueRunTokens.set(chatId,batchToken);
-      // A fresh batch starts: steered inputs admitted into the PREVIOUS batch
-      // completed with it (consumed or not); their failure observers are stale.
+      // A fresh batch starts: previous ephemeral handles are stale. Accepted
+      // insertions remain durable/unconfirmed, NOT completed with that batch.
       this.runFailureObservers.delete(chatId);
       this.admittedSteerAcks.delete(chatId);
       const pendingMessages = this.store.getPendingTriggerMessages(this.config.name, chatId);
@@ -1985,6 +2005,10 @@ export class FeishuBot {
       const processedMessages = [...contextMsgs, ...mergedTriggers].filter((m) => m.id);
 
       const queueStartedAt = Date.now();
+      // Recovery/drain has no ingress handler: establish the same local-only
+      // queued presentation before ensureSession or metadata RPCs as well.
+      if (!isNativeCommandTrigger) this.presentation(()=>this.queuedPresentations.receive(chatId,triggerId,lastHuman.messageId || "",false));
+      const liveStatus = this.presentation(()=>this.queuedPresentations.claim(chatId,mergedTriggerIds,owner.id,owner.batchId!,isNativeCommandTrigger));
       let sessionKey: string;
       try {
         sessionKey = await this.ensureSession(chatId);
@@ -1993,6 +2017,8 @@ export class FeishuBot {
         guard();owner.sessionId=generation?.session?.sessionId;
       } catch (err) {
         if(!current()) break;
+        await liveStatus?.pauseForUnconfirmedResult(this.isEn(chatId) ? "Session setup failed before admission" : "会话准备失败，尚未提交 Gateway",
+          this.isEn(chatId) ? `${this.config.name} setup unavailable` : `${this.config.name} 会话准备未完成`).catch(()=>{});
         // Model policy/capability failures happen before chat.send. Clear the
         // busy marker, report the actionable error, and retire only this batch
         // so the chat cannot remain wedged indefinitely.
@@ -2022,9 +2048,9 @@ export class FeishuBot {
       );
 
       let foregroundRunId: string | undefined;
+      let initialPresentationRunId: string | undefined;
       const foregroundSessionId = this.store.getActiveGoJob(this.config.name,chatId)?.executorSessionId;
       let runAcceptedByOpenClaw = false;
-      let liveStatus: LiveStatusController | undefined;
       try {
         const releaseActiveDeliveryTarget = lastHuman.messageId ? this.setActiveDeliveryTarget(chatId, triggerId, lastHuman.messageId) : () => {};
         let reply: string;
@@ -2042,19 +2068,11 @@ export class FeishuBot {
             currentMarkedSubmitted = true;
           }
         };
-        liveStatus = this.shouldUseLiveStatus(chatId, isNativeCommandTrigger)
-          ? new LiveStatusController({
-              ...this.liveStatusCallbacks(chatId, lastHuman.messageId || ""),
-              warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)),
-            }, {
-              botName: this.config.name,
-              model: this.config.model,
-              thinkingLevel: await this.fetchThinkingLabel(sessionKey),
-              locale: this.isEn(chatId) ? "en" : "zh",
-            })
-          : undefined;
         guard();
-        liveStatus?.start(this.isEn(chatId) ? "waiting for OpenClaw" : "等待 OpenClaw 回复");
+        // Metadata is decoration, never a reason to postpone receipt/admission.
+        if (liveStatus) void this.fetchThinkingLabel(sessionKey).then(thinking => {
+          if (current()) liveStatus?.setMetadata(this.config.model, thinking);
+        }).catch(()=>{});
         const activeTargetForStatus = this.activeDeliveryTargets.get(chatId);
         if (activeTargetForStatus?.triggerId === triggerId && liveStatus) activeTargetForStatus.liveStatus = liveStatus;
         try {
@@ -2071,6 +2089,7 @@ export class FeishuBot {
             includeBridgeAttachmentHint: !isNativeCommandTrigger,
             onSendAttempt: (submissionId:string) => {
               guard();
+              this.presentation(()=>this.queuedPresentations.attempted(liveStatus,submissionId,owner.id,owner.batchId!));
               if(submissionId && lastHuman.messageId) {
                 this.store.bindDeliveryRun(this.config.name,chatId,submissionId,{triggerId,triggerIds:mergedTriggerIds,messageId:lastHuman.messageId,runId:submissionId,stopGeneration:this.stopGeneration(chatId)});
                 for(const ack of this.pendingAckMessages.get(chatId)||[]) if(mergedTriggerIdSet.has(ack.rowId)) void this.receiptReaction(chatId,ack.rowId,ack.messageId,'Typing',submissionId).catch(()=>{});
@@ -2083,7 +2102,8 @@ export class FeishuBot {
             onRunIdentified: (runId:string,identity?:{sessionId?:string})=>{guard();owner.runId=runId;owner.sessionId=identity?.sessionId || owner.sessionId;foregroundRunId=runId;},
             onSubmitted: async (runId: string) => {
               guard();
-              owner.runId=runId;owner.admitted=true;
+              owner.runId=runId;owner.admitted=true;initialPresentationRunId=runId;
+              void this.queuedPresentations.admit(liveStatus,runId,owner.id,owner.batchId!).catch(err=>console.warn("queued presentation ACK checkpoint failed",this.errorSummary(err)));
               this.store.saveDispatchCustody(this.config.name,chatId,{id:owner.id,batchId:owner.batchId,runId,sessionId:owner.sessionId,admitted:true,stopEpoch:owner.stopEpoch,sessionKey});
               void this.reconcileInsertions(chatId).catch(()=>{});
               this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || '',liveStatus});
@@ -2106,7 +2126,7 @@ export class FeishuBot {
               // INSERT OR IGNORE in message_sync.
               markSubmittedBatch(`submitted:${runId}`);
             },
-            onProgress: (event) => current() ? liveStatus?.progress(event) : undefined,
+            onProgress: (event) => current() && runAcceptedByOpenClaw && !!initialPresentationRunId && owner.runId === initialPresentationRunId ? liveStatus?.progress(event) : undefined,
             onCollectionStarted:runId=>{guard();if(owner.runId===runId)owner.collecting=true;},
             onYieldHandoff: runId=>{
               guard();
@@ -2160,7 +2180,7 @@ export class FeishuBot {
           onSendAttempt:submissionId=>{
             guard();this.store.bindDeliveryRun(this.config.name,chatId,submissionId,{triggerId,messageId:lastHuman.messageId || '',runId:submissionId,stopGeneration:this.stopGeneration(chatId),sessionKey:`agent:main:${sessionKey.replace(/^agent:[^:]+:/,'')}`});
           },
-          onSubmitted:async runId=>{guard();owner.runId=runId;foregroundRunId=runId;this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || "",liveStatus});},
+          onSubmitted:async runId=>{guard();const previousRoot=owner.runId;owner.runId=runId;foregroundRunId=runId;void this.queuedPresentations.advance(liveStatus,previousRoot,runId,owner.id,owner.batchId!).catch(()=>{});this.bindRunDeliveryTarget(chatId,runId,{triggerId,messageId:lastHuman.messageId || "",liveStatus});},
         });
 
         guard();
@@ -2334,27 +2354,14 @@ export class FeishuBot {
           }
         }
         guard(); this.pendingAckMessages.set(chatId, remainingAcks);
-        // Steered messages admitted into THIS batch were consumed with it:
-        // flip their Get → DONE alongside the batch's own triggers.
-        // B9 (2026-10-16 audit): flip only THIS batch's admitted steer acks. A
-        // superseded inner completing late must never DONE a newer batch's
-        // steered inputs — foreign acks stay for their owning batch.
+        // Root success and Feishu receipts cover ordinary triggers only. The
+        // legacy SDK acknowledged enqueue, not per-input commitment. B9 still
+        // fences cleanup by batch; durable accepted/Get custody remains held.
         const allSteers = this.admittedSteerAcks.get(chatId) || [];
-        const admittedSteers = allSteers.filter((s) => s.batch === batchToken);
         if (allSteers.length > 0) {
           this.admittedSteerAcks.set(chatId, allSteers.filter((s) => s.batch !== batchToken));
         }
-        if (visibleOutcomeConfirmed && admittedSteers.length > 0) {
-          for (const s of admittedSteers) {
-            guard();
-            const custody=this.store.getInsertion(this.config.name,chatId,s.insertedId);
-            if(custody?.state!=='accepted' || custody.expectedRunId!==owner.runId) continue;
-            this.store.saveInsertion(this.config.name,chatId,s.insertedId,custody.insertionId,'committed',custody);
-            await this.receiptReaction(chatId,s.insertedId,s.messageId,'DONE',owner.runId);
-          }
-          const acksAfter = this.pendingAckMessages.get(chatId) || [];
-          guard(); this.pendingAckMessages.set(chatId, acksAfter.filter((a) => !admittedSteers.some((s) => a.messageId === s.messageId)));
-        }
+        if (visibleOutcomeConfirmed && owner.runId) await this.queuedPresentations.settleRun(chatId,owner.runId).catch(()=>{});
       } catch (err) {
         if (!current() || err instanceof SupersededObservation) {
           if(current()) {this.busyChats.set(chatId,0);owner.revoked=true;}
@@ -2387,6 +2394,17 @@ export class FeishuBot {
           const acks = this.pendingAckMessages.get(chatId) || [];
           for (const ack of acks) if (completedTriggerIdSet.has(ack.rowId)) await this.removeReaction(ack.messageId, ack.emoji).catch(() => {});
           guard(); this.pendingAckMessages.set(chatId, acks.filter(ack => !completedTriggerIdSet.has(ack.rowId)));
+          break;
+        }
+        if (err instanceof CollectorStalledError) {
+          // Not a task failure: do not restore/replay accepted insertions or
+          // mark DONE. Retain exact dispatch/result custody; release the local
+          // owner independently of potentially hung card/reaction effects.
+          owner.observationDetached=true;
+          const epoch=owner.stopEpoch;
+          if(this.stopGeneration(chatId)===epoch && !this.store.hasDeliveredReply(this.config.name,chatId,triggerId))
+            void liveStatus?.pauseForUnconfirmedResult(err.message).catch(()=>{});
+          console.warn(`[${this.config.name}] local observer stalled for ${chatId.slice(-8)}; durable exact-result custody retained`);
           break;
         }
         if (err instanceof InactiveRunObservation) {
@@ -2451,7 +2469,7 @@ export class FeishuBot {
       } finally {
         if(current()) {
           this.busyChats.set(chatId, 0);
-          if(owner.batchId && !owner.yielded)this.store.clearDispatchCustody(this.config.name,chatId,owner.id,owner.batchId);
+          if(owner.batchId && !owner.yielded && !owner.observationDetached)this.store.clearDispatchCustody(this.config.name,chatId,owner.id,owner.batchId);
         }
       }
 
@@ -3890,7 +3908,7 @@ export class FeishuBot {
         .join("\n");
       elements.push({ tag: "markdown", content });
     } else {
-      elements.push({ tag: "markdown", content: en ? "_working…_" : "_正在启动…_" });
+      elements.push({ tag: "markdown", content: view.state === "queued" ? (en ? "_Received locally; waiting for admission_" : "_本地已收件，等待提交确认_") : view.state === "admitted" ? (en ? "_Accepted; waiting for activity_" : "_已接收，等待活动_") : (en ? "_working…_" : "_正在启动…_") });
     }
     elements.push({ tag: "hr" });
     // Keep the active model visible while the run is in progress or failed.
@@ -5123,6 +5141,7 @@ export class FeishuBot {
       // supervision instead of letting the checker judge a wiped transcript.
       void this.goController?.onExecutorSessionChanged(chatId, "执行会话被 /reset");
       this.stopEpoch.set(chatId,this.store.bumpStopGeneration(this.config.name,chatId));
+      this.presentation(()=>this.queuedPresentations.retire(chatId));
       this.store.stopInsertions(this.config.name,chatId);
       this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
       void this.openclawClient.cancelSteerSession?.(sessionKey,this.stopGeneration(chatId)).catch(()=>{});
@@ -5156,6 +5175,7 @@ export class FeishuBot {
       // Bump the stop generation FIRST so any in-flight auto-retry loop sees the
       // cancellation on its next iteration and stops retrying immediately.
       this.stopEpoch.set(chatId,this.store.bumpStopGeneration(this.config.name,chatId));
+      this.presentation(()=>this.queuedPresentations.retire(chatId));
       this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
       void this.reconcileReactions(chatId).catch(()=>{});
       this.store.stopInsertions(this.config.name,chatId);

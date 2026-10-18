@@ -1,6 +1,11 @@
 /** Consecutive effective-activity silence, not a total foreground lifetime.
  * Starts with accepted-request collection; does not change Gateway execution limits. */
 export const FOREGROUND_WAIT_MS = 10 * 60_000;
+/** Bound one local status-watch callback, never the lifetime of a business run. */
+const configuredIdleGuard = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_IDLE_GUARD_MS || 30_000);
+export const IDLE_GUARD_MS = Number.isFinite(configuredIdleGuard) && configuredIdleGuard > 0 && configuredIdleGuard <= 2_147_483_647
+  ? configuredIdleGuard : 30_000;
+
 
 export type SessionRuntimeStatus = {
   status: string;

@@ -96,11 +96,14 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     await final(); expect(await run.result).toEqual({ text: "actual final" });
   });
 
-  it("still completes ordinary lifecycle-only silent discussion after the bounded window", async () => {
-    const run = await start({ emptyFinalAsNoReply: true });
-    agent("lifecycle", { phase: "end", livenessState: "working" });
-    await vi.advanceTimersByTimeAsync(5100);
-    expect(await run.result).toEqual({ text: "NO_REPLY" }); expect(notice).not.toHaveBeenCalled(); noAbort();
+  it("ordinary lifecycle-only discussion remains pending until exact silent commitment", async () => {
+    let committed=false;const rpc=c.rpc;
+    c.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait' && committed
+      ?{runId:'r',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'silent'}}:rpc(m,p));
+    const run=await start({emptyFinalAsNoReply:true});agent('lifecycle',{phase:'end',livenessState:'working'});
+    await vi.advanceTimersByTimeAsync(5100);expect(run.settled()).toBe(false);expect(notice).not.toHaveBeenCalled();
+    committed=true;agent('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);
+    expect(await run.result).toEqual({text:'NO_REPLY'});expect(notice).not.toHaveBeenCalled();noAbort();
   });
 
   it("deduplicates repeated yields, blank finals and lifecycle ends without salvaging interim prose", async () => {
@@ -132,15 +135,20 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     expect(await run.result).toEqual({ text: "late final" }); noAbort();
   });
 
-  it.each(["assistant", "transcript"])("retains resumed same-run %s final collection without a chat final", async source => {
-    const run = await start(); chat({ yielded: true }); await vi.advanceTimersByTimeAsync(50);
-    agent("lifecycle", { phase: "start" });
-    if (source === "assistant") agent("assistant", { delta: "resumed actual final" });
-    else wire("session.message", { sessionKey: KEY, runId: "r", message: message("resumed actual final") });
-    agent("lifecycle", { phase: "end", livenessState: "working" });
-    // Existing transcript-only completion uses the lifecycle's 5s grace window.
-    await vi.advanceTimersByTimeAsync(5100);
-    expect(await run.result).toEqual({ text: "resumed actual final" }); expect(notice).toHaveBeenCalledOnce(); noAbort();
+  it.each(["assistant", "transcript"])("retains resumed same-run %s progress and waits for exact commitment without chat final", async source => {
+    let committed=false;const rpc=c.rpc,progress=vi.fn();
+    c.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait' && committed
+      ?{runId:'r',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'committed resumed answer'}}:rpc(m,p));
+    const run=await start({onProgress:progress});chat({yielded:true});await vi.advanceTimersByTimeAsync(50);
+    agent('lifecycle',{phase:'start'});
+    if(source==='assistant')agent('assistant',{delta:'resumed actual final'});
+    else wire('session.message',{sessionKey:KEY,runId:'r',message:message('resumed actual final')});
+    agent('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(5100);
+    expect(run.settled()).toBe(false);expect(notice).toHaveBeenCalledOnce();
+    if(source==='assistant')expect(JSON.stringify(progress.mock.calls)).toContain('resumed actual final');
+    else expect(c.agentEvents.get(KEY).some((e:any)=>e.stream==='transcriptAssistant' && e.data.deltaText==='resumed actual final')).toBe(true);
+    committed=true;agent('lifecycle',{phase:'end',livenessState:'working'});await vi.advanceTimersByTimeAsync(100);
+    expect(await run.result).toEqual({text:'committed resumed answer'});expect(notice).toHaveBeenCalledOnce();noAbort();
   });
 
   it("keeps tools-only continuation and another yield pending until real text", async () => {
@@ -254,7 +262,7 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     await final(); expect(await run.result).toEqual({ text: "actual final" });
   });
 
-  it("preserves the explicitly muted discussion collector's anchored new-run continuation", async () => {
+  it("keeps muted foreign continuation independent until the original exact root terminal is read", async () => {
     const release = c.muteProactiveDelivery(KEY);
     const proactive = vi.fn(); c.sessionMessageCallbacks.set(KEY, proactive);
     const run = await start({ emptyFinalAsNoReply: true });
@@ -267,7 +275,8 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     const rpc=c.rpc;c.rpc=vi.fn(async(m:string,p:any)=>m==='agent.wait'?{runId:'r',status:'ok',endedAt:Date.now(),terminalReply:{disposition:'visible',text:'discussion continuation result'}}:rpc(m,p));
     chat({ message: message("discussion continuation result") }, "continuation");
     agent("lifecycle", { phase: "end", livenessState: "working" }, "continuation");
-    await vi.advanceTimersByTimeAsync(100);
+    await vi.advanceTimersByTimeAsync(100);expect(run.settled()).toBe(false);
+    await c.runStateChecks.get(KEY)();
     expect(await run.result).toEqual({ text: "discussion continuation result" });
     // Existing mute applies to transcript mirrors, not external chat-final
     // callbacks; preserve that independent route (no new session-wide mute).

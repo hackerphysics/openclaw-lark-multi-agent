@@ -1882,6 +1882,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.("r-noreply-race");
         await params.onSubmitted?.("r-noreply-race");
         await new Promise((resolve) => setTimeout(resolve, 1_250));
         await cb("proactive final answer", { runId: "r-noreply-race" });
@@ -1905,6 +1906,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const cb = h.openclaw.sessionCallbacks.get("lma-gpt-chat1")!;
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
+        await params.onSendAttempt?.("r-empty-race");
         await params.onSubmitted?.("r-empty-race");
         await new Promise((resolve) => setTimeout(resolve, 1_250));
         await cb("proactive final answer", { runId: "r-empty-race" });
@@ -1930,6 +1932,7 @@ describe("FeishuBot routing and queue behavior", () => {
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         await new Promise((resolve) => setTimeout(resolve, 1_250));
+        await params.onSendAttempt?.("r-attachment-race");
         await params.onSubmitted?.("r-attachment-race");
         await cb('<LMA_BRIDGE_ATTACHMENTS>{"attachments":[{"type":"file","path":"/tmp/proactive.pdf"}]}</LMA_BRIDGE_ATTACHMENTS>', { runId: "r-attachment-race" });
         return "NO_REPLY";
@@ -1988,6 +1991,7 @@ describe("FeishuBot routing and queue behavior", () => {
       const release = (h.bot as any).setActiveDeliveryTarget("chat1", 42, "reply-42");
       const activeTarget = (h.bot as any).activeDeliveryTargets.get("chat1");
       const meta = { messageId: "live-proactive", toolCalls: 3, elapsed: "0:21", model: "model-GPT", locale: "zh" as const };
+      activeTarget.runId = "proactive-root"; // exact admitted root, never an unbound wildcard
       activeTarget.liveStatus = {
         prepareTerminalDelivery: vi.fn(async () => meta),
         prepareFinalDelivery: vi.fn(async () => meta),
@@ -2531,6 +2535,7 @@ describe("FeishuBot routing and queue behavior", () => {
       h.openclaw.chatSendWithContext = vi.fn(async (params: any) => {
         h.openclaw.chatCalls.push(params);
         params.onSendAttempt?.();
+        await params.onSubmitted?.("killed-active-run"); // actual admitted-root fixture, not an unacknowledged attempt
         await new Promise(() => {});
         return "never";
       });
@@ -2797,13 +2802,14 @@ describe("FeishuBot routing and queue behavior", () => {
     } finally {h.cleanup();}
   });
 
-  it("genuine run-bound acceptance gets Get and only its exact task settlement gets DONE", async () => {
+  it("queue acceptance gets Get but exact root settlement cannot prove insertion commitment/DONE", async () => {
     const h=makeHarness("GPT");try {
       const run=await deferredRun(h,'original');h.openclaw.steer=matchingSteer('accepted');
       await (h.bot as any).handleMessage(event({chatType:'p2p',text:'insertion',messageId:'B'}));const row=h.store.getMessageId('B')!;
       await vi.waitUntil(()=>h.store.getInsertion('GPT','chat1',row)?.state==='accepted');expect((h.bot as any).addReaction).toHaveBeenCalledWith('B','Get');
       expect((h.bot as any).activeDeliveryTargets.get('chat1').messageId).toBe('original');expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','DONE');
-      run.resolve('done');await run.first;expect((h.bot as any).addReaction).toHaveBeenCalledWith('B','DONE');expect(h.openclaw.chatCalls).toHaveLength(1);
+      run.resolve('done');await run.first;expect((h.bot as any).addReaction).not.toHaveBeenCalledWith('B','DONE');
+      expect(h.store.getInsertion('GPT','chat1',row).state).toBe('accepted');expect((h.bot as any).addReaction).toHaveBeenCalledWith('original','DONE');expect(h.openclaw.chatCalls).toHaveLength(1);
     } finally {h.cleanup();}
   });
 

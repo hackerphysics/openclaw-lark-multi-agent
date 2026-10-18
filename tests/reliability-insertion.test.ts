@@ -39,7 +39,9 @@ describe('real bridge SQLite + production plugin + public SDK queue synthetic ap
   if(ms>3600_000)vi.setSystemTime(Date.now()+ms);else await tick(ms);
   ready=true;if(ms>3600_000)setActiveEmbeddedRun('generation-1',handle,h.key);await tick(5000);
   expect(calls).toBe(1);expect(h.store.getInsertion('Bot','chat',row()).state).toBe('accepted');expect(h.bot.addReaction).toHaveBeenCalledWith('B','Get');
-  h.final('r1');await tick(300);await first.promise;expect(h.bot.addReaction).toHaveBeenCalledWith('B','DONE');expect(h.sends).toHaveLength(1);
+  h.final('r1');await tick(300);await first.promise;
+  expect(h.bot.addReaction).not.toHaveBeenCalledWith('B','DONE');expect(h.store.getInsertion('Bot','chat',row()).state).toBe('accepted');
+  expect(h.bot.addReaction).toHaveBeenCalledWith('A','DONE');expect(h.sends).toHaveLength(1);
  });
  it.each([3500,9100])('a callback delayed %sms is queryable after short RPC returns and gets Get once',async(ms)=>{
   const first=await start();ready=true;delay=ms;await input();expect(calls).toBe(1);
@@ -103,6 +105,7 @@ describe('real bridge SQLite + production plugin + public SDK queue synthetic ap
   });
   await tick(10_000);expect(h.sends).toHaveLength(2);expect(h.sends[1].message).toContain('B');expect(calls).toBe(0);
   expect(h.store.getInsertion('Bot','chat',row()).state).toBe('ordinary');h.final('r2');await tick(300);await tick(20_000);expect(h.sends).toHaveLength(2);
+  expect(h.bot.addReaction).toHaveBeenCalledWith('B','DONE');expect(h.store.getReactionIntent('Bot','chat',row()).runId).toBe('r2');
  });
  it('plugin lost lifecycle map with a ready successor: exact old terminal prevents SDK retarget and ordinary handoff waits for idle',async()=>{
   const first=await start();await input();h.final('r1');await tick(300);await first.promise;
@@ -138,6 +141,53 @@ describe('real bridge SQLite + production plugin + public SDK queue synthetic ap
   h.client.getSessionInfo=vi.fn(async()=>await new Promise(r=>release=()=>r({session:{sessionId:'generation-1'}})));
   ready=true;await input();expect(release).toBeTypeOf('function');await h.bot.handleStopCommand('chat','stop');release();await tick(300);await first.promise;
   expect(calls).toBe(0);expect(h.store.getInsertion('Bot','chat',row()).state).toBe('stopped');expect(h.bot.addReaction).not.toHaveBeenCalledWith('B','Get');
+ });
+ it.each(['accepted','unknown'] as const)('restart retains %s insertion plus B2 unknown root receipt without replay or DONE',async(status)=>{
+  const first=await start();ready=true;callbackMode=status==='accepted'?'accept':'silent';await input();
+  h.create.mockResolvedValue({code:0,data:{}});h.final('r1');await tick(300);await first.promise;
+  const originalRow=row(),old=h,db=join(h.dir!,'db');
+  expect(h.store.getDeliveryDispatchOutcome('Bot','chat','trigger:1').state).toBe('unknown');
+  for(const map of [old.bot.deliveryRetryTimers,old.bot.errorNoticeTimers,old.bot.delayedFailureTimers])for(const timer of map.values())clearTimeout(timer);
+  if(old.bot.insertionTimer)clearTimeout(old.bot.insertionTimer);old.bot.goController?.dispose();await old.client.disconnect();old.store.close();
+  dispose();mount();h=harness(db);connect();vi.setSystemTime(Date.now()+20_000);
+  const base=h.client.rpc;h.client.rpc=vi.fn(async(name:string,p:any)=>name==='agent.wait'?{runId:p.runId,status:'error',endedAt:Date.now(),error:'root terminal, input unknown'}:base(name,p));
+  await h.bot.reconcileInsertions('chat');await h.bot.dispatchPendingDeliveries('chat');await tick();
+  expect(h.store.getInsertion('Bot','chat',originalRow).state).toBe(status);
+  expect(h.store.getReactionIntent('Bot','chat',originalRow).desired).toBe(status==='accepted'?'Get':'Typing');
+  expect(h.store.getDeliveryDispatchOutcome('Bot','chat','trigger:1').state).toBe('unknown');
+  expect(calls).toBe(1);expect(h.sends).toHaveLength(0);expect(h.create).not.toHaveBeenCalled();
+  expect(h.bot.addReaction).not.toHaveBeenCalledWith('B','DONE');
+  await h.cleanup();h=harness();rmSync(old.dir!,{recursive:true,force:true});
+ });
+ it('real public SDK acceptance callback after root terminal is still admission only, not committed/DONE',async()=>{
+  const first=await start();ready=true;callbackMode='silent';await input();expect(calls).toBe(1);
+  h.final('r1');await tick(300);await first.promise;
+  const base=h.client.rpc;
+  h.client.rpc=vi.fn(async(name:string,p:any)=>name==='agent.wait'?{runId:p.runId,status:'error',endedAt:Date.now(),error:'root failed before queue drain'}:base(name,p));
+  callbacks[0](true);await tick(20_000);
+  expect(h.store.getInsertion('Bot','chat',row()).state).toBe('accepted');
+  expect(h.store.getReactionIntent('Bot','chat',row()).desired).toBe('Get');
+  await tick(70_000);
+  expect(calls).toBe(1);expect(h.sends).toHaveLength(1);
+  expect(h.store.getInsertion('Bot','chat',row()).state).toBe('accepted');
+  expect(h.bot.addReaction).not.toHaveBeenCalledWith('B','DONE');
+  expect(h.store.hasDeliveredReply('Bot','chat',row())).toBe(false);
+ });
+ it('identical input bodies with distinct queue identities never borrow root or text commitment proof',async()=>{
+  const first=await start();ready=true;
+  await h.bot.handleMessage(event('same private body','same-1'));await tick();
+  await h.bot.handleMessage(event('same private body','same-2'));await tick();
+  const rows=['same-1','same-2'].map(id=>h.store.getMessageId(id)!);
+  expect(calls).toBe(2);
+  expect(h.store.getInsertion('Bot','chat',rows[0]).insertionId).not.toBe(h.store.getInsertion('Bot','chat',rows[1]).insertionId);
+  h.client.handleSteerConsumption(h.key,'same private body');
+  h.final('r1');await tick(300);await first.promise;
+  for(const [index,id] of ['same-1','same-2'].entries()){
+   expect(h.store.getInsertion('Bot','chat',rows[index]).state).toBe('accepted');
+   expect(h.store.getReactionIntent('Bot','chat',rows[index]).desired).toBe('Get');
+   expect(h.bot.addReaction).not.toHaveBeenCalledWith(id,'DONE');
+  }
+  expect(h.sends).toHaveLength(1);expect(calls).toBe(2);
  });
  it('archive / generation change pauses rather than migrates pending input',async()=>{
   const first=await start();await input();const base=h.client.rpc;

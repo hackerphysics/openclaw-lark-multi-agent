@@ -2,7 +2,7 @@ import type { GoExecutorResult } from "./go-execution.js";
 import WebSocket from "ws";
 import { safeErrorSummary, rawErrorExcerpt } from "./provider-errors.js";
 import { inspectError, genericFailure, announceCandidate, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
-import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
+import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, IDLE_GUARD_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve, sep } from "path";
@@ -35,6 +35,11 @@ export class SupersededObservation extends Error {
     super(`${reason}（未停止网关运行）`);
     this.name = "SupersededObservation";
   }
+}
+
+/** Local observer only: the exact background result remains owned by durable recovery. */
+export class CollectorStalledError extends Error {
+  constructor() { super('本地状态观察未及时返回，已转为后台结果监听；没有停止任务或自动重发输入。'); this.name='CollectorStalledError'; }
 }
 
 export class AdmissionUnconfirmed extends Error {
@@ -71,12 +76,19 @@ const CONTEXT_SYNC_DIR = join(getDataDir(), "context-sync");
 const FEISHU_DOCS_DIR = join(getDataDir(), "feishu-docs");
 const MAX_FEISHU_DOC_ATTACHMENT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_FEISHU_DOC_ATTACHMENT_BYTES || 1024 * 1024);
 const MAX_INLINE_CONTEXT_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_MESSAGES || 20);
+// Byte budgets apply to lossy progress projections, NEVER authoritative terminal
+// text. Terminal records stay complete until exact readers + ACK reservations
+// release, then successful result/durable observation custody can retire them.
+const EVENT_PROGRESS_BUCKET_BYTES = 256 * 1024;
+const EVENT_PROGRESS_TOTAL_BYTES = 4 * 1024 * 1024;
+const EVENT_PROGRESS_FIELD_CHARS = 2048;
 const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 128 * 1024);
 
 type PendingReq = {
   resolve: (data: any) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  onSuccess?: (data:any)=>void;
 };
 
 /**
@@ -93,9 +105,14 @@ export class OpenClawClient {
   private config: OpenClawConfig;
   private ws: WebSocket | null = null;
   private pending: Map<string, PendingReq> = new Map();
+  private admissionResponseHooks=new Map<string,(data:any)=>void>();
   private connected = false;
   private connectPromise: Promise<void> | null = null;
   private agentEvents: Map<string, any[]> = new Map();
+  private eventProgressSizes=new WeakMap<object,number>();
+  private runEventReaders=new Map<string,number>();
+  private runEventReservations=new Map<string,number>();
+  private completedRunEventCustody=new Set<string>();
   private reconnectDelay = 1000;
   private maxReconnectDelay = 30000;
   private shouldReconnect = true;
@@ -108,10 +125,12 @@ export class OpenClawClient {
    * `stream=item` mirrors when a runtime emits both representations. */
   private recentToolEventKeys: Map<string, number> = new Map();
   private privateInputToolCalls = new Set<string>();
+  private publicToolCalls = new Set<string>();
   private sessionSettlementCallbacks=new Map<string,(meta:ProactiveMessageMeta)=>void|Promise<void>>();
   private sessionMessageCallbacks: Map<string, (text: string, meta?: ProactiveMessageMeta) => void> = new Map();
   private progressCallbacks: Map<string, (event: ProgressEvent) => void | Promise<void>> = new Map();
   private progressGenerations=new Map<string,number>();
+  private progressRuns=new Map<string,string>();
   /** Live collectReply fences per canonical session key. The most recent
    *  collector for a session owns the shared event bucket; a new batch (or a
    *  queue-custody revocation) fences stale ones synchronously so they cannot
@@ -229,16 +248,131 @@ export class OpenClawClient {
     } finally {this.recoveryChecking=false;}
   }
 
+  private runEventKey(sessionKey:string|undefined,runId:string):string {
+    return JSON.stringify([sessionKey===undefined?null:this.shortKey(sessionKey),runId]);
+  }
+
+  private retainRunEventCustody(kind:'reader'|'reservation',sessionKey:string|undefined,runId:string):()=>void {
+    const key=this.runEventKey(sessionKey,runId);
+    const refs=kind==='reader'?this.runEventReaders:this.runEventReservations;
+    refs.set(key,(refs.get(key)||0)+1);
+    let released=false;
+    return ()=>{
+      if(released)return;released=true;
+      const count=(refs.get(key)||1)-1;
+      if(count)refs.set(key,count);else refs.delete(key);
+      for(const completed of this.completedRunEventCustody) {
+        if(JSON.parse(completed)[1]===runId)this.retireCompletedRunEvents(completed);
+      }
+    };
+  }
+
+  private retireCompletedRunEvents(key:string):void {
+    const [session,runId]=JSON.parse(key) as [string,string];
+    // A same-run second reader or receiver ACK reservation can still need the
+    // exact terminal. Never reclaim on merely seeing another session's frame.
+    if(this.runEventReaders.has(key) || this.runEventReaders.has(this.runEventKey(undefined,runId)) || this.runEventReservations.has(key))return;
+    for(const [bucketKey,bucket] of this.agentEvents) {
+      const retained=bucket.filter(ev=>!(ev.runId===runId && this.shortKey(ev.sessionKey || bucketKey)===session));
+      if(retained.length!==bucket.length)this.agentEvents.set(bucketKey,retained);
+    }
+    this.completedRunEventCustody.delete(key);
+  }
+
+  private isTerminalBufferedEvent(event:any):boolean {
+    return event.stream==='chatFinal' || event.stream==='chatError'
+      || event.stream==='lifecycle' && event.data?.phase==='error';
+  }
+
+  /** Buffers are observation indexes, not raw tool-output/transcript caches.
+   * Presentation/evidence callbacks still see the already privacy-filtered wire
+   * payload. Keep only the fields collectReply actually consumes here. */
+  private projectBufferedEvent(event:any):any {
+    const data=event.data || {},clip=(value:any)=>typeof value==='string'?value.slice(0,EVENT_PROGRESS_FIELD_CHARS):value;
+    const out:any={runId:event.runId,sessionKey:event.sessionKey,stream:event.stream,seq:event.seq,data:{}};
+    if(event.stream==='chatFinal') {
+      out.data={text:data.gatewayYielded===true?'':typeof data.text==='string'?data.text:'',gatewayYielded:data.gatewayYielded===true};
+      return out; // Entire authority, not a preview; no duplicated message body.
+    }
+    if(event.stream==='chatError'){out.data={error:data.error};return out;}
+    const keep=event.stream==='lifecycle'
+      ?['phase','livenessState','status','stopReason','replayInvalid','aborted',...(data.phase==='error'?['error']:[])]
+      :event.stream==='tool' || event.stream==='item'
+        ?['kind','phase','name','toolName','toolCallId','itemId','id','isError']
+        :['text','deltaText','delta','replace'];
+    for(const key of keep)if(data[key]!==undefined)out.data[key]=key==='error'?data[key]:clip(data[key]);
+    if(['assistant','chatDelta','transcriptAssistant'].includes(event.stream)) {
+      const full=typeof data.text==='string'?data.text:'';
+      const chunk=full || data.deltaText || data.delta;
+      if(typeof chunk==='string' && chunk.length>EVENT_PROGRESS_FIELD_CHARS) {
+        // Activity identity must notice changes beyond a retained preview, and
+        // dedup cumulative snapshots/mirrors, without retaining the raw draft.
+        if(chunk.trim())out.data.activityFingerprint=createHash('sha256').update(chunk).digest('hex');
+        else out.data.text=out.data.deltaText=out.data.delta='';
+      }
+    }
+    if(event.stream==='tool' || event.stream==='item') {
+      if(typeof data.meta==='string')out.data.meta=clip(data.meta);
+      // The ONLY tool-result semantic consumed by collectReply is a top-level
+      // message terminate hint. Preserve that boolean, not an echoed body.
+      if(String(data.name || data.toolName)==='message') {
+        let value=data.output ?? data.result ?? data.error;
+        if(typeof value==='string') {try {value=JSON.parse(value);}catch {value=/^terminate\s*=\s*true$/i.test(value.trim())?{terminate:true}:undefined;}}
+        if(value && typeof value==='object' && value.terminate===true)out.data.output={terminate:true};
+      }
+    }
+    return out;
+  }
+
+  private progressEventBytes(event:any):number {
+    if(this.isTerminalBufferedEvent(event))return 0;
+    let bytes=this.eventProgressSizes.get(event);
+    if(bytes===undefined) {
+      bytes=Buffer.byteLength(JSON.stringify(event),'utf8')+2;
+      this.eventProgressSizes.set(event,bytes);
+    }
+    return bytes;
+  }
+
+  private enforceEventProgressBudget():void {
+    let total=0;
+    for(const [key,bucket] of this.agentEvents) {
+      let bytes=bucket.reduce((n,event)=>n+this.progressEventBytes(event),0);
+      let excessCount=Math.max(0,bucket.length-2048);
+      for(let i=0;i<bucket.length && (bytes>EVENT_PROGRESS_BUCKET_BYTES || excessCount>0);) {
+        const event=bucket[i];
+        if(this.isTerminalBufferedEvent(event)){i++;continue;}
+        bytes-=this.progressEventBytes(event);bucket.splice(i,1);excessCount--;
+      }
+      total+=bytes;
+    }
+    if(total>EVENT_PROGRESS_TOTAL_BYTES)for(const [key,bucket] of this.agentEvents) {
+      for(let i=0;i<bucket.length && total>EVENT_PROGRESS_TOTAL_BYTES;) {
+        if(this.isTerminalBufferedEvent(bucket[i])){i++;continue;}
+        total-=this.progressEventBytes(bucket[i]);bucket.splice(i,1);
+      }
+      if(total<=EVENT_PROGRESS_TOTAL_BYTES)break;
+    }
+    // Empty/nonterminal-only idle buckets may go; unknown terminal custody is
+    // explicitly exempt, not silently discarded to satisfy a count ceiling.
+    if(this.agentEvents.size>512)for(const [key,bucket] of this.agentEvents) {
+      if(this.agentEvents.size<=512)break;
+      if(!this.sessionCollectorFences.has(this.canonicalSessionKey(key)) && !bucket.some(ev=>this.isTerminalBufferedEvent(ev)))this.agentEvents.delete(key);
+    }
+  }
+
   private bufferEvent(key:string,event:any):void {
     let bucket=this.agentEvents.get(key);
     if(!bucket){bucket=[];this.agentEvents.set(key,bucket);}
-    bucket.push(event);
-    if(bucket.length>2048) bucket.splice(0,bucket.length-2048);
-    if(this.agentEvents.size>512) {
-      for(const candidate of this.agentEvents.keys()) {
-        if(candidate!==key && !this.sessionCollectorFences.has(this.canonicalSessionKey(candidate))) {this.agentEvents.delete(candidate);break;}
-      }
-    }
+    bucket.push(this.projectBufferedEvent(event));
+  }
+
+  private dispatchBufferedEvents():void {
+    // Deliver the just-received projection to every current exact reader BEFORE
+    // applying lossy progress pressure, even if this is the oldest session in
+    // the map. Progress pressure must never manufacture effective silence.
+    for(const wake of this.eventCollectors)wake();
+    this.enforceEventProgressBudget();
   }
 
   constructor(config: OpenClawConfig) {
@@ -340,12 +474,16 @@ export class OpenClawClient {
           if (p) {
             this.pending.delete(frame.id);
             clearTimeout(p.timer);
-            if (frame.ok) p.resolve(frame.payload);
+            if (frame.ok) {
+              p.onSuccess?.(frame.payload);
+              p.resolve(frame.payload);
+            }
             else p.reject(new Error(`RPC error: ${JSON.stringify(frame.error)}`));
           }
         }
 
-        if(frame.event==='agent' && ['tool','item'].includes(frame.payload?.stream))this.redactPrivateInputTool(frame.payload);
+        if(frame.event==='agent' && ['tool','item','command_output'].includes(frame.payload?.stream))this.redactPrivateInputTool(frame.payload);
+        if(frame.event==='session.message')this.redactPrivateTranscriptTools(frame.payload);
 
         // Public transcript projections can render an INPUT as role=assistant
         // (forwarded sessions_send / internal receipts). Reject its structured
@@ -411,10 +549,9 @@ export class OpenClawClient {
         }
 
         if (frame.type === "event" && ["agent", "chat"].includes(frame.event)) {
-          for(const wake of this.eventCollectors) wake();
-          // Bound disconnected/unobserved event buffers. Terminal recovery uses
-          // exact public agent.wait, never an unbounded transcript cache.
-          for(const [key,bucket] of this.agentEvents) if(bucket.length>2048) bucket.splice(0,bucket.length-2048);
+          // No unconditional count splice: a foreign progress burst cannot
+          // evict a reserved/unknown full terminal.
+          this.dispatchBufferedEvents();
         }
         if (frame.type === "event" && ["agent", "chat", "session.message"].includes(frame.event) &&
           !(frame.event==='session.message' && this.isInputRecord(frame.payload))) {
@@ -447,7 +584,7 @@ export class OpenClawClient {
             // now actually consumed it (session.message is emitted as the message
             // is committed to the transcript). Render it on the live-status card
             // in correct time order and flip the reaction to Get.
-            this.handleSteerConsumption(rawKey, visibleUserText);
+            this.handleSteerConsumption(rawKey, visibleUserText, frame.payload.runId);
           }
           const inputRecord=this.isInputRecord(frame.payload);
           const visibleAssistantText = inputRecord ? "" : this.extractVisibleAssistantText(msg);
@@ -461,7 +598,7 @@ export class OpenClawClient {
             });
           }
           if(!inputRecord)this.handleProactiveSessionMessage(rawKey, msg, frame.payload.runId, frame.payload.sessionId);
-          for(const wake of this.eventCollectors) wake();
+          this.dispatchBufferedEvents();
 
           // Tool calls in assistant messages — skip, using agent item events instead
           // (session.message toolCall events are batched, not real-time)
@@ -476,8 +613,8 @@ export class OpenClawClient {
         }
         if (frame.event === "agent" && frame.payload?.stream === "lifecycle" && frame.payload?.data?.phase === "end") {
           const rawKey = frame.payload.sessionKey || "";
-          this.flushVerboseAssistantState(rawKey);
-          this.clearVerboseAssistantState(rawKey);
+          this.flushVerboseAssistantState(rawKey, frame.payload.runId);
+          this.clearVerboseAssistantState(rawKey, frame.payload.runId);
         }
 
         // Agent item / command output events — real-time tool tracking for verbose mode.
@@ -489,20 +626,20 @@ export class OpenClawClient {
           if (data.itemId && data.name) this.lastToolNamesByItemId.set(String(data.itemId), String(data.name));
 
           if (data.kind === "tool" && data.phase === "start") {
-            this.flushVerboseAssistantState(rawKey);
-            this.clearVerboseAssistantState(rawKey);
+            this.flushVerboseAssistantState(rawKey, frame.payload.runId);
+            this.clearVerboseAssistantState(rawKey, frame.payload.runId);
           }
 
           if (data.kind === "tool" && data.name && (data.phase === "start" || data.phase === "end" || data.phase === "error")) {
             const phase = data.phase as "start" | "end" | "error";
             const eventId = String(data.toolCallId || data.itemId || data.id || data.name);
-            if (this.claimToolEvent(rawKey, eventId, phase)) {
+            if (this.claimToolEvent(rawKey, eventId, phase, Date.now(), frame.payload.runId)) {
               const meta = data.meta || data.input || data.args || "";
               const output = data.output || data.result || data.error || "";
               const inputText = this.formatToolValue(meta, String(data.name), "start");
               const outputText = this.formatToolValue(output, String(data.name), phase);
               if (toolCb) toolCb(`${data.name} ${phase}`.trim(), inputText, outputText);
-              const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+              const progressCb = this.progressForRun(rawKey, frame.payload.runId);
               if (progressCb) {
                 const detail = phase === "start" ? inputText : (outputText || inputText);
                 void progressCb({ kind: "tool", phase, name: String(data.name), text: `${data.name} ${phase}${detail ? `: ${detail}` : ""}` });
@@ -524,10 +661,10 @@ export class OpenClawClient {
               : undefined;
           const name = String(data.name || data.toolName || "tool");
           const eventId = String(data.toolCallId || data.itemId || data.id || name);
-          if (phase && this.claimToolEvent(rawKey, eventId, phase)) {
+          if (phase && this.claimToolEvent(rawKey, eventId, phase, Date.now(), frame.payload.runId)) {
             if (phase === "start") {
-              this.flushVerboseAssistantState(rawKey);
-              this.clearVerboseAssistantState(rawKey);
+              this.flushVerboseAssistantState(rawKey, frame.payload.runId);
+              this.clearVerboseAssistantState(rawKey, frame.payload.runId);
             }
             const input = data.input || data.args || data.meta || "";
             const output = data.output || data.result || data.error || "";
@@ -535,7 +672,7 @@ export class OpenClawClient {
             const outputText = this.formatToolValue(output, name, phase);
             const toolCb = this.toolEventCallbacks.get(rawKey) || this.toolEventCallbacks.get(shortKey);
             if (toolCb) toolCb(`${name} ${phase}`, inputText, outputText);
-            const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+            const progressCb = this.progressForRun(rawKey, frame.payload.runId);
             if (progressCb) {
               const detail = phase === "start" ? inputText : (outputText || inputText);
               void progressCb({ kind: "tool", phase, name, text: `${name} ${phase}${detail ? `: ${detail}` : ""}` });
@@ -639,8 +776,23 @@ export class OpenClawClient {
     return this.verboseTranscriptSessions.has(rawKey) || this.verboseTranscriptSessions.has(shortKey);
   }
 
-  private clearVerboseAssistantState(sessionKey: string): void {
-    for (const key of [sessionKey, `agent:main:${sessionKey}`]) {
+  private progressKey(sessionKey:string,runId?:string):string {
+    return JSON.stringify([this.canonicalSessionKey(sessionKey),runId || ""]);
+  }
+
+  private progressForRun(sessionKey:string,runId?:string) {
+    const key=this.canonicalSessionKey(this.shortKey(sessionKey));
+    // Installed public agent events already map runtime continuations to the
+    // admitted client runId. Session proximity/lifecycle starts are not lineage.
+    if(!runId || this.progressRuns.get(key)!==runId)return undefined;
+    return this.progressCallbacks.get(key) || this.progressCallbacks.get(this.shortKey(key));
+  }
+
+  private clearVerboseAssistantState(sessionKey: string, runId?:string): void {
+    const canonical=this.canonicalSessionKey(sessionKey);
+    const keys=runId!==undefined ? [this.progressKey(sessionKey,runId)]
+      : [...this.verboseAssistantLastTouched.keys()].filter(key=>{try{return JSON.parse(key)[0]===canonical;}catch{return false;}});
+    for (const key of keys) {
       const timer = this.verboseAssistantTimers.get(key);
       if (timer) clearTimeout(timer);
       this.verboseAssistantTimers.delete(key);
@@ -650,38 +802,107 @@ export class OpenClawClient {
     }
   }
 
-  /** Internal message tools carry private input, not assistant narration.
-   * Redact before buffering as well as progress callbacks (including failure
-   * summaries). Preserve tool identity/phase for activity and acceptance logic. */
-  private redactPrivateInputTool(payload:any):void {
+  private canonicalToolName(name:unknown):string {
+    return String(name || "").split(/[.:]/).pop() || "";
+  }
+
+  /** Inspect supported public wrappers recursively, including JSON arguments.
+   * A wrapper containing any private coordination call has private results too;
+   * do not try to salvage arbitrary echoed result/error strings. */
+  private isPrivateCoordination(name:unknown,value:unknown,depth=0):boolean {
+    const tool=this.canonicalToolName(name);
+    if(['sessions_spawn','sessions_send','sessions_yield'].includes(tool))return true;
+    if(depth>16)return ['tool_call','parallel'].includes(tool);
+    let args:any=value;
+    if(typeof args==='string'){try{args=JSON.parse(args);}catch{return false;}}
+    if(!args || typeof args!=='object')return false;
+    if(tool==='tool_call')return this.isPrivateCoordination(args.id || args.name,args.args ?? args.parameters,depth+1);
+    if(tool==='parallel' && Array.isArray(args.tool_uses))return args.tool_uses.some((call:any)=>
+      this.isPrivateCoordination(call?.recipient_name || call?.name || call?.id,call?.parameters ?? call?.args,depth+1));
+    return false;
+  }
+
+  private knownPublicWrapper(name:unknown,value:unknown,depth=0):boolean {
+    if(depth>16)return false;
+    const tool=this.canonicalToolName(name);
+    if(['sessions_spawn','sessions_send','sessions_yield'].includes(tool))return false;
+    if(!['tool_call','parallel'].includes(tool))return Boolean(tool);
+    let args:any=value;
+    if(typeof args==='string'){try{args=JSON.parse(args);}catch{return false;}}
+    if(!args || typeof args!=='object')return false;
+    if(tool==='tool_call')return this.knownPublicWrapper(args.id || args.name,args.args ?? args.parameters,depth+1);
+    return Array.isArray(args.tool_uses) && args.tool_uses.every((call:any)=>
+      this.knownPublicWrapper(call?.recipient_name || call?.name || call?.id,call?.parameters ?? call?.args,depth+1));
+  }
+
+  /** Redact BEFORE event buffers, logging, observers, cards and verbose sinks.
+   * Call custody is session+run+id scoped, so item/command/result mirrors stay
+   * private even after the original wrapper arguments have disappeared. */
+  private redactPrivateInputTool(payload:any):boolean {
     const data=payload?.data;
-    if(!data || payload.stream==='item' && data.kind!=='tool')return;
-    const name=String(data.name || data.toolName || '').split('.').pop();
+    if(!data || payload.stream==='item' && data.kind!=='tool')return false;
     const eventId=String(data.toolCallId || data.itemId || data.id || '').replace(/^(?:tool|command):/,'');
-    const key=JSON.stringify([this.canonicalSessionKey(payload.sessionKey || ''),payload.runId || '',eventId]);
-    let args=data.input ?? data.args ?? data.meta;
-    if(typeof args==='string') {try {args=JSON.parse(args);} catch {args=undefined;}}
-    const wrapped=name==='tool_call' && /(?:^|[.:])sessions_(?:send|yield)$/.test(String(args?.id || ''));
-    const privateBody=name==='sessions_send' || name==='sessions_yield' || wrapped;
+    const key=this.progressKey(payload.sessionKey || '',payload.runId)+':'+eventId;
+    const name=data.name || data.toolName;
+    const wrapper=['tool_call','parallel'].includes(this.canonicalToolName(name));
+    const privateBody=[data.input,data.args,data.meta,data.output,data.result,data.error].some(value=>this.isPrivateCoordination(name,value));
+    if(data.phase==='start' && eventId && !privateBody && this.knownPublicWrapper(name,data.input ?? data.args ?? data.meta)) {
+      this.publicToolCalls.add(key);
+      if(this.publicToolCalls.size>2048)this.publicToolCalls.delete(this.publicToolCalls.values().next().value!);
+    }
+    // An orphan wrapper result can echo hidden arguments. Only a correlated
+    // known-public call may expose its arbitrary scalar output.
+    const ambiguousResult=(wrapper || ['', 'tool', 'command_output'].includes(this.canonicalToolName(name))) && data.phase!=='start' && !this.publicToolCalls.has(key);
     if(privateBody && eventId) {
       this.privateInputToolCalls.add(key);
       if(this.privateInputToolCalls.size>2048)this.privateInputToolCalls.delete(this.privateInputToolCalls.values().next().value!);
     }
-    if(!privateBody && !this.privateInputToolCalls.has(key))return;
+    if(!privateBody && !ambiguousResult && (!eventId || !this.privateInputToolCalls.has(key)))return false;
     payload.data=Object.fromEntries(['kind','phase','name','toolName','toolCallId','itemId','id','isError'].filter(k=>data[k]!==undefined).map(k=>[k,data[k]]));
+    return true;
   }
+
+  private redactPrivateTranscriptTools(payload:any):void {
+    const msg=payload?.message || payload;
+    if(!msg || typeof msg!=='object')return;
+    const redact=(part:any,phase:string)=>{
+      const synthetic={sessionKey:payload?.sessionKey,runId:payload?.runId,stream:'tool',data:{
+        ...part,name:part?.name || part?.toolName,toolCallId:part?.toolCallId || part?.tool_use_id || part?.id,
+        phase,input:part?.arguments ?? part?.input ?? part?.args,result:part?.content ?? part?.output ?? part?.result,
+      }};
+      return this.redactPrivateInputTool(synthetic);
+    };
+    if(['tool','toolResult'].includes(msg.role) && redact(msg,'result')) {
+      msg.content=[];delete msg.output;delete msg.result;delete msg.error;delete msg.arguments;delete msg.input;delete msg.args;
+    }
+    if(Array.isArray(msg.content))msg.content=msg.content.map((part:any)=>{
+      const type=String(part?.type || '').toLowerCase();
+      const phase=['toolcall','tool_call','tooluse','tool_use'].includes(type)?'start'
+        : ['toolresult','tool_result'].includes(type)?'result':undefined;
+      if(!phase || !redact(part,phase))return part;
+      return Object.fromEntries(['type','id','name','toolName','toolCallId','tool_use_id','isError'].filter(k=>part[k]!==undefined).map(k=>[k,part[k]]));
+    });
+  }
+
 
   /** Render protocol-4 structured tool args/results without `[object Object]`.
    * Prefer useful, non-secret fields and keep the fallback bounded. */
   private formatToolValue(value: unknown, toolName: string, phase: "start" | "end" | "error"): string {
-    // sessions_yield.message is private resumed context. Do not mirror its
-    // arguments/results (including JSON strings) into process cards or verbose
-    // tool replies. This is redaction only, never evidence of a handoff.
-    if (toolName === "sessions_yield" || toolName === "sessions_send") return "";
-    // Generic public-tool wrapper: redact only the internal send operation,
-    // not all tool bodies or outputs. Its returned body can echo the input.
-    if(toolName === 'tool_call' && value && typeof value==='object' &&
-      /(?:^|[.:])sessions_send$/.test(String((value as any).id || '')))return "";
+    if(this.isPrivateCoordination(toolName,value))return "";
+    toolName=this.canonicalToolName(toolName);
+    if(phase==='start' && ['tool_call','parallel'].includes(toolName)) {
+      let args:any=value;
+      if(typeof args==='string'){try{args=JSON.parse(args);}catch{return "";}}
+      if(toolName==='tool_call' && args?.id) {
+        const name=this.canonicalToolName(args.id),detail=this.formatToolValue(args.args ?? args.parameters,name,phase);
+        return `${name}${detail ? ': '+detail : ''}`;
+      }
+      if(toolName==='parallel' && Array.isArray(args?.tool_uses))return args.tool_uses.slice(0,4).map((call:any)=>{
+        const name=this.canonicalToolName(call?.recipient_name || call?.name || call?.id),detail=this.formatToolValue(call?.parameters ?? call?.args,name,phase);
+        return `${name}${detail ? ': '+detail : ''}`;
+      }).join('; ');
+      return "";
+    }
     if (value === null || value === undefined || value === "") return "";
     if (typeof value === "string") return value.trim();
     if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return String(value);
@@ -740,10 +961,10 @@ export class OpenClawClient {
     return parts.join(", ");
   }
 
-  private claimToolEvent(sessionKey: string, eventId: string, phase: "start" | "end" | "error", now = Date.now()): boolean {
+  private claimToolEvent(sessionKey: string, eventId: string, phase: "start" | "end" | "error", now = Date.now(), runId?:string): boolean {
     const normalizedPhase = phase === "error" ? "end" : phase;
     const normalizedId = eventId.replace(/^(?:tool|command):/, "");
-    const key = `${this.shortKey(sessionKey)}:${normalizedId}:${normalizedPhase}`;
+    const key = `${this.progressKey(sessionKey,runId)}:${normalizedId}:${normalizedPhase}`;
     const seenAt = this.recentToolEventKeys.get(key);
     if (seenAt !== undefined && now - seenAt < 60_000) return false;
     this.recentToolEventKeys.set(key, now);
@@ -775,13 +996,13 @@ export class OpenClawClient {
     }
   }
 
-  private flushVerboseAssistantState(rawKey: string): boolean {
+  private flushVerboseAssistantState(rawKey: string,runId?:string): boolean {
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-    const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+    const progressCb = this.progressForRun(rawKey, runId);
     if (!this.isVerboseTranscriptEnabled(rawKey) && !progressCb) return false;
     if (!cb && !progressCb) return false;
-    const key = rawKey;
+    const key = this.progressKey(rawKey,runId);
     const latest = this.verboseAssistantLatest.get(key)?.trim() || "";
     if (!latest) return false;
     const sent = this.verboseAssistantSent.get(key) || "";
@@ -792,7 +1013,7 @@ export class OpenClawClient {
     }
     if (!toSend) return false;
     this.verboseAssistantSent.set(key, latest);
-    if (this.isVerboseTranscriptEnabled(rawKey) && cb) cb(toSend, { sourceType: "verbose_transcript" });
+    if (this.isVerboseTranscriptEnabled(rawKey) && cb) cb(toSend, { sourceType: "verbose_transcript",...(runId?{runId,sessionKey:this.canonicalSessionKey(rawKey)}:{}) });
     if (progressCb) void progressCb({ kind: "assistant_note", text: toSend });
     return true;
   }
@@ -803,13 +1024,13 @@ export class OpenClawClient {
     if (!rawKey) return;
     const shortKey = rawKey.replace(/^agent:[^:]+:/, "");
     const cb = this.sessionMessageCallbacks.get(rawKey) || this.sessionMessageCallbacks.get(shortKey);
-    const progressCb = this.progressCallbacks.get(rawKey) || this.progressCallbacks.get(shortKey);
+    const progressCb = this.progressForRun(rawKey, payload.runId);
     if (!this.isVerboseTranscriptEnabled(rawKey) && !progressCb) return;
     if (!cb && !progressCb) return;
     const data = payload.data || {};
     const fullText = typeof data.text === "string" ? data.text : typeof data.deltaText === "string" && data.replace ? data.deltaText : "";
     const deltaText = !fullText && typeof data.delta === "string" ? data.delta : !fullText && typeof data.deltaText === "string" ? data.deltaText : "";
-    const key = rawKey;
+    const key = this.progressKey(rawKey,payload.runId);
     const previous = this.verboseAssistantLatest.get(key) || "";
     const text = (fullText || (previous + deltaText)).trim().slice(-1024*1024);
     if (!text) return;
@@ -818,7 +1039,7 @@ export class OpenClawClient {
     this.verboseAssistantLastTouched.set(key, now);
     this.pruneVerboseCaches(now);
     if (text.length >= 3000) {
-      this.flushVerboseAssistantState(rawKey);
+      this.flushVerboseAssistantState(rawKey, payload.runId);
     }
   }
 
@@ -892,20 +1113,19 @@ export class OpenClawClient {
         this.pending.delete(id);
         reject(new Error(`RPC timeout: ${method}`));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { resolve, reject, timer,
+        onSuccess:method==='chat.send' ? this.admissionResponseHooks.get(params?.idempotencyKey) : undefined });
       this.ws!.send(JSON.stringify({ type: "req", id, method, params }));
     });
   }
 
-  /**
-   * Collect agent reply by polling accumulated events.
-   * Matches by initial runId OR sessionKey to handle multi-turn tool calling
-   * where OpenClaw creates new runIds for each tool-call round.
-   * Existing event/anchor matching is retained. Foreground effective silence
-   * triggers read-only reconciliation, never a task-lifetime cutoff or draft final.
-   * Explicit terminal/error/disconnect paths keep their existing behavior.
+  /** Exact admitted-root observation with non-destructive event cursors.
+   * Gateway maps runtime continuations to its public client runId; an unrelated
+   * session lifecycle start is not lineage. Separate requester/task continuation
+   * lineage remains owned by handoffLinkedContinuation + exact root recovery.
+   * Effective silence prompts read-only reconciliation, never a lifetime cutoff.
    */
-private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { exactRunIdentity?: boolean; emptyFinalAsNoReply?: boolean; expectedUserText?: string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>; onYieldHandoff?: (runId:string)=>void }): Promise<string> {
+private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessionKey?: string, options?: { exactRunIdentity?: boolean; emptyFinalAsNoReply?: boolean; expectedUserText?: string; expectedSessionId?:string; onWaitPaused?: (notice: SessionWaitPaused) => void | Promise<void>; onYieldHandoff?: (runId:string)=>void }): Promise<string> {
     let cleanupObservation = () => {};
     return new Promise<string>((resolveResult, rejectResult) => {
       // Whether we were connected when the run started. We only treat a later
@@ -913,13 +1133,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // this keeps unit tests that drive collectReply without a live socket from
       // tripping the disconnect path.
       const startedConnected = this.connected;
-      let text = "";
-      let chatDeltaText = "";
       let chatFinalText = "";
-      let chatFinalSeen = false;
-      let transcriptAssistantText = "";
-      let draftOverflow=false;
-      const boundedDraft=(value:string)=>{if(value.length>1024*1024){draftOverflow=true;return value.slice(-1024*1024);}return value;};
       let sessionKey = targetSessionKey ? `agent:main:${targetSessionKey.replace(/^agent:[^:]+:/, "")}` : "";
       let shortSessionKey = targetSessionKey ? targetSessionKey.replace(/^agent:[^:]+:/, "") : "";
       let chatFinalTimer: ReturnType<typeof setTimeout> | null = null;
@@ -937,18 +1151,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let lastActivityAt = 0;
       const collectStartedAt = Date.now();
       let lifecycleStartedLogged = false;
-      const expectedUserText = options?.expectedUserText?.trim() || "";
-      let anchorSeen = !expectedUserText;
       const activeRunIds = new Set<string>([runId]);
-      let preAnchorEvents: any[] = [];
-      const foreignUserRuns=new Set<string>();
-      const normalizeText = (value: string) => value.replace(/\s+/g, " ").trim();
-      const isExpectedUserText = (value: string) => {
-        const actual = normalizeText(value);
-        const expected = normalizeText(expectedUserText);
-        if (!actual || !expected) return false;
-        return actual === expected || actual.includes(expected) || expected.includes(actual);
-      };
+      const seenEvents=new WeakSet<object>();
+      const releaseEventReader=this.retainRunEventCustody('reader',targetSessionKey,runId);
 
       let idleTimer: ReturnType<typeof setTimeout>;
       let observationClosed = false;
@@ -962,10 +1167,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       let decidingTimeout = false;
       let waitNoticeSent = false;
       let foregroundPaused = false;
-      let foregroundYielded = false;
       let turnYielded = false;
-      const handleTimeoutResult = async (error: Error) => {
+      const handleTimeoutResult = async (error: Error, stillCurrent=()=>true) => {
+        collectEvents();
         if (observationClosed) return;
+        if(!stillCurrent()){decidingTimeout=false;return;}
         if (chatFinalText.trim()) { finish(chatFinalText); return; }
         if (error instanceof SessionWaitPaused) {
           // Presentation only. A separate trusted-yield callback may transfer
@@ -977,7 +1183,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             catch { console.warn("[OpenClaw] wait notice delivery pending; observation retained"); }
           }
           decidingTimeout = false;
-          if (!observationClosed) resetIdleTimer(60_000, false);
+          if (!observationClosed && stillCurrent()) resetIdleTimer(60_000, false);
           return;
         }
         reject(error);
@@ -986,10 +1192,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if (observationClosed || checkingState || !force && Date.now() - lastStateCheckAt < 60_000) return;
         checkingState = true;
         lastStateCheckAt = Date.now();
+        const decisionGeneration=idleGeneration;
         try {
           const snapshot = await this.rpc("agent.wait", { runId, timeoutMs: 1500 }, 2500);
+          // A query can return a terminal projection sampled before a newer
+          // same-root continuation made real progress. Drain the received wire
+          // first and fence that stale cut; a fresh exact query may still fail.
+          collectEvents();
+          if(!idleStillCurrent() || idleGeneration!==decisionGeneration)return;
           if (observationClosed || snapshot?.runId !== runId || snapshot?.pendingError === true
-            || snapshot?.timeoutPhase === "queue" || snapshot?.timeoutPhase === "gateway_draining") return;
+            || snapshot?.yielded === true || snapshot?.timeoutPhase === "queue" || snapshot?.timeoutPhase === "gateway_draining") return;
           // A bare wait timeout is not an execution timeout. Require a recorded
           // terminal time; never infer failure from stopReason or replay flags.
           const ended = snapshot.endedAt;
@@ -999,23 +1211,15 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             const terminal = snapshot.terminalReply;
             // B6 (2026-10-16 audit): disposition "empty" is an authoritative
             // no-visible-text terminal — never recycle an interim draft as the
-            // final answer. Only genuinely unspecified metadata may fall back.
+            // final answer. Unspecified/malformed metadata retains observation.
             const visible = terminal?.disposition === "visible" && typeof terminal.text === "string"
               ? terminal.text
               : terminal?.disposition === "silent" || terminal?.disposition === "empty"
                 ? "NO_REPLY"
                 : "";
-            if (!visible && terminal?.disposition !== "visible") return;
-            resolve(visible || "NO_REPLY");
+            if (!visible.trim()) return;
+            resolve(visible);
           } else if (snapshot.status === "error" || snapshot.status === "timeout") {
-            if (snapshot.status === "timeout" || isWaitTimeout(String(snapshot.error || ""))) {
-              const status = await this.getSessionRuntimeStatus(targetSessionKey || sessionKey);
-              collectEvents();
-              if (!observationClosed && status.running) {
-                if (idleStillCurrent()) await handleTimeoutResult(new SessionWaitPaused(status, true));
-                return;
-              }
-            }
             if (observationClosed) return;
             reject(new Error(`Agent error: ${typeof snapshot.error === "string" && snapshot.error.trim()
               ? snapshot.error : `Gateway 已确认运行以 ${snapshot.status} 结束`}`));
@@ -1026,13 +1230,27 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // One clock for foreground silence and subsequent low-frequency observation.
       // A generation fences status RPCs that complete after newer real activity.
       let idleGeneration = 0;
+      let idleGuardTimer: ReturnType<typeof setTimeout> | undefined;
+      const clearIdleGuard = () => { if(idleGuardTimer) clearTimeout(idleGuardTimer); idleGuardTimer=undefined; };
       const resetIdleTimer = (delayMs = timeoutMs, activity = true) => {
         if (activity) { if (!foregroundPaused) waitNoticeSent = false; quietNotified = false; }
         const generation = ++idleGeneration;
         const idleStillCurrent = () => !observationClosed && generation === idleGeneration;
         if (idleTimer) clearTimeout(idleTimer);
+        clearIdleGuard();
         if (observationClosed) return;
-        idleTimer = setTimeout(async () => {
+        idleTimer = setTimeout(() => {
+          const ownGuard = setTimeout(() => {
+            if(!idleStillCurrent()) return;
+            // Remove success suppression synchronously BEFORE closing this exact
+            // observer. Late final/error stays on its durable original route.
+            this.releasePausedWait(runId);
+            cleanupObservation();
+            reject(new CollectorStalledError());
+          }, IDLE_GUARD_MS);
+          idleGuardTimer=ownGuard;
+          ownGuard.unref?.();
+          void (async () => {
           // Drain already-received frames before judging silence: the 50ms
           // collection poll may otherwise run just after this deadline.
           collectEvents();
@@ -1050,10 +1268,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // status is unknown/idle; never invent running. Without one, retain
           // the published running-only typed outcome and background checks.
           if (status.running || options?.onWaitPaused) {
-            await handleTimeoutResult(new SessionWaitPaused(status));
+            await handleTimeoutResult(new SessionWaitPaused(status), idleStillCurrent);
             return;
           }
           resetIdleTimer(60_000, false);
+          })().catch(error => { if(idleStillCurrent()) reject(error instanceof Error ? error : new Error(String(error))); })
+            .finally(() => {
+              // An obsolete callback must never clear a newer callback's guard.
+              clearTimeout(ownGuard);
+              if(idleGuardTimer===ownGuard) idleGuardTimer=undefined;
+            });
         }, delayMs);
       };
       // Activity filtering is deliberately separate from reply assembly/matching:
@@ -1086,7 +1310,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         }
         if (ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") {
           const fullText = typeof data.text === "string" ? data.text : "";
-          const chunk = fullText || data.deltaText || data.delta;
+          const rawChunk = fullText || data.deltaText || data.delta;
+          const chunk = typeof data.activityFingerprint==='string'
+            ? `[activity-sha256:${data.activityFingerprint}]`:rawChunk;
           const replace = Boolean(fullText || data.replace);
           if (typeof chunk !== "string" || !chunk.trim()) return false;
           const source = JSON.stringify([run, ev.stream]);
@@ -1139,26 +1365,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           lastActivityAt = Date.now();
         }
       };
-      const buildFailureText = (ev: any): string => {
-        const state = ev.data?.livenessState || ev.data?.status || "unknown";
-        const reason = ev.data?.stopReason || "";
-        const replayInvalid = ev.data?.replayInvalid ? ", replayInvalid" : "";
-        const lines = [`⚠️ Agent 未正常完成`, `状态: ${state}${replayInvalid}${reason ? "\n原因: " + reason : ""}`];
-        if (lastActivitySummary) {
-          lines.push(`最后活动: ${lastActivitySummary}`);
-          lines.push(`最后活动时间: ${new Date(lastActivityAt).toLocaleString()}`);
-        }
-        lines.push("请重试，或用 /reset 重置会话");
-        return lines.join("\n");
-      };
       resetIdleTimer();
 
       const finish = (finalText: string) => {
-        if(draftOverflow && finalText!=='NO_REPLY' && finalText!==chatFinalText) {
-          // Never publish a truncated accumulator. Keep exact result custody
-          // until authoritative root terminalReply or full root chat final.
-          void checkRunState(()=>true,true);return;
-        }
         clearTimeout(idleTimer);
         clearInterval(poller);
         if (chatFinalTimer) clearTimeout(chatFinalTimer);
@@ -1195,101 +1404,21 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
           let i = 0;
           while (i < bucket.length) {
-            const ev = bucket[i];
-
+            const ev = bucket[i++];
+            if(seenEvents.has(ev))continue;
             const evRunId = typeof ev.runId === "string" ? ev.runId : "";
-            const eventSessionMatches = Boolean(sessionKey && (ev.sessionKey === sessionKey || ev.sessionKey === targetSessionKey || ev.sessionKey === shortSessionKey || activeRunIds.has(evRunId) && this.shortKey(ev.sessionKey || '')===shortSessionKey));
+            const eventSessionMatches = Boolean(sessionKey && this.shortKey(ev.sessionKey || bucketKey)===this.shortKey(sessionKey));
             const matchesRun = evRunId ? activeRunIds.has(evRunId) : false;
-
-            if (options?.exactRunIdentity && !matchesRun) { i++; continue; }
-            if(evRunId && foreignUserRuns.has(evRunId)) {i++;continue;}
-
+            // Non-destructive per-observer cursor: ACK and a replacement final
+            // may be delivered synchronously before the awaiting sender resumes.
+            // Leave every foreign/unidentified frame available to its own owner.
+            if(!matchesRun || sessionKey && !eventSessionMatches)continue;
+            seenEvents.add(ev);
             if (!sessionKey && ev.sessionKey) {
               shortSessionKey = String(ev.sessionKey).replace(/^agent:[^:]+:/, "");
-              sessionKey = `agent:main:${shortSessionKey}`;
+              sessionKey = this.canonicalSessionKey(ev.sessionKey);
             }
-
-            if (eventSessionMatches && ev.stream === "sessionUser") {
-              if(anchorSeen && evRunId && !matchesRun) {foreignUserRuns.add(evRunId);i++;continue;}
-              bucket.splice(i, 1);
-              if (!anchorSeen && isExpectedUserText(ev.data?.text || "")) {
-                anchorSeen = true;
-                for (const pendingEv of preAnchorEvents) {
-                  const pendingRunId = typeof pendingEv.runId === "string" ? pendingEv.runId : "";
-                  if (pendingRunId && pendingEv.stream === "lifecycle" && pendingEv.data?.phase === "start") {
-                    activeRunIds.add(pendingRunId);
-                  }
-                }
-                const replay = preAnchorEvents.filter((pendingEv) => {
-                  const pendingRunId = typeof pendingEv.runId === "string" ? pendingEv.runId : "";
-                  return !pendingRunId || activeRunIds.has(pendingRunId);
-                });
-                preAnchorEvents = [];
-                if (replay.length) bucket.splice(i, 0, ...replay);
-              } else if (!anchorSeen) {
-                // A different user/runtime continuation belongs to stale queued work;
-                // anything before it should not be attributed to the next real user turn.
-                preAnchorEvents = [];
-              }
-              continue;
-            }
-
-            // After handoff, an unowned new run (including requester-settle)
-            // retains its existing proactive delivery route. A session/lifecycle
-            // start alone must not turn it into the old run's final. Discussion's
-            // transcript mute marks scheduler-owned collection; retain its existing
-            // anchored collector path rather than changing discussion routing.
-            if (eventSessionMatches && foregroundYielded && evRunId && !matchesRun
-              && !this.mutedProactiveSessions.has(sessionKey) && !this.mutedProactiveSessions.has(shortSessionKey)) {
-              bucket.splice(i, 1);
-              continue;
-            }
-
-            if (eventSessionMatches && expectedUserText && !anchorSeen && !matchesRun) {
-              bucket.splice(i, 1);
-              preAnchorEvents.push(ev);
-              if(preAnchorEvents.length>2048) preAnchorEvents.splice(0,preAnchorEvents.length-2048);
-              if (preAnchorEvents.length > 200) preAnchorEvents.shift();
-              continue;
-            }
-
-            let matchesSession = false;
-            if (!options?.exactRunIdentity && eventSessionMatches && anchorSeen) {
-              if (!expectedUserText) {
-                // Backward-compatible mode for tests/internal callers that do not
-                // provide an anchor: allow session-key matching as before.
-                matchesSession = true;
-              } else if (!evRunId) {
-                matchesSession = true;
-              } else if (activeRunIds.has(evRunId)) {
-                matchesSession = true;
-              } else if (ev.stream === "lifecycle" && ev.data?.phase === "start") {
-                activeRunIds.add(evRunId);
-                matchesSession = true;
-              }
-            }
-
-            if (!(matchesRun || matchesSession)) {
-              // When collectReply is anchored to a specific user message, discard stale
-              // session events that arrive before that anchor (or from unrelated runIds)
-              // so replayInvalid/aborted events from older runtime continuations cannot
-              // be misattributed to the current user turn.
-              if (eventSessionMatches && expectedUserText) {
-                bucket.splice(i, 1);
-              } else {
-                i++;
-              }
-              continue;
-            }
-
-            bucket.splice(i, 1);
-            // Continuation progress is valid, but only the admitted root's
-            // committed terminalReply can authorize another run's final text.
-            if(evRunId && evRunId!==runId && (ev.stream==='chatFinal' || ev.stream==='chatError' || ev.stream==='lifecycle' && ['end','error'].includes(ev.data?.phase))) {
-              if(ev.stream==='chatFinal' && ev.data?.gatewayYielded===true) continue;
-              void checkRunState(()=>true,true);
-              continue;
-            }
+            if(ev.stream==='sessionUser')continue;
             if (hasEffectiveActivity(ev)) resetIdleTimer();
             rememberActivity(ev);
             // Terminating channel-send detection (2026-10-16 frozen-card
@@ -1347,41 +1476,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               lifecycleStartedLogged = true;
               console.log(`[OpenClaw] lifecycle start for runId=${runId} after ${Date.now() - collectStartedAt}ms`);
             }
-            if ((!evRunId || evRunId===runId) && (ev.stream === "assistant" || ev.stream === "chatDelta" || ev.stream === "transcriptAssistant") && (ev.data?.deltaText || ev.data?.delta)) {
-              const chunk = ev.data.deltaText || ev.data.delta;
-              if (ev.stream === "assistant") {
-                if (ev.data?.replace) {
-                  text = boundedDraft(chunk);
-                } else {
-                  text = boundedDraft(text+chunk);
-                }
-              } else if (ev.stream === "chatDelta") {
-                if (ev.data?.replace) {
-                  chatDeltaText = boundedDraft(chunk);
-                } else {
-                  chatDeltaText = boundedDraft(chatDeltaText+chunk);
-                }
-              } else {
-                if (ev.data?.replace) {
-                  transcriptAssistantText = boundedDraft(chunk);
-                } else {
-                  transcriptAssistantText = boundedDraft(transcriptAssistantText+chunk);
-                }
-              }
-            }
             if (ev.stream === "chatFinal") {
               // Only the exact admitted root's public chat envelope can yield
               // scheduling custody. Session fallback/foreign/tool flags cannot.
               if(ev.data?.gatewayYielded===true && (evRunId!==runId || !eventSessionMatches)) continue;
-              chatFinalSeen = true;
               if (ev.data?.gatewayYielded === true) {
                 // A yielded turn is not a terminal answer, even if its buffered
                 // message contains a preface. Keep the final key unclaimed;
                 // opt-in durable handoff can retire only foreground observation.
                 if (chatFinalText.trim()) continue; // an actual final wins
-                foregroundYielded = true;
                 turnYielded = true;
-                text = chatDeltaText = transcriptAssistantText = "";
                 if (chatFinalTimer) { clearTimeout(chatFinalTimer); chatFinalTimer = null; }
                 if (lifecycleEndTimer) { clearTimeout(lifecycleEndTimer); lifecycleEndTimer = null; }
                 // Finish scanning this batch first so an already-arrived real
@@ -1405,90 +1509,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               chatFinalText = ev.data?.text || "";
               if (chatFinalText.trim()) turnYielded = false;
               else if (turnYielded) continue;
-              // Fallback: if lifecycle end doesn't arrive within 5s, resolve
+              // A nonempty exact root chat terminal is authoritative. Empty
+              // envelopes/timers never promote streaming/transcript drafts.
               if (!chatFinalTimer) {
                 chatFinalTimer = setTimeout(() => {
-                  console.warn(`[OpenClaw] collectReply: lifecycle end missing, using chatFinal fallback`);
-                  // Prefer final chat message over accumulated deltas: some providers may
-                  // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-                  const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
-                  // Never abort a yielded original run, nor an empty final.
-                  if (latestFinalText) {
-                    finish(latestFinalText);
-                  } else if (options?.emptyFinalAsNoReply) {
-                    finish("NO_REPLY");
-                  } else {
-                    console.warn(`[OpenClaw] collectReply: empty chatFinal fallback ignored; waiting for real text or idle timeout`);
-                    chatFinalTimer = null;
-                  }
+                  chatFinalTimer = null;
+                  if(chatFinalText.trim())finish(chatFinalText);
+                  else void checkRunState(()=>true,true);
                 }, 5000);
               }
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "end") {
-              // paused/end_turn can beat the confirming chat event, including
-              // discussion's emptyFinalAsNoReply path. It is neither success
-              // nor failure and alone does NOT authorize a handoff notice.
-              if (!chatFinalText.trim() && (turnYielded || (ev.data?.livenessState === "paused" && ev.data?.stopReason === "end_turn"))) continue;
-              // Prefer final chat message over accumulated deltas: some providers may
-              // emit only partial deltas (e.g. "N") while final contains "NO_REPLY".
-              const finalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
-              const finishFromLifecycle = () => {
-                const latestFinalText = this.pickBestCollectedText(chatFinalText, text, chatDeltaText, transcriptAssistantText);
-                if (!chatFinalText && latestFinalText.trim() === "N") {
-                  // Some providers stream the first character of NO_REPLY ("N") but
-                  // never deliver a final chat message in time. Never surface a lone
-                  // "N" to the user; treat it as a suppressed reply.
-                  finish("NO_REPLY");
-                  return;
-                }
-                if (!latestFinalText && options?.emptyFinalAsNoReply) {
-                  finish("NO_REPLY");
-                  return;
-                }
-                if (!latestFinalText) {
-                  const failureText = buildFailureText(ev);
-                  const state = ev.data?.livenessState || "";
-                  const reason = ev.data?.stopReason || "";
-                  // replayInvalid, cancelled/rpc, and abandoned are often
-                  // transient runtime states — the real reply may still arrive
-                  // shortly after via session.message or a subsequent run.
-                  // Defer the failure instead of finishing immediately.
-                  const isTransient = ev.data?.replayInvalid
-                    || state === "cancelled"
-                    || state === "abandoned"
-                    || reason === "rpc";
-                  if (isTransient) {
-                    pendingRuntimeFailureText = failureText;
-                    console.warn(`[OpenClaw] transient lifecycle end (${state}, reason=${reason}) for runId=${evRunId || runId}; waiting for real text or idle timeout`);
-                    return;
-                  }
-                  if (state !== "working") {
-                    if (isWaitTimeout(failureText)) {
-                      if (!decidingTimeout) {
-                        decidingTimeout = true;
-                        void this.classifyWaitTimeout(failureText, targetSessionKey || sessionKey).then(handleTimeoutResult);
-                      }
-                    } else finish(failureText);
-                    return;
-                  }
-                  console.warn(`[OpenClaw] empty lifecycle end ignored for runId=${evRunId || runId}; waiting for real text or idle timeout`);
-                  return;
-                }
-                finish(latestFinalText);
-              };
-
-              // If lifecycle end beats chat final, a short delta like "N" can be a truncated
-              // final reply. Wait for chatFinal before resolving; otherwise suppress lone "N".
-              if ((!options?.emptyFinalAsNoReply && ev.data?.livenessState === "working" && !chatFinalText && text.length <= 1)
-                || (options?.emptyFinalAsNoReply && !chatFinalSeen && !finalText)) {
-                // A lifecycle-only empty discussion end also needs this small
-                // window for a confirming yielded chat final, not instant NO_REPLY.
-                if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
-                lifecycleEndTimer = setTimeout(finishFromLifecycle, 5000);
-              } else {
-                finishFromLifecycle();
-              }
-              return;
+              if(chatFinalText.trim()){finish(chatFinalText);return;}
+              // Lifecycle can precede chat final and can describe a yielded or
+              // abandoned turn. It is only a read-only reconciliation hint.
+              void checkRunState(()=>true,true);
+              continue;
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
               const errText = String(ev.data?.error || "unknown");
@@ -1512,7 +1548,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 // (a real chatFinal following a timeout error was swallowed).
                 if (!decidingTimeout) {
                   decidingTimeout = true;
-                  void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(handleTimeoutResult);
+                  const decisionGeneration=idleGeneration;
+                  void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(error=>handleTimeoutResult(error,()=>idleGeneration===decisionGeneration));
                 }
                 continue;
               }
@@ -1539,15 +1576,17 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 if (!genericChatErrorTimer) {
                   genericChatErrorTimer = setTimeout(() => {
                     genericChatErrorTimer = null;
+                    const decisionGeneration=idleGeneration;
                     void this.resolveTerminalChatError(evRunId || runId, targetSessionKey || sessionKey).then((detail) => {
-                      if (observationClosed) return;
+                      collectEvents();
+                      if (observationClosed || idleGeneration!==decisionGeneration) return;
                       if (chatFinalText.trim()) { finish(chatFinalText); return; }
                       clearTimeout(idleTimer);
                       clearInterval(poller);
                       if (chatFinalTimer) clearTimeout(chatFinalTimer);
                       if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
                       reject(new Error(`Agent error: ${detail}`));
-                    }, error => { void handleTimeoutResult(error); });
+                    }, error => { void handleTimeoutResult(error,()=>idleGeneration===decisionGeneration); });
                   }, 350);
                 }
                 continue;
@@ -1564,7 +1603,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 // (a real chatFinal following a timeout error was swallowed).
                 if (!decidingTimeout) {
                   decidingTimeout = true;
-                  void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(handleTimeoutResult);
+                  const decisionGeneration=idleGeneration;
+                  void this.classifyWaitTimeout(errText, targetSessionKey || sessionKey).then(error=>handleTimeoutResult(error,()=>idleGeneration===decisionGeneration));
                 }
                 continue;
               }
@@ -1574,12 +1614,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
               if (genericChatErrorTimer) clearTimeout(genericChatErrorTimer);
         if (terminatingReconcileTimer) clearTimeout(terminatingReconcileTimer);
-              // Abort the (possibly still-running) backgrounded run before we
-              // reject, so an auto-retry probe does not race a zombie run on the
-              // same session. Idempotent/best-effort.
-              this.abortChat(targetSessionKey || sessionKey, evRunId || runId).catch((abortErr) => {
-                console.warn(`[OpenClaw] abort after chat error failed:`, safeErrorSummary(abortErr));
-              });
               reject(new Error(`Agent error: ${errText}`));
               return;
             }
@@ -1600,14 +1634,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       this.eventCollectors.add(wakeCollector);
       const observationKey = targetSessionKey ? this.canonicalSessionKey(targetSessionKey) : "";
       const checkAfterNoActiveRun = async () => {
+        const decisionGeneration=idleGeneration;
         await checkRunState();
-        if (observationClosed || !observationKey) return;
+        if (observationClosed || !observationKey || decisionGeneration!==idleGeneration) return;
         try {
           // Used only after the plugin reports no active run. Missing terminal
           // history is not failure, but an explicit idle session must not keep
           // a phantom queue owner blocking this newly-arrived user message.
-          const history = await this.rpc("chat.history", { sessionKey: observationKey, limit: 1 }, 2500);
-          if (!observationClosed && history?.sessionKey === observationKey && history?.sessionInfo?.hasActiveRun === false) {
+          const dispatch = await this.getSessionDispatchStatus(observationKey);
+          collectEvents();
+          if (!observationClosed && decisionGeneration===idleGeneration && dispatch.idleConfirmed && !dispatch.archived && (!options?.expectedSessionId || dispatch.sessionId===options.expectedSessionId)) {
             reject(new InactiveRunObservation());
           }
         } catch { /* Unknown activity cannot authorize releasing an active owner. */ }
@@ -1615,6 +1651,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if (observationKey) this.runStateChecks.set(observationKey, checkAfterNoActiveRun);
       cleanupObservation = () => {
         observationClosed = true;
+        releaseEventReader();
+        clearIdleGuard();
         clearTimeout(idleTimer);
         this.eventCollectors.delete(wakeCollector);
         clearInterval(poller);
@@ -1670,15 +1708,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   private async resolveTerminalChatError(runId: string, sessionKey?: string): Promise<string> {
     try {
       const snapshot = await this.rpc("agent.wait", { runId, timeoutMs: 1500 }, 2500);
-      if (sessionKey && (snapshot?.status === "timeout" || isWaitTimeout(String(snapshot?.error || "")))) {
-        const status = await this.getSessionRuntimeStatus(sessionKey);
-        if (status.running) throw new SessionWaitPaused(status, true);
+      if(snapshot?.runId!==runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError
+        || ['queue','gateway_draining'].includes(snapshot.timeoutPhase) || typeof snapshot.startedAt==='number' && snapshot.endedAt<snapshot.startedAt
+        || !['error','timeout'].includes(snapshot.status)) {
+        throw new SessionWaitPaused(await this.getSessionRuntimeStatus(sessionKey || ''),true);
       }
       return this.formatTerminalRunError(snapshot);
     } catch (err) {
       if (err instanceof SessionWaitPaused) throw err;
-      const detail = err instanceof Error ? err.message : String(err);
-      return `OpenClaw 运行失败，但未返回具体原因${detail ? `（${detail}）` : ""}`;
+      // Failed read-only reconciliation is not the execution's failure.
+      throw new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined),true);
     }
   }
 
@@ -1696,7 +1735,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         : 0;
       const elapsed = elapsedSeconds > 0 ? `（运行约 ${this.formatDurationSeconds(elapsedSeconds)}）` : "";
       const phase = timeoutPhase ? `，阶段：${timeoutPhase}` : "";
-      return `等待 Agent 运行结果超时${elapsed}${phase}；底层运行可能仍在继续`;
+      return `等待 Agent 运行结果超时${elapsed}${phase}；底层运行可能仍在继续${rawError ? `；${rawError}` : ""}`;
     }
     if (rawError) return rawError;
     if (stopReason === "stop" || stopReason === "rpc") return `Agent 被停止（${stopReason}）`;
@@ -1718,18 +1757,6 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       || t.includes("too many tokens")
       || t.includes("maximum context");
   }
-
-  private pickBestCollectedText(chatFinalText: string, assistantText: string, chatDeltaText: string, transcriptAssistantText: string): string {
-    if (chatFinalText) return chatFinalText;
-    const candidates = [assistantText, chatDeltaText, transcriptAssistantText].filter((value) => value && value.trim());
-    if (candidates.length === 0) return "";
-    // transcriptAssistant is a full transcript mirror. Keep it separate from
-    // streaming deltas to avoid concatenating the same response twice; choose
-    // the richest available non-final text as fallback.
-    return candidates.sort((a, b) => b.length - a.length)[0];
-  }
-
-
 
   // --- Session management ---
 
@@ -1921,7 +1948,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    * order, showing the ORIGINAL text) and the steer-consumed callback, then
    * clear that pending entry. Returns true if it matched a steered message.
    */
-  private handleSteerConsumption(sessionKey: string, text: string): boolean {
+  private handleSteerConsumption(sessionKey: string, text: string,runId?:string): boolean {
     const key = this.shortKey(sessionKey);
     const queue = this.pendingSteerTexts.get(key);
     if (!queue || queue.length === 0) return false;
@@ -1943,7 +1970,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (matchedIndex < 0) return false;
     const [matched] = queue.splice(matchedIndex, 1);
     if (queue.length === 0) this.pendingSteerTexts.delete(key);
-    const progressCb = this.progressCallbacks.get(key) || this.progressCallbacks.get(`agent:main:${key}`);
+    const progressCb = this.progressForRun(sessionKey,runId);
     if (progressCb) void progressCb({ kind: "steer", text: matched.displayText });
     const list = this.steerConsumedCallbacks.get(key);
     if (list && list.length > 0) {
@@ -2088,7 +2115,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
 
   private async classifyWaitTimeout(text: string, sessionKey: string): Promise<Error> {
     const status = await this.getSessionRuntimeStatus(sessionKey).catch(() => normalizeSessionRuntimeStatus(undefined));
-    return status.running ? new SessionWaitPaused(status, true) : new Error(`Agent error: ${text}`);
+    // A wait timeout plus session idle/unknown is still not exact terminal proof.
+    return new SessionWaitPaused(status, true);
   }
 
   async getSessionInfo(sessionKey: string,timeoutMs=120000): Promise<any> {
@@ -2710,9 +2738,15 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     const stopGeneration=this.stopGenerations.get(fullSessionKey)||0;
     const isCurrent=()=>this.observationEpoch.get(fullSessionKey)===generation && (this.stopGenerations.get(fullSessionKey)||0)===stopGeneration;
     const assertCurrent=()=>{if(!isCurrent()) throw new SupersededObservation('admission generation revoked');};
-    this.clearVerboseAssistantState(sk);
     const submissionId=randomUUID();
     let ownedRunId = "";
+    let eventReservationRunId='';
+    let releaseEventReservation=()=>{};
+    const reserveEvents=(runId:string)=>{
+      if(eventReservationRunId===runId)return;
+      releaseEventReservation();eventReservationRunId=runId;
+      releaseEventReservation=this.retainRunEventCustody('reservation',fullSessionKey,runId);
+    };
     let waitPaused = false;
     try {
       // New user inputs arriving after /stop are admitted only AFTER that
@@ -2732,10 +2766,23 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         const sendChat = () => { assertCurrent();
           this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,'dispatching',{generation,stopGeneration,payloadDigest:createHash('sha256').update(params.message).digest('hex')});
           this.recoveryStore?.saveRunObservation(fullSessionKey,submissionId,{admissionOnly:true},Date.now()+30_000);
+          // Claim exact output custody synchronously in the WS ACK handler.
+          // ws.Receiver can emit ACK + final before any await continuation runs.
+          // Failed admission never runs this hook and cannot revoke the old owner.
+          this.admissionResponseHooks.set(idempotencyKey,receipt=>{
+            if(isCurrent() && typeof receipt?.runId==='string' && receipt.runId && !this.isExplicitlyStoppedRun(fullSessionKey,receipt.runId)) {
+              ownedRunId=receipt.runId;
+              reserveEvents(ownedRunId);
+              this.ownDeliveryRun(ownedRunId);
+            }
+          });
           return this.rpc("chat.send", {
           sessionKey: this.canonicalSessionKey(sk),
           message: params.message,
           attachments: params.attachments,
+          // Ordinary admission is a separate serialized turn, not a request to
+          // inherit stored interrupt/steer policy or its commit-wait finalizer.
+          queueMode: "followup",
           deliver: params.deliver ?? false,
           idempotencyKey,
         }); };
@@ -2773,6 +2820,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // must leave the healthy old collector and its custody intact.
       const previous=this.sessionCollectorFences.get(fullSessionKey);
       if(previous) for(const fence of [...previous]) fence();
+      reserveEvents(ownedRunId); // mocked/legacy transports may not use the WS ACK hook
       this.ownDeliveryRun(ownedRunId);
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
       await params.onRunIdentified?.(result.runId,{sessionId:result.sessionId});
@@ -2782,22 +2830,39 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if(result.status==='started' || result.status==='ok' || Number.isSafeInteger(result.messageSeq) && result.messageSeq>=0) await params.onSubmitted?.(result.runId);
       assertCurrent();
       if (params.onProgress) {
+        this.progressRuns.set(fullSessionKey,ownedRunId);
         this.progressCallbacks.set(sk, params.onProgress);
         this.progressCallbacks.set(fullSessionKey, params.onProgress);
         this.progressGenerations.set(sk,generation);
         this.progressGenerations.set(fullSessionKey,generation);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      const collecting=this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
+      const collecting=this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, expectedSessionId:result.sessionId, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
+      // Reader registration is synchronous inside collectReply. Only now may
+      // the receiver's ACK reservation release its same-run terminal custody.
+      releaseEventReservation();
       params.onCollectionStarted?.(result.runId);
       const reply=await collecting;
       if(reply.trim().toUpperCase()==='NO_REPLY') this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
       else this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId,terminalText:reply,terminalObserved:true},Date.now()+30_000);
+      // Do not retire on lifecycle/timeout/cleanup alone. Successful full result
+      // custody (and synchronous durable save when bound) precedes retirement.
+      const durable=this.recoveryStore?.getRunObservation(fullSessionKey,ownedRunId);
+      const durableResult=!this.recoveryStore || (reply.trim().toUpperCase()==='NO_REPLY'
+        ? durable?.state==='settled'
+        : durable?.terminalObserved===true && durable?.terminalText===reply);
+      if(durableResult) {
+        const completedKey=this.runEventKey(fullSessionKey,ownedRunId);
+        this.completedRunEventCustody.add(completedKey);
+        this.retireCompletedRunEvents(completedKey);
+      }
       return reply;
     } catch (error) {
-      waitPaused = error instanceof SessionWaitPaused || error instanceof SupersededObservation;
+      waitPaused = error instanceof SessionWaitPaused || error instanceof SupersededObservation || error instanceof CollectorStalledError;
       throw error;
     } finally {
+      this.admissionResponseHooks.delete(submissionId);
+      releaseEventReservation();
       // OpenClaw can emit the final assistant session.message a moment after
       // collectReply returns. Keep a short grace window so normal chat replies
       // are not delivered twice via the proactive-message path. Cron/LMA runs
@@ -2807,7 +2872,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // batch may already have registered its own callback).
       if (params.onProgress) {
         if (this.progressGenerations.get(sk)===generation && this.progressCallbacks.get(sk) === params.onProgress) {this.progressCallbacks.delete(sk);this.progressGenerations.delete(sk);}
-        if (this.progressGenerations.get(fullSessionKey)===generation && this.progressCallbacks.get(fullSessionKey) === params.onProgress) {this.progressCallbacks.delete(fullSessionKey);this.progressGenerations.delete(fullSessionKey);}
+        if (this.progressGenerations.get(fullSessionKey)===generation && this.progressCallbacks.get(fullSessionKey) === params.onProgress) {this.progressCallbacks.delete(fullSessionKey);this.progressGenerations.delete(fullSessionKey);this.progressRuns.delete(fullSessionKey);}
       }
       if (waitPaused) this.releasePausedWait(ownedRunId);
       else this.releaseOwnedDeliveryRunAfter(ownedRunId, 30000);

@@ -36,9 +36,10 @@ describe('independent real WS lifecycle provenance',()=>{
   expect(result).toBeUndefined();
   final('r1','own exact final');await vi.advanceTimersByTimeAsync(50);expect(await old.promise).toEqual({text:'own exact final'});
  });
- it('own-root lifecycle-only assistant delta remains a valid ordinary answer',async()=>{
+ it('own-root lifecycle-only assistant draft waits for an exact committed answer',async()=>{
   const old=await send('old');wire('agent',{runId:'r1',stream:'assistant',data:{delta:'own original answer'}});
   wire('agent',{runId:'r1',stream:'lifecycle',data:{phase:'end',livenessState:'working'}});
-  await vi.advanceTimersByTimeAsync(100);expect(await old.promise).toEqual({text:'own original answer'});
+  let settled=false;void old.promise.then(()=>settled=true);await vi.advanceTimersByTimeAsync(100);expect(settled).toBe(false);
+  final('r1','own original answer');await vi.advanceTimersByTimeAsync(50);expect(await old.promise).toEqual({text:'own original answer'});
  });
 });
