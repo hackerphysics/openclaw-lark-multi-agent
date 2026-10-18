@@ -226,6 +226,24 @@ export class MessageStore {
     return this.db.prepare(`DELETE FROM dispatch_custody WHERE bot_name=? AND chat_id=?
       AND json_extract(record_json,'$.id')=? AND json_extract(record_json,'$.batchId')=?`).run(bot,chat,ownerId,batchId).changes===1;
   }
+  /** A Gateway-accepted guarded ordinary batch becomes ordinary/synced in one
+   * transaction. Until then its unknown input custody remains non-replayable. */
+  acceptGuardedFollowup(bot: string, chat: string, rows: number[], submissionId: string, runId: string, syncBatchId: string): void {
+    if (!submissionId || !runId || rows.length === 0) throw new Error('Missing guarded followup acceptance identity');
+    this.db.transaction(() => {
+      for (const id of rows) {
+        const item = this.getInsertion(bot, chat, id);
+        if (!item || item.admissionSubmissionId !== submissionId || item.attempted !== true ||
+          !['unknown', 'ordinary'].includes(item.state) || item.stopEpoch !== this.getStopGeneration(bot, chat)) {
+          throw new Error('Guarded followup acceptance custody changed');
+        }
+        this.saveInsertion(bot, chat, id, item.insertionId, 'ordinary', {...item, attempted: true, admittedRunId: runId});
+      }
+      this.markMessagesSynced(bot, chat, rows, syncBatchId);
+      for (const id of rows) this.clearPendingTrigger(bot, chat, id);
+    })();
+  }
+
   /** Atomic release of proven never-attempted reservations only. Unknown and
    * accepted inputs retain their exact target and never enter ordinary drain. */
   releaseDispatchCustody(bot:string,chat:string,ownerId:string,batchId:string,followup?:{sessionKey:string;sessionId:string;expectedLeafEntryId:string}):boolean {

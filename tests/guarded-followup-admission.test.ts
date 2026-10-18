@@ -118,6 +118,7 @@ describe('separate guarded followup admission (actual WS / Client / Bot / SQLite
   await tick(55_000);expect(h.sends).toHaveLength(0);
   await tick(7600);expect(h.sends).toHaveLength(1);expect(h.sends[0].queueMode).toBe('followup');
   expect(h.store.getReactionIntent('Bot','chat',b.row).desired).toBe('Get');
+  expect(synced(b.row)).toBe(1); // accepted guarded input must not return as catch-up
   expect((await h.client.getSessionDispatchStatus(h.key)).idleConfirmed).toBe(false);
   await final('r1','B exact');await b.promise;expect(item(b.row)).toMatchObject({state:'ordinary',attempted:true,admittedRunId:'r1'});noMutation();
  });
@@ -406,4 +407,48 @@ describe('SQLite reopen retains guarded proof and original admission identities'
   await final('r1','A durable exact result');await final('r2','B result after restart');await b.promise;
   expect(h.store.getDeliveryByKey('Bot','chat',`trigger:${a.row}`)?.content).toBe('A durable exact result');noMutation();
  });
+});
+
+describe('guarded cohorts remain bounded without discarding unsent input',()=>{
+ it.each([['bytes',6,32*1024],['count',101,1]] as const)('%s cap splits same-proof backlog; latest input stays pending until its own batch',async(_kind,count,size)=>{
+  const proof={sessionKey:h.key,sessionId:'generation-1',expectedLeafEntryId:'leaf-1'};
+  const rows:number[]=[];
+  for(let i=0;i<count;i++){
+   const id=`backlog-${i}`,text=`[payload-${i}] `+'x'.repeat(size);
+   const row=h.store.insert({chatId:'chat',messageId:id,senderType:'human',senderName:'fixture-user',content:text,timestamp:Date.now()});rows.push(row);
+   h.store.markPendingTrigger('Bot','chat',row);
+   h.store.saveInsertion('Bot','chat',row,id,'ordinary',{messageId:id,text,stopEpoch:0,sessionKey:h.key,sessionId:'generation-1',expectedRunId:'',attempted:false,ordinaryEligible:true,followupAdmissionGuard:proof});
+  }
+  const work=h.bot.processQueue('chat',true);void work.catch(()=>{});await tick(100);
+  expect(h.sends).toHaveLength(1);
+  expect(Buffer.byteLength(h.sends[0].message,'utf8')).toBeLessThan(128*1024+4096);
+  expect(h.store.getPendingTriggerIds('Bot','chat').has(rows.at(-1)!)).toBe(true);
+  await final('r1','first bounded cohort');await tick(400);
+  expect(h.sends).toHaveLength(2);
+  await final('r2','last bounded cohort');await work;
+  expect(h.store.getPendingTriggerIds('Bot','chat').size).toBe(0);
+  const submitted=h.sends.map(send=>send.message).join('\n');
+  for(let i=0;i<count;i++){
+   const appearances=h.sends.map(send=>send.message.split(`[payload-${i}]`).length-1);
+   expect(submitted.split(`[payload-${i}]`).length-1,`payload ${i}, appearances=${appearances.join(',')}, lengths=${h.sends.map(send=>send.message.length).join(',')}`).toBe(1);
+  }
+  noMutation();
+ });
+});
+
+
+it('guarded acceptance rolls back state/sync/pending together on a local checkpoint failure',()=>{
+ const row=h.store.insert({chatId:'chat',messageId:'atomic-guarded',senderType:'human',senderName:'fixture-user',content:'atomic input',timestamp:Date.now()});
+ h.store.markPendingTrigger('Bot','chat',row);
+ const proof={sessionKey:h.key,sessionId:'generation-1',expectedLeafEntryId:'leaf-1'};
+ h.store.saveInsertion('Bot','chat',row,'atomic-id','unknown',{messageId:'atomic-guarded',stopEpoch:0,attempted:true,admissionSubmissionId:'atomic-submission',followupAdmissionGuard:proof});
+ const sync=vi.spyOn(h.store,'markMessagesSynced').mockImplementationOnce(()=>{throw new Error('synthetic local checkpoint failure');});
+ expect(()=>h.store.acceptGuardedFollowup('Bot','chat',[row],'atomic-submission','exact-root','atomic-sync')).toThrow('synthetic local checkpoint');
+ expect(item(row)).toMatchObject({state:'unknown',attempted:true,admissionSubmissionId:'atomic-submission'});
+ expect(h.store.getPendingTriggerIds('Bot','chat').has(row)).toBe(true);expect(synced(row)).toBe(0);
+ sync.mockRestore();
+ h.store.acceptGuardedFollowup('Bot','chat',[row],'atomic-submission','exact-root','atomic-sync');
+ expect(item(row)).toMatchObject({state:'ordinary',attempted:true,admittedRunId:'exact-root'});
+ expect(h.store.getPendingTriggerIds('Bot','chat').has(row)).toBe(false);expect(synced(row)).toBe(1);
+ expect(h.sends).toHaveLength(0);
 });

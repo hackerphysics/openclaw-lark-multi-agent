@@ -2063,6 +2063,20 @@ export class FeishuBot {
           mergedTriggers.push(m);
         }
       }
+      if (!firstIsNative && batchProof) {
+        // Guarded, not-yet-submitted inputs must not be dropped to meet a
+        // payload budget. Submit a bounded prefix and leave the remainder in
+        // durable pending custody for the next batch (with its own proof).
+        const selected: typeof pendingHumanTriggers = [];
+        let bytes = 0;
+        for (const message of mergedTriggers) {
+          const addBytes = Buffer.byteLength((selected.length ? "\n" : "") + message.content, "utf8");
+          if (selected.length > 0 && (selected.length >= MAX_MERGED_TRIGGER_MESSAGES || bytes + addBytes > MAX_MERGED_TRIGGER_BYTES)) break;
+          selected.push(message);
+          bytes += addBytes;
+        }
+        mergedTriggers = selected;
+      }
       // Bound the merged current message payload. When a bot is stuck, many
       // human triggers can accumulate; sending all of them can exceed OpenClaw's
       // single-message/payload limit. Keep the most recent messages and drop the
@@ -2326,11 +2340,11 @@ export class FeishuBot {
               // Refine state for logs/idempotent sync rows when OpenClaw returns
               // a runId. markSubmittedBatch is idempotent due to local flags and
               // INSERT OR IGNORE in message_sync.
+              if (batchProof) this.store.acceptGuardedFollowup(this.config.name, chatId, mergedTriggerIds, guardedSubmissionId!, runId,
+                `${this.config.name}:${chatId}:${triggerId}:guarded-accepted:${runId}`);
+              // The guarded inputs must already be ordinary before this helper's
+              // ordinary-only sync filter runs, or a later batch replays them as context.
               markSubmittedBatch(`submitted:${runId}`);
-              if(batchProof)for(const id of mergedTriggerIds) {
-                const row=this.store.getInsertion(this.config.name,chatId,id);
-                this.store.saveInsertion(this.config.name,chatId,id,row.insertionId,'ordinary',{...row,attempted:true,admittedRunId:runId});
-              }
             },
             onProgress: (event) => current() && runAcceptedByOpenClaw && !!initialPresentationRunId && owner.runId === initialPresentationRunId ? liveStatus?.progress(event) : undefined,
             onCollectionStarted:runId=>{guard();if(owner.runId===runId)owner.collecting=true;},
