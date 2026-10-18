@@ -304,6 +304,29 @@ export class MessageStore {
     const finals=rows.filter(row=>row.source_type.startsWith('assistant_visible'));
     return (finals.length ? finals : rows).some(row=>this.getDeliveryDispatchOutcome(bot,chat,row.delivery_key).state!=='delivered');
   }
+  /** UI-only witness of an exact run's visible reply in the original Bot/chat.
+   * Does not prove any legacy inserted input was committed or consumed. */
+  getDeliveredRunReply(bot: string, app: string, chat: string, runId: string, epoch: number):
+    {outboxId: number; runId: string; createdAt: number; deliveredAt: number; platformMessageIds: string[]; sessionId?: string} | undefined {
+    if (!runId || this.hasUnconfirmedRunDelivery(bot, chat, runId)) return;
+    const rows = this.db.prepare(`SELECT id,delivery_key,created_at,updated_at,delivery_meta_json FROM delivery_outbox
+      WHERE bot_name=? AND chat_id=? AND status='delivered' AND source_type IN ('assistant_visible','discussion')
+      AND json_extract(delivery_meta_json,'$.provenance.runId')=?
+      AND json_extract(delivery_meta_json,'$.provenance.final')=1
+      AND json_extract(delivery_meta_json,'$.botIdentity')=?
+      AND json_extract(delivery_meta_json,'$.deliveryStopEpoch')=? ORDER BY id DESC LIMIT 20`)
+      .all(bot, chat, runId, app, epoch) as any[];
+    for (const row of rows) {
+      if (this.getDeliveryDispatchOutcome(bot, chat, row.delivery_key).state !== 'delivered') continue;
+      const receipts = this.listDeliveryReceipts(row.id);
+      const ids = [...new Set(receipts.map(receipt => receipt.messageId).filter(Boolean))];
+      if (!ids.length || !Number.isFinite(row.created_at) || !Number.isFinite(row.updated_at)) continue;
+      const meta = JSON.parse(row.delivery_meta_json || '{}');
+      return {outboxId: row.id, runId, createdAt: row.created_at, deliveredAt: row.updated_at, platformMessageIds: ids,
+        sessionId: meta.provenance?.sessionId};
+    }
+  }
+
   settleRunReactionIntents(bot:string,chat:string,runId:string):void {
     if(this.hasUnconfirmedRunDelivery(bot,chat,runId)) return;
     // A root outcome/visible reply proves nothing about a legacy SDK queue

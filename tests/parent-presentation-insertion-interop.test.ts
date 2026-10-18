@@ -9,7 +9,7 @@ const terminal=(runId:string,text:string)=>{wire('chat',{runId,state:'final',mes
 beforeEach(async()=>{vi.useFakeTimers();vi.spyOn(console,'log').mockImplementation(()=>{});vi.spyOn(console,'warn').mockImplementation(()=>{});h=harness();let cardN=0;h.bot.replyLiveStatusCard=vi.fn(async()=>`status-${++cardN}`);const p=h.client._doConnect();h.client.ws.emit('message',Buffer.from(JSON.stringify({type:'res',ok:true,payload:{type:'hello-ok',protocol:4}})));await p;});
 afterEach(async()=>{await h.cleanup();vi.clearAllTimers();vi.useRealTimers();vi.restoreAllMocks();});
 describe('parent cross-candidate presentation / custody invariants',()=>{
- it('B1+D3: root reply may finish ordinary A, not a coalesced accepted-but-unproven insertion B',async()=>{
+ it('B1+D3: linked reply may close presentation, never commit a coalesced unproven insertion B',async()=>{
   const p=h.bot.handleMessage(event('ordinary-A'));void p.catch(()=>{});await tick(1000);
   h.client.steer=vi.fn(async(_s:any,_t:any,_d:any,id:any)=>({...id,status:'accepted',attempted:true,sessionId:'generation-1'}));
   await h.bot.handleMessage(event('inserted-B'));await tick(150);
@@ -20,9 +20,11 @@ describe('parent cross-candidate presentation / custody invariants',()=>{
   expect(h.store.getReactionIntent('Bot','chat',b)?.desired).toBe('Get');
   expect(h.store.getInsertion('Bot','chat',b)?.state).toBe('accepted');
   await tick(1000);
-  const held=h.store.listPresentations('Bot','offline-app','chat').filter((row:any)=>!row.retired&&row.triggerIds.includes(b)&&row.cardId&&['queued','admitted','waiting'].includes(row.view?.phase));
+  const held=h.store.listPresentations('Bot','offline-app','chat').filter((row:any)=>!row.retired&&row.triggerIds.includes(b)&&row.cardId);
   expect(held.length).toBeGreaterThan(0);
-  expect(held.every((row:any)=>row.view.state!=='done')).toBe(true);
+  expect(held.every((row:any)=>row.view.state==='replied'&&row.view.phase==='replied'&&row.linkedReply?.runId==='r1')).toBe(true);
+  expect(h.store.hasDeliveredReply('Bot','chat',b)).toBe(false);
+  expect(h.store['db'].prepare('SELECT COUNT(*) n FROM message_sync WHERE message_row_id=?').get(b)?.n).toBe(0);
  });
  it('D3: an accepted create receipt survives a transient post-SDK journal failure without resend',async()=>{
   h.bot.replyLiveStatusCard.mockResolvedValue('accepted-card');

@@ -10,6 +10,8 @@ type Presentation = {
   startedAt: number; lease: string; runId?: string; ownerId?: string; batchId?: string;
   createToken?: string; submissionId?: string; ordinaryTriggerIds?: number[]; enqueueAcceptedIds?: number[]; expectedInsertionRoot?: string; acceptedIds?: number[]; insertionRoot?: string; cardId?: string; create: "never" | "attempted" | "accepted" | "unknown" | "rejected";
   editEffects?: Record<string, "attempted" | "unknown">;
+  /** Seals UI cohort only; not input acceptance/commit/result custody. */
+  linkedReply?: { runId: string; outboxId: number; deliveredAt: number; rendered?: "summary" | "reply_payload"; retryAfter?: number; attempts?: number };
   view?: LiveStatusView; retired?: boolean;
 };
 type Entry = { record: Presentation; live: LiveStatusController };
@@ -17,6 +19,7 @@ type JournalRepair = {
   record: Presentation;
   create?: { token: string; lease: string; state: Presentation["create"]; cardId?: string };
   edits: Map<string, { lease: string; state: "unknown" | "clear" }>;
+  linkedReplyApplied?: {runId: string; outboxId: number; cardId: string};
 };
 
 /** One unbound cohort per chat, or reuse the exact active-root presentation.
@@ -24,6 +27,8 @@ type JournalRepair = {
  * retried: the SDK offers no durable query-by-create-key or edit CAS. */
 export class QueuedPresentations {
   private entries = new Map<string, Entry>();
+  /** UI effects only; never an admission/execution lock. */
+  private replyFlights = new Map<string, Promise<void>>();
   /** Receipt custody only: never a business busy/admission flag or SDK retry. */
   private repairs = new Map<string, JournalRepair>();
   private repairTimer?: ReturnType<typeof setTimeout>;
@@ -66,6 +71,9 @@ export class QueuedPresentations {
       row.create = create.state;
       if (create.state === "never") delete row.createToken; // proven zero SDK
     }
+    const applied = repair.linkedReplyApplied;
+    if (applied && row.cardId === applied.cardId && row.linkedReply?.runId === applied.runId && row.linkedReply.outboxId === applied.outboxId)
+      row.linkedReply = {...row.linkedReply, rendered: "summary"};
     for (const [token, receipt] of repair.edits) {
       if (receipt.state === "clear") delete row.editEffects![token];
       else if (row.editEffects![token] || row.lease === receipt.lease) row.editEffects![token] = "unknown";
@@ -89,7 +97,10 @@ export class QueuedPresentations {
         : row.createToken !== create.token || row.create === create.state || row.create === "accepted")) repair.create = undefined;
       for (const [token, receipt] of repair.edits) if (receipt.state === "clear" ? !row.editEffects?.[token]
         : row.editEffects?.[token] === "unknown" || !row.editEffects?.[token] && row.lease !== receipt.lease) repair.edits.delete(token);
-      if (!repair.create && !repair.edits.size) this.repairs.delete(row.id);
+      const applied = repair.linkedReplyApplied;
+      if (applied && row.cardId === applied.cardId && row.linkedReply?.runId === applied.runId &&
+        row.linkedReply.outboxId === applied.outboxId && row.linkedReply.rendered === "summary") repair.linkedReplyApplied = undefined;
+      if (!repair.create && !repair.edits.size && !repair.linkedReplyApplied) this.repairs.delete(row.id);
     }
     if (!this.repairs.size) { clearTimeout(this.repairTimer); this.repairTimer = undefined; this.repairDelay = 1000; }
   }
@@ -103,8 +114,9 @@ export class QueuedPresentations {
     if (repair.create?.state !== "accepted" || state === "accepted") repair.create = { token, lease: record.lease, state, cardId };
     this.scheduleRepair(true);
   }
-  private editReceipt(record: Presentation, token: string, state: "unknown" | "clear"): void {
+  private editReceipt(record: Presentation, token: string, state: "unknown" | "clear", linkedReplyApplied?: {runId: string; outboxId: number; cardId: string}): void {
     const repair = this.repairFor(record);
+    if (linkedReplyApplied) repair.linkedReplyApplied = linkedReplyApplied;
     if (repair.edits.get(token)?.state !== "clear" || state === "clear") repair.edits.set(token, { lease: record.lease, state });
     this.scheduleRepair(true);
   }
@@ -138,11 +150,11 @@ export class QueuedPresentations {
   }
   private usable(row: Presentation): boolean {
     return !row.retired && row.stopEpoch === this.store.getStopGeneration(this.bot, row.chatId)
-      && row.view?.state !== "done" && row.view?.state !== "failed";
+      && !row.linkedReply?.rendered && row.view?.state !== "done" && row.view?.state !== "failed" && row.view?.state !== "replied";
   }
   private current(record: Presentation): boolean {
     const row = this.latest(record);
-    return !!row && this.usable(row) && row.lease === record.lease && this.enabled(record.chatId);
+    return !!row && this.usable(row) && !row.linkedReply && row.lease === record.lease && this.enabled(record.chatId);
   }
   private hydrate(record: Presentation): Entry {
     const cached = this.entries.get(record.id);
@@ -233,12 +245,15 @@ export class QueuedPresentations {
       edit: async (id, view, effect) => {
         const token = randomUUID();
         let attempted = false, settled = false;
+        let linkedReplyApplied: {runId: string; outboxId: number; cardId: string} | undefined;
         try {
           await base.edit(id, view, { run: send => effect.run(async () => {
             try {
               const row = this.latest(record);
               if (!row || row.lease !== record.lease || row.retired || row.stopEpoch !== this.store.getStopGeneration(this.bot, row.chatId)
                 || !this.enabled(row.chatId) || row.cardId !== id) throw new LiveStatusEffectSuppressedError("presentation edit suppressed before transport");
+              if (view.state === "replied" && row.linkedReply)
+                linkedReplyApplied = {runId: row.linkedReply.runId, outboxId: row.linkedReply.outboxId, cardId: id};
               try { this.save({ ...row, editEffects: { ...row.editEffects, [token]: "attempted" } }); }
               catch (err) { this.editReceipt(record, token, "clear"); throw err; }
             } catch (err) {
@@ -255,7 +270,7 @@ export class QueuedPresentations {
             settled = true;
             // Clear only THIS successful token; do not replay the SDK or erase
             // another unknown progress/terminal operation if SQLite is busy.
-            this.editReceipt(record, token, "clear");
+            this.editReceipt(record, token, "clear", linkedReplyApplied);
           }) });
           // D2 has recorded the successful effect before local persistence.
           this.flushRepairs();
@@ -266,7 +281,8 @@ export class QueuedPresentations {
       },
     }, {
       botName: this.bot, locale: this.english(record.chatId) ? "en" : "zh", initialPhase: "queued",
-      restore: { messageId: record.cardId, view: record.view, startedAt: record.startedAt,
+      restore: { messageId: record.cardId, view: record.linkedReply?.rendered && record.view
+        ? {...record.view, state: "replied", phase: "replied"} : record.view, startedAt: record.startedAt,
         blockCreate: record.create !== "never", blockEdits: Object.keys(record.editEffects || {}).length > 0 },
     });
     const entry = { record, live };
@@ -276,12 +292,16 @@ export class QueuedPresentations {
 
   receive(chat: string, rowId: number, messageId: string, native = false, activeRunId?: string): LiveStatusController | undefined {
     if (native || !rowId || !this.enabled(chat)) return undefined;
-    const rows = this.records(chat).filter(row => this.usable(row));
+    const all = this.records(chat);
+    const replied = all.find(row => !row.retired && row.stopEpoch === this.store.getStopGeneration(this.bot, chat)
+      && (row.view?.state === "replied" || !!row.linkedReply?.rendered) && row.triggerIds.includes(rowId));
+    if (replied) return this.hydrate(replied).live;
+    const rows = all.filter(row => this.usable(row));
     // Repeated ingress and steering bursts reuse one card. A foreign/old run
     // is never selected merely because it happens to have a card in this chat.
     let record = rows.find(row => row.triggerIds.includes(rowId))
-      || rows.find(row => !row.runId && !row.submissionId)
-      || (activeRunId ? rows.find(row => row.runId === activeRunId && row.view?.phase !== "waiting") : undefined);
+      || rows.find(row => !row.runId && !row.submissionId && !row.linkedReply)
+      || (activeRunId ? rows.find(row => row.runId === activeRunId && row.view?.phase !== "waiting" && !row.linkedReply) : undefined);
     if (!record) {
       record = { id: randomUUID(), chatId: chat, messageId, triggerIds: [], stopEpoch: this.store.getStopGeneration(this.bot, chat),
         startedAt: Date.now(), lease: "", create: "never" };
@@ -319,7 +339,7 @@ export class QueuedPresentations {
   }
 
   async insertionAccepted(chat: string, rowId: number, expectedRunId: string): Promise<void> {
-    const row = this.records(chat).find(row => this.usable(row) && row.triggerIds.includes(rowId)
+    const row = this.records(chat).find(row => this.usable(row) && !row.linkedReply && row.triggerIds.includes(rowId)
       && (!row.runId || row.runId === expectedRunId));
     if (!row || !expectedRunId) return;
     // Legacy accepted means enqueue only. expectedRunId is NOT an actual
@@ -334,8 +354,62 @@ export class QueuedPresentations {
     else await live.showInputWaiting(detail, this.english(chat) ? `${this.bot} enqueued · input confirmation pending` : `${this.bot} 已排队 · 追加输入回执待确认`);
   }
 
+  /** A legacy insertion owns no actual run. Its card may nevertheless report
+   * the exact associated run's platform-delivered reply, without changing any
+   * insertion, reaction, sync or scheduling record. Recoverable after restart. */
+  async reconcileDeliveredReply(chat: string, runId: string): Promise<void> {
+    if (!runId || !this.enabled(chat)) return;
+    const epoch = this.store.getStopGeneration(this.bot, chat);
+    const evidence = this.store.getDeliveredRunReply(this.bot, this.app, chat, runId, epoch);
+    if (!evidence) return;
+    const eligible = (row: Presentation): boolean => {
+      const retry = row.view?.state === "replied" && !!row.linkedReply && !row.linkedReply.rendered &&
+        row.create === "accepted" && !!row.cardId && !Object.keys(row.editEffects || {}).length;
+      if ((!this.usable(row) && !retry) || row.retired || row.stopEpoch !== epoch || row.linkedReply?.rendered ||
+        evidence.createdAt < row.startedAt || (row.expectedInsertionRoot !== runId && row.runId !== runId)) return false;
+      const ordinary = row.runId === runId && !!row.ownerId && !!row.batchId ? row.ordinaryTriggerIds || [] : [];
+      const extra = row.triggerIds.filter(id => !ordinary.includes(id));
+      return extra.length > 0 && extra.every(id => {
+        const item = this.store.getInsertion(this.bot, chat, id);
+        const input = item?.messageId ? this.store.getMessageByMessageId(item.messageId) : undefined;
+        return row.enqueueAcceptedIds?.includes(id) && item?.state === 'accepted' && item.stopEpoch === epoch &&
+          item.expectedRunId === runId && (!evidence.sessionId || item.sessionId === evidence.sessionId) &&
+          input?.id === id && input.chatId === chat && input.senderType === 'human' && input.timestamp <= evidence.createdAt;
+      });
+    };
+    const flights: Promise<void>[] = [];
+    // There is no await in this staging loop: seal every currently eligible
+    // cohort before the first SDK effect can allow new ingress to interleave.
+    for (const snapshot of this.records(chat)) {
+      const row = this.latest(snapshot);
+      if (!row || !eligible(row) || this.replyFlights.has(row.id) || (row.linkedReply?.retryAfter || 0) > Date.now()) continue;
+      const entry = this.hydrate(row);
+      const current = this.latest(entry.record);
+      if (!current || !eligible(current) || current.lease !== entry.record.lease) continue;
+      const ids = JSON.stringify(current.triggerIds);
+      const preservePayload = !!current.cardId && evidence.platformMessageIds.includes(current.cardId);
+      const retry = current.view?.state === "replied";
+      const attempts = (current.linkedReply?.attempts || 0) + 1;
+      this.save({...current, linkedReply: {runId, outboxId: evidence.outboxId, deliveredAt: evidence.deliveredAt, attempts,
+        retryAfter: Date.now() + Math.min(15 * 60_000, 60_000 * 2 ** Math.min(attempts - 1, 4)),
+        ...(preservePayload ? {rendered: "reply_payload" as const} : {})}});
+      const flight = Promise.resolve().then(async () => {
+        const fresh = this.latest(entry.record);
+        const proof = this.store.getDeliveredRunReply(this.bot, this.app, chat, runId, epoch);
+        if (this.disposed || !fresh || fresh.retired || fresh.lease !== entry.record.lease ||
+          fresh.stopEpoch !== this.store.getStopGeneration(this.bot, chat) || JSON.stringify(fresh.triggerIds) !== ids ||
+          fresh.linkedReply?.outboxId !== evidence.outboxId || proof?.outboxId !== evidence.outboxId) return;
+        await entry.live.linkedReplyDelivered(evidence.deliveredAt, preservePayload, retry);
+      }).finally(() => { if (this.replyFlights.get(current.id) === flight) this.replyFlights.delete(current.id); });
+      this.replyFlights.set(current.id, flight);
+      flights.push(flight);
+    }
+    await Promise.allSettled(flights);
+  }
+
   async settleRun(chat: string, runId: string): Promise<void> {
     if (!runId || !this.enabled(chat)) return;
+    await this.reconcileDeliveredReply(chat, runId);
     for (const row of this.records(chat)) if (this.usable(row) && row.runId === runId) await this.hydrate(row).live.complete();
   }
 
@@ -392,5 +466,6 @@ export class QueuedPresentations {
     this.flushRepairs(); // one best-effort journal-only shutdown pass, never SDK
     for (const entry of this.entries.values()) entry.live.dispose();
     this.entries.clear();
+    this.replyFlights.clear();
   }
 }

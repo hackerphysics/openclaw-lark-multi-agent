@@ -40,8 +40,8 @@ export type LiveStatusView = {
   /** True when finished via noReply(): the model produced no user-visible reply. */
   noReply: boolean;
   /** Presentation only: queued/admitted do not claim model execution. */
-  state: "queued" | "admitted" | "running" | "done" | "failed";
-  phase?: "queued" | "admitted" | "working" | "waiting" | "done" | "failed";
+  state: "queued" | "admitted" | "running" | "done" | "failed" | "replied";
+  phase?: "queued" | "admitted" | "working" | "waiting" | "done" | "failed" | "replied";
 };
 
 /** Persisted metadata needed to turn the live-status card into the final answer. */
@@ -177,6 +177,9 @@ export class LiveStatusController {
         this.noReplyResult = restored.view.noReply;
         this.waitingForResult = restored.view.phase === "waiting";
         this.updatesFrozen = this.waitingForResult;
+        if (restored.view.state === "replied") {
+          this.finalized = true; this.terminalOutcome = true; this.updatesFrozen = true;
+        }
       }
       // Attempted/unknown create survives process loss as a no-create fence.
       if (restored.blockCreate && !this.messageId) this.disabled = true;
@@ -328,6 +331,33 @@ export class LiveStatusController {
     this.stopTimers();
     const view = this.buildView();
     view.title = title || (this.opts.locale === "en" ? `${this.opts.botName} result unconfirmed` : `${this.opts.botName} 结果未确认`);
+    await this.finishView(view);
+  }
+
+  /** Close only the display after the associated run's original-chat reply is
+   * platform-confirmed. This deliberately does not claim inserted-input commit. */
+  async linkedReplyDelivered(deliveredAt: number, preserveReplyPayload = false, retryZeroEffect = false): Promise<void> {
+    const safeRetry = retryZeroEffect && this.state === "replied" && !this.unknownEdits.size && !this.editPump && !this.pendingEdit;
+    if (this.disposed || this.terminalOutcome && !safeRetry || !Number.isFinite(deliveredAt) || deliveredAt < this.startedAt) return;
+    this.state = "replied";
+    this.waitingForResult = false;
+    this.updatesFrozen = true;
+    this.finalized = true;
+    this.terminalOutcome = true;
+    this.stopTimers();
+    const seconds = Math.max(0, Math.floor((deliveredAt - this.startedAt) / 1000));
+    const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
+    const view = this.buildView();
+    view.title = this.opts.locale === "en" ? `${this.opts.botName} linked run replied` : `${this.opts.botName} 关联轮次已回复`;
+    view.elapsed = elapsed;
+    view.lines = [{kind: "summary", text: this.opts.locale === "en" ? "Linked run reply delivered; input commitment is separate" : "关联轮次回复已送达；不据此确认追加输入提交", at: seconds}];
+    if (preserveReplyPayload) {
+      // The card itself already contains the business answer: never replace it
+      // with a compact status line or let this controller issue further writes.
+      this.callbacks.desired?.(view);
+      this.dispose();
+      return;
+    }
     await this.finishView(view);
   }
 
@@ -711,6 +741,7 @@ export class LiveStatusController {
     let title: string;
     if (this.state === "done") title = en ? `\u2705 ${this.opts.botName} done` : `\u2705 ${this.opts.botName} \u5df2\u5b8c\u6210`;
     else if (this.state === "failed") title = en ? `\u26A0\uFE0F ${this.opts.botName} stopped` : `\u26A0\uFE0F ${this.opts.botName} \u6267\u884c\u4e2d\u65ad`;
+    else if (this.state === "replied") title = en ? `${this.opts.botName} linked run replied` : `${this.opts.botName} 关联轮次已回复`;
     else if (this.waitingForResult) title = en ? `${this.opts.botName} waiting (card frozen)` : `${this.opts.botName} 等待后续结果（已停止刷新）`;
     else if (this.state === "queued") title = en ? `${this.opts.botName} received · queued` : `${this.opts.botName} 已收件 · 排队等待`;
     else if (this.state === "admitted") title = en ? `${this.opts.botName} accepted · waiting` : `${this.opts.botName} 已接收 · 等待活动`;
@@ -735,7 +766,7 @@ export class LiveStatusController {
       toolCalls: this.toolCallCount,
       noReply: this.noReplyResult,
       state: this.state,
-      phase: this.state === "done" || this.state === "failed" ? this.state : this.waitingForResult ? "waiting" : this.state === "running" ? "working" : this.state,
+      phase: this.state === "done" || this.state === "failed" || this.state === "replied" ? this.state : this.waitingForResult ? "waiting" : this.state === "running" ? "working" : this.state,
     };
   }
 

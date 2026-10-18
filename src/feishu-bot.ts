@@ -1662,6 +1662,9 @@ export class FeishuBot {
         if(item.admissionSubmissionId)continue;
         const stillCurrent=()=>this.stopGeneration(chatId)===item.stopEpoch && !['stopped','ordinary','committed'].includes(this.store.getInsertion(this.config.name,chatId,item.rowId)?.state);
         if(!stillCurrent()) {if(this.stopGeneration(chatId)!==item.stopEpoch)this.store.stopInsertionAtEpoch(this.config.name,chatId,item.rowId,item.stopEpoch);continue;}
+        // UI-only recovery uses durable original-chat receipts; do not make it
+        // depend on a new Core/session-info lookup after the reply was sent.
+        if(item.state==='accepted')void this.queuedPresentations.reconcileDeliveredReply(chatId,item.expectedRunId).catch(()=>{});
         if(item.activityUnbound) {
           await this.reconcileCurrentInputActivity(chatId,item.rowId,item.messageId,item.text);
           if(!stillCurrent()) {if(this.store.getInsertion(this.config.name,chatId,item.rowId)?.state==='ordinary')void this.processQueue(chatId,true).catch(()=>{});continue;}
@@ -4112,6 +4115,12 @@ export class FeishuBot {
 
   private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
     const en = this.isEn(chatId);
+    if (view.state === "replied") {
+      // Neutral UI-only closure, not a green business/input-completion claim.
+      const summary = en ? `💬 Linked run replied · ⏱ ${view.elapsed}` : `💬 关联轮次已回复 · ⏱ 耗时${view.elapsed}`;
+      return {schema: "2.0", config: {update_multi: true, width_mode: "fill"},
+        body: {elements: [{tag: "markdown", content: `<font color='grey'>${summary}</font>`}]}};
+    }
     // Clean finish (done / NO_REPLY): keep it minimal — no header, no footer, just
     // one compact grey line (status emoji + tool-call count + total elapsed) so
     // the finished card does not take up much screen space.
