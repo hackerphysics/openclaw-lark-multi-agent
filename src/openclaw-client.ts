@@ -48,6 +48,22 @@ export class AdmissionUnconfirmed extends Error {
   }
 }
 
+/** A genuinely observed physical session + nonempty transcript leaf. The
+ * public non-steer chat.send branch CAS uses BOTH; sessionId alone is not CAS. */
+export type FollowupAdmissionGuard = { sessionKey:string; sessionId:string; expectedLeafEntryId:string; /** Prior verified SDK no-effect target, NOT a current receiver identity. */ nonInjectableRunId?:string };
+export class FollowupAdmissionRefused extends Error {
+  constructor(readonly reason:string, readonly submissionId:string) {
+    super(`Followup admission refused before effect; input retained: ${reason}`);this.name='FollowupAdmissionRefused';
+  }
+}
+export type SessionDispatchStatus = {
+  idleConfirmed:boolean;sessionId?:string;archived?:boolean;activeRunId?:string;busyConfirmed?:boolean;
+  /** Explicit incompatible identity is not a genuinely unknown observation. */
+  identityConflict?:boolean;
+  /** Independent admission proof, NOT an assertion that aggregate work ended. */
+  followupAdmissionEligible?:boolean;expectedLeafEntryId?:string;
+};
+
 export type ChatAttachment = {
   type?: string;
   mimeType?: string;
@@ -2033,11 +2049,19 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     finally { if (timer) clearTimeout(timer); }
   }
 
-  /** Strong public current-session activity, independent of expired root
-   * terminal caches. Unknown/missing fields never authorize scheduling. */
-  async getSessionDispatchStatus(sessionKey:string):Promise<{idleConfirmed:boolean;sessionId?:string;archived?:boolean;activeRunId?:string;busyConfirmed?:boolean}> {
+  /** Execution-idle proof remains a complete pending scan. Independently,
+   * receiving a serialized followup does not require idle or empty pending
+   * work. A positive admission proof never turns an incomplete scan idle. */
+  async getSessionDispatchStatus(sessionKey:string):Promise<SessionDispatchStatus> {
     let timer:ReturnType<typeof setTimeout>|undefined;
     const key=this.canonicalSessionKey(sessionKey),deadline=Date.now()+8000;
+    let admissionProof:Pick<SessionDispatchStatus,'followupAdmissionEligible'|'expectedLeafEntryId'>={};
+    const admissionFrom=(history:any):typeof admissionProof=>{
+      const info=history?.sessionInfo,run=history?.inFlightRun;
+      const knownTarget=run===undefined || run===null || typeof run?.runId==='string' && !!run.runId.trim();
+      return info?.archived===false && knownTarget && typeof info?.activeLeafEntryId==='string' && !!info.activeLeafEntryId.trim()
+        ? {followupAdmissionEligible:true,expectedLeafEntryId:info.activeLeafEntryId} : {};
+    };
     // One budget covers the entire public pending scan, not 1500ms per page.
     // Retained interrupted/cancelled inputs are recovery records, NOT runnable
     // queue entries. Never delete, mutate or replay them to prove schedulability.
@@ -2048,18 +2072,25 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       const unknown=()=>({idleConfirmed:false,sessionId});
       const validId=(value:any)=>value===undefined || typeof value==='string' && !!value.trim();
       for(let page=0;page<32;page++) {
+        admissionProof={};
         const history:any=await this.rpc('chat.history',{sessionKey:key,limit:20,...(before?{pendingBefore:before}:{})},1500);
         if(Date.now()>=deadline)return unknown();
         const info=history?.sessionInfo;
         const id=info?.sessionId || history?.sessionId;
+        if(typeof history?.sessionKey==='string' && !!history.sessionKey && history.sessionKey!==key ||
+          typeof info?.sessionId==='string' && !!info.sessionId && typeof history?.sessionId==='string' && !!history.sessionId && info.sessionId!==history.sessionId ||
+          sessionId && typeof id==='string' && !!id && sessionId!==id)return {...unknown(),identityConflict:true};
         if(!validId(info?.sessionId) || !validId(history?.sessionId) || history?.sessionKey!==key || typeof id!=='string' || !id.trim() ||
           info?.sessionId && history?.sessionId && info.sessionId!==history.sessionId || sessionId && sessionId!==id)return unknown();
         sessionId=id;
         const base={sessionId,archived:info?.archived===true};
         if(base.archived)return {...base,idleConfirmed:false};
+        admissionProof=admissionFrom(history);
+        const pending=history?.pendingInputs;
+        // Existing queued/interrupted/hidden inputs are not a receiving veto.
+        // Core owns FIFO/cap/drop. Below, idle still requires complete evidence.
         if(info?.hasActiveRun===true || history?.inFlightRun)return {...base,idleConfirmed:false,busyConfirmed:true,
           activeRunId:typeof history?.inFlightRun?.runId==='string'?history.inFlightRun.runId:undefined};
-        const pending=history?.pendingInputs;
         if(!Number.isSafeInteger(pending?.total) || pending.total<0 || total!==undefined && total!==pending.total)return unknown();
         total=pending.total;
         if(pending.queuedCount!==undefined && (!Number.isSafeInteger(pending.queuedCount) || pending.queuedCount<0))return unknown();
@@ -2086,11 +2117,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         if(page>0) {
           // Pagination is not an atomic snapshot. Re-read the current head and
           // identity/activity before returning positive evidence to local CAS.
+          admissionProof={};
           const head:any=await this.rpc('chat.history',{sessionKey:key,limit:20},1500);
           if(Date.now()>=deadline)return unknown();
           const hi=head?.sessionInfo,hp=head?.pendingInputs,hid=hi?.sessionId || head?.sessionId;
           if(!validId(hi?.sessionId) || !validId(head?.sessionId) || head?.sessionKey!==key || hid!==id || hi?.sessionId && head?.sessionId && hi.sessionId!==head.sessionId)return unknown();
           if(hi?.archived===true)return {...base,archived:true,idleConfirmed:false};
+          admissionProof=admissionFrom(head);
           if(hi?.hasActiveRun===true || head?.inFlightRun || Number.isSafeInteger(hp?.queuedCount) && hp.queuedCount>0)
             return {...base,idleConfirmed:false,busyConfirmed:true,activeRunId:typeof head?.inFlightRun?.runId==='string'?head.inFlightRun.runId:undefined};
           if(hi?.hasActiveRun!==false)return unknown();
@@ -2106,9 +2139,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // The outer race must honor the SAME total budget as the scan itself
       // (audit P1 2026-10-17: an 8000ms scan raced against a 1500ms timer was
       // still killed at 1500ms — three real 650ms pages never got to finish).
-      return await Promise.race([scan(),new Promise<never>((_,reject)=>{
+      const result=await Promise.race([scan(),new Promise<never>((_,reject)=>{
         timer=setTimeout(()=>reject(new Error('activity lookup timeout')),8000);
       })]);
+      return {...result,...admissionProof};
     } catch {return {idleConfirmed:false};}
     finally {if(timer)clearTimeout(timer);}
   }
@@ -2719,6 +2753,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     /** Consecutive effective-activity silence after admission/collector start; default 10 minutes, not total run time. */
     timeoutMs?: number;
     emptyFinalAsNoReply?: boolean;
+    /** Restricted busy/no-target admission. No archive restore or unguarded retry. */
+    followupAdmissionGuard?: FollowupAdmissionGuard;
+    /** Local stop/owner/batch/admission CAS, checked around every async boundary. */
+    admissionGuard?: () => void;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
     onSendAttempt?: (submissionId:string) => void | Promise<void>;
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the user message. */
@@ -2737,7 +2775,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     this.observationEpoch.set(fullSessionKey,generation);
     const stopGeneration=this.stopGenerations.get(fullSessionKey)||0;
     const isCurrent=()=>this.observationEpoch.get(fullSessionKey)===generation && (this.stopGenerations.get(fullSessionKey)||0)===stopGeneration;
-    const assertCurrent=()=>{if(!isCurrent()) throw new SupersededObservation('admission generation revoked');};
+    const assertCurrent=()=>{if(!isCurrent()) throw new SupersededObservation('admission generation revoked');params.admissionGuard?.();};
     const submissionId=randomUUID();
     let ownedRunId = "";
     let eventReservationRunId='';
@@ -2759,7 +2797,20 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       const sendStartedAt = Date.now();
       try {
         assertCurrent();
-        this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,'reserved',{generation,stopGeneration});
+        const restricted=params.followupAdmissionGuard;
+        if(restricted) {
+          const refuse=(reason:string):never=>{throw new FollowupAdmissionRefused(reason,submissionId);};
+          if(restricted.sessionKey!==fullSessionKey || !restricted.sessionId?.trim() || !restricted.expectedLeafEntryId?.trim())refuse('missing or incompatible observed generation/leaf');
+          const activity=await this.getSessionDispatchStatus(fullSessionKey);
+          assertCurrent();
+          const runtime=await this.getSessionRuntimeStatus(fullSessionKey);
+          assertCurrent();
+          if(!activity.followupAdmissionEligible || activity.identityConflict || activity.archived || runtime.archived ||
+            activity.activeRunId && !restricted.nonInjectableRunId ||
+            activity.sessionId!==restricted.sessionId || runtime.sessionId!==restricted.sessionId)
+            refuse('current session/leaf/archive/admission evidence changed');
+        }
+        this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,'reserved',{generation,stopGeneration,...(restricted?{followupAdmissionGuard:restricted}:{})});
         await params.onSendAttempt?.(submissionId);
         assertCurrent();
         const idempotencyKey=submissionId;
@@ -2783,12 +2834,29 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // Ordinary admission is a separate serialized turn, not a request to
           // inherit stored interrupt/steer policy or its commit-wait finalizer.
           queueMode: "followup",
+          ...(restricted ? {sessionId:restricted.sessionId,expectedLeafEntryId:restricted.expectedLeafEntryId,suppressCommandInterpretation:true} : {}),
           deliver: params.deliver ?? false,
           idempotencyKey,
         }); };
         try {
           result = await sendChat();
         } catch (err) {
+          if(restricted) {
+            // Only named public pre-effect guard refusals prove zero effect.
+            // Other RPC errors/transport failures retain the ORIGINAL identity;
+            // an error string alone must never authorize a new-ID replay.
+            let detail:any;
+            if(err instanceof Error && err.message.startsWith('RPC error:')) {
+              try {detail=JSON.parse(err.message.slice('RPC error:'.length));} catch { /* unknown */ }
+            }
+            const noEffect=detail?.code==='INVALID_REQUEST' && ['active-leaf-changed','session-changed'].includes(detail?.details?.reason);
+            this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,noEffect?'rejected':'unknown',{generation,stopGeneration,followupAdmissionGuard:restricted});
+            if(noEffect) {
+              this.recoveryStore?.finishRunObservation(fullSessionKey,submissionId,'rejected');
+              throw new FollowupAdmissionRefused(detail.details.reason,submissionId);
+            }
+            throw new AdmissionUnconfirmed(idempotencyKey,err);
+          }
           // The Gateway auto-archives sessions past the active-session cap; an
           // archived session refuses new work. Restore it once and retry — the
           // user should never have to fix this by hand.
@@ -2920,6 +2988,10 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     includeContext?: boolean;
     /** Disable bridge attachment hints for native commands and other exact pass-through messages. */
     includeBridgeAttachmentHint?: boolean;
+    /** Restricted busy/no-target admission. No archive restore or unguarded retry. */
+    followupAdmissionGuard?: FollowupAdmissionGuard;
+    /** Local stop/owner/batch/admission CAS, checked around every async boundary. */
+    admissionGuard?: () => void;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
     onSendAttempt?: (submissionId:string) => void | Promise<void>;
     /** Called after chat.send RPC succeeds and OpenClaw has accepted the combined message. */
@@ -2950,6 +3022,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         deliver: params.deliver,
         timeoutMs: params.timeoutMs,
         emptyFinalAsNoReply: params.emptyFinalAsNoReply,
+        followupAdmissionGuard: params.followupAdmissionGuard,
+        admissionGuard: params.admissionGuard,
         onSendAttempt: params.onSendAttempt,
         onSubmitted: params.onSubmitted,
         onRunIdentified: params.onRunIdentified,
@@ -2992,6 +3066,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       deliver: params.deliver,
       timeoutMs: params.timeoutMs,
       emptyFinalAsNoReply: params.emptyFinalAsNoReply,
+      followupAdmissionGuard: params.followupAdmissionGuard,
+      admissionGuard: params.admissionGuard,
       onSendAttempt: params.onSendAttempt,
       onSubmitted: params.onSubmitted,
       onRunIdentified: params.onRunIdentified,

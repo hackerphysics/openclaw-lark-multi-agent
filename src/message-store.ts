@@ -228,7 +228,7 @@ export class MessageStore {
   }
   /** Atomic release of proven never-attempted reservations only. Unknown and
    * accepted inputs retain their exact target and never enter ordinary drain. */
-  releaseDispatchCustody(bot:string,chat:string,ownerId:string,batchId:string):boolean {
+  releaseDispatchCustody(bot:string,chat:string,ownerId:string,batchId:string,followup?:{sessionKey:string;sessionId:string;expectedLeafEntryId:string}):boolean {
     return this.db.transaction(()=>{
       const custody=this.getDispatchCustody(bot,chat);
       if(!custody || !this.clearDispatchCustody(bot,chat,ownerId,batchId))return false;
@@ -236,11 +236,17 @@ export class MessageStore {
         '$.dispatchOwnerId',?,'$.dispatchBatchId',?,'$.sessionId',?) WHERE bot_name=? AND chat_id=? AND run_id=?`)
         .run(ownerId,batchId,custody.sessionId,bot,chat,custody.runId);
       this.db.prepare(`UPDATE insertion_custody SET state='ordinary',next_check_at=0,
-        record_json=json_set(record_json,'$.reason','current session confirmed schedulable; no backend attempt')
+        record_json=json_set(record_json,'$.reason','current session confirmed schedulable; no backend attempt'
+          ${followup ? ", '$.followupAdmissionGuard',json(COALESCE(json_extract(record_json,'$.followupAdmissionGuard'),?))" : ''})
         WHERE bot_name=? AND chat_id=? AND state='pending'
         AND COALESCE(json_extract(record_json,'$.attempted'),0)=0
         AND json_extract(record_json,'$.ownerId')=? AND json_extract(record_json,'$.batchId')=?
-        AND json_extract(record_json,'$.stopEpoch')=?`).run(bot,chat,ownerId,batchId,this.getStopGeneration(bot,chat));
+        AND json_extract(record_json,'$.stopEpoch')=?
+        ${followup ? `AND json_extract(record_json,'$.sessionId')=?
+          AND COALESCE(json_extract(record_json,'$.ordinaryEligible'),1)!=0
+          AND json_extract(record_json,'$.sessionKey') IN (?,?)
+          AND message_row_id IN (SELECT id FROM messages WHERE sender_type='human' AND trigger_kind='normal')` : ''}`)
+        .run(...(followup?[JSON.stringify(followup)]:[]),bot,chat,ownerId,batchId,this.getStopGeneration(bot,chat),...(followup?[followup.sessionId,followup.sessionKey,followup.sessionKey.replace(/^agent:[^:]+:/,'')]:[]));
       return true;
     })();
   }
@@ -383,10 +389,10 @@ export class MessageStore {
   }
   stopInsertionAtEpoch(bot:string,chat:string,row:number,epoch:number):void {
     this.db.prepare(`UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND message_row_id=?
-      AND json_extract(record_json,'$.stopEpoch')=? AND state NOT IN ('committed','ordinary')`).run(bot,chat,row,epoch);
+      AND json_extract(record_json,'$.stopEpoch')=? AND (state NOT IN ('committed','ordinary') OR state='ordinary' AND json_type(record_json,'$.followupAdmissionGuard')='object')`).run(bot,chat,row,epoch);
   }
   stopInsertions(bot: string,chat: string): void {
-    this.db.prepare("UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND state NOT IN ('committed','ordinary')").run(bot,chat);
+    this.db.prepare("UPDATE insertion_custody SET state='stopped' WHERE bot_name=? AND chat_id=? AND (state NOT IN ('committed','ordinary') OR state='ordinary' AND json_type(record_json,'$.followupAdmissionGuard')='object')").run(bot,chat);
   }
   hasUnknownDeliveryOperation(outbox:number): boolean {
     return !!this.db.prepare(`SELECT 1 FROM delivery_operations o WHERE outbox_id=? AND state IN ('attempted','unknown')

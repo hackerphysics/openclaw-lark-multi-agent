@@ -3,13 +3,11 @@ import {afterEach,beforeEach,describe,it,expect,vi} from 'vitest';
 vi.mock('ws',()=>({default:class extends EventEmitter {send(){} close(){}}}));
 import {harness} from './helpers/reliability-harness.js';
 
-// A4 regression (2026-10-17 protocol audit): the 60s bounded fallback in
-// reconcileCurrentInputActivity must rescue ONLY genuinely-unknown states.
-// Positive gateway assertions — archived session, incompatible session
-// generation, busy-without-injectable-owner — stay retained with a
-// blocker-noting reason for field diagnosis; ordinary admission is not
-// authoritative for them. Unknown-state behavior is unchanged: it still
-// falls back to ordinary admission after 60s.
+// A4 updated 2026-10-18: preserve the original ordinary unknown-state rescue
+// and positive control. Unknown ACTIVITY for never-attempted input differs from
+// an unknown SUBMISSION receipt. Restricted positive-busy admission is covered
+// separately; archive/generation/busy or prior restricted proof cannot escape
+// through ordinary unknown-state rescue.
 let h:ReturnType<typeof harness>,runtime:any,dispatch:any;
 const tick=(ms=0)=>vi.advanceTimersByTimeAsync(ms);
 const recordUnbound=(name:string,ageMs=61_000)=>{
@@ -38,7 +36,7 @@ beforeEach(async()=>{
 afterEach(async()=>{
   await h.cleanup();vi.clearAllTimers();vi.useRealTimers();vi.restoreAllMocks();
 });
-describe('A4: 60s bounded fallback fires only for genuinely-unknown state',()=>{
+describe('A4: positive blockers retained; ordinary unknown-state rescue preserved',()=>{
   it.each([
     ['archived-status',{sessionId:'generation-1',running:false,archived:true,idleConfirmed:false},{idleConfirmed:false,sessionId:'generation-1',archived:false},'retained: archived'],
     ['archived-activity',{sessionId:'generation-1',running:false,archived:false,idleConfirmed:false},{idleConfirmed:false,sessionId:'generation-1',archived:true},'retained: archived'],

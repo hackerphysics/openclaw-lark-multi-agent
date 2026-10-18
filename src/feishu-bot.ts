@@ -5,7 +5,7 @@ import * as lark from "@larksuiteoapi/node-sdk";
 import { createRequire } from "module";
 import { BotConfig, persistBotModel } from "./config.js";
 import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
-import { OpenClawClient, InactiveRunObservation, AdmissionUnconfirmed, CollectorStalledError } from "./openclaw-client.js";
+import { OpenClawClient, InactiveRunObservation, AdmissionUnconfirmed, CollectorStalledError, FollowupAdmissionRefused, type FollowupAdmissionGuard, type SessionDispatchStatus } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { SupersededObservation } from "./openclaw-client.js";
 import { LiveStatusController, LiveStatusEffectRejectedError, LiveStatusEffectUnknownError, type LiveStatusCallbacks, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
@@ -30,7 +30,8 @@ export class SendDeadlineError extends Error {
 }
 
 const nonemptyReceipt=(value:unknown):value is string=>typeof value==='string' && !!value.trim();
-type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; collecting?:boolean; observationDetached?:boolean; yielded?:boolean };
+const canonicalPhysicalSessionKey=(key:string):string=>/^agent:[^:]+:/.test(key)?key:`agent:main:${key}`;
+type QueueOwner = { id:string;batchId?:string;triggerIds?:Set<number>;token: object; revoked: boolean; stopEpoch: number; batch?: object; runId?: string; sessionId?:string; admitted?:boolean; collecting?:boolean; observationDetached?:boolean; yielded?:boolean; continuePending?:boolean };
 
 const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
@@ -174,6 +175,9 @@ export class FeishuBot {
   /** Per-chat processQueue lock to avoid duplicate concurrent chat.send runs */
   private queueRuns: Map<string, Promise<void>> = new Map();
   private queueOwners = new Map<string, QueueOwner>();
+  /** Monotone local batch epoch: an empty owner map must not hide an
+   * intervening admission/finish (ABA) from an asynchronous public lookup. */
+  private queueAdmissionEpoch = new Map<string,number>();
   /** Per-chat serial send queue to guarantee message order */
   private sendQueue: Map<string, Promise<void>> = new Map();
   /** Per-chat delayed runtime failure notifications, canceled if a real reply arrives. */
@@ -1280,9 +1284,9 @@ export class FeishuBot {
         await this.warnUnhealthySessionAndContinue(chatId, messageId, unhealthy);
       }
 
-      // Inspect current public activity, not just the local promise. A yielded
-      // task (or a settled/uncached old root with authoritative idle history)
-      // keeps its result observer but cannot monopolize independent new input.
+      // Inspect public activity, not just the local promise. Trusted yield,
+      // positive idle, or bounded guarded-followup proof may hand off ONLY the
+      // local scheduler; the original exact result observer/target survives.
       const dispatchReleased=await this.reconcileDispatchCustody(chatId);
       if(this.stopGeneration(chatId)!==inputStopEpoch)return;
       if(!isBot && insertedId>0 && !dispatchReleased && !this.queueRuns.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId))
@@ -1308,8 +1312,8 @@ export class FeishuBot {
       }
 
       // --- Queue-based sending: if agent is busy, just accumulate ---
-      // The actual queue owner, not elapsed wall time, decides whether input
-      // should steer/queue. Long healthy runs must not lose their busy ownership.
+      // No task-lifetime cutoff: long healthy runs retain execution/result
+      // custody. Local scheduling handoff requires independent public proof.
       const isBusy = reservedAtIngress || this.queueRuns.has(chatId) || !!this.store.getDispatchCustody(this.config.name,chatId);
 
       if (isBusy) {
@@ -1332,16 +1336,54 @@ export class FeishuBot {
     }
   }
 
+  /** Separate guarded-admission proof. Aggregate busy never becomes idle. */
+  private observedFollowupGuard(chatId:string,status:{sessionId?:string;archived?:boolean},activity:SessionDispatchStatus,noEffectRunId?:string):FollowupAdmissionGuard|undefined {
+    if(!activity.followupAdmissionEligible || activity.identityConflict || activity.activeRunId && !noEffectRunId || activity.archived || status.archived ||
+      !status.sessionId || status.sessionId!==activity.sessionId || !activity.expectedLeafEntryId)return;
+    return {sessionKey:canonicalPhysicalSessionKey(this.getSessionKey(chatId)),sessionId:status.sessionId,expectedLeafEntryId:activity.expectedLeafEntryId,
+      ...(noEffectRunId?{nonInjectableRunId:noEffectRunId}:{})};
+  }
+
+  /** A positive refusal must be durable AND explained to the sender. */
+  private retainChangedFollowup(chatId:string,item:any,reason:string):void {
+    this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'target_changed',{...item,reason});
+    const key=`followup:${item.insertionId}:refused`;
+    void this.enqueueAndDispatchDelivery(chatId,'admission_status',key,
+      'ℹ️ 这条消息仍保留在本地，尚未确认 Gateway 接收：会话或准入保护条件已变化。不会迁移或自动重发；请检查会话后决定是否另发新消息。',
+      [],item.messageId,key).catch(()=>{});
+  }
+
+  private explainUnconfirmedFollowup(chatId:string,item:any):void {
+    const key=`followup:${item.insertionId}:guard-unavailable`;
+    void this.enqueueAndDispatchDelivery(chatId,'admission_status',key,
+      'ℹ️ 这条消息仍在本地保管，尚未确认 Gateway 接收：目前缺少可核验的会话/分支准入证据，或插入能力不可确认。不会显示已接收，也不会盲目重发；证据恢复后继续核验。',
+      [],item.messageId,key).catch(()=>{});
+  }
+
+  /** Keep each input's first observed leaf: a fresh arrival must not borrow
+   * an obsolete scheduler leaf from before it was received. */
+  private pinDispatchFollowupProof(chatId:string,saved:any,proof:FollowupAdmissionGuard):void {
+    for(const item of this.store.listInsertions(this.config.name,chatId)) {
+      if(item.state!=='pending' || item.attempted || item.followupAdmissionGuard || item.ordinaryEligible===false ||
+        item.ownerId!==saved.id || item.batchId!==saved.batchId || item.stopEpoch!==saved.stopEpoch || item.sessionId!==proof.sessionId ||
+        !item.sessionKey || canonicalPhysicalSessionKey(item.sessionKey)!==proof.sessionKey)continue;
+      const source=this.store.getMessageByMessageId(item.messageId);
+      if(source?.senderType!=='human' || source.triggerKind!=='normal')continue;
+      this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'pending',
+        {...item,followupAdmissionGuard:proof,followupObservedAt:Date.now()},item.nextCheckAt);
+    }
+  }
+
   /** With no local owner, the Gateway can still have externally admitted work.
    * Read public activity and pin its exact root before choosing insertion. Missing
    * identity is durable unbound custody, never a fabricated run or blind send. */
   private async reconcileCurrentInputActivity(chatId:string,rowId:number,messageId:string,text:string):Promise<void> {
     if(!this.openclawClient.getSessionRuntimeStatus || !this.openclawClient.getSessionDispatchStatus)return;
-    const epoch=this.stopGeneration(chatId);
+    const epoch=this.stopGeneration(chatId),admissionEpoch=this.queueAdmissionEpoch.get(chatId)||0;
     // A different ingress handler can ordinary-admit AND finish this row while
     // a public lookup is in flight. Check message custody, not just an empty
     // owner map, at every boundary so a late lookup can never reinsert it.
-    const unsubmitted=()=>this.stopGeneration(chatId)===epoch &&
+    const unsubmitted=()=>this.stopGeneration(chatId)===epoch && (this.queueAdmissionEpoch.get(chatId)||0)===admissionEpoch &&
       this.store.getPendingTriggerIds(this.config.name,chatId).has(rowId) &&
       !this.queueOwners.get(chatId)?.triggerIds?.has(rowId);
     if(!unsubmitted())return;
@@ -1367,51 +1409,113 @@ export class FeishuBot {
     if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
     const current=this.store.getInsertion(this.config.name,chatId,rowId);
     if(current && (!current.activityUnbound || current.attempted))return;
+    if(current && (current.stopEpoch!==epoch || !current.sessionKey || canonicalPhysicalSessionKey(current.sessionKey)!==canonicalPhysicalSessionKey(this.getSessionKey(chatId))))return;
     const activity=await this.openclawClient.getSessionDispatchStatus(this.getSessionKey(chatId));
     if(!unsubmitted() || this.queueRuns.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return;
     // Another recovery/ingress lookup may have identified the root and begun
     // dispatch while this one awaited history. Never restore its older
     // never-attempted snapshot over an attempted/unknown/accepted journal.
     const fresh=this.store.getInsertion(this.config.name,chatId,rowId);
-    if(current ? fresh?.insertionId!==current.insertionId || fresh.state!=='pending' || fresh.attempted===true || !fresh.activityUnbound || !!fresh.expectedRunId : !!fresh)return;
-    const compatible=!activity.sessionId || !status.sessionId || activity.sessionId===status.sessionId;
-    const idle=compatible && !status.running && !status.archived && !activity.archived && !activity.busyConfirmed &&
-      activity.idleConfirmed===true && !!activity.sessionId;
-    if(idle) {
+    if(current ? JSON.stringify(fresh)!==JSON.stringify(current) || fresh?.insertionId!==current.insertionId || fresh.state!=='pending' || fresh.attempted===true || !fresh.activityUnbound || !!fresh.expectedRunId : !!fresh)return;
+    const compatible=!!status.sessionId && status.sessionId===activity.sessionId && (!current?.sessionId || current.sessionId===status.sessionId);
+    const archived=!!status.archived || !!activity.archived;
+    const generationConflict=activity.identityConflict===true || !!activity.sessionId && !!status.sessionId && activity.sessionId!==status.sessionId ||
+      !!current?.sessionId && !!status.sessionId && current.sessionId!==status.sessionId;
+    const source=this.store.getMessageByMessageId(messageId);
+    const ordinaryHuman=source?.id===rowId && source.chatId===chatId && source.senderType==='human' && source.triggerKind==='normal';
+    const proof=ordinaryHuman && compatible && !current?.followupBlocked && !archived ? this.observedFollowupGuard(chatId,status,activity) : undefined;
+    const previous=current?.followupAdmissionGuard as FollowupAdmissionGuard|undefined;
+    if(previous && (archived || generationConflict)) {
+      this.retainChangedFollowup(chatId,{...current,rowId},'observed followup session/archive changed; input retained without migration');
+      return;
+    }
+    const idle=compatible && !status.running && !archived && !activity.busyConfirmed && activity.idleConfirmed===true;
+    if(idle && !previous && !current?.followupBlocked) {
       if(current)this.store.saveInsertion(this.config.name,chatId,rowId,current.insertionId,'ordinary',{...current,activityUnbound:false});
       return;
     }
-    const identified=compatible && !!activity.activeRunId && !!activity.sessionId && !activity.archived && !status.archived;
-    // A4 (2026-10-17 protocol audit): positive blockers are gateway assertions,
-    // not unknown states. An archived session, an incompatible session
-    // generation, or confirmed busy-without-injectable-owner each positively
-    // forbids fresh ordinary admission, so the bounded fallback below must
-    // never hand such an input to the ordinary queue; it stays retained.
-    const archived=!!status.archived || !!activity.archived;
-    const generationConflict=!!activity.sessionId && !!status.sessionId && activity.sessionId!==status.sessionId;
-    const positivelyBusy=activity.busyConfirmed===true;
-    // Bounded retention (2026-10-17 deadlock): an input that has stayed
-    // activity-unbound for over 60s despite re-checks must not be held forever.
-    // Hand it to the ordinary queue — the gateway's own chat.send admission is
-    // the authoritative answer and admission custody already dedups. This
-    // rescue is reserved for GENUINELY unknown states; positive blockers are
-    // excluded above and keep the never-attempted input retained.
-    const unboundSince=current?.activityUnbound ? (current.unboundSince || 0) : 0;
-    if(!identified && !archived && !generationConflict && !positivelyBusy && unboundSince && Date.now()-unboundSince>60_000) {
-      this.store.saveInsertion(this.config.name,chatId,rowId,current!.insertionId,'ordinary',
-        {...current!,activityUnbound:false,reason:'gateway state unconfirmable over 60s; ordinary admission is authoritative'});
+    const identified=compatible && !!activity.activeRunId && !archived;
+    // Explicit followup no longer inherits stored steer/interrupt. After two
+    // matching physical-session observations separated by 60s, busy-without-a-target may
+    // admit ONE guarded queued turn. Unknown/missing leaf is NOT a timeout CAS.
+    // Keep the EARLIEST genuinely observed leaf. The public RPC accepts an
+    // ancestor on the active path with sessionId, but rejects an off-path leaf.
+    // Ordinary transcript advancement is NOT a local generation conflict.
+    const observedAt=previous && proof ? current.followupObservedAt : Date.now();
+    if(!identified && proof && previous && Number.isFinite(observedAt) && Date.now()-observedAt>=60_000) {
+      this.store.saveInsertion(this.config.name,chatId,rowId,current.insertionId,'ordinary',
+        {...current,activityUnbound:false,followupAdmissionGuard:previous,reason:'bounded matching public proof; explicit guarded followup admission only'});
       return;
     }
-    const blockerReason=archived ? 'retained: archived (gateway positively reported archived session; 60s ordinary fallback suppressed)'
-      : generationConflict ? 'retained: generation-conflict (activity session generation differs from runtime status; 60s ordinary fallback suppressed)'
-      : positivelyBusy ? 'retained: positively-busy (gateway confirmed busy without an injectable owner; 60s ordinary fallback suppressed)' : '';
+    // Preserve the deployed ordinary rescue for a fresh NEVER-ATTEMPTED input
+    // whose ACTIVITY observation is genuinely unknown. That is not an unknown
+    // submission receipt, nor an escape from this restricted/positive proof.
+    const unboundSince=current?.activityUnbound ? current.unboundSince : undefined;
+    if(!identified && !archived && !generationConflict && activity.busyConfirmed!==true && !previous && !current?.followupBlocked && !current?.restrictedObservation &&
+      current?.state==='pending' && !current.attempted && !current.admissionSubmissionId && current.ordinaryEligible!==false &&
+      unboundSince && Date.now()-unboundSince>60_000) {
+      this.store.saveInsertion(this.config.name,chatId,rowId,current.insertionId,'ordinary',
+        {...current,activityUnbound:false,reason:'fresh never-attempted input; ordinary unknown-state bounded followup rescue'});
+      return;
+    }
+    const blockerReason=archived ? 'retained: archived'
+      : generationConflict ? 'retained: generation-conflict'
+      : activity.busyConfirmed ? 'retained: positively-busy; guarded followup proof absent or observation window pending'
+      : 'retained: genuinely unknown activity; fresh ordinary rescue observation pending';
     this.store.saveInsertion(this.config.name,chatId,rowId,current?.insertionId || JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
-      messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:identified ? activity!.sessionId : status.sessionId,
-      expectedRunId:identified ? activity!.activeRunId : '',ownerId:identified ? `external:${activity!.activeRunId}` : undefined,
-      batchId:identified ? activity!.activeRunId : undefined,activityUnbound:!identified,attempted:false,
-      ...(identified ? {} : {unboundSince: unboundSince || Date.now()}),
-      reason:identified?'current Gateway run observed; insertion custody only':(blockerReason || 'current Gateway activity/run identity unavailable; retained without admission'),
+      ...current,messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:current?.sessionId || activity.sessionId || status.sessionId,
+      expectedRunId:identified ? activity.activeRunId : '',ownerId:identified ? `external:${activity.activeRunId}` : undefined,
+      batchId:identified ? activity.activeRunId : undefined,activityUnbound:!identified,attempted:false,
+      ...(!identified ? {unboundSince:current?.unboundSince || Date.now()} : {}),
+      ...(proof ? {followupAdmissionGuard:previous || proof,followupObservedAt:observedAt} : {}),
+      ...(activity.busyConfirmed ? {restrictedObservation:true} : {}),
+      ...((archived || generationConflict) ? {followupBlocked:true} : {}),
+      reason:identified?'current Gateway run observed; insertion custody only':blockerReason,
     },Date.now()+(identified?0:5000));
+    if(!identified && !proof && current?.unboundSince && Date.now()-current.unboundSince>=60_000 &&
+      (archived || generationConflict || activity.busyConfirmed || current.restrictedObservation))
+      this.explainUnconfirmedFollowup(chatId,{...current,rowId,messageId});
+  }
+
+  /** An ingress reservation can outlive an ACK-window owner which finished
+   * before learning its runId. It is still never-attempted custody, not a
+   * licence to retarget/steer a successor. Require the same guarded proof and
+   * bounded observation with NO replacement local scheduler at every await. */
+  private async reconcileRetainedFollowup(chatId:string,item:any):Promise<boolean> {
+    if(!this.openclawClient.getSessionRuntimeStatus || !this.openclawClient.getSessionDispatchStatus ||
+      this.queueOwners.has(chatId) || this.store.getDispatchCustody(this.config.name,chatId))return false;
+    const source=this.store.getMessageByMessageId(item.messageId);
+    if(item.state!=='pending' || item.attempted || item.ordinaryEligible===false || !item.sessionId ||
+      !source || source.id!==item.rowId || source.chatId!==chatId || source.senderType!=='human' || source.triggerKind!=='normal' ||
+      !item.sessionKey || canonicalPhysicalSessionKey(item.sessionKey)!==canonicalPhysicalSessionKey(this.getSessionKey(chatId)))return false;
+    const admissionEpoch=this.queueAdmissionEpoch.get(chatId)||0;
+    const snapshot=this.store.getInsertion(this.config.name,chatId,item.rowId);
+    const unchanged=()=>{
+      const row=this.store.getInsertion(this.config.name,chatId,item.rowId);
+      return (this.queueAdmissionEpoch.get(chatId)||0)===admissionEpoch && JSON.stringify(row)===JSON.stringify(snapshot) && this.stopGeneration(chatId)===item.stopEpoch && !this.queueOwners.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId) &&
+        row?.state==='pending' && !row.attempted && row.insertionId===item.insertionId && row.ownerId===item.ownerId && row.batchId===item.batchId;
+    };
+    if(!unchanged())return false;
+    const status=await this.openclawClient.getSessionRuntimeStatus(item.sessionKey).catch(()=>null);
+    if(!unchanged())return true;
+    const activity=await this.openclawClient.getSessionDispatchStatus?.(item.sessionKey).catch(()=>null);
+    if(!unchanged())return true;
+    if(status?.archived || activity?.archived || status?.sessionId && status.sessionId!==item.sessionId || activity?.sessionId && activity.sessionId!==item.sessionId) {
+      this.retainChangedFollowup(chatId,item,'retained input session/archive changed; no migration');
+      return true;
+    }
+    const proof=status && activity ? this.observedFollowupGuard(chatId,status,activity,item.noEffectRunId) : undefined;
+    if(!proof)return false;
+    if(item.followupAdmissionGuard && (item.followupAdmissionGuard.sessionKey!==proof.sessionKey || item.followupAdmissionGuard.sessionId!==proof.sessionId)) {
+      this.retainChangedFollowup(chatId,item,'retained followup physical identity changed; no migration');
+      return true;
+    }
+    const since=item.followupAdmissionGuard ? item.followupObservedAt : Date.now();
+    const eligible=Number.isFinite(since) && Date.now()-since>=60_000;
+    this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,eligible?'ordinary':'pending',
+      {...item,followupAdmissionGuard:item.followupAdmissionGuard || proof,followupObservedAt:since,reason:'retained never-attempted input; bounded guarded followup observation'},Date.now()+5000);
+    if(eligible)void this.processQueue(chatId,true).catch(()=>{});
+    return true;
   }
 
   /** CAS includes the actual batch, not merely the queue Promise, and excludes
@@ -1421,20 +1525,63 @@ export class FeishuBot {
     const saved=this.store.getDispatchCustody(this.config.name,chatId);
     if(!saved?.runId || !saved.batchId || !saved.sessionId || !saved.admitted && !saved.yielded)return false;
     if(local && (local.id!==saved.id || local.batchId!==saved.batchId || !local.admitted && !local.yielded || !local.collecting))return false;
-    const batch=local?.batch,runId=local?.runId,epoch=this.stopGeneration(chatId);
+    const batch=local?.batch,runId=local?.runId,epoch=this.stopGeneration(chatId),admissionEpoch=this.queueAdmissionEpoch.get(chatId)||0;
     const unchanged=()=>{
       const now=this.store.getDispatchCustody(this.config.name,chatId);
-      return this.stopGeneration(chatId)===epoch && now?.id===saved.id && now?.batchId===saved.batchId && now?.runId===saved.runId &&
+      return (this.queueAdmissionEpoch.get(chatId)||0)===admissionEpoch && this.stopGeneration(chatId)===epoch && saved.stopEpoch===epoch && JSON.stringify(now)===JSON.stringify(saved) &&
         this.queueOwners.get(chatId)===local && (!local || local.batch===batch && local.runId===runId && (local.admitted===true || local.yielded===true) && local.collecting===true);
     };
     const activity=await this.openclawClient.getSessionDispatchStatus?.(this.getSessionKey(chatId)).catch(()=>null);
-    if(!unchanged() || !activity?.idleConfirmed || activity.busyConfirmed || activity.archived || activity.sessionId!==saved.sessionId)return false;
+    if(!unchanged() || !activity || activity.archived || activity.sessionId!==saved.sessionId)return false;
+    if(activity.activeRunId===saved.runId)return false; // real foreground keeps SDK priority
+    if(!activity.idleConfirmed && !activity.followupAdmissionEligible)return false;
     const status=await this.openclawClient.getSessionRuntimeStatus(this.getSessionKey(chatId)).catch(()=>null);
-    if(!unchanged() || !status?.idleConfirmed || status.archived || status.sessionId!==saved.sessionId)return false;
-    if(!this.store.releaseDispatchCustody(this.config.name,chatId,saved.id,saved.batchId))return false;
+    if(!unchanged() || !status || status.archived || status.sessionId!==saved.sessionId)return false;
+    if(activity.activeRunId && activity.activeRunId!==saved.runId) {
+      // An accepted local followup can itself be queued behind a different
+      // public foreground root. Do not steer a new input into that queued ID.
+      // Rebind ONLY same-generation never-attempted custody to the genuinely
+      // observed foreground for SDK priority; accepted/unknown inputs stay put.
+      for(const item of this.store.listInsertions(this.config.name,chatId)) {
+        if(item.state!=='pending' || item.attempted || item.noEffectRunId || item.ordinaryEligible===false || item.ownerId!==saved.id || item.batchId!==saved.batchId ||
+          item.stopEpoch!==epoch || item.sessionId!==saved.sessionId || !item.sessionKey ||
+          canonicalPhysicalSessionKey(item.sessionKey)!==canonicalPhysicalSessionKey(this.getSessionKey(chatId)))continue;
+        const source=this.store.getMessageByMessageId(item.messageId);
+        if(source?.senderType!=='human' || source.triggerKind!=='normal')continue;
+        const earlier=item.followupAdmissionGuard;
+        this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,'pending',{
+          ...item,expectedRunId:activity.activeRunId,ownerId:`external:${activity.activeRunId}`,batchId:activity.activeRunId,
+          noEffectRunId:undefined,followupAdmissionGuard:earlier ? {
+            sessionKey:earlier.sessionKey,sessionId:earlier.sessionId,expectedLeafEntryId:earlier.expectedLeafEntryId,
+          } : undefined,
+          reason:'public foreground observed; never-attempted input retains SDK priority; queued original result kept',
+        });
+      }
+      if(!this.store.clearDispatchCustody(this.config.name,chatId,saved.id,saved.batchId))return false;
+      const target=this.store.getDeliveryRunTarget(this.config.name,chatId,saved.runId);
+      if(target)this.store.bindDeliveryRun(this.config.name,chatId,saved.runId,{...target,dispatchReleased:true});
+      if(local)this.forceExpireQueueOwner(chatId,'public foreground differs from locally queued original; exact result custody retained');
+      return true;
+    }
+    const idle=activity.idleConfirmed && !activity.busyConfirmed && status.idleConfirmed;
+    let followup:FollowupAdmissionGuard|undefined;
+    if(!idle || saved.followupAdmissionGuard) {
+      const proof=this.observedFollowupGuard(chatId,status,activity);
+      if(!proof || !saved.sessionKey || canonicalPhysicalSessionKey(saved.sessionKey)!==proof.sessionKey)return false;
+      const previous=saved.followupAdmissionGuard;
+      if(previous && (previous.sessionKey!==proof.sessionKey || previous.sessionId!==proof.sessionId))return false;
+      this.pinDispatchFollowupProof(chatId,saved,proof);
+      followup=previous || proof; // host CAS distinguishes ancestor from off-path
+      if(!previous) {
+        if(unchanged())this.store.saveDispatchCustody(this.config.name,chatId,{...saved,followupAdmissionGuard:followup,followupObservedAt:Date.now()});
+        return false;
+      }
+      if(!Number.isFinite(saved.followupObservedAt) || Date.now()-saved.followupObservedAt<60_000)return false;
+    }
+    if(!unchanged() || !this.store.releaseDispatchCustody(this.config.name,chatId,saved.id,saved.batchId,followup))return false;
     // The target was committed on admission and survives this local cleanup.
     // Only this exact old owner can be revoked; never a replacement batch.
-    if(local)this.forceExpireQueueOwner(chatId,'current session confirmed schedulable; exact result observation retained');
+    if(local)this.forceExpireQueueOwner(chatId,followup?'guarded followup schedulable (NOT idle); exact result observation retained':'current session confirmed schedulable; exact result observation retained');
     return true;
   }
 
@@ -1509,6 +1656,10 @@ export class FeishuBot {
       if(released)void this.processQueue(chatId,true).catch(()=>{});
       for(const item of this.store.listInsertions(this.config.name,chatId)) {
         if(item.nextCheckAt>Date.now()) continue;
+        // This is an ordinary chat.send identity, NOT an SDK insertion. The
+        // client's exact-run recovery queries its original ID; never steer or
+        // resend it with an insertion/new submission identity on restart.
+        if(item.admissionSubmissionId)continue;
         const stillCurrent=()=>this.stopGeneration(chatId)===item.stopEpoch && !['stopped','ordinary','committed'].includes(this.store.getInsertion(this.config.name,chatId,item.rowId)?.state);
         if(!stillCurrent()) {if(this.stopGeneration(chatId)!==item.stopEpoch)this.store.stopInsertionAtEpoch(this.config.name,chatId,item.rowId,item.stopEpoch);continue;}
         if(item.activityUnbound) {
@@ -1518,6 +1669,7 @@ export class FeishuBot {
           if(!refreshed?.expectedRunId)continue;
           Object.assign(item,refreshed);
         }
+        if(await this.reconcileRetainedFollowup(chatId,item))continue;
         const owner=this.queueOwners.get(chatId);
         if(!item.expectedRunId && owner?.id===item.ownerId && owner?.batchId===item.batchId && owner?.runId) item.expectedRunId=owner.runId;
         if(!item.expectedRunId) {
@@ -1576,6 +1728,8 @@ export class FeishuBot {
         // Time elapsed and attempted-unknown receipts never authorize replay.
         if(valid && receipt.attempted===false && receipt.ordinaryEligible!==false && ['pending','target_ended'].includes(state) &&
           ['target_not_ready','backend_rejected_no_effect','original run ended without an insertion attempt'].includes(receipt.reason || '')) {
+          item.noEffectRunId=item.expectedRunId;
+          item.noEffectSince=item.noEffectSince || Date.now();
           const status=await this.openclawClient.getSessionRuntimeStatus(item.sessionKey).catch(()=>null);
           if(!stillCurrent()) continue;
           const activity=status?.idleConfirmed ? await this.openclawClient.getSessionDispatchStatus?.(item.sessionKey).catch(()=>null) : null;
@@ -1586,20 +1740,31 @@ export class FeishuBot {
             state='ordinary';
             // Never expire a successor merely to schedule the old input.
             if(runAtCheck===item.expectedRunId) this.forceExpireQueueOwner(chatId,'confirmed idle exact batch; insertion never accepted/unknown');
-          } else if(state==='target_ended') state='pending';
-          else if(state==='pending') {
-            // Safe recovery for a NON-INSERTABLE target (audit P1 #2
-            // 2026-10-17): this branch only runs for EXPLICIT no-effect
-            // receipts (attempted===false, definitively not inserted — the
-            // outer guard). If the exact target run has settled, or the
-            // target has refused insertion for over 60s (e.g. a long-lived
-            // maintenance run), hand the input to the ordinary queue: the
-            // gateway queues it behind whatever currently holds the session
-            // instead of parking it in bridge-side limbo forever. Unknown
-            // receipts never enter this branch and are never replayed.
-            const boundSince=Number.isFinite(item.boundSince)?item.boundSince:Date.now();
-            item.boundSince=boundSince;
-            if(originalRunEnded || Date.now()-boundSince>60_000) state='ordinary';
+          } else {
+            // A definitive SDK no-effect receipt is replay authority ONLY with
+            // fresh matching public followup proof + local owner/batch CAS.
+            // Root end or elapsed time alone does not prove safe admission.
+            const live=activity || await this.openclawClient.getSessionDispatchStatus?.(item.sessionKey).catch(()=>null);
+            if(!stillCurrent())continue;
+            const source=this.store.getMessageByMessageId(item.messageId);
+            const proof=live && status && source && source.id===item.rowId && source.chatId===chatId && source.senderType==='human' && source.triggerKind==='normal'
+              ? this.observedFollowupGuard(chatId,status,live,item.noEffectRunId) : undefined;
+            const sameOwner=this.queueOwners.get(chatId)===owner && owner?.batch===batchAtCheck && owner?.runId===runAtCheck;
+            if(proof && proof.sessionId===item.sessionId && sameOwner) {
+              const previous=item.followupAdmissionGuard;
+              if(previous && (previous.sessionKey!==proof.sessionKey || previous.sessionId!==proof.sessionId))state='target_changed';
+              else {
+                item.followupAdmissionGuard=previous ? {...previous,nonInjectableRunId:item.noEffectRunId} : proof;
+                item.followupObservedAt=previous ? item.followupObservedAt : Date.now();
+                if(previous && Number.isFinite(item.followupObservedAt) && Date.now()-item.followupObservedAt>=60_000) {
+                  state='ordinary';
+                  if(owner?.runId===item.expectedRunId)this.forceExpireQueueOwner(chatId,'definitive no-effect input; guarded queued followup, result custody retained');
+                } else state='pending';
+              }
+            } else {
+              state='pending';
+              if(Date.now()-item.noEffectSince>=60_000)this.explainUnconfirmedFollowup(chatId,item);
+            }
           }
         }
         if(state==='target_ended') state='rejected'; // prior explicit backend refusal; never silently move it to a successor
@@ -1609,9 +1774,11 @@ export class FeishuBot {
         // every insertion spams the chat. Use real elapsed time from the first
         // unknown observation, not query count, and commit one reminder intent.
         const unknownChecks = state === 'unknown' ? (Number(item.unknownChecks) || 0) + 1 : 0;
-        const record={...item,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks,
+        const record={...item,pendingSince:state==='pending' ? (item.pendingSince || Date.now()) : undefined,
+          ordinaryEligible:receipt.ordinaryEligible,attempted:valid ? (receipt.attempted??true) : true,sessionId:item.sessionId,reason:receipt.reason,unknownChecks,
           unknownSince:state==='unknown' ? (item.state==='unknown' && Number.isFinite(item.unknownSince) ? item.unknownSince : Date.now()) : undefined};
         this.store.saveInsertion(this.config.name,chatId,item.rowId,item.insertionId,state,record,Date.now()+(state==='unknown'?15_000:5000));
+        if(state==='pending' && !record.attempted && Date.now()-(record.pendingSince || Date.now())>=60_000)this.explainUnconfirmedFollowup(chatId,record);
         if(state==='ordinary') {
           this.store.deletePendingInsertionNotices(this.config.name,chatId,item.insertionId);
           void this.enqueueAndDispatchDelivery(chatId,'insertion_status',`insertion:${item.insertionId}:ordinary`,
@@ -1805,6 +1972,7 @@ export class FeishuBot {
         this.admittedSteerAcks.delete(chatId);
         this.queueRunTokens.delete(chatId);
         if(this.queueOwners.get(chatId)===owner) this.queueOwners.delete(chatId);
+        if(owner.continuePending)void this.processQueue(chatId,true).catch(()=>{});
       }
     });
     this.queueRuns.set(chatId, run);
@@ -1812,11 +1980,10 @@ export class FeishuBot {
   }
 
   /**
-   * Force-release a stuck queue owner after the gateway authoritatively
-   * reported the session idle (no active run). The zombie owner's deep waits
-   * can otherwise hold chat custody forever: completion events routed through
-   * the proactive path are invisible to them. Steer-fallback triggers are
-   * restored via the failure observers so their input drains normally.
+   * Retire only the local queue scheduler after positive idle, trusted yield,
+   * or bounded guarded-followup proof. Never stop Gateway execution or infer
+   * a terminal outcome. Exact result recovery/target custody remains durable;
+   * attempted-unknown and accepted insertion records never enter replay.
    */
   private forceExpireQueueOwner(chatId: string, reason: string,preserveDispatch=false): boolean {
     const owner = this.queueRuns.get(chatId);
@@ -1825,7 +1992,7 @@ export class FeishuBot {
     if(context?.batchId && !preserveDispatch)this.store.clearDispatchCustody(this.config.name,chatId,context.id,context.batchId);
     if(context) context.revoked=true;
     this.busyChats.set(chatId,0);
-    console.warn(`[${this.config.name}] force-expiring zombie queue owner for ${chatId.slice(-8)}: ${reason}`);
+    console.warn(`[${this.config.name}] retiring local queue scheduler for ${chatId.slice(-8)}: ${reason}`);
     // Fence the stale batch's local observation BEFORE releasing custody: an
     // alive old poller would keep destructively consuming the replacement
     // batch's frames from the shared session bucket (2026-10-16 regression).
@@ -1845,7 +2012,10 @@ export class FeishuBot {
     while (current()) {
       const batchToken={};
       owner.batch=batchToken;
+      const admissionEpoch=(this.queueAdmissionEpoch.get(chatId)||0)+1;
+      this.queueAdmissionEpoch.set(chatId,admissionEpoch);
       owner.batchId=randomUUID();
+      const batchId=owner.batchId;
       owner.triggerIds=undefined;
       owner.runId=undefined;
       owner.admitted=false;owner.collecting=false;owner.observationDetached=false;owner.yielded=false;owner.sessionId=undefined;
@@ -1878,6 +2048,7 @@ export class FeishuBot {
       // pass-through requests that must not receive catch-up context.
       const firstPending = pendingHumanTriggers[0];
       const firstIsNative = firstPending.triggerKind === "native_command";
+      const batchProof=this.store.getInsertion(this.config.name,chatId,firstPending.id!)?.followupAdmissionGuard as FollowupAdmissionGuard|undefined;
       let mergedTriggers: typeof pendingHumanTriggers;
       if (firstIsNative) {
         // One native command at a time.
@@ -1887,6 +2058,8 @@ export class FeishuBot {
         mergedTriggers = [];
         for (const m of pendingHumanTriggers) {
           if (m.triggerKind === "native_command") break;
+          const proof=this.store.getInsertion(this.config.name,chatId,m.id!)?.followupAdmissionGuard;
+          if(JSON.stringify(proof)!==JSON.stringify(batchProof))break;
           mergedTriggers.push(m);
         }
       }
@@ -1897,7 +2070,7 @@ export class FeishuBot {
       // not clog the queue forever).
       const originalMergedTriggers = mergedTriggers;
       const droppedMergedTriggers: typeof pendingHumanTriggers = [];
-      if (!firstIsNative) {
+      if (!firstIsNative && !batchProof) {
         const selected: typeof pendingHumanTriggers = [];
         let bytes = 0;
         for (let i = originalMergedTriggers.length - 1; i >= 0; i--) {
@@ -2019,6 +2192,14 @@ export class FeishuBot {
         if(!current()) break;
         await liveStatus?.pauseForUnconfirmedResult(this.isEn(chatId) ? "Session setup failed before admission" : "会话准备失败，尚未提交 Gateway",
           this.isEn(chatId) ? `${this.config.name} setup unavailable` : `${this.config.name} 会话准备未完成`).catch(()=>{});
+        if(batchProof) {
+          for(const id of mergedTriggerIds) {
+            const item=this.store.getInsertion(this.config.name,chatId,id);
+            if(item?.state==='ordinary' && !item.attempted)this.store.saveInsertion(this.config.name,chatId,id,item.insertionId,'target_changed',
+              {...item,reason:'guarded followup session setup failed before effect; input retained'});
+          }
+          break;
+        }
         // Model policy/capability failures happen before chat.send. Clear the
         // busy marker, report the actionable error, and retire only this batch
         // so the chat cannot remain wedged indefinitely.
@@ -2051,6 +2232,7 @@ export class FeishuBot {
       let initialPresentationRunId: string | undefined;
       const foregroundSessionId = this.store.getActiveGoJob(this.config.name,chatId)?.executorSessionId;
       let runAcceptedByOpenClaw = false;
+      let guardedSubmissionId:string|undefined;
       try {
         const releaseActiveDeliveryTarget = lastHuman.messageId ? this.setActiveDeliveryTarget(chatId, triggerId, lastHuman.messageId) : () => {};
         let reply: string;
@@ -2087,6 +2269,19 @@ export class FeishuBot {
             timeoutMs: FOREGROUND_WAIT_MS,
             includeContext: !isNativeCommandTrigger,
             includeBridgeAttachmentHint: !isNativeCommandTrigger,
+            followupAdmissionGuard:batchProof,
+            admissionGuard:()=>{
+              guard();
+              if(owner.batch!==batchToken || owner.batchId!==batchId || this.queueAdmissionEpoch.get(chatId)!==admissionEpoch)throw new SupersededObservation('batch admission epoch changed');
+              if(!batchProof)return;
+              for(const id of mergedTriggerIds) {
+                const row=this.store.getInsertion(this.config.name,chatId,id);
+                if(!row || row.ordinaryEligible===false || row.stopEpoch!==owner.stopEpoch || JSON.stringify(row.followupAdmissionGuard)!==JSON.stringify(batchProof) ||
+                  !['ordinary','unknown'].includes(row.state) ||
+                  batchProof.nonInjectableRunId && row.noEffectRunId!==batchProof.nonInjectableRunId ||
+                  (guardedSubmissionId ? row.admissionSubmissionId!==guardedSubmissionId : row.attempted===true))throw new SupersededObservation('followup batch/admission CAS changed');
+              }
+            },
             onSendAttempt: (submissionId:string) => {
               guard();
               this.presentation(()=>this.queuedPresentations.attempted(liveStatus,submissionId,owner.id,owner.batchId!));
@@ -2097,7 +2292,14 @@ export class FeishuBot {
               // At-most-once: as soon as we begin issuing chat.send, do not let
               // this batch auto-replay. If the RPC response is lost after
               // OpenClaw accepts it, retrying would duplicate the same message.
-              markSubmittedBatch("send-attempt");
+              if(batchProof) {
+                guardedSubmissionId=submissionId;
+                for(const id of mergedTriggerIds) {
+                  const row=this.store.getInsertion(this.config.name,chatId,id);
+                  this.store.saveInsertion(this.config.name,chatId,id,row.insertionId,'unknown',
+                    {...row,attempted:true,admissionSubmissionId:submissionId,reason:'original guarded followup submission only; no new-ID replay'});
+                }
+              } else markSubmittedBatch("send-attempt");
             },
             onRunIdentified: (runId:string,identity?:{sessionId?:string})=>{guard();owner.runId=runId;owner.sessionId=identity?.sessionId || owner.sessionId;foregroundRunId=runId;},
             onSubmitted: async (runId: string) => {
@@ -2125,6 +2327,10 @@ export class FeishuBot {
               // a runId. markSubmittedBatch is idempotent due to local flags and
               // INSERT OR IGNORE in message_sync.
               markSubmittedBatch(`submitted:${runId}`);
+              if(batchProof)for(const id of mergedTriggerIds) {
+                const row=this.store.getInsertion(this.config.name,chatId,id);
+                this.store.saveInsertion(this.config.name,chatId,id,row.insertionId,'ordinary',{...row,attempted:true,admittedRunId:runId});
+              }
             },
             onProgress: (event) => current() && runAcceptedByOpenClaw && !!initialPresentationRunId && owner.runId === initialPresentationRunId ? liveStatus?.progress(event) : undefined,
             onCollectionStarted:runId=>{guard();if(owner.runId===runId)owner.collecting=true;},
@@ -2372,6 +2578,20 @@ export class FeishuBot {
           console.log(`[${this.config.name}] batch observation superseded for ${chatId.slice(-8)}; ending quietly`);
           break;
         }
+        if(err instanceof FollowupAdmissionRefused && batchProof) {
+          // onSendAttempt is only an uncertainty fence, not acceptance/sync.
+          // Named pre-effect refusal parks ONLY this new batch, visibly. Never
+          // restore accepted originals, and never migrate to a different leaf.
+          for(const id of mergedTriggerIds) {
+            const row=this.store.getInsertion(this.config.name,chatId,id);
+            if(row && !row.admittedRunId)this.store.saveInsertion(this.config.name,chatId,id,row.insertionId,'target_changed',
+              {...row,attempted:false,reason:err.message});
+          }
+          await this.enqueueAndDispatchDelivery(chatId,'admission_status',`admission:${err.submissionId}:refused`,err.message,[],lastHuman.messageId,`admission:${err.submissionId}:refused`).catch(()=>{});
+          await liveStatus?.pauseForUnconfirmedResult(err.message).catch(()=>{});
+          owner.continuePending=true; // independently proved newer cohorts may still be sent
+          break;
+        }
         if(err instanceof AdmissionUnconfirmed) {
           await this.enqueueAndDispatchDelivery(chatId,'admission_status',`admission:${err.submissionId}:unknown`,err.message,[],lastHuman.messageId,`admission:${err.submissionId}:unknown`).catch(()=>{});
           await liveStatus?.pauseForUnconfirmedResult(err.message).catch(()=>{});
@@ -2425,6 +2645,15 @@ export class FeishuBot {
           // without being forced through /reset.
           await liveStatus?.fail().catch(() => {});
           console.warn(`[${this.config.name}] processQueue stopped because session became unhealthy: ${err.status}`);
+          break;
+        }
+        if(batchProof && !runAcceptedByOpenClaw) {
+          for(const id of mergedTriggerIds) {
+            const row=this.store.getInsertion(this.config.name,chatId,id);
+            if(row && !row.admissionSubmissionId && !row.admittedRunId)this.store.saveInsertion(this.config.name,chatId,id,row.insertionId,'target_changed',
+              {...row,attempted:false,reason:'guarded pre-admission failure; input retained without sync or new-ID retry'});
+          }
+          await liveStatus?.pauseForUnconfirmedResult('Guarded admission unavailable; input custody retained without replay').catch(()=>{});
           break;
         }
         console.error(`[${this.config.name}] processQueue error:`, safeErrorSummary(err));
