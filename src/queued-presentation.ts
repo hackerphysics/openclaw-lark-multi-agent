@@ -388,7 +388,10 @@ export class QueuedPresentations {
       if (!current || !eligible(current) || current.lease !== entry.record.lease) continue;
       const ids = JSON.stringify(current.triggerIds);
       const preservePayload = !!current.cardId && evidence.platformMessageIds.includes(current.cardId);
-      const retry = current.view?.state === "replied";
+      // Desired persistence may itself have failed while the controller became
+      // terminal. A sealed, unrendered, clear-effect obligation permits only
+      // the controller's own no-flight/no-unknown retry, not business replay.
+      const retry = !!current.linkedReply && !current.linkedReply.rendered && !Object.keys(current.editEffects || {}).length;
       const attempts = (current.linkedReply?.attempts || 0) + 1;
       this.save({...current, linkedReply: {runId, outboxId: evidence.outboxId, deliveredAt: evidence.deliveredAt, attempts,
         retryAfter: Date.now() + Math.min(15 * 60_000, 60_000 * 2 ** Math.min(attempts - 1, 4)),
@@ -400,6 +403,9 @@ export class QueuedPresentations {
           fresh.stopEpoch !== this.store.getStopGeneration(this.bot, chat) || JSON.stringify(fresh.triggerIds) !== ids ||
           fresh.linkedReply?.outboxId !== evidence.outboxId || proof?.outboxId !== evidence.outboxId) return;
         await entry.live.linkedReplyDelivered(evidence.deliveredAt, preservePayload, retry);
+      }).catch(() => {
+        // Own rejection immediately: a later synchronous cohort read can fail
+        // before this method reaches allSettled. UI outages must not crash LMA.
       }).finally(() => { if (this.replyFlights.get(current.id) === flight) this.replyFlights.delete(current.id); });
       this.replyFlights.set(current.id, flight);
       flights.push(flight);

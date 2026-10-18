@@ -144,6 +144,43 @@ describe('platform-linked reply closes only the legacy insertion presentation', 
     expect(h.bot.patchLiveStatusCard.mock.calls.length).toBe(edits + 1);
     expect(h.create).toHaveBeenCalledTimes(1); assertBusinessUnchanged(b.row);
   });
+  it('combined desired and pre-effect write outage retries a sealed UI obligation without restarting', async () => {
+    const b = await acceptedInput();
+    const save = h.store.savePresentation.bind(h.store); let block = true;
+    vi.spyOn(h.store, 'savePresentation').mockImplementation((bot: any, app: any, chat: any, id: any, record: any) => {
+      if (block && (record.view?.state === 'replied' || Object.values(record.editEffects || {}).includes('attempted')))
+        throw Object.assign(new Error('desired and pre-effect outage'), { code: 'SQLITE_BUSY' });
+      return save(bot, app, chat, id, record);
+    });
+    const edits = h.bot.patchLiveStatusCard.mock.calls.length;
+    await publish();
+    expect(rows()[0].view.state).toBe('queued');
+    expect(rows()[0].linkedReply.rendered).toBeUndefined();
+    expect(h.bot.patchLiveStatusCard.mock.calls.length).toBe(edits);
+    block = false; await tick(70_000); await h.bot.reconcileInsertions('chat'); await tick(200);
+    expect(rows()[0].linkedReply.rendered).toBe('summary');
+    expect(h.bot.patchLiveStatusCard.mock.calls.length).toBe(edits + 1);
+    expect(h.create).toHaveBeenCalledTimes(1); assertBusinessUnchanged(b.row);
+  });
+  it('a later cohort staging read outage owns earlier flight rejections without an unhandled process error', async () => {
+    const one = await acceptedInput('B1');
+    const first = rows()[0];
+    h.store.savePresentation('Bot', 'offline-app', 'chat', first.id, { ...first, submissionId: 'sealed-first-cohort' });
+    const two = await acceptedInput('B2'); await storedReply();
+    const get = h.store.getPresentation.bind(h.store); let outage = false;
+    const probe = vi.spyOn(h.store, 'getPresentation').mockImplementation((bot: any, app: any, chat: any, id: any) => {
+      if (id === two.card.id) outage = true;
+      if (outage) throw Object.assign(new Error('later staging and earlier flight read outage'), { code: 'SQLITE_BUSY' });
+      return get(bot, app, chat, id);
+    });
+    await expect(manager().reconcileDeliveredReply('chat', ROOT)).rejects.toThrow('read outage');
+    await Promise.resolve(); await Promise.resolve(); await Promise.resolve();
+    probe.mockRestore(); await tick(100);
+    // Vitest additionally fails the test run if the earlier flight escapes as
+    // an unhandled rejection, even when the parent rejection was caught.
+    expect(manager().replyFlights.size).toBe(0);
+    assertBusinessUnchanged(one.row); assertBusinessUnchanged(two.row);
+  });
   it('a crash after desired replied checkpoint but before SDK invocation can retry that known card after reopen', async () => {
     const b = await acceptedInput(); await tick(10_000); await storedReply();
     const proof = h.store.getDeliveredRunReply('Bot', 'offline-app', 'chat', ROOT, 0)!;
