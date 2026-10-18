@@ -1236,6 +1236,11 @@ export class MessageStore {
     return row?.id || (this.db.prepare('SELECT message_row_id FROM platform_message_aliases WHERE message_id=?').get(messageId) as any)?.message_row_id || null;
   }
 
+  getMessageByRowId(rowId: number): ChatMessage | null {
+    const row = this.db.prepare('SELECT message_id FROM messages WHERE id = ?').get(rowId) as {message_id: string} | undefined;
+    return row ? this.getMessageByMessageId(row.message_id) : null;
+  }
+
   getMessageByMessageId(messageId: string): ChatMessage | null {
     const row = this.db.prepare(`SELECT * FROM messages WHERE message_id = ?`).get(messageId) as any;
     if (!row) return null;

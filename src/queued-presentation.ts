@@ -11,7 +11,7 @@ type Presentation = {
   createToken?: string; submissionId?: string; ordinaryTriggerIds?: number[]; enqueueAcceptedIds?: number[]; expectedInsertionRoot?: string; acceptedIds?: number[]; insertionRoot?: string; cardId?: string; create: "never" | "attempted" | "accepted" | "unknown" | "rejected";
   editEffects?: Record<string, "attempted" | "unknown">;
   /** Seals UI cohort only; not input acceptance/commit/result custody. */
-  linkedReply?: { runId: string; outboxId: number; deliveredAt: number; rendered?: "summary" | "reply_payload"; retryAfter?: number; attempts?: number };
+  linkedReply?: { runId: string; outboxId: number; deliveredAt: number; relatedOutboxIds?: number[]; rendered?: "summary" | "reply_payload"; retryAfter?: number; attempts?: number };
   view?: LiveStatusView; retired?: boolean;
 };
 type Entry = { record: Presentation; live: LiveStatusController };
@@ -362,47 +362,62 @@ export class QueuedPresentations {
     const epoch = this.store.getStopGeneration(this.bot, chat);
     const evidence = this.store.getDeliveredRunReply(this.bot, this.app, chat, runId, epoch);
     if (!evidence) return;
-    const eligible = (row: Presentation): boolean => {
+    const witnesses = (row: Presentation, preserveSealedPayload = false): typeof evidence[] | undefined => {
       const retry = row.view?.state === "replied" && !!row.linkedReply && !row.linkedReply.rendered &&
         row.create === "accepted" && !!row.cardId && !Object.keys(row.editEffects || {}).length;
-      if ((!this.usable(row) && !retry) || row.retired || row.stopEpoch !== epoch || row.linkedReply?.rendered ||
-        evidence.createdAt < row.startedAt || (row.expectedInsertionRoot !== runId && row.runId !== runId)) return false;
-      const ordinary = row.runId === runId && !!row.ownerId && !!row.batchId ? row.ordinaryTriggerIds || [] : [];
+      const preserved = preserveSealedPayload && row.linkedReply?.rendered === 'reply_payload';
+      if ((!this.usable(row) && !retry && !preserved) || row.retired || row.stopEpoch !== epoch || row.linkedReply?.rendered && !preserved ||
+        evidence.createdAt < row.startedAt || (row.expectedInsertionRoot !== runId && row.runId !== runId)) return;
+      const ordinary = row.runId && row.ownerId && row.batchId ? row.ordinaryTriggerIds || [] : [];
       const extra = row.triggerIds.filter(id => !ordinary.includes(id));
-      return extra.length > 0 && extra.every(id => {
+      if (!extra.length) return;
+      const proofs: typeof evidence[] = [];
+      for (const id of row.triggerIds) {
+        const input = this.store.getMessageByRowId(id);
         const item = this.store.getInsertion(this.bot, chat, id);
-        const input = item?.messageId ? this.store.getMessageByMessageId(item.messageId) : undefined;
-        return row.enqueueAcceptedIds?.includes(id) && item?.state === 'accepted' && item.stopEpoch === epoch &&
-          item.expectedRunId === runId && (!evidence.sessionId || item.sessionId === evidence.sessionId) &&
-          input?.id === id && input.chatId === chat && input.senderType === 'human' && input.timestamp <= evidence.createdAt;
-      });
+        const isOrdinary = ordinary.includes(id);
+        if (isOrdinary ? item && (item.state !== 'ordinary' || item.stopEpoch !== epoch) :
+          !row.enqueueAcceptedIds?.includes(id) || item?.state !== 'accepted' || item.stopEpoch !== epoch) return;
+        if (!isOrdinary && !item.sessionId) return;
+        const root = isOrdinary ? row.runId : item.expectedRunId;
+        const proof = root ? this.store.getDeliveredRunReply(this.bot, this.app, chat, root, epoch) : undefined;
+        if (!proof || input?.id !== id || input.chatId !== chat || input.senderType !== 'human' || input.timestamp > proof.createdAt ||
+          item && (item.messageId !== input.messageId || proof.sessionId && item.sessionId && item.sessionId !== proof.sessionId)) return;
+        proofs.push(proof);
+      }
+      return proofs;
     };
     const flights: Promise<void>[] = [];
     // There is no await in this staging loop: seal every currently eligible
     // cohort before the first SDK effect can allow new ingress to interleave.
     for (const snapshot of this.records(chat)) {
       const row = this.latest(snapshot);
-      if (!row || !eligible(row) || this.replyFlights.has(row.id) || (row.linkedReply?.retryAfter || 0) > Date.now()) continue;
+      if (!row || !witnesses(row) || this.replyFlights.has(row.id) || (row.linkedReply?.retryAfter || 0) > Date.now()) continue;
       const entry = this.hydrate(row);
       const current = this.latest(entry.record);
-      if (!current || !eligible(current) || current.lease !== entry.record.lease) continue;
+      const proofs = current && witnesses(current);
+      if (!current || !proofs || current.lease !== entry.record.lease) continue;
+      const latestProof = proofs.reduce((a, b) => a.deliveredAt >= b.deliveredAt ? a : b);
+      const proofIds = [...new Set(proofs.map(proof => proof.outboxId))].sort((a,b) => a-b);
       const ids = JSON.stringify(current.triggerIds);
-      const preservePayload = !!current.cardId && evidence.platformMessageIds.includes(current.cardId);
+      const preservePayload = !!current.cardId && proofs.some(proof => proof.platformMessageIds.includes(current.cardId!));
       // Desired persistence may itself have failed while the controller became
       // terminal. A sealed, unrendered, clear-effect obligation permits only
       // the controller's own no-flight/no-unknown retry, not business replay.
       const retry = !!current.linkedReply && !current.linkedReply.rendered && !Object.keys(current.editEffects || {}).length;
       const attempts = (current.linkedReply?.attempts || 0) + 1;
-      this.save({...current, linkedReply: {runId, outboxId: evidence.outboxId, deliveredAt: evidence.deliveredAt, attempts,
+      this.save({...current, linkedReply: {runId: latestProof.runId, outboxId: latestProof.outboxId, deliveredAt: latestProof.deliveredAt,
+        relatedOutboxIds: proofIds, attempts,
         retryAfter: Date.now() + Math.min(15 * 60_000, 60_000 * 2 ** Math.min(attempts - 1, 4)),
         ...(preservePayload ? {rendered: "reply_payload" as const} : {})}});
       const flight = Promise.resolve().then(async () => {
         const fresh = this.latest(entry.record);
-        const proof = this.store.getDeliveredRunReply(this.bot, this.app, chat, runId, epoch);
+        const freshProofs = fresh && witnesses(fresh, preservePayload);
         if (this.disposed || !fresh || fresh.retired || fresh.lease !== entry.record.lease ||
           fresh.stopEpoch !== this.store.getStopGeneration(this.bot, chat) || JSON.stringify(fresh.triggerIds) !== ids ||
-          fresh.linkedReply?.outboxId !== evidence.outboxId || proof?.outboxId !== evidence.outboxId) return;
-        await entry.live.linkedReplyDelivered(evidence.deliveredAt, preservePayload, retry);
+          fresh.linkedReply?.outboxId !== latestProof.outboxId || !freshProofs ||
+          JSON.stringify([...new Set(freshProofs.map(proof => proof.outboxId))].sort((a,b) => a-b)) !== JSON.stringify(proofIds)) return;
+        await entry.live.linkedReplyDelivered(latestProof.deliveredAt, preservePayload, retry);
       }).catch(() => {
         // Own rejection immediately: a later synchronous cohort read can fail
         // before this method reaches allSettled. UI outages must not crash LMA.

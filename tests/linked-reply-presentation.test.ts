@@ -62,7 +62,7 @@ async function publish(root = ROOT, text = 'OK') {
   await tick(200);
 }
 async function storedReply(root = ROOT) {
-  return h.bot.enqueueAndDispatchDelivery('chat', 'assistant_visible', 'stored-reply', 'OK', [], undefined, 'proactive:stored-reply', undefined,
+  return h.bot.enqueueAndDispatchDelivery('chat', 'assistant_visible', `stored-reply-${root}`, 'OK', [], undefined, `proactive:stored-reply-${root}`, undefined,
     { sessionKey: h.key, sessionId: 'generation-1', runId: root, final: true });
 }
 
@@ -246,6 +246,61 @@ describe('platform-linked reply closes only the legacy insertion presentation', 
     const before = h.bot.patchLiveStatusCard.mock.calls.length;
     await publish();
     expect(rows()[0].view.state).toBe('replied');
+    expect(h.bot.patchLiveStatusCard.mock.calls.length).toBe(before);
+    assertBusinessUnchanged(b.row);
+  });
+});
+
+describe('historical old-version card reused by a newer ordinary run', () => {
+  async function mixed(withOldReply = true) {
+    // Reproduce a cohort persisted by 1.8.16: the new implementation must not
+    // repair B before the historical later-C reuse has been constructed.
+    const recovery = vi.spyOn(manager(), 'reconcileDeliveredReply').mockResolvedValue(undefined);
+    const b = await acceptedInput();
+    await tick(b.start + 42_000 - Date.now());
+    if (withOldReply) await storedReply();
+    await tick(60_000);
+    const c = h.store.insert({chatId:'chat',messageId:'new-C',senderType:'human',senderName:'fixture-user',content:'new ordinary question',timestamp:Date.now()});
+    manager().receive('chat',c,'new-C');
+    h.store.saveInsertion('Bot','chat',c,'ordinary-C','ordinary',{messageId:'new-C',expectedRunId:'',admittedRunId:'new-ordinary-root',sessionId:'generation-1',stopEpoch:0,attempted:true});
+    const live=manager().claim('chat',[c],'owner-C','batch-C');
+    manager().attempted(live,'new-ordinary-root','owner-C','batch-C');
+    await manager().admit(live,'new-ordinary-root','owner-C','batch-C');
+    recovery.mockRestore();
+    expect(rows()).toHaveLength(1);
+    expect(rows()[0].triggerIds).toEqual([b.row,c]);
+    return {...b,c};
+  }
+  it('closes only after BOTH old insertion-linked reply and newer ordinary reply have platform receipts',async()=>{
+    const b=await mixed();
+    await manager().reconcileDeliveredReply('chat',ROOT);await tick(100);
+    expect(rows()[0].view.state).not.toBe('replied');
+    await tick(3000);await storedReply('new-ordinary-root');
+    const at=Date.now();await manager().reconcileDeliveredReply('chat',ROOT);await tick(100);
+    expect(rows()[0]).toMatchObject({cardId:b.card.cardId,view:{state:'replied'},linkedReply:{runId:'new-ordinary-root',relatedOutboxIds:[1,2],rendered:'summary'}});
+    const seconds=Math.floor((at-b.start)/1000);
+    expect(rows()[0].view.elapsed).toBe(`${Math.floor(seconds/60)}:${String(seconds%60).padStart(2,'0')}`);
+    expect(h.bot.replyLiveStatusCard).toHaveBeenCalledTimes(1);
+    expect(h.create).toHaveBeenCalledTimes(2);assertBusinessUnchanged(b.row);
+  });
+  it('a newer ordinary root reply cannot substitute for the missing old insertion-linked reply',async()=>{
+    const b=await mixed(false);await storedReply('new-ordinary-root');
+    await manager().reconcileDeliveredReply('chat','new-ordinary-root');await tick(100);
+    expect(rows()[0].view.state).not.toBe('replied');assertBusinessUnchanged(b.row);
+  });
+  it('an older delivered insertion-linked reply cannot finish the newer ordinary run without its actual reply',async()=>{
+    const b=await mixed();
+    await manager().reconcileDeliveredReply('chat',ROOT);await tick(100);
+    expect(rows()[0].view.state).not.toBe('replied');
+    expect(rows()[0].linkedReply).toBeUndefined();assertBusinessUnchanged(b.row);
+  });
+  it('preserves the newer business answer when either verified reply uses the shared card',async()=>{
+    const b=await mixed();
+    h.create.mockResolvedValue({code:0,data:{message_id:b.card.cardId,chat_id:'chat'}});
+    await storedReply('new-ordinary-root');
+    const before=h.bot.patchLiveStatusCard.mock.calls.length;
+    await manager().reconcileDeliveredReply('chat',ROOT);await tick(100);
+    expect(rows()[0].linkedReply.rendered).toBe('reply_payload');
     expect(h.bot.patchLiveStatusCard.mock.calls.length).toBe(before);
     assertBusinessUnchanged(b.row);
   });
