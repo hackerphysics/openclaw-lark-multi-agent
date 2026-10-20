@@ -796,3 +796,33 @@ describe("recovered ingress context is not queue-owner lifetime authority",()=>{
   expect(h.store.getPendingTriggerIds("GPT",GROUP).has(b)).toBe(false);
  });
 });
+
+describe("shared service timers do not retain an ingress ALS owner",()=>{
+ it.each(["insertions","delivery","notices"])("%s recovery timer runs outside a recalled ingress context",async kind=>{
+  const h=fixture();let seen:any="not-called";let finish!:()=>void;
+  const observed=new Promise<void>(resolve=>{finish=resolve;});
+  const observe=async()=>{seen=h.bot.identityEffects.getStore()?.item.messageId;finish();};
+  const item={messageId:"recalled-A",chatId:GROUP,stopEpoch:0,target:{state:"bound",sessionKey:h.bot.getSessionKey(GROUP),sessionId:"identity-generation"}};
+  if(kind==="insertions"){
+   const row=h.store.insert({chatId:GROUP,messageId:"valid-B",senderType:"human",senderName:"fixture-user",content:"B",timestamp:Date.now()});
+   h.store.saveInsertion("GPT",GROUP,row,"B-custody","pending",{messageId:"valid-B",stopEpoch:0,expectedRunId:"B-run",attempted:false});
+   h.bot.reconcileInsertions=vi.fn(observe);h.bot.reconcileReactions=vi.fn(async()=>{});
+  }else if(kind==="delivery")h.bot.dispatchPendingDeliveries=vi.fn(observe);
+  else{vi.spyOn(h.store,"listPendingErrorNotices").mockReturnValue([{nextCheckAt:Date.now()+1000}] as any);h.bot.reconcileErrorNotices=vi.fn(observe);}
+  try{
+   h.bot.identityEffects.run({item,epoch:0},()=>{
+    if(kind==="insertions")h.bot.scheduleInsertionRecovery();
+    else if(kind==="delivery")h.bot.scheduleDeliveryRetry(GROUP,1);
+    else h.bot.scheduleErrorNoticeCheck(GROUP);
+   });
+   h.store.markMessageRecalled("recalled-A",GROUP);
+   // Real Node timers are required: fake timer callbacks run in their driver's
+   // context and would incorrectly pass even before the production fix.
+   await observed;await tick();expect(seen).toBeUndefined();
+  }finally{
+   if(h.bot.insertionTimer)clearTimeout(h.bot.insertionTimer);
+   for(const timer of h.bot.deliveryRetryTimers.values())clearTimeout(timer);
+   for(const timer of h.bot.errorNoticeTimers.values())clearTimeout(timer);
+  }
+ });
+});

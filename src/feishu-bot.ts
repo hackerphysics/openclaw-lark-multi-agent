@@ -1915,6 +1915,9 @@ export class FeishuBot {
     this.scheduleInsertionRecovery();
   }
   private async reconcileReactions(chatId:string):Promise<void> {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.reconcileReactions(chatId));
+    if (this.identityClosed) return;
     if(this.reactionChecks.has(chatId))return;
     this.reactionChecks.add(chatId);
     try {
@@ -1952,6 +1955,9 @@ export class FeishuBot {
   private insertionTimer?: ReturnType<typeof setTimeout>;
   private insertionChecks=new Set<string>();
   private scheduleInsertionRecovery(): void {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.scheduleInsertionRecovery());
+    if (this.identityClosed) return;
     if(this.insertionTimer || (!this.store.listInsertions(this.config.name).length && !this.store.listReactionIntents(this.config.name).length)) return;
     this.insertionTimer=setTimeout(()=>{
       this.insertionTimer=undefined;
@@ -1961,6 +1967,9 @@ export class FeishuBot {
     this.insertionTimer.unref?.();
   }
   private async reconcileInsertions(chatId:string): Promise<void> {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.reconcileInsertions(chatId));
+    if (this.identityClosed) return;
     if(this.insertionChecks.has(chatId)) return;
     this.insertionChecks.add(chatId);
     try {
@@ -2248,7 +2257,7 @@ export class FeishuBot {
     // A queue owner spans several independent inputs. Never inherit one
     // recovered ingress's ALS guard for later batches or delayed result sends;
     // retained inputs carry their own durable target/recall/epoch guards below.
-    if (this.identityEffects.getStore()) return this.identityEffects.exit(() => this.processQueue(chatId, activityChecked));
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.processQueue(chatId, activityChecked));
     const existing = this.queueRuns.get(chatId);
     if (existing) {
       console.log(`[${this.config.name}] processQueue already running for ${chatId.slice(-8)}, joining existing run`);
@@ -3867,6 +3876,9 @@ export class FeishuBot {
   }
 
   private scheduleErrorNoticeCheck(chatId: string): void {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.scheduleErrorNoticeCheck(chatId));
+    if (this.identityClosed) return;
     const previous = this.errorNoticeTimers.get(chatId);
     if (previous) clearTimeout(previous);
     this.errorNoticeTimers.delete(chatId);
@@ -3882,6 +3894,9 @@ export class FeishuBot {
 
   /** Bounded read-only diagnosis; known live tasks retain low-frequency observation. */
   private async reconcileErrorNotices(chatId: string): Promise<void> {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.reconcileErrorNotices(chatId));
+    if (this.identityClosed) return;
     const running = this.errorNoticeChecks.get(chatId);
     if (running) return running;
     const work = async () => {
@@ -3928,6 +3943,9 @@ export class FeishuBot {
   }
 
   private scheduleDeliveryRetry(chatId: string, attempt: number,local=false): void {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.scheduleDeliveryRetry(chatId, attempt, local));
+    if (this.identityClosed) return;
     if (this.deliveryRetryTimers.has(chatId)) return;
     const delay = Math.min(local ? 300_000 : 30_000, DELIVERY_RETRY_BASE_MS * Math.max(1, 2 ** Math.min(16,Math.max(0, attempt - 1))));
     const timer = setTimeout(() => {
@@ -4018,6 +4036,9 @@ export class FeishuBot {
   }
 
   private async dispatchPendingDeliveries(chatId: string, replyToMessageId?: string): Promise<void> {
+    // Shared durable owner, not the lifetime of the ingress that woke it.
+    if (this.identityEffects?.getStore()) return this.identityEffects.exit(() => this.dispatchPendingDeliveries(chatId, replyToMessageId));
+    if (this.identityClosed) return;
     this.installGoReceiptCapture();
     for(const id of this.localDeliveryRetryCustody.get(chatId) || []) {
       try {this.store.deferLocalDelivery(id,'local_store_unavailable');this.localDeliveryRetryCustody.get(chatId)?.delete(id);}

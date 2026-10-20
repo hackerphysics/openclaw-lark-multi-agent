@@ -118,7 +118,7 @@ The public tree uses synthetic same-shape app/open/chat/message IDs instead of
 private incident identifiers. A parent regression additionally checks durable
 physical-session custody *before* terminal output when a legacy admission ACK
 omits sessionId; the identified-run observation now preserves resultSessionId.
-This adds one identity case: final release gate is 91 identity cases / 1886 total,
+This adds one identity case: final release gate is 94 identity cases / 1889 total,
 with exact-lock Node 24 and Node 26 validation recorded separately by the parent.
 The intermediate 1883 count above is retained as historical author evidence.
 
@@ -128,3 +128,10 @@ input-specific ALS at processQueue entry while retaining explicit per-batch
 durable target, recall and epoch guards. Real-queue known/recovered controls
 recall only input A and require independent queued B to submit exactly once;
 the recovered variant failed before the fix and both controls pass afterward.
+
+The same isolation applies to shared insertion/reaction, error-notice and outbox
+recovery roots/timers. These components keep their own durable per-record fences,
+not the recalled ingress that originally woke a service timer. Three real-Node-
+timer controls failed before this extension and pass afterward. Fake timers alone
+would have falsely passed because their driver invokes callbacks outside the
+original Node async resource; they are not used for these three ALS assertions.
