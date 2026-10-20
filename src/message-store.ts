@@ -1,4 +1,4 @@
-import { errorIdentity, type ErrorProvenance, type ErrorVerdict } from "./terminal-errors.js";
+import { closedStopReason, errorNoticeIdentity, errorIdentity, type ErrorProvenance, type ErrorVerdict } from "./terminal-errors.js";
 import Database from "better-sqlite3";
 import { resolve } from "path";
 import { mkdirSync } from "fs";
@@ -13,8 +13,10 @@ export interface ChatInfo {
   members: string;
   /** Comma-separated member names */
   memberNames: string;
-  /** Which bot owns this chat (for p2p isolation) */
+  /** Display label of the p2p owner; not a durable identity once pinned. */
   ownerBot: string;
+  /** Stable application identity of the p2p owner. Empty on legacy rows. */
+  ownerAppId?: string;
   /** Legacy chat-level free discussion flag; per-bot mode is authoritative. */
   freeDiscussion: boolean;
   verbose: boolean;
@@ -859,7 +861,7 @@ export class MessageStore {
   }
 
   observeRunError(botName: string, chatId: string, provenance: ErrorProvenance): PendingErrorNotice {
-    const noticeId = errorIdentity(provenance.sessionKey, provenance.runId);
+    const noticeId = errorNoticeIdentity(provenance);
     const previous = this.getErrorNotice(botName, chatId, noticeId);
     if (previous) {
       if (provenance.userStop) {
@@ -870,8 +872,8 @@ export class MessageStore {
       }
       // A committed transcript abort is weaker than a gateway terminal error.
       // One stronger envelope can wake a parked observation; repeats cannot.
-      const terminalChat = (p: ErrorProvenance) => p.source === "chat" && (p.state === "error" || (p.state === "final" && p.stopReason === "error"));
-      if (!provenance.userStop && !previous.provenance.userStop && terminalChat(provenance) && !terminalChat(previous.provenance)
+      const terminalChat = (p: ErrorProvenance) => p.source === "chat" && (p.state === "error" || p.state==='aborted' && !!closedStopReason(p.stopReason) || (p.state === "final" && p.stopReason === "error"));
+      if (!provenance.userStop && !previous.provenance.userStop && terminalChat(provenance) && (!terminalChat(previous.provenance) || !!closedStopReason(provenance.stopReason) && !closedStopReason(previous.provenance.stopReason))
           && ["pending", "parked"].includes(previous.status)) {
         previous.provenance = provenance;
         previous.status = "pending";
@@ -935,8 +937,36 @@ export class MessageStore {
       AND json_extract(delivery_meta_json,'$.provenance.final')=1
       AND json_extract(delivery_meta_json,'$.provenance.sessionKey')=?
       AND json_extract(delivery_meta_json,'$.provenance.runId')=?
+      AND (? IS NULL OR json_extract(delivery_meta_json,'$.botIdentity')=?)
+      AND (? IS NULL OR json_extract(delivery_meta_json,'$.deliveryStopEpoch')=?)
+      AND (? IS NULL OR json_extract(delivery_meta_json,'$.provenance.sessionId') IS NULL OR json_extract(delivery_meta_json,'$.provenance.sessionId')=?)
       AND ${confirmed ? "status='delivered'" : "status IN ('pending','delivering')"} LIMIT 1`)
-      .get(botName, chatId, p.sessionKey, p.runId));
+      .get(botName, chatId, p.sessionKey, p.runId,p.sessionId ? p.botIdentity ?? null : null,p.sessionId ? p.botIdentity ?? null : null,p.sessionId ? p.stopEpoch ?? null : null,p.sessionId ? p.stopEpoch ?? null : null,p.sessionId ?? null,p.sessionId ?? null));
+  }
+
+  /** Compatibility is exact provenance/legacy key + original app/epoch, never
+   * text similarity. Existing attempted/unknown/delivered rows retain custody;
+   * this lookup neither requeues nor edits historical deliveries. */
+  findRunErrorOwner(bot: string, chat: string, p: ErrorProvenance): DeliveryOutboxItem | undefined {
+    const target=this.getDeliveryRunTarget(bot,chat,p.runId);
+    const oldKey=`run-error:${errorIdentity(p.sessionKey,p.runId)}`;
+    const triggerKey=target?.triggerId ? `trigger:${target.triggerId}:provider-error` : '';
+    const rows=this.db.prepare(`SELECT * FROM delivery_outbox WHERE bot_name=? AND chat_id=?
+      AND source_type IN ('run_error','provider_error') AND (delivery_key IN (?,?,?) OR
+        json_extract(CASE WHEN json_valid(delivery_meta_json) THEN delivery_meta_json ELSE '{}' END,'$.provenance.runId')=?) ORDER BY id LIMIT 100`)
+      .all(bot,chat,oldKey,triggerKey,`run-error:${errorNoticeIdentity(p)}`,p.runId) as any[];
+    for(const row of rows) {
+      let meta:any;try{meta=JSON.parse(row.delivery_meta_json);}catch{continue;}
+      if(p.botIdentity && meta.botIdentity!==p.botIdentity || p.stopEpoch!==undefined && meta.deliveryStopEpoch!==p.stopEpoch)continue;
+      const q=meta.provenance;
+      if(q?.runId && q.runId!==p.runId || q?.sessionKey && q.sessionKey!==p.sessionKey)continue;
+      if(p.sessionId && q?.sessionId && q.sessionId!==p.sessionId)continue;
+      const exact=q?.runId===p.runId && q.sessionKey===p.sessionKey;
+      const legacy=row.delivery_key===oldKey || row.delivery_key===triggerKey && target?.sessionKey===p.sessionKey &&
+        (p.stopEpoch===undefined || target.stopGeneration===p.stopEpoch) && (!p.sessionId || !target.sessionId || target.sessionId===p.sessionId);
+      if(exact || legacy)return this.mapDelivery(row);
+    }
+    return undefined;
   }
 
   renewUnsentErrorDelivery(id: number, content: string, contentHash: string, metadata: string): void {
@@ -1015,6 +1045,18 @@ export class MessageStore {
         bot_name TEXT NOT NULL,
         message_id TEXT NOT NULL,
         PRIMARY KEY (bot_name, message_id)
+      );
+
+      -- Private ingress dedup only: neither table grants chat ownership or
+      -- changes name-scoped sessions, sync, triggers, delivery or group routing.
+      CREATE TABLE IF NOT EXISTS p2p_processed_events (
+        app_id TEXT NOT NULL, chat_id TEXT NOT NULL, message_id TEXT NOT NULL,
+        PRIMARY KEY (app_id, chat_id, message_id)
+      );
+      CREATE TABLE IF NOT EXISTS p2p_owner_aliases (
+        app_id TEXT NOT NULL, chat_id TEXT NOT NULL, bot_name TEXT NOT NULL,
+        proof TEXT NOT NULL CHECK(proof IN ('pinned_owner','verified_migration')),
+        PRIMARY KEY (app_id, chat_id, bot_name)
       );
 
       -- Tracks recalled human messages. Recalled messages are kept in the raw
@@ -1269,6 +1311,14 @@ export class MessageStore {
     } catch {
       // Column already exists
     }
+
+    // Additive only: never infer ownership from a retired display name. Legacy
+    // rows are pinned lazily only when their existing owner label still matches.
+    this.db.transaction(() => {
+      if (!(this.db.prepare('PRAGMA table_info(chat_info)').all() as any[]).some(row => row.name === 'owner_app_id')) {
+        this.db.exec(`ALTER TABLE chat_info ADD COLUMN owner_app_id TEXT NOT NULL DEFAULT ''`);
+      }
+    }).immediate();
 
     // Migration: add trigger_kind column if missing
     try {
@@ -1874,10 +1924,80 @@ export class MessageStore {
 
   // --- Chat info ---
 
+  /** Authorize the already app-specific SDK's private chat. The first event
+   * pins a new chat; a matching legacy label may be backfilled. Thereafter only
+   * the exact application pin authorizes access, including across bot renames.
+   * Existing unowned/mismatched/malformed rows fail closed, not first-claim wins.
+   * This operation changes no history, sync, pending input or delivery state. */
+  claimP2pOwner(chatId: string, botName: string, appId: string): boolean {
+    if (!chatId || !botName?.trim() || !this.validOwnerAppId(appId)) return false;
+    return this.db.transaction(() => {
+      const row = this.db.prepare('SELECT chat_type,owner_bot,owner_app_id FROM chat_info WHERE chat_id=?').get(chatId) as any;
+      if (!row) {
+        this.db.prepare(`INSERT INTO chat_info(chat_id,chat_type,chat_name,owner_bot,owner_app_id,updated_at)
+          VALUES(?,'p2p','私聊',?,?,?)`).run(chatId, botName, appId, Date.now());
+        this.rememberP2pOwnerAlias(chatId, appId, botName, 'pinned_owner');
+        return true;
+      }
+      if (row.chat_type !== 'p2p') return false;
+      if (row.owner_app_id === '') {
+        if (row.owner_bot !== botName) return false;
+        const pinned = this.db.prepare(`UPDATE chat_info SET owner_app_id=? WHERE chat_id=? AND chat_type='p2p' AND owner_bot=? AND owner_app_id=''`)
+          .run(appId, chatId, botName).changes === 1;
+        if (pinned) this.rememberP2pOwnerAlias(chatId, appId, botName, 'pinned_owner');
+        return pinned;
+      }
+      if (!this.validOwnerAppId(row.owner_app_id) || row.owner_app_id !== appId) return false;
+      // Preserve the proven previous scope BEFORE replacing the readable label.
+      this.rememberP2pOwnerAlias(chatId, appId, row.owner_bot, 'pinned_owner');
+      if (row.owner_bot !== botName) {
+        const renamed = this.db.prepare(`UPDATE chat_info SET owner_bot=? WHERE chat_id=? AND chat_type='p2p' AND owner_app_id=?`)
+          .run(botName, chatId, appId).changes === 1;
+        if (renamed) this.rememberP2pOwnerAlias(chatId, appId, botName, 'pinned_owner');
+        return renamed;
+      }
+      return true;
+    }).immediate();
+  }
+
+  /** Operator-only CAS after independently verifying the original account.
+   * No runtime caller: a retired legacy label alone cannot prove app ownership.
+   * Idempotent for the exact destination, refuses any conflicting existing pin.
+   * Preserves cache metadata/timestamps and every business/history table.
+   * verifiedPreviousOwnerBot is an explicit independently verified old scope
+   * when an earlier operator repair already replaced the legacy cache label. */
+  migrateLegacyP2pOwner(chatId: string, expectedOwnerBot: string, botName: string, appId: string, verifiedPreviousOwnerBot?: string): boolean {
+    if (!chatId || !expectedOwnerBot?.trim() || !botName?.trim() || !this.validOwnerAppId(appId)
+      || (verifiedPreviousOwnerBot !== undefined && !verifiedPreviousOwnerBot.trim())) return false;
+    return this.db.transaction(() => {
+      const migrated = this.db.prepare(`UPDATE chat_info SET owner_bot=?,owner_app_id=?
+        WHERE chat_id=? AND chat_type='p2p' AND owner_bot=? AND owner_app_id=''`)
+        .run(botName, appId, chatId, expectedOwnerBot).changes === 1;
+      const row = this.db.prepare('SELECT chat_type,owner_bot,owner_app_id FROM chat_info WHERE chat_id=?').get(chatId) as any;
+      if (row?.chat_type !== 'p2p' || row.owner_bot !== botName || row.owner_app_id !== appId) return false;
+      if (migrated) this.rememberP2pOwnerAlias(chatId, appId, expectedOwnerBot, 'verified_migration');
+      this.rememberP2pOwnerAlias(chatId, appId, botName, 'pinned_owner');
+      if (verifiedPreviousOwnerBot !== undefined) this.rememberP2pOwnerAlias(chatId, appId, verifiedPreviousOwnerBot, 'verified_migration');
+      return true;
+    }).immediate();
+  }
+
+  private rememberP2pOwnerAlias(chatId: string, appId: string, botName: unknown, proof: 'pinned_owner' | 'verified_migration'): void {
+    if (typeof botName !== 'string' || !botName.trim()) return;
+    this.db.prepare('INSERT OR IGNORE INTO p2p_owner_aliases(app_id,chat_id,bot_name,proof) VALUES(?,?,?,?)')
+      .run(appId, chatId, botName, proof);
+  }
+
+  private validOwnerAppId(value: unknown): value is string {
+    // Exact, opaque identity, not a display name. Do not normalize malformed
+    // pins into either a valid identity or the empty legacy sentinel.
+    return typeof value === 'string' && /^[A-Za-z0-9_-]+$/.test(value);
+  }
+
   upsertChatInfo(info: ChatInfo): void {
     this.db.prepare(`
-      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, discuss, discuss_max_rounds, chairman_bot, locale, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO chat_info (chat_id, chat_type, chat_name, members, member_names, verbose, free_discussion, owner_bot, owner_app_id, discuss, discuss_max_rounds, chairman_bot, locale, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (chat_id) DO UPDATE SET
         chat_type = excluded.chat_type,
         chat_name = excluded.chat_name,
@@ -1885,13 +2005,13 @@ export class MessageStore {
         member_names = excluded.member_names,
         verbose = excluded.verbose,
         free_discussion = excluded.free_discussion,
-        owner_bot = CASE WHEN excluded.owner_bot != '' THEN excluded.owner_bot ELSE chat_info.owner_bot END,
+        owner_bot = CASE WHEN chat_info.chat_type = 'p2p' THEN chat_info.owner_bot WHEN excluded.owner_bot != '' THEN excluded.owner_bot ELSE chat_info.owner_bot END,
         discuss = CASE WHEN excluded.discuss != 0 THEN excluded.discuss ELSE chat_info.discuss END,
         discuss_max_rounds = CASE WHEN excluded.discuss_max_rounds != 10 THEN excluded.discuss_max_rounds ELSE chat_info.discuss_max_rounds END,
         chairman_bot = CASE WHEN excluded.chairman_bot != '' THEN excluded.chairman_bot ELSE chat_info.chairman_bot END,
         locale = CASE WHEN excluded.locale != '' THEN excluded.locale ELSE chat_info.locale END,
         updated_at = excluded.updated_at
-    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.discuss ? 1 : 0, info.discussMaxRounds || 10, info.chairmanBot || '', info.locale || '', info.updatedAt);
+    `).run(info.chatId, info.chatType, info.chatName, info.members, info.memberNames, info.verbose ? 1 : 0, info.freeDiscussion ? 1 : 0, info.ownerBot || '', info.ownerAppId ?? '', info.discuss ? 1 : 0, info.discussMaxRounds || 10, info.chairmanBot || '', info.locale || '', info.updatedAt);
   }
 
   setFreeDiscussion(chatId: string, on: boolean): void {
@@ -2033,6 +2153,7 @@ export class MessageStore {
       members: row.members,
       memberNames: row.member_names,
       ownerBot: row.owner_bot || '',
+      ownerAppId: row.owner_app_id,
       freeDiscussion: !!row.free_discussion,
       verbose: !!row.verbose,
       discuss: !!row.discuss,
@@ -2052,6 +2173,7 @@ export class MessageStore {
       members: r.members,
       memberNames: r.member_names,
       ownerBot: r.owner_bot || '',
+      ownerAppId: r.owner_app_id,
       freeDiscussion: !!r.free_discussion,
       verbose: !!r.verbose,
       discuss: !!r.discuss,
@@ -2096,6 +2218,30 @@ export class MessageStore {
   tryMarkBotProcessed(botName: string, messageId: string): boolean {
     const result = this.db.prepare(`INSERT OR IGNORE INTO processed_events (bot_name, message_id) VALUES (?, ?)`).run(botName, messageId);
     return result.changes === 1;
+  }
+
+  /** Private-only monotonic ingress fence. Write even for an owner-rejected
+   * event: a rejected input is a tombstone, never permission to retry after a
+   * rename. Legacy name tombstones are consulted ONLY in a pinned/explicitly
+   * verified owner scope (plus the existing current-name fence), never inferred
+   * from message history or mentions. Each duplicate promotes only its own ID;
+   * no historical name ledger is copied or renamed. Ownership is checked later. */
+  tryMarkP2pProcessed(appId: string, chatId: string, botName: string, messageId: string): boolean {
+    if (!this.validOwnerAppId(appId) || !chatId || !botName?.trim() || !messageId) return false;
+    return this.db.transaction(() => {
+      const owner = this.db.prepare('SELECT chat_type,owner_bot,owner_app_id FROM chat_info WHERE chat_id=?').get(chatId) as any;
+      if (owner?.chat_type === 'p2p' && owner.owner_app_id === appId) {
+        // Intake dedup runs before metadata refresh/startup can replace a label.
+        this.rememberP2pOwnerAlias(chatId, appId, owner.owner_bot, 'pinned_owner');
+      }
+      const legacyDuplicate = !!this.db.prepare(`SELECT 1 FROM p2p_owner_aliases a
+        JOIN processed_events p ON p.bot_name=a.bot_name
+        WHERE a.app_id=? AND a.chat_id=? AND p.message_id=? LIMIT 1`).get(appId, chatId, messageId);
+      const freshApp = this.db.prepare('INSERT OR IGNORE INTO p2p_processed_events(app_id,chat_id,message_id) VALUES(?,?,?)')
+        .run(appId, chatId, messageId).changes === 1;
+      const freshName = this.tryMarkBotProcessed(botName, messageId);
+      return freshApp && freshName && !legacyDuplicate;
+    }).immediate();
   }
 
   // --- Go / Go-Checker supervision (DESIGN.md §10) ---

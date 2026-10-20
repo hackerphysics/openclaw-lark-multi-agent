@@ -4,12 +4,25 @@ import { safeErrorSummary } from "./provider-errors.js";
 /** Only gateway envelopes / committed assistant metadata populate this record. */
 export interface ErrorProvenance {
   sessionKey: string;
+  sessionId?: string;
+  botIdentity?: string;
+  stopEpoch?: number;
   runId: string;
   source: "chat" | "session.message";
   state: string;
   stopReason?: string;
   detail?: string;
   userStop?: boolean;
+}
+export type ClosedStopReason = 'timeout' | 'restart' | 'superseded' | 'aborted' | 'error' | 'stop' | 'rpc';
+export const closedStopReason = (value: unknown): ClosedStopReason | undefined =>
+  typeof value === 'string' && ['timeout','restart','superseded','aborted','error','stop','rpc'].includes(value) ? value as ClosedStopReason : undefined;
+/** Carries original public terminal metadata, never model/prompt-derived cause. */
+export class RunTerminalError extends Error {
+  constructor(readonly provenance: ErrorProvenance) {
+    super(`Agent error: ${provenance.detail || provenance.stopReason || 'aborted'}`);
+    this.name = 'RunTerminalError';
+  }
 }
 export interface ProactiveMessageMeta {
   /** Bridge-local Go result owner; never derived from an untrusted model body. */
@@ -42,11 +55,15 @@ export interface ErrorVerdict {
   reason: string;
   task?: TaskEvidence;
   terminalKey?: string;
+  stopReason?: ClosedStopReason;
   text?: string;
 }
 export type ReadRPC = (method: string, params: Record<string, unknown>, timeoutMs: number) => Promise<any>;
 export const errorIdentity = (sessionKey: string, runId: string) =>
   createHash("sha256").update(JSON.stringify([sessionKey, runId])).digest("hex");
+export const errorNoticeIdentity = (p: ErrorProvenance) => p.sessionId && p.botIdentity && Number.isSafeInteger(p.stopEpoch)
+  ? errorIdentity(JSON.stringify([p.sessionKey,p.sessionId,p.botIdentity,p.stopEpoch]),p.runId)
+  : errorIdentity(p.sessionKey,p.runId);
 export const genericFailure = (text: string) => text.trim() === "The agent run failed before producing a reply.";
 
 // These are candidate locators, NOT business identities. Verify every component
@@ -81,10 +98,14 @@ export async function inspectError(p: ErrorProvenance, rpc: ReadRPC): Promise<Er
   const announce = p.runId.startsWith("announce:");
   if (!p.runId) return pending("missing_run_identity");
   if (!announce) {
+    if (p.source === 'chat' && p.state === 'aborted' && closedStopReason(p.stopReason)) return {
+      state:'terminal',reason:'closed_gateway_terminal',terminalKey:`run-error:${errorNoticeIdentity(p)}`,
+      text:'⚠️ 该次运行已终止，未能完成回复。',
+    };
     // Ordinary chat.error is a gateway terminal envelope (after gateway retry
     // grace). Do not rewrite normal collector/auth/parameter/tool-error handling.
     if (p.source === "chat" && (p.state === "error" || (p.state === "final" && p.stopReason === "error"))) return {
-      state: "terminal", reason: "ordinary_gateway_error", terminalKey: `run-error:${errorIdentity(p.sessionKey, p.runId)}`,
+      state: "terminal", reason: "ordinary_gateway_error", terminalKey: `run-error:${errorNoticeIdentity(p)}`,
       text: `⚠️ Agent run failed${p.detail ? `: ${safeErrorSummary(p.detail)}` : ""}`,
     };
     try {
@@ -93,9 +114,11 @@ export async function inspectError(p: ErrorProvenance, rpc: ReadRPC): Promise<Er
       const started = wait?.startedAt;
       const terminalTime = typeof ended === "number" && Number.isFinite(ended) && ended > 0
         && (started === undefined || (typeof started === "number" && Number.isFinite(started) && started >= 0 && ended >= started));
-      if (wait?.runId === p.runId && wait?.status === "error" && wait?.pendingError !== true
+      if (wait?.runId === p.runId && (wait?.status === "error" || wait?.status === 'timeout') && wait?.pendingError !== true
+        && !['queue','gateway_draining'].includes(wait?.timeoutPhase) && (!p.sessionId || !wait.sessionId || wait.sessionId===p.sessionId)
         && wait?.yielded !== true && terminalTime) return {
-        state: "terminal", reason: "exact_run_terminal_error", terminalKey: `run-error:${errorIdentity(p.sessionKey, p.runId)}`,
+        state: "terminal", reason: "exact_run_terminal_error", terminalKey: `run-error:${errorNoticeIdentity(p)}`,
+        stopReason:closedStopReason(wait.stopReason) || (wait.status==='timeout' ? 'timeout' : undefined),
         text: "⚠️ 该次运行已终止，未能完成回复。",
       };
       return pending("wait_not_terminal_failure");

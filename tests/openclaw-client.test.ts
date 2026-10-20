@@ -149,7 +149,9 @@ describe("OpenClawClient collectReply", () => {
     });
 
     const replyPromise = (client as any).collectReply("chat-run", 2000, "s1");
-    const rejection = expect(replyPromise).rejects.toThrow(/等待 Agent 运行结果超时.*10 分钟.*provider.*可能仍在继续/);
+    // 2026-10-20: endedAt + exact terminal timeout is not a paused
+    // collector. Preserve closed metadata; never promise the run may continue.
+    const rejection = expect(replyPromise).rejects.toMatchObject({name:'RunTerminalError',provenance:{runId:'chat-run',stopReason:'timeout',state:'error'}});
     events.get(key)!.push({ runId: "chat-run", sessionKey: key, stream: "chatError", data: { error: "chat error" } });
     await vi.advanceTimersByTimeAsync(400);
 

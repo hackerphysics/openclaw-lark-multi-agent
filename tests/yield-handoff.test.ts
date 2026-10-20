@@ -202,7 +202,9 @@ describe("Gateway-confirmed yield foreground handoff", () => {
     const run = await start();
     chat({ state: "aborted", yielded: true, errorMessage: "Aborted" });
     agent("lifecycle", { phase: "error", error: "Aborted", yielded: true });
-    await vi.advanceTimersByTimeAsync(100);
+    // 2026-10-20: allow the bounded same-run cause reconciliation window;
+    // a yielded field on an abort still cannot authorize a yield handoff.
+    await vi.advanceTimersByTimeAsync(500);
     expect((await run.result).error?.message).toContain("Aborted"); expect(notice).not.toHaveBeenCalled();
   });
 

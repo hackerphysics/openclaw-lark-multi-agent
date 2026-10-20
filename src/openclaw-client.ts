@@ -1,7 +1,7 @@
 import type { GoExecutorResult } from "./go-execution.js";
 import WebSocket from "ws";
 import { safeErrorSummary, rawErrorExcerpt } from "./provider-errors.js";
-import { inspectError, genericFailure, announceCandidate, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
+import { RunTerminalError, closedStopReason, inspectError, genericFailure, announceCandidate, type ErrorProvenance, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { SessionWaitPaused, normalizeSessionRuntimeStatus, isWaitTimeout, FOREGROUND_WAIT_MS, IDLE_GUARD_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { createHash, randomUUID } from "crypto";
 import { mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
@@ -99,6 +99,9 @@ const EVENT_PROGRESS_BUCKET_BYTES = 256 * 1024;
 const EVENT_PROGRESS_TOTAL_BYTES = 4 * 1024 * 1024;
 const EVENT_PROGRESS_FIELD_CHARS = 2048;
 const MAX_INLINE_CONTEXT_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_INLINE_CONTEXT_BYTES || 128 * 1024);
+
+const reasonPriority=(r:unknown)=>r==='superseded'||r==='restart'?4:r==='timeout'?3:r==='error'||r==='aborted'?2:closedStopReason(r)?1:0;
+const terminalReason=(...values:unknown[])=>values.map(closedStopReason).sort((a,b)=>reasonPriority(b)-reasonPriority(a)).find(Boolean);
 
 type PendingReq = {
   resolve: (data: any) => void;
@@ -241,7 +244,7 @@ export class OpenClawClient {
           if(['error','timeout'].includes(snapshot.status)) {
             // endedAt + exact run is terminal evidence; bare query timeouts never get here.
             await callback?.(String(snapshot.error || snapshot.status),{sourceType:'run_error',sessionKey:item.sessionKey,runId:item.runId,
-              error:{sessionKey:item.sessionKey,runId:item.runId,source:'chat',state:'error',detail:String(snapshot.error || snapshot.status)}});
+              error:{sessionKey:item.sessionKey,sessionId:item.sessionId,runId:item.runId,source:'chat',state:'error',stopReason:closedStopReason(snapshot.stopReason) || (snapshot.status==='timeout'?'timeout':undefined),detail:String(snapshot.error || snapshot.status)}});
             this.recoveryStore.settleExactRunReactions(item.sessionKey,item.runId);
             this.recoveryStore.finishRunObservation(item.sessionKey,item.runId);
             await this.sessionSettlementCallbacks.get(this.canonicalSessionKey(item.sessionKey))?.({sessionKey:item.sessionKey,runId:item.runId,sessionId:item.sessionId,final:true});
@@ -305,12 +308,12 @@ export class OpenClawClient {
    * payload. Keep only the fields collectReply actually consumes here. */
   private projectBufferedEvent(event:any):any {
     const data=event.data || {},clip=(value:any)=>typeof value==='string'?value.slice(0,EVENT_PROGRESS_FIELD_CHARS):value;
-    const out:any={runId:event.runId,sessionKey:event.sessionKey,stream:event.stream,seq:event.seq,data:{}};
+    const out:any={runId:event.runId,sessionKey:event.sessionKey,sessionId:event.sessionId,stream:event.stream,seq:event.seq,data:{}};
     if(event.stream==='chatFinal') {
       out.data={text:data.gatewayYielded===true?'':typeof data.text==='string'?data.text:'',gatewayYielded:data.gatewayYielded===true};
       return out; // Entire authority, not a preview; no duplicated message body.
     }
-    if(event.stream==='chatError'){out.data={error:data.error};return out;}
+    if(event.stream==='chatError'){out.data={error:data.error,state:data.state,stopReason:closedStopReason(data.stopReason)};return out;}
     const keep=event.stream==='lifecycle'
       ?['phase','livenessState','status','stopReason','replayInvalid','aborted',...(data.phase==='error'?['error']:[])]
       :event.stream==='tool' || event.stream==='item'
@@ -548,7 +551,7 @@ export class OpenClawClient {
                 // Never infer it from tool names, arguments or raw tool output.
                 data: { text: textParts.join("\n"), gatewayYielded: frame.payload?.yielded === true },
               });
-            } else if (state === "error") {
+            } else if (state === "error" || state === "aborted") {
               // A chat-level error (e.g. "Request timed out before a response")
               // must NOT be silently dropped — otherwise mid-run delta text gets
               // surfaced as if it were a normal reply and the run neither errors
@@ -556,7 +559,8 @@ export class OpenClawClient {
               this.bufferEvent(sk,{
                 ...frame.payload,
                 stream: "chatError",
-                data: { error: frame.payload?.errorMessage || frame.payload?.error || "chat error" },
+                data: { error: frame.payload?.errorMessage || frame.payload?.error || (state === 'aborted' ? 'aborted' : 'chat error'),
+                  state, stopReason: terminalReason(frame.payload?.stopReason,frame.payload?.message?.stopReason) },
               });
             }
           } else {
@@ -1067,13 +1071,13 @@ export class OpenClawClient {
     // structured content arrays rather than a plain string. Extract only visible
     // text parts and ignore thinking/tool blocks so the bridge can deliver final
     // cron results via the bot.
-    if (msg?.role === "assistant" && ["error", "aborted"].includes(msg?.stopReason)) {
+    if (msg?.role === "assistant" && ["error", "aborted", "timeout", "restart", "superseded"].includes(msg?.stopReason)) {
       if (this.mutedProactiveSessions.has(rawKey) || this.mutedProactiveSessions.has(shortKey)) return false;
       if (runId && this.ownedDeliveryRuns.has(runId)) return false;
       return this.emitProactiveForSession(rawKey, String(msg.errorMessage || "Agent run failed"), {
         sourceType: "run_error", runId,
         error: { sessionKey: this.canonicalSessionKey(rawKey), runId: runId || "", source: "session.message",
-          state: "final", stopReason: msg.stopReason, detail: String(msg.errorMessage || ""),
+          state: "final", sessionId, stopReason: closedStopReason(msg.stopReason), detail: String(msg.errorMessage || ""),
           ...(this.isExplicitlyStoppedRun(rawKey, runId) ? { userStop: true } : {}) },
       });
     }
@@ -1162,6 +1166,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       // root's recorded terminal state (all tools settled, no error, no async
       // pending) before anything resolves.
       let terminatingReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+      let terminalHint: ErrorProvenance | undefined;
       let pendingRuntimeFailureText = "";
       let lastActivitySummary = "";
       let lastActivityAt = 0;
@@ -1216,13 +1221,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // first and fence that stale cut; a fresh exact query may still fail.
           collectEvents();
           if(!idleStillCurrent() || idleGeneration!==decisionGeneration)return;
-          if (observationClosed || snapshot?.runId !== runId || snapshot?.pendingError === true
+          if (observationClosed || snapshot?.runId !== runId || options?.expectedSessionId && snapshot?.sessionId && snapshot.sessionId!==options.expectedSessionId || snapshot?.pendingError === true
             || snapshot?.yielded === true || snapshot?.timeoutPhase === "queue" || snapshot?.timeoutPhase === "gateway_draining") return;
           // A bare wait timeout is not an execution timeout. Require a recorded
           // terminal time; never infer failure from stopReason or replay flags.
           const ended = snapshot.endedAt;
           if (typeof ended !== "number" || !Number.isFinite(ended) || ended <= 0
-            || (typeof snapshot.startedAt === "number" && ended < snapshot.startedAt)) return;
+            || (snapshot.startedAt !== undefined && (typeof snapshot.startedAt !== 'number' || !Number.isFinite(snapshot.startedAt) || snapshot.startedAt<0 || ended < snapshot.startedAt))) return;
           if (snapshot.status === "ok" && snapshot.yielded !== true) {
             const terminal = snapshot.terminalReply;
             // B6 (2026-10-16 audit): disposition "empty" is an authoritative
@@ -1237,8 +1242,9 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             resolve(visible);
           } else if (snapshot.status === "error" || snapshot.status === "timeout") {
             if (observationClosed) return;
-            reject(new Error(`Agent error: ${typeof snapshot.error === "string" && snapshot.error.trim()
-              ? snapshot.error : `Gateway 已确认运行以 ${snapshot.status} 结束`}`));
+            reject(new RunTerminalError({sessionKey,sessionId:options?.expectedSessionId,runId,source:'chat',state:'error',
+              stopReason:closedStopReason(snapshot.stopReason) || (snapshot.status==='timeout' ? 'timeout' : undefined),
+              detail:typeof snapshot.error==='string' ? snapshot.error : undefined}));
           }
         } catch { /* Unavailable evidence means keep waiting, never abort/replay. */ }
         finally { checkingState = false; }
@@ -1394,6 +1400,63 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         resolve(finalText);
       };
 
+      // One bounded public exact-run reconciliation for generic aborts. A
+      // closed wire cause wins over generic later prose, never another run.
+      const deferTerminal = (ev: any, detail: string) => {
+        const reason = closedStopReason(ev.data?.stopReason);
+        const p: ErrorProvenance = {sessionKey,sessionId:options?.expectedSessionId || ev.sessionId,runId,
+          source:'chat',state:ev.data?.state==='aborted' || reason ? 'aborted' : 'error',stopReason:reason,detail};
+        if (!terminalHint || reasonPriority(reason)>reasonPriority(terminalHint.stopReason)) terminalHint=p;
+        if (genericChatErrorTimer) return;
+        const abortGeneration=idleGeneration;
+        genericChatErrorTimer=setTimeout(() => {
+          genericChatErrorTimer=null;
+          void (async () => {
+            collectEvents();
+            if(observationClosed)return;
+            if(!terminalHint?.stopReason && idleGeneration!==abortGeneration){terminalHint=undefined;return;}
+            if(chatFinalText.trim()){finish(chatFinalText);return;}
+            let candidate=terminalHint!;
+            if(!candidate.stopReason) {
+              try {
+                const snapshot=await this.rpc('agent.wait',{runId,timeoutMs:1},2000);
+                collectEvents();if(observationClosed)return;
+                if(options?.expectedSessionId && snapshot?.sessionId && snapshot.sessionId!==options.expectedSessionId)return;
+                if(chatFinalText.trim()){finish(chatFinalText);return;}
+                // The query sampled the provisional abort's old liveness cut.
+                // Drain first, then fence even a recorded terminal snapshot if
+                // verified same-run progress advanced while this read awaited.
+                if(!terminalHint?.stopReason && idleGeneration!==abortGeneration){terminalHint=undefined;return;}
+                if(terminalHint?.stopReason) candidate=terminalHint;
+                else if(snapshot?.runId===runId && !snapshot.pendingError && !snapshot.yielded &&
+                  !['queue','gateway_draining'].includes(snapshot.timeoutPhase) && Number.isFinite(snapshot.endedAt) && snapshot.endedAt>0 &&
+                  (snapshot.startedAt===undefined || typeof snapshot.startedAt==='number' && Number.isFinite(snapshot.startedAt) && snapshot.startedAt>=0 && snapshot.endedAt>=snapshot.startedAt)) {
+                  if(snapshot.status==='ok' && snapshot.terminalReply?.disposition==='visible' && typeof snapshot.terminalReply.text==='string') {finish(snapshot.terminalReply.text);return;}
+                  if(snapshot.status==='ok' && ['silent','empty'].includes(snapshot.terminalReply?.disposition)){finish('NO_REPLY');return;}
+                  if(!['error','timeout'].includes(snapshot.status))return;
+                  candidate={...candidate,state:'error',stopReason:closedStopReason(snapshot.stopReason) || (snapshot.status==='timeout'?'timeout':undefined),
+                    detail:typeof snapshot.error==='string'?snapshot.error:candidate.detail};
+                } else {
+                  if(snapshot?.pendingError || snapshot?.yielded || ['queue','gateway_draining'].includes(snapshot?.timeoutPhase)){terminalHint=undefined;return;}
+                  // A wait-only timeout adds NO terminal cause. The actual
+                  // abort/error envelope can still be reported as unknown.
+                  candidate={...candidate,state:'error',stopReason:undefined};
+                }
+              } catch { /* No cause proof: preserve the generic, unclassified diagnostic. */ }
+            }
+            // A rejected lookup crosses the same await boundary. It cannot
+            // revive a stale generic hint either; new wire final/closed metadata
+            // and explicit-stop receipts still outrank that provisional cut.
+            collectEvents();
+            if(observationClosed)return;
+            if(chatFinalText.trim()){finish(chatFinalText);return;}
+            if(!terminalHint?.stopReason && idleGeneration!==abortGeneration){terminalHint=undefined;return;}
+            if(terminalHint?.stopReason && reasonPriority(terminalHint.stopReason)>reasonPriority(candidate.stopReason))candidate=terminalHint;
+            if(this.isExplicitlyStoppedRun(sessionKey,runId)){finish('NO_REPLY');return;}
+            reject(new RunTerminalError(candidate));
+          })().catch(error=>{if(!observationClosed)reject(error);});
+        },350);
+      };
       const collectEvents = () => {
         if (observationClosed) return;
         // Gateway connection dropped mid-run (e.g. gateway restart): the run will
@@ -1428,7 +1491,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             // Non-destructive per-observer cursor: ACK and a replacement final
             // may be delivered synchronously before the awaiting sender resumes.
             // Leave every foreign/unidentified frame available to its own owner.
-            if(!matchesRun || sessionKey && !eventSessionMatches)continue;
+            if(!matchesRun || sessionKey && !eventSessionMatches || options?.expectedSessionId && ev.sessionId && ev.sessionId!==options.expectedSessionId)continue;
             seenEvents.add(ev);
             if (!sessionKey && ev.sessionKey) {
               shortSessionKey = String(ev.sessionKey).replace(/^agent:[^:]+:/, "");
@@ -1544,6 +1607,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             }
             if (ev.stream === "lifecycle" && ev.data?.phase === "error") {
               const errText = String(ev.data?.error || "unknown");
+              if(closedStopReason(ev.data?.stopReason) && ev.data.stopReason!=='error' || /^(?:agent run )?aborted$/i.test(errText.trim()) || terminalHint) {deferTerminal(ev,errText);continue;}
               // Some agent errors are recoverable: OpenClaw emits a lifecycle
               // error (e.g. "Context overflow: prompt too large") and then
               // auto-compacts and KEEPS RUNNING the same run, eventually emitting
@@ -1583,6 +1647,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
               // surfaces the failure / lets auto-retry kick in — instead of
               // surfacing whatever mid-run delta text happened to be collected.
               const errText = String(ev.data?.error || "chat error");
+              if(ev.data?.state==='aborted' || closedStopReason(ev.data?.stopReason) && ev.data.stopReason!=='error' || /^(?:agent run )?aborted$/i.test(errText.trim()) || terminalHint) {deferTerminal(ev,errText);continue;}
               if (this.isGenericChatError(errText)) {
                 // Gateway can emit a terminal chat error without errorMessage,
                 // then persist a richer terminal snapshot a moment later. Do
@@ -1592,17 +1657,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
                 if (!genericChatErrorTimer) {
                   genericChatErrorTimer = setTimeout(() => {
                     genericChatErrorTimer = null;
+                    if(terminalHint){deferTerminal({data:terminalHint},terminalHint.detail || 'aborted');return;}
                     const decisionGeneration=idleGeneration;
-                    void this.resolveTerminalChatError(evRunId || runId, targetSessionKey || sessionKey).then((detail) => {
+                    void this.resolveTerminalChatError(evRunId || runId, targetSessionKey || sessionKey, options?.expectedSessionId).then((detail) => {
                       collectEvents();
                       if (observationClosed || idleGeneration!==decisionGeneration) return;
                       if (chatFinalText.trim()) { finish(chatFinalText); return; }
+                      if(terminalHint){deferTerminal({data:terminalHint},terminalHint.detail || 'aborted');return;}
                       clearTimeout(idleTimer);
                       clearInterval(poller);
                       if (chatFinalTimer) clearTimeout(chatFinalTimer);
                       if (lifecycleEndTimer) clearTimeout(lifecycleEndTimer);
-                      reject(new Error(`Agent error: ${detail}`));
-                    }, error => { void handleTimeoutResult(error,()=>idleGeneration===decisionGeneration); });
+                      reject(detail);
+                    }, error => {
+                      if(terminalHint){deferTerminal({data:terminalHint},terminalHint.detail || 'aborted');return;}
+                      void handleTimeoutResult(error,()=>idleGeneration===decisionGeneration);
+                    });
                   }, 350);
                 }
                 continue;
@@ -1721,48 +1791,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return t === "chat error" || t === "agent error: chat error";
   }
 
-  private async resolveTerminalChatError(runId: string, sessionKey?: string): Promise<string> {
+  private async resolveTerminalChatError(runId: string, sessionKey?: string, expectedSessionId?:string): Promise<RunTerminalError> {
     try {
       const snapshot = await this.rpc("agent.wait", { runId, timeoutMs: 1500 }, 2500);
-      if(snapshot?.runId!==runId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError
-        || ['queue','gateway_draining'].includes(snapshot.timeoutPhase) || typeof snapshot.startedAt==='number' && snapshot.endedAt<snapshot.startedAt
+      if(snapshot?.runId!==runId || expectedSessionId && snapshot?.sessionId && snapshot.sessionId!==expectedSessionId || !Number.isFinite(snapshot.endedAt) || snapshot.endedAt<=0 || snapshot.yielded || snapshot.pendingError
+        || ['queue','gateway_draining'].includes(snapshot.timeoutPhase) || snapshot.startedAt!==undefined &&
+          (typeof snapshot.startedAt!=='number' || !Number.isFinite(snapshot.startedAt) || snapshot.startedAt<0 || snapshot.endedAt<snapshot.startedAt)
         || !['error','timeout'].includes(snapshot.status)) {
         throw new SessionWaitPaused(await this.getSessionRuntimeStatus(sessionKey || ''),true);
       }
-      return this.formatTerminalRunError(snapshot);
+      return new RunTerminalError({sessionKey:this.canonicalSessionKey(sessionKey || ''),sessionId:expectedSessionId || snapshot.sessionId,runId,source:'chat',state:'error',
+        stopReason:closedStopReason(snapshot.stopReason) || (snapshot.status==='timeout'?'timeout':undefined),detail:typeof snapshot.error==='string'?snapshot.error:undefined});
     } catch (err) {
       if (err instanceof SessionWaitPaused) throw err;
       // Failed read-only reconciliation is not the execution's failure.
       throw new SessionWaitPaused(normalizeSessionRuntimeStatus(undefined),true);
     }
-  }
-
-  private formatTerminalRunError(snapshot: any): string {
-    const rawError = typeof snapshot?.error === "string" ? snapshot.error.trim() : "";
-    const timeoutPhase = typeof snapshot?.timeoutPhase === "string" ? snapshot.timeoutPhase.trim() : "";
-    const stopReason = typeof snapshot?.stopReason === "string" ? snapshot.stopReason.trim() : "";
-    const status = typeof snapshot?.status === "string" ? snapshot.status.trim() : "";
-    const timedOut = status === "timeout" || Boolean(timeoutPhase) || /timed?\s*out|timeout/i.test(rawError);
-    if (timedOut) {
-      const startedAt = Number(snapshot?.startedAt);
-      const endedAt = Number(snapshot?.endedAt);
-      const elapsedSeconds = Number.isFinite(startedAt) && Number.isFinite(endedAt) && endedAt > startedAt
-        ? Math.round((endedAt - startedAt) / 1000)
-        : 0;
-      const elapsed = elapsedSeconds > 0 ? `（运行约 ${this.formatDurationSeconds(elapsedSeconds)}）` : "";
-      const phase = timeoutPhase ? `，阶段：${timeoutPhase}` : "";
-      return `等待 Agent 运行结果超时${elapsed}${phase}；底层运行可能仍在继续${rawError ? `；${rawError}` : ""}`;
-    }
-    if (rawError) return rawError;
-    if (stopReason === "stop" || stopReason === "rpc") return `Agent 被停止（${stopReason}）`;
-    const meta = [status && `状态=${status}`, stopReason && `原因=${stopReason}`, timeoutPhase && `阶段=${timeoutPhase}`].filter(Boolean).join("，");
-    return meta ? `OpenClaw 运行失败：${meta}` : "OpenClaw 运行失败，但未返回具体原因";
-  }
-
-  private formatDurationSeconds(seconds: number): string {
-    if (seconds % 3600 === 0) return `${seconds / 3600} 小时`;
-    if (seconds % 60 === 0) return `${seconds / 60} 分钟`;
-    return `${seconds} 秒`;
   }
 
   private isRecoverableAgentError(errText: string): boolean {
@@ -2404,17 +2448,16 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       return;
     }
     if(runId && this.isExplicitlyStoppedRun(sessionKey,runId) && state==='final') return;
-    const stopReason = [payload?.stopReason, payload?.message?.stopReason].find(reason => reason === "error" || reason === "aborted")
-      || payload?.stopReason || payload?.message?.stopReason;
-    const isError = state === "error" || state === "aborted" || stopReason === "error" || stopReason === "aborted";
+    const stopReason = terminalReason(payload?.stopReason,payload?.message?.stopReason);
+    const isError = state === "error" || state === "aborted" || ['error','aborted','timeout','restart','superseded'].includes(stopReason || '');
     if (isError) {
       const detail = String(payload?.errorMessage || payload?.message?.errorMessage || payload?.error || payload?.reason || "").trim();
       const aborted = state === "aborted" || stopReason === "aborted";
       const text = `⚠️ Agent run ${aborted ? "was aborted" : "failed"}${detail ? `: ${detail}` : ""}`;
       this.emitProactiveForSession(sessionKey, text, {
         sourceType: "run_error", runId,
-        error: { sessionKey: this.canonicalSessionKey(sessionKey), runId, source: "chat", state: state || "final",
-          ...(typeof stopReason === "string" ? { stopReason } : {}), detail,
+        error: { sessionKey: this.canonicalSessionKey(sessionKey), runId, source: "chat", state: state || "final", sessionId:typeof payload?.sessionId==='string'?payload.sessionId:undefined,
+          ...(closedStopReason(stopReason) ? { stopReason:closedStopReason(stopReason) } : {}), detail,
           ...(this.isExplicitlyStoppedRun(sessionKey, runId) ? { userStop: true } : {}) },
       });
       this.releaseSuppressedSessionKeysAfter(keys, 0);

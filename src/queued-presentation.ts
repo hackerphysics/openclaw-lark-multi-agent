@@ -1,3 +1,4 @@
+import { inputPreview, visibleInputPreview, type InputHint, type InputHintChange, type InputHintKind, type InputStatusContext } from "./input-status-display.js";
 import { randomUUID } from "node:crypto";
 import { MessageStore } from "./message-store.js";
 import { LiveStatusController, LiveStatusEffectRejectedError, LiveStatusEffectUnknownError, LiveStatusEffectSuppressedError,
@@ -12,6 +13,12 @@ type Presentation = {
   editEffects?: Record<string, "attempted" | "unknown">;
   /** Seals UI cohort only; not input acceptance/commit/result custody. */
   linkedReply?: { runId: string; outboxId: number; deliveredAt: number; relatedOutboxIds?: number[]; rendered?: "summary" | "reply_payload"; retryAfter?: number; attempts?: number };
+  /** UI-only per-input phase/source references; never admission or replay custody. */
+  inputStates?: Record<string, InputHint>;
+  inputMessageIds?: Record<string,string>;
+  inputPreviews?: Record<string,string>;
+  inputPreviewSources?: Record<string,'visible'>;
+  inputNote?: InputHint;
   view?: LiveStatusView; retired?: boolean;
 };
 type Entry = { record: Presentation; live: LiveStatusController };
@@ -156,6 +163,37 @@ export class QueuedPresentations {
     const row = this.latest(record);
     return !!row && this.usable(row) && !row.linkedReply && row.lease === record.lease && this.enabled(record.chatId);
   }
+  private inputContext(record:Presentation,change?:InputHintChange):InputStatusContext|undefined {
+    const row=this.latest(record);
+    if(!row || row.lease!==record.lease || row.retired || row.stopEpoch!==this.store.getStopGeneration(this.bot,row.chatId))return undefined;
+    const messages={...row.inputMessageIds},states={...row.inputStates};
+    for(const id of row.triggerIds){
+      if(messages[id]!==undefined)continue;
+      const source=this.store.getMessageByRowId(id);
+      messages[id]=source?.chatId===row.chatId && source.senderType==='human' ? source.messageId : '';
+    }
+    const phaseKind=():InputHintKind=>row.view?.state==='replied'?'replied':row.view?.state==='failed'?'failed':
+      row.view?.state==='done'?(row.view.noReply?'no_reply':'completed'):row.view?.phase==='waiting'?'waiting':
+      row.view?.phase==='working'?'processing':row.view?.phase==='admitted'?'accepted':row.submissionId?'submitting':'queued';
+    if(change){
+      const ids=change.ids || (change.kind==='replied' ? row.triggerIds : row.ordinaryTriggerIds || row.triggerIds);
+      if(change.kind==='partial' && !ids.length)row.inputNote={kind:'partial',detail:change.detail,at:change.at};
+      else {
+        if(['queued','accepted','submitting','replied'].includes(change.kind))delete row.inputNote;
+        for(const id of ids)if(row.triggerIds.includes(id) && states[id]?.kind!==change.kind){
+          const known=states[id]?.kind || (row.enqueueAcceptedIds?.includes(id)?'append_queued':row.runId && row.ordinaryTriggerIds?.includes(id)?phaseKind():undefined);
+          if(change.kind==='received' && known && !['received','queued'].includes(known))continue;
+          states[id]={kind:change.kind,detail:change.detail,at:change.at};
+        }
+      }
+      row.inputStates=states;row.inputMessageIds=messages;this.save(row);
+    }
+    return {botName:this.bot,appId:this.app,chatId:row.chatId,stopEpoch:row.stopEpoch,note:row.inputNote,
+      items:row.triggerIds.map(id=>({...states[id],rowId:id,messageId:messages[id],preview:row.inputPreviews?.[id],previewSource:row.inputPreviewSources?.[id],kind:states[id]?.kind ||
+        (row.linkedReply?.rendered?'replied':row.ordinaryTriggerIds?.includes(id)?phaseKind():row.enqueueAcceptedIds?.includes(id)?'append_queued':'received'),
+        at:states[id]?.at || 0}))};
+  }
+
   private hydrate(record: Presentation): Entry {
     const cached = this.entries.get(record.id);
     if (cached && cached.record.lease === record.lease) return cached;
@@ -178,6 +216,7 @@ export class QueuedPresentations {
     };
     const live = new LiveStatusController({
       warn: base.warn,
+      inputStatus:change=>this.inputContext(record,change),
       desired,
       unconfirmedInputs: outcome => {
         try {
@@ -193,7 +232,14 @@ export class QueuedPresentations {
           });
           if (!pending.length) return undefined;
           const en = this.english(row.chatId);
+          const ordinaryIds=ordinary.filter(id=>!pending.includes(id));
+          if(!ordinaryIds.length)return {
+            title:en?`${this.bot} input confirmation pending`:`${this.bot} 输入接收待确认`,
+            detail:en?`${pending.length} input(s) retain local/submission receipts; no ordinary run acceptance confirmed; no replay.`:
+              `${pending.length} 条输入保留本地/提交回执；尚未确认普通运行接收，不重放。`,ordinaryIds,
+          };
           return {
+            ordinaryIds,
             title: en ? `${this.bot} ${ordinary.length ? outcome === "failed" ? "run ended · " : "partial result · " : ""}input confirmation pending`
               : `${this.bot} ${ordinary.length ? outcome === "failed" ? "本轮结束 · " : "部分完成 · " : ""}追加输入回执待确认`,
             detail: en ? `${pending.length} additional input(s) have only local/enqueue receipts; actual receiver, commitment and result are unconfirmed. Root completion covers only ordinary inputs; no automatic replay.`
@@ -290,8 +336,10 @@ export class QueuedPresentations {
     return entry;
   }
 
-  receive(chat: string, rowId: number, messageId: string, native = false, activeRunId?: string): LiveStatusController | undefined {
+  receive(chat: string, rowId: number, messageId: string, native = false, activeRunId?: string, displayText?:string|{source:'visible';text:string}): LiveStatusController | undefined {
     if (native || !rowId || !this.enabled(chat)) return undefined;
+    const input=this.store.getMessageByRowId(rowId);
+    if(!input || input.chatId!==chat || input.messageId!==messageId || input.senderType!=='human')return undefined;
     const all = this.records(chat);
     const replied = all.find(row => !row.retired && row.stopEpoch === this.store.getStopGeneration(this.bot, chat)
       && (row.view?.state === "replied" || !!row.linkedReply?.rendered) && row.triggerIds.includes(rowId));
@@ -307,9 +355,16 @@ export class QueuedPresentations {
         startedAt: Date.now(), lease: "", create: "never" };
     }
     if (!record.triggerIds.includes(rowId)) record.triggerIds.push(rowId);
+    record.inputMessageIds={...record.inputMessageIds,[rowId]:messageId};
+    const visible=typeof displayText==='object' && displayText.source==='visible';
+    const text=typeof displayText==='string'?displayText:displayText?.text;
+    if(text!==undefined && (record.inputPreviews?.[rowId]===undefined || visible && record.inputPreviewSources?.[rowId]!=='visible')){
+      record.inputPreviews={...record.inputPreviews,[rowId]:text.trim()?(visible?visibleInputPreview(text,512,true):inputPreview(text,512,true)):''};
+      if(visible)record.inputPreviewSources={...record.inputPreviewSources,[rowId]:'visible'};
+    }
     this.save(record); // local receipt already exists; UI record is separate
     const { live } = this.hydrate(record);
-    live.received(this.english(chat) ? "Input durably received locally; acceptance not yet confirmed" : "消息已在本地可靠收件；尚未确认 Gateway 接收");
+    live.received(this.english(chat) ? "Input durably received locally; acceptance not yet confirmed" : "消息已在本地可靠收件；尚未确认 Gateway 接收",[rowId]);
     live.start();
     return live;
   }
@@ -336,6 +391,7 @@ export class QueuedPresentations {
     // The actual public submission key seals this cohort. It is NOT a run ID.
     row.submissionId = submissionId;
     this.save(row);
+    live?.submitting();
   }
 
   async insertionAccepted(chat: string, rowId: number, expectedRunId: string): Promise<void> {
@@ -350,8 +406,8 @@ export class QueuedPresentations {
     this.save(row);
     const live = this.hydrate(row).live;
     const detail = this.english(chat) ? "Input enqueued; actual receiver, commitment and result unconfirmed" : "追加输入已进入队列；实际接收方、提交及处理结果未确认";
-    if (row.runId) live.received(detail); // ordinary A can still show its own real progress
-    else await live.showInputWaiting(detail, this.english(chat) ? `${this.bot} enqueued · input confirmation pending` : `${this.bot} 已排队 · 追加输入回执待确认`);
+    if (row.runId) live.received(detail,[rowId],'append_queued'); // ordinary A keeps its own activity phase
+    else await live.showInputWaiting(detail, this.english(chat) ? `${this.bot} enqueued · input confirmation pending` : `${this.bot} 已排队 · 追加输入回执待确认`,[rowId],'append_queued');
   }
 
   /** A legacy insertion owns no actual run. Its card may nevertheless report
@@ -469,6 +525,40 @@ export class QueuedPresentations {
     if (!runId || !this.enabled(chat)) return undefined;
     const row = this.records(chat).find(row => this.usable(row) && row.runId === runId);
     return row ? this.hydrate(row).live : undefined;
+  }
+
+  /** Recall invalidates copied UI previews, including frozen/terminal cards.
+   * It never changes input custody or recreates/retargets an uncertain effect. */
+  async refreshRecalledInput(chat:string,rowId:number,messageId:string):Promise<void> {
+    const source=this.store.getMessageByRowId(rowId);
+    if(!source || source.chatId!==chat || source.messageId!==messageId || source.senderType!=='human' || !this.store.isMessageRecalled(messageId))return;
+    const effects:Promise<void>[]=[];
+    for(const snapshot of this.records(chat)){
+      if(!snapshot.triggerIds.includes(rowId) || snapshot.inputMessageIds?.[rowId] && snapshot.inputMessageIds[rowId]!==messageId)continue;
+      const row=this.latest(snapshot);if(!row)continue;
+      const previews={...row.inputPreviews},sources={...row.inputPreviewSources};delete previews[rowId];delete sources[rowId];
+      const view=row.view ? {...row.view,lines:row.view.lines.filter(line=>line.kind!=='steer'),inputStatus:row.view.inputStatus ? {
+        ...row.view.inputStatus,items:row.view.inputStatus.items.map(item=>{
+          if(item.rowId!==rowId && item.messageId!==messageId)return item;
+          const {preview,previewSource,...reference}=item;return reference;
+        }),
+      }:undefined}:undefined;
+      this.save({...row,inputPreviews:previews,inputPreviewSources:sources,view});
+      if(row.retired || row.stopEpoch!==this.store.getStopGeneration(this.bot,chat) || row.linkedReply?.rendered==='reply_payload')continue;
+      let entry=this.entries.get(row.id);
+      if(entry?.record.lease!==row.lease)entry=undefined;
+      if(!entry && row.create==='accepted' && row.cardId && !Object.keys(row.editEffects || {}).length)entry=this.hydrate(this.latest(row)!);
+      if(!entry)continue; // unknown/no-ID restoration: persist redaction only
+      const owned=entry;
+      const effectCurrent=()=>{
+        const fresh=this.latest(owned.record);
+        return !this.disposed && !!fresh && !fresh.retired && fresh.lease===owned.record.lease && this.enabled(chat) &&
+          fresh.stopEpoch===this.store.getStopGeneration(this.bot,chat) && fresh.create==='accepted' && !!fresh.cardId &&
+          fresh.cardId===owned.live.id && !Object.keys(fresh.editEffects || {}).length && fresh.linkedReply?.rendered!=='reply_payload';
+      };
+      effects.push(owned.live.redactRecalledInput(effectCurrent));
+    }
+    await Promise.allSettled(effects);
   }
 
   retire(chat: string): void {

@@ -1,3 +1,4 @@
+import type { InputHint, InputHintChange, InputHintKind, InputStatusContext } from "./input-status-display.js";
 import type { ProgressEvent } from "./openclaw-client";
 
 const DEFAULT_DELAY_MS = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_LIVE_STATUS_DELAY_MS || 800);
@@ -21,10 +22,14 @@ export type LiveStatusLine = {
   text: string;
   /** Relative time (seconds since run start) when this line was produced. */
   at: number;
+  /** Delivery hint text is rendered through exact input references, not activity markdown. */
+  inputHint?: boolean;
 };
 
 /** Structured snapshot the renderer turns into a Feishu interactive card. */
 export type LiveStatusView = {
+  /** UI-only source references; bodies are resolved at the actual card boundary. */
+  inputStatus?: InputStatusContext;
   /** Card title, e.g. "Claude 正在执行" / "✅ Claude 已完成". */
   title: string;
   /** Activity lines (oldest first); when finished this holds a summary instead. */
@@ -53,6 +58,7 @@ export type LiveStatusFinalMeta = {
   thinkingLevel?: string;
   locale: "zh" | "en";
   noReply?: boolean;
+  inputStatus?: InputStatusContext;
 };
 
 /** Optional external presentation owner (e.g. the durable outbox). A local
@@ -93,9 +99,13 @@ type EditRequest = {
   settled: boolean;
   accepted: boolean;
   rejection?: LiveStatusEffectRejectedError;
+  /** Restriction on UI privacy refresh, never business effect authority. */
+  effectGuard?: () => boolean;
 };
 
 export type LiveStatusCallbacks = {
+  /** UI-only update/read; cannot grant admission, progress or input completion. */
+  inputStatus?: (change?: InputHintChange) => InputStatusContext | undefined;
   /** Create the status card; returns the new message id. */
   create: (view: LiveStatusView, effect: LiveStatusEffect<string | undefined>) => Promise<string | undefined>;
   /** Patch the existing status card. Reject with LiveStatusEffectRejectedError
@@ -105,7 +115,7 @@ export type LiveStatusCallbacks = {
   /** Synchronous journal checkpoint, before scheduling any new UI effect. */
   desired?: (view: LiveStatusView) => void;
   /** UI-only cohort completeness. A root outcome is not per-input proof. */
-  unconfirmedInputs?: (outcome: "done" | "failed") => { title: string; detail: string } | undefined;
+  unconfirmedInputs?: (outcome: "done" | "failed") => { title: string; detail: string; ordinaryIds?:number[] } | undefined;
 };
 
 export type LiveStatusOptions = {
@@ -142,6 +152,7 @@ export class LiveStatusController {
   private generation = 0;
   /** Frozen/terminal presentation wins over every older progress snapshot. */
   private pinnedView?: LiveStatusView;
+  private pinnedInputGuard?: () => boolean;
   private terminalOwner?: LiveStatusTerminalOwner;
   private pendingEdit?: EditRequest;
   private editPump?: Promise<void>;
@@ -162,6 +173,7 @@ export class LiveStatusController {
   private toolCallCount = 0;
   /** True when finished via noReply(): show a "no content" summary. */
   private noReplyResult = false;
+  private fallbackInputHint?: InputHint;
 
   constructor(private readonly callbacks: LiveStatusCallbacks, private readonly opts: LiveStatusOptions) {
     if (opts.initialPhase) this.state = opts.initialPhase;
@@ -177,9 +189,10 @@ export class LiveStatusController {
         this.noReplyResult = restored.view.noReply;
         this.waitingForResult = restored.view.phase === "waiting";
         this.updatesFrozen = this.waitingForResult;
-        if (restored.view.state === "replied") {
+        if (['done','failed','replied'].includes(restored.view.state)) {
           this.finalized = true; this.terminalOutcome = true; this.updatesFrozen = true;
         }
+        if(this.waitingForResult || this.terminalOutcome)this.pinnedView=restored.view;
       }
       // Attempted/unknown create survives process loss as a no-create fence.
       if (restored.blockCreate && !this.messageId) this.disabled = true;
@@ -187,9 +200,10 @@ export class LiveStatusController {
   }
 
   /** Receipt is durable locally, NOT Gateway admission. */
-  received(detail: string): void {
+  received(detail: string, ids?: number[], kind: InputHintKind = "received"): void {
     if (this.finalized || this.disposed) return;
-    this.pushLine("lifecycle", detail);
+    this.updateInputHint(kind, detail, ids);
+    this.pushLine("lifecycle", detail, true);
     this.callbacks.desired?.(this.buildView());
     void this.safeEdit(this.buildView());
   }
@@ -203,6 +217,7 @@ export class LiveStatusController {
     this.waitingForResult = false;
     this.waitingCreateAllowed = false;
     this.state = "queued";
+    this.updateInputHint("queued");
     this.generation++;
     this.pinnedView = undefined;
     this.pendingEdit = undefined;
@@ -213,12 +228,13 @@ export class LiveStatusController {
 
   /** Enqueue/local receipt remains waiting, not actual-owner/model evidence.
    * Keep one latest pinned view while allowing another input to coalesce. */
-  async showInputWaiting(detail: string, title?: string): Promise<void> {
+  async showInputWaiting(detail: string, title?: string, ids?: number[], kind:InputHintKind="waiting"): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
     this.updatesFrozen = true;
     this.waitingForResult = true;
     this.waitingCreateAllowed = !this.messageId && !this.disabled;
-    this.pushLine("lifecycle", detail);
+    this.updateInputHint(kind,detail,ids);
+    this.pushLine("lifecycle", detail,true);
     this.stopTimers();
     const view = this.buildView();
     if (title) view.title = title;
@@ -237,9 +253,17 @@ export class LiveStatusController {
     if (this.finalized || this.disposed || (!successor && this.state !== "queued")) return;
     this.waitingForResult = false;
     this.state = "admitted";
-    this.pushLine("lifecycle", this.opts.locale === "en" ? "Gateway accepted; waiting for activity" : "Gateway 已接收，等待执行活动");
+    this.updateInputHint("accepted");
+    this.pushLine("lifecycle", this.opts.locale === "en" ? "Gateway accepted; waiting for activity" : "Gateway 已接收，等待执行活动",true);
     this.callbacks.desired?.(this.buildView());
     await this.safeEdit(this.buildView());
+  }
+
+  submitting(): void {
+    if(this.finalized || this.disposed)return;
+    this.updateInputHint("submitting");
+    this.callbacks.desired?.(this.buildView());
+    void this.safeEdit(this.buildView());
   }
 
   get id(): string | undefined { return this.messageId; }
@@ -305,6 +329,7 @@ export class LiveStatusController {
     }
     this.waitingForResult = false;
     this.state = "running";
+    this.updateInputHint("processing");
     this.callbacks.desired?.(this.buildView());
     await this.ensureCreatedNow();
     await this.safeEdit(this.buildView());
@@ -316,16 +341,18 @@ export class LiveStatusController {
     if (this.disabled || this.finalized || this.updatesFrozen) return;
     this.updatesFrozen = true;
     this.waitingForResult = true;
-    this.pushLine("lifecycle", detail);
+    this.updateInputHint("waiting",detail);
+    this.pushLine("lifecycle", detail,true);
     this.stopTimers();
     await this.finishView(this.buildView());
   }
 
   /** Release only local observation of a now-idle session, without claiming
    * the previous task succeeded or was aborted. Normal progress is unchanged. */
-  async pauseForUnconfirmedResult(detail: string, title?: string): Promise<void> {
+  async pauseForUnconfirmedResult(detail: string, title?: string, kind:InputHintKind="unconfirmed"): Promise<void> {
     if (this.finalized) return;
-    this.pushLine("lifecycle", detail);
+    this.updateInputHint(kind,detail);
+    this.pushLine("lifecycle", detail,true);
     this.waitingForResult = true;
     this.finalized = true;
     this.stopTimers();
@@ -340,6 +367,7 @@ export class LiveStatusController {
     const safeRetry = retryZeroEffect && this.state === "replied" && !this.unknownEdits.size && !this.editPump && !this.pendingEdit;
     if (this.disposed || this.terminalOutcome && !safeRetry || !Number.isFinite(deliveredAt) || deliveredAt < this.startedAt) return;
     this.state = "replied";
+    this.updateInputHint("replied");
     this.waitingForResult = false;
     this.updatesFrozen = true;
     this.finalized = true;
@@ -363,8 +391,8 @@ export class LiveStatusController {
 
   async complete(): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
-    const pending = this.callbacks.unconfirmedInputs?.("done");
-    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return; }
+    const pending = this.terminalInputHint("completed","done");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title, [], pending.ordinaryIds?.length?"partial":"queued"); return; }
     this.terminalOutcome = true;
     this.state = "done";
     this.finalized = true;
@@ -383,8 +411,8 @@ export class LiveStatusController {
    */
   async prepareTerminalDelivery(noReply = false, owner?: LiveStatusTerminalOwner): Promise<LiveStatusFinalMeta | undefined> {
     if (this.disposed || (this.terminalOutcome && this.state !== "done")) return undefined;
-    const pending = this.callbacks.unconfirmedInputs?.("done");
-    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return undefined; }
+    const pending = this.terminalInputHint(noReply ? "no_reply" : "delivery_pending","done");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title, [], pending.ordinaryIds?.length?"partial":"queued"); return undefined; }
     if (owner) {
       this.terminalOwner = owner;
       this.generation++; // retire any queued controller-owned terminal effect
@@ -412,6 +440,7 @@ export class LiveStatusController {
       thinkingLevel: this.opts.thinkingLevel,
       locale: this.opts.locale === "en" ? "en" : "zh",
       noReply: this.noReplyResult,
+      inputStatus:this.inputSnapshot(),
     };
   }
 
@@ -421,8 +450,8 @@ export class LiveStatusController {
 
   async fail(): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
-    const pending = this.callbacks.unconfirmedInputs?.("failed");
-    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return; }
+    const pending = this.terminalInputHint("failed","failed");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title, [], pending.ordinaryIds?.length?"partial":"queued"); return; }
     this.terminalOutcome = true;
     this.state = "failed";
     this.finalized = true;
@@ -437,8 +466,8 @@ export class LiveStatusController {
    */
   async noReply(): Promise<void> {
     if (this.disposed || this.terminalOutcome) return;
-    const pending = this.callbacks.unconfirmedInputs?.("done");
-    if (pending) { await this.showInputWaiting(pending.detail, pending.title); return; }
+    const pending = this.terminalInputHint("no_reply","done");
+    if (pending) { await this.showInputWaiting(pending.detail, pending.title, [], pending.ordinaryIds?.length?"partial":"queued"); return; }
     this.terminalOutcome = true;
     this.state = "done";
     this.noReplyResult = true;
@@ -455,7 +484,22 @@ export class LiveStatusController {
     this.stopTimers();
   }
 
-  private pinView(view: LiveStatusView): void {
+  /** Refresh only the existing UI-owned card after recall. Never create a
+   * card, restart ticking, change phase or invoke a business terminal owner.
+   * Unknown effects remain fenced; a later known receipt retains this guard. */
+  async redactRecalledInput(effectGuard:()=>boolean):Promise<void> {
+    if(this.disposed)return;
+    this.lines=this.lines.filter(line=>line.kind!=='steer');
+    const base=this.pinnedView || this.buildView();
+    const view={...base,lines:base.lines.filter(line=>line.kind!=='steer'),inputStatus:this.inputSnapshot()};
+    if(this.terminalOwner){this.callbacks.desired?.(view);return;}
+    this.pinView(view,effectGuard);
+    if(!this.messageId || this.blockedEdits || this.unknownEdits.size || !effectGuard())return;
+    await this.queueEdit(view,true,true,effectGuard);
+  }
+
+  private pinView(view: LiveStatusView, effectGuard?:()=>boolean): void {
+    this.pinnedInputGuard=effectGuard;
     this.generation++;
     this.callbacks.desired?.(view);
     this.pinnedView = view;
@@ -472,7 +516,7 @@ export class LiveStatusController {
   private async reconcilePinnedView(force = false): Promise<void> {
     if (!this.pinnedView || this.disposed) return;
     if (!this.terminalOwner) {
-      await this.queueEdit(this.pinnedView, true, force);
+      await this.queueEdit(this.pinnedView, true, force,this.pinnedInputGuard);
       return;
     }
     const meta = this.finalMeta();
@@ -512,7 +556,27 @@ export class LiveStatusController {
     return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 1))}\u2026` : text;
   }
 
-  private pushLine(kind: LiveStatusLine["kind"], text: string): void {
+  private terminalInputHint(kind:InputHintKind,outcome:'done'|'failed') {
+    const pending=this.callbacks.unconfirmedInputs?.(outcome);
+    // Existing custody decides membership FIRST. Presentation never invents
+    // an admitted run or upgrades an unconfirmed/appended input's outcome.
+    if(!pending)this.updateInputHint(kind);
+    else if(pending.ordinaryIds?.length)this.updateInputHint(kind,undefined,pending.ordinaryIds);
+    return pending;
+  }
+
+  private updateInputHint(kind:InputHintKind,detail?:string,ids?:number[]):void {
+    const at=Math.max(0,Math.floor((Date.now()-this.startedAt)/1000));
+    this.fallbackInputHint={kind,detail,at};
+    try{this.callbacks.inputStatus?.({kind,detail,ids,at});}catch(err){this.callbacks.warn?.("input display checkpoint unavailable",err);}
+  }
+
+  private inputSnapshot():InputStatusContext|undefined {
+    try{return this.callbacks.inputStatus?.() || (this.fallbackInputHint?{items:[this.fallbackInputHint]}:undefined);}
+    catch{return {items:[{kind:"unconfirmed",at:0}]};}
+  }
+
+  private pushLine(kind: LiveStatusLine["kind"], text: string, inputHint=false): void {
     const clean = this.normalizeText(text);
     if (!clean) return;
     const clipped = this.clip(clean);
@@ -520,7 +584,7 @@ export class LiveStatusController {
     const last = this.lines[this.lines.length - 1];
     if (last && last.kind === kind && last.text === clipped) return;
     const at = Math.max(0, Math.floor((Date.now() - this.startedAt) / 1000));
-    this.lines.push({ kind, text: clipped, at });
+    this.lines.push({ kind, text: clipped, at, ...(inputHint?{inputHint:true}:{}) });
     const limit = this.opts.historySize ?? DEFAULT_HISTORY;
     if (this.lines.length > limit) this.lines = this.lines.slice(this.lines.length - limit);
   }
@@ -599,13 +663,13 @@ export class LiveStatusController {
   }
 
   /** One flight + one latest pending snapshot, regardless of tick/event rate. */
-  private queueEdit(view: LiveStatusView, priority: boolean, force = false): Promise<void> {
+  private queueEdit(view: LiveStatusView, priority: boolean, force = false, effectGuard?:()=>boolean): Promise<void> {
     this.callbacks.desired?.(view);
     if (this.blockedEdits) return Promise.resolve();
     if (!this.messageId || this.disposed || (priority && view !== this.pinnedView)
       || (!priority && (this.disabled || this.finalized || this.updatesFrozen))) return Promise.resolve();
     if (!priority) this.generation++;
-    this.pendingEdit = { view, generation: this.generation, priority, force, started: false, settled: false, accepted: false };
+    this.pendingEdit = { view, generation: this.generation, priority, force, effectGuard, started: false, settled: false, accepted: false };
     return this.flushEdits();
   }
 
@@ -661,7 +725,7 @@ export class LiveStatusController {
     };
     const effect: LiveStatusEffect<void> = {
       run: async send => {
-        if (!current()) { request.settled = true; return; }
+        if (!current() || request.effectGuard && !request.effectGuard()) { request.settled = true; return; }
         request.started = true;
         try {
           await send();
@@ -714,7 +778,7 @@ export class LiveStatusController {
   /** Dedupe key includes elapsed so the footer timer ticks even without new
    *  activity, while identical content within the same second is still skipped. */
   private signature(view: LiveStatusView): string {
-    return `${view.state}|${view.title}|${view.elapsed}|${view.lines.map((l) => `${l.kind}@${l.at}:${l.text}`).join("|")}`;
+    return `${view.state}|${view.title}|${view.elapsed}|${JSON.stringify(view.inputStatus || null)}|${view.lines.map((l) => `${l.kind}@${l.at}:${l.text}`).join("|")}`;
   }
 
   private isNoReplyText(text: string): boolean {
@@ -760,6 +824,7 @@ export class LiveStatusController {
     return {
       title,
       lines,
+      inputStatus:this.inputSnapshot(),
       elapsed: this.formatElapsed(),
       model: this.opts.model,
       thinkingLevel: this.opts.thinkingLevel,

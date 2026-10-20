@@ -1,4 +1,5 @@
 import type { GoExecutorResult } from "./go-execution.js";
+import { INPUT_DISPLAY_LIMITS, LIVE_CARD_BYTES, displayClip, hintDetail, hintLabel, inertInputText, inputPreview, visibleInputPreview, selectInputHints, type InputDisplayLimits, type InputHint } from "./input-status-display.js";
 import { createHash, randomUUID } from 'node:crypto';
 import { AsyncLocalStorage } from "node:async_hooks";
 import * as lark from "@larksuiteoapi/node-sdk";
@@ -8,12 +9,12 @@ import { getI18n, normalizeLocale, type Locale } from "./i18n.js";
 import { OpenClawClient, InactiveRunObservation, AdmissionUnconfirmed, CollectorStalledError, FollowupAdmissionRefused, type FollowupAdmissionGuard, type SessionDispatchStatus } from "./openclaw-client.js";
 import { SessionWaitPaused, isWaitTimeout, normalizeSessionRuntimeStatus, formatSessionFooter, FOREGROUND_WAIT_MS, type SessionRuntimeStatus } from "./session-status.js";
 import { SupersededObservation } from "./openclaw-client.js";
-import { LiveStatusController, LiveStatusEffectRejectedError, LiveStatusEffectUnknownError, type LiveStatusCallbacks, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
+import { LiveStatusController, LiveStatusEffectRejectedError, LiveStatusEffectUnknownError, LiveStatusEffectSuppressedError, type LiveStatusCallbacks, type LiveStatusFinalMeta, type LiveStatusView } from "./live-status.js";
 import { QueuedPresentations } from "./queued-presentation.js";
 import { CompactProgressController, type CompactProgressView } from "./compact-progress.js";
 import { GoController } from "./go-controller.js";
 import { MessageStore, type PendingErrorNotice, type DeliveryDispatchOutcome } from "./message-store.js";
-import { errorIdentity, type ErrorVerdict, type ProactiveMessageMeta } from "./terminal-errors.js";
+import { RunTerminalError, closedStopReason, errorNoticeIdentity, errorIdentity, type ErrorProvenance, type ErrorVerdict, type ProactiveMessageMeta } from "./terminal-errors.js";
 import { formatProviderError, safeErrorSummary } from "./provider-errors.js";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "fs";
 import { basename, extname, join, resolve } from "path";
@@ -446,6 +447,10 @@ export class FeishuBot {
     if (!rowId) return;
 
     this.store.clearPendingTrigger(this.config.name, chatId, rowId);
+    // Privacy invalidation starts before reaction SDK I/O: unrelated lookup
+    // latency must not retain a recalled preview on a frozen/terminal card.
+    void this.queuedPresentations.refreshRecalledInput(chatId,rowId,messageId)
+      .catch(err=>console.warn(`[${this.config.name}] Recalled-input UI redaction unavailable:`,this.errorSummary(err)));
     const pendingAcks = this.pendingAckMessages.get(chatId) || [];
     const remainingAcks: typeof pendingAcks = [];
     for (const ack of pendingAcks) {
@@ -570,7 +575,7 @@ export class FeishuBot {
         }
         if (meta?.sourceType === "run_error" || provenance) {
           if (provenance) {
-            this.store.observeRunError(this.config.name, chatId, provenance);
+            this.store.observeRunError(this.config.name, chatId, this.scopeRunError(chatId,provenance));
             await this.reconcileErrorNotices(chatId);
           } else console.warn(`[${this.config.name}] Uncorrelated run_error retained in logs; no finality evidence`);
           return; // errors never cancel pending results or complete live cards
@@ -894,7 +899,7 @@ export class FeishuBot {
       const drainTasks: Promise<void>[] = [];
       for (const chat of chats) {
         // Skip p2p chats that belong to other bots
-        if (chat.chatType === "p2p" && chat.ownerBot && chat.ownerBot !== this.config.name) {
+        if (chat.chatType === "p2p" && !this.store.claimP2pOwner(chat.chatId, this.config.name, this.config.appId)) {
           continue;
         }
 
@@ -954,7 +959,9 @@ export class FeishuBot {
       if (!message?.chat_id || !message.message_id || !["text", "image", "file", "audio", "sticker", "post", "share_doc"].includes(message.message_type)) return;
       if((message.mentions || []).some((mention:any)=>mention?.id && Object.hasOwn(mention.id,'open_id') &&
         (typeof mention.id.open_id!=='string' || !mention.id.open_id.trim())))return;
-      if (this.store.hasBotProcessed(this.config.name, message.message_id)) return;
+      // Private duplicates must reach the stable app/chat fence so an old
+      // name-scoped tombstone cannot disappear across a later bot rename.
+      if (message.chat_type !== "p2p" && this.store.hasBotProcessed(this.config.name, message.message_id)) return;
       // A duplicate must honor the original journal owner, even if its envelope
       // differs or identity has resolved since the first receipt.
       if (this.store.hasIdentityIngress(this.config.name, this.config.appId, message.message_id) || this.needsIdentityRecovery(message)) {
@@ -1008,7 +1015,9 @@ export class FeishuBot {
       // has-then-mark sequence races and can send the same user message into
       // OpenClaw twice.
       if (this.identityClosed) return;
-      if (!identityItem && !this.store.tryMarkBotProcessed(this.config.name, messageId)) return;
+      if (!identityItem && !(chatType === "p2p"
+        ? this.store.tryMarkP2pProcessed(this.config.appId, chatId, this.config.name, messageId)
+        : this.store.tryMarkBotProcessed(this.config.name, messageId))) return;
       const identityCurrent = () => {
         if(this.identityClosed)return false;
         if(identityItem){try{this.assertIdentityCurrent();}catch{return false;}}
@@ -1020,11 +1029,8 @@ export class FeishuBot {
       if (!identityCurrent()) return;
 
       // --- P2P isolation: only the owning bot processes p2p messages ---
-      if (chatType === "p2p") {
-        const chatInfo = this.store.getChatInfo(chatId);
-        if (chatInfo?.ownerBot && chatInfo.ownerBot !== this.config.name) {
-          return; // This p2p chat belongs to another bot
-        }
+      if (chatType === "p2p" && !this.store.claimP2pOwner(chatId, this.config.name, this.config.appId)) {
+        return; // A display-name match cannot override a conflicting app pin.
       }
 
       let content: any;
@@ -1034,6 +1040,15 @@ export class FeishuBot {
         console.warn(`[${this.config.name}] Failed to parse message content, skipping`);
         return;
       }
+
+      // Original visible input for UI only; never use hydrated media paths,
+      // synthetic routing prompts or model/history text as its body.
+      const inputCaption=[content.text,content.caption].find(value=>typeof value==='string') || '';
+      const inputDisplayText=messageType==='text' ? (typeof content.text==='string'?content.text.replace(/@_user_\d+/g,(key:string)=>{const mention=(message.mentions || []).find((item:any)=>item.key===key);return typeof mention?.name==='string'?`@${mention.name}`:key;}):'') :
+        messageType==='file' ? `[${this.isEn(chatId)?'File':'文件'}: ${(typeof content.file_name==='string'?content.file_name:'file').split(/[\\/]/).at(-1)}] ${inputCaption}` :
+        messageType==='image' ? `[${this.isEn(chatId)?'Image':'图片'}] ${inputCaption}` : messageType==='audio' ? `[${this.isEn(chatId)?'Audio':'语音'}] ${inputCaption}` : messageType==='sticker' ? (this.isEn(chatId)?'[Sticker]':'[贴纸]') :
+        messageType==='post' ? this.visiblePostInput(content,chatId) :
+        [content.title,content.name,content.text,content.url].find(value=>typeof value==='string') || '';
 
       // --- Extract text content based on message type ---
       let cleanText = "";
@@ -1554,7 +1569,7 @@ export class FeishuBot {
         // No health/setup/model/history await precedes this honest local receipt.
         // UI custody cannot reserve dispatch or claim Gateway/model acceptance.
         const presentationRoot = this.queueOwners.get(chatId)?.runId || this.store.getDispatchCustody(this.config.name,chatId)?.runId;
-        this.presentation(()=>this.queuedPresentations.receive(chatId,insertedId,messageId,isNativeOpenClawCommand,presentationRoot));
+        this.presentation(()=>this.queuedPresentations.receive(chatId,insertedId,messageId,isNativeOpenClawCommand,presentationRoot,{source:'visible',text:inputDisplayText}));
         // Reserve BEFORE the first health/reaction await. Otherwise an ending
         // owner can ordinary-drain this row while its handler is still waiting,
         // and the later steer would submit the same message a second time.
@@ -2547,7 +2562,7 @@ export class FeishuBot {
           break;
         }
         await liveStatus?.pauseForUnconfirmedResult(this.isEn(chatId) ? "Session setup failed before admission" : "会话准备失败，尚未提交 Gateway",
-          this.isEn(chatId) ? `${this.config.name} setup unavailable` : `${this.config.name} 会话准备未完成`).catch(()=>{});
+          this.isEn(chatId) ? `${this.config.name} setup unavailable` : `${this.config.name} 会话准备未完成`,"blocked").catch(()=>{});
         if(batchProof) {
           for(const id of mergedTriggerIds) {
             const item=this.store.getInsertion(this.config.name,chatId,id);
@@ -2838,7 +2853,7 @@ export class FeishuBot {
               );
               visibleOutcomeConfirmed = outcome.state === 'delivered';
               if (!visibleOutcomeConfirmed) {
-                await liveStatus?.pauseForUnconfirmedResult("飞书投递回执尚未确认；保留原投递保管，不重复发送").catch(() => {});
+                await liveStatus?.pauseForUnconfirmedResult("飞书投递回执尚未确认；保留原投递保管，不重复发送",undefined,"delivery_pending").catch(() => {});
               } else {
                 await liveStatus?.complete();
                 // Mark every merged trigger only after receipt confirmation.
@@ -2947,24 +2962,24 @@ export class FeishuBot {
               {...row,attempted:false,reason:err.message});
           }
           await this.enqueueAndDispatchDelivery(chatId,'admission_status',`admission:${err.submissionId}:refused`,err.message,[],lastHuman.messageId,`admission:${err.submissionId}:refused`).catch(()=>{});
-          await liveStatus?.pauseForUnconfirmedResult(err.message).catch(()=>{});
+          await liveStatus?.pauseForUnconfirmedResult(err.message,undefined,"blocked").catch(()=>{});
           owner.continuePending=true; // independently proved newer cohorts may still be sent
           break;
         }
         if(err instanceof AdmissionUnconfirmed) {
           await this.enqueueAndDispatchDelivery(chatId,'admission_status',`admission:${err.submissionId}:unknown`,err.message,[],lastHuman.messageId,`admission:${err.submissionId}:unknown`).catch(()=>{});
-          await liveStatus?.pauseForUnconfirmedResult(err.message).catch(()=>{});
+          await liveStatus?.pauseForUnconfirmedResult(err.message,undefined,"submitting").catch(()=>{});
           break;
         }
         let pause = err instanceof SessionWaitPaused ? err : undefined;
-        if (!pause && isWaitTimeout(err instanceof Error ? err.message : String(err))) {
+        if (!pause && !(err instanceof RunTerminalError) && isWaitTimeout(err instanceof Error ? err.message : String(err))) {
           const state = await this.readSessionStatus(chatId);
           if (state.running) pause = new SessionWaitPaused(state, true);
         }
         if (pause) {
           const target = this.activeDeliveryTargets.get(chatId);
           if (target?.triggerId === triggerId && target.runId) this.openclawClient.releasePausedWait?.(target.runId);
-          await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · ${pause.snapshot.status}`).catch(() => {});
+          await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · ${pause.snapshot.status}`,"paused").catch(() => {});
           await this.sendWaitPaused(chatId, triggerId, lastHuman.messageId, pause).catch(() => {});
           // A wait notice is not the final answer and must never claim its key.
           // Do not mark DONE, retry this input, or abort the running session.
@@ -3012,7 +3027,7 @@ export class FeishuBot {
             if(row && !row.admissionSubmissionId && !row.admittedRunId)this.store.saveInsertion(this.config.name,chatId,id,row.insertionId,'target_changed',
               {...row,attempted:false,reason:'guarded pre-admission failure; input retained without sync or new-ID retry'});
           }
-          await liveStatus?.pauseForUnconfirmedResult('Guarded admission unavailable; input custody retained without replay').catch(()=>{});
+          await liveStatus?.pauseForUnconfirmedResult('Guarded admission unavailable; input custody retained without replay',undefined,'blocked').catch(()=>{});
           break;
         }
         console.error(`[${this.config.name}] processQueue error:`, safeErrorSummary(err));
@@ -3022,7 +3037,14 @@ export class FeishuBot {
         if (lastHuman.messageId) {
           // Error message goes through the normal delivery path; the live status
           // is a separate message that we mark interrupted afterwards.
-          await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`)
+          if(err instanceof RunTerminalError) {
+            const p=this.scopeRunError(chatId,err.provenance);
+            this.store.observeRunError(this.config.name,chatId,p);
+            await this.reconcileErrorNotices(chatId);
+            errorOutcomeConfirmed=this.store.findRunErrorOwner(this.config.name,chatId,p)?.status==='delivered';
+          } else await this.enqueueAndDispatchDelivery(chatId, "provider_error", `trigger:${triggerId}:provider-error`, errorText, [], lastHuman.messageId, `trigger:${triggerId}:provider-error`,undefined,
+            foregroundRunId ? (()=>{const p=this.scopeRunError(chatId,{sessionKey:`agent:main:${this.getSessionKey(chatId).replace(/^agent:[^:]+:/,'')}`,sessionId:owner.sessionId,runId:foregroundRunId,source:'chat',state:'error',detail:err instanceof Error?err.message:undefined});
+              return {sessionKey:p.sessionKey,sessionId:p.sessionId,runId:p.runId,error:p};})() : undefined)
             .then(outcome => {
               errorOutcomeConfirmed = outcome.state === 'delivered';
               if (errorOutcomeConfirmed && current() && triggerId) this.store.markDeliveredReply(this.config.name, chatId, triggerId, lastHuman.messageId);
@@ -3271,6 +3293,7 @@ export class FeishuBot {
       thinkingLevel: meta.thinkingLevel,
       toolCalls: meta.toolCalls,
       noReply: Boolean(meta.noReply),
+      inputStatus:meta.inputStatus ? {...meta.inputStatus,items:meta.inputStatus.items.map(item=>item.kind==='delivery_pending'?{...item,kind:'completed' as const}:item)} : {items:[{kind:meta.noReply?"no_reply":"completed",at:0}]},
       state: "done",
     };
     await this.patchLiveStatusCard(messageId, view, chatId);
@@ -3570,7 +3593,12 @@ export class FeishuBot {
     const key = this.deliveryRunTargetKey(chatId, runId);
     const previous = this.deliveryTargetsByRun.get(key);
     if (previous?.timer) clearTimeout(previous.timer);
-    this.store.bindDeliveryRun(this.config.name,chatId,runId,{...this.store.getDeliveryRunTarget(this.config.name,chatId,runId),triggerId:target.triggerId,messageId:target.messageId,runId,stopGeneration:this.stopGeneration(chatId),sessionKey:`agent:main:${this.getSessionKey(chatId).replace(/^agent:[^:]+:/,'')}`});
+    const persisted=this.store.getDeliveryRunTarget(this.config.name,chatId,runId);
+    const owner=this.queueOwners.get(chatId);
+    this.store.bindDeliveryRun(this.config.name,chatId,runId,{...persisted,triggerId:target.triggerId,messageId:target.messageId,runId,
+      sessionId:persisted?.sessionId || (owner?.runId===runId ? owner.sessionId : undefined),
+      botIdentity:persisted?.botIdentity || this.config.appId,stopGeneration:persisted?.stopGeneration ?? this.stopGeneration(chatId),
+      sessionKey:persisted?.sessionKey || `agent:main:${this.getSessionKey(chatId).replace(/^agent:[^:]+:/,'')}`});
     this.deliveryTargetsByRun.set(key, {
       triggerId: target.triggerId,
       messageId: target.messageId,
@@ -3674,9 +3702,9 @@ export class FeishuBot {
     const contentHash = this.stableHash(normalizedPayload);
     const finalDeliveryKey = deliveryKey || sourceId;
     const deliveryMetaJson = JSON.stringify({
-      botIdentity:this.config.appId,
+      botIdentity:provenance?.error?.botIdentity || this.config.appId,
       ...(completionTriggerIds?.length ? {completionTriggerIds} : {}),
-      deliveryStopEpoch:this.stopGeneration(chatId),
+      deliveryStopEpoch:provenance?.error?.stopEpoch ?? this.stopGeneration(chatId),
       ...(finalReplyModel?.trim() ? { model: finalReplyModel.trim() } : {}),
       ...(provenance ? { provenance } : {}), ...(errorNoticeId ? { errorNoticeId } : {}),
     });
@@ -3825,20 +3853,59 @@ export class FeishuBot {
     return this.store.getDeliveryDispatchOutcome(this.config.name,chatId,finalDeliveryKey);
   }
 
+  private scopeRunError(chatId:string,p:ErrorProvenance):ErrorProvenance {
+    const key=/^agent:[^:]+:/.test(p.sessionKey) ? p.sessionKey : `agent:main:${p.sessionKey}`;
+    const target=this.store.getDeliveryRunTarget(this.config.name,chatId,p.runId);
+    const observation=this.store.getRunObservation(key,p.runId);
+    // Pre-upgrade targets may lack app/physical fields. A known exact legacy
+    // outbox owner is original route evidence, never permission for the current
+    // replacement app to take over its notice.
+    const legacy=!target?.botIdentity ? this.store.findRunErrorOwner(this.config.name,chatId,{...p,sessionKey:key}) : undefined;
+    let meta:any;try{meta=JSON.parse(legacy?.deliveryMetaJson || '{}');}catch{meta={};}
+    return {...p,sessionKey:key,sessionId:p.sessionId || target?.sessionId || observation?.sessionId || meta.provenance?.sessionId,
+      botIdentity:p.botIdentity || target?.botIdentity || meta.botIdentity || this.config.appId,
+      stopEpoch:p.stopEpoch ?? target?.stopGeneration ?? meta.deliveryStopEpoch ?? this.stopGeneration(chatId)};
+  }
+
+  /** Shared original-error authorization for journaled terminals AND ordinary
+   * admitted provider errors. Current outbox/config metadata is not authority
+   * to replace the retained admission route or physical target. */
+  private errorRouteRevocation(chatId:string,p:ErrorProvenance):string|undefined {
+    const original=this.store.getDeliveryRunTarget(this.config.name,chatId,p.runId);
+    if(original?.messageId && this.store.isMessageRecalled(original.messageId) ||
+      original?.sessionId && p.sessionId && original.sessionId!==p.sessionId ||
+      original?.sessionKey && canonicalPhysicalSessionKey(original.sessionKey)!==canonicalPhysicalSessionKey(p.sessionKey))
+      return 'original_error_target_revoked';
+    const epoch=this.stopGeneration(chatId);
+    if(p.botIdentity && p.botIdentity!==this.config.appId || original?.botIdentity && original.botIdentity!==this.config.appId ||
+      p.stopEpoch!==undefined && p.stopEpoch!==epoch || original?.stopGeneration!==undefined && original.stopGeneration!==epoch)
+      return 'original_error_route_revoked';
+  }
+
   private async inspectErrorNotice(record: PendingErrorNotice): Promise<ErrorVerdict> {
+    const revoked=this.errorRouteRevocation(record.chatId,record.provenance);
+    if(revoked)return {state:'stopped',reason:revoked};
     if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, true)) {
       return { state: "suppressed", reason: "exact_run_final_platform_delivery_confirmed" };
     }
     if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, false)) {
       return { state: "pending", reason: "exact_run_final_delivery_pending" };
     }
+    const existing=this.store.findRunErrorOwner(this.config.name,record.chatId,record.provenance);
+    if(!record.provenance.runId.startsWith('announce:') && existing && existing.deliveryKey!==`run-error:${errorNoticeIdentity(record.provenance)}`)
+      return {state:'suppressed',reason:'existing_exact_run_error_owner'};
     let verdict: ErrorVerdict;
     try { verdict = await this.openclawClient.inspectRunError(record.provenance); }
     catch { verdict = { state: "pending", reason: "inspection_unavailable" }; }
     // Presentation only: leave exact-run finality, stop suppression and durable
     // outbox keys owned by the existing verdict; no retry/model fallback here.
-    if (verdict.state === "terminal" && verdict.reason === "ordinary_gateway_error") {
-      verdict = { ...verdict, text: this.formatUserVisibleError(record.provenance.detail, record.chatId) };
+    if (verdict.state === "terminal" && ['ordinary_gateway_error','closed_gateway_terminal','exact_run_terminal_error'].includes(verdict.reason)) {
+      const reason=closedStopReason(record.provenance.stopReason) || verdict.stopReason;
+      const en=this.isEn(record.chatId);
+      verdict = { ...verdict, text: reason==='timeout' ? this.formatUserVisibleError({code:'execution_timeout'},record.chatId)
+        : reason==='superseded' ? (en?'⚠️ This run ended after being superseded by a newer session writer; no user stop is inferred.':'⚠️ 本次运行已被新的会话写入者取代而终止；不据此认定用户停止。')
+        : reason==='restart' ? (en?'⚠️ This run ended for a Gateway restart; no user stop is inferred.':'⚠️ 本次运行因 Gateway 重启而终止；不据此认定用户停止。')
+        : this.formatUserVisibleError(record.provenance.detail, record.chatId) };
     }
     // A stop or final may have arrived during the read-only lookup.
     const latest = this.store.getErrorNotice(this.config.name, record.chatId, record.noticeId);
@@ -3857,6 +3924,8 @@ export class FeishuBot {
     if (this.store.hasRunFinalDelivery(this.config.name, record.chatId, record.provenance, false)) {
       return { state: "pending", reason: "exact_run_final_delivery_pending" };
     }
+    if(verdict.state==='terminal' && verdict.stopReason && !record.provenance.stopReason)
+      record.provenance={...record.provenance,stopReason:verdict.stopReason};
     return verdict;
   }
 
@@ -3927,7 +3996,7 @@ export class FeishuBot {
           // Independent identity: never take the result's trigger/final key.
           await this.enqueueAndDispatchDelivery(chatId, "run_error", verdict.terminalKey, verdict.text,
             [], undefined, verdict.terminalKey, undefined,
-            { sourceType: "run_error", sessionKey:record.provenance.sessionKey, runId: record.provenance.runId, error: record.provenance, terminalEvidence: verdict }, record.noticeId);
+            { sourceType: "run_error", sessionKey:record.provenance.sessionKey, sessionId:record.provenance.sessionId, runId: record.provenance.runId, error: record.provenance, terminalEvidence: verdict }, record.noticeId);
           // The send-time recheck may have parked or suppressed the observation.
           const refreshed = this.store.getErrorNotice(this.config.name, chatId, record.noticeId);
           if (refreshed?.verdict && ["pending", "suppressed", "stopped"].includes(refreshed.verdict.state)) continue;
@@ -4071,8 +4140,12 @@ export class FeishuBot {
         const work = this.goDeliveryReceipts.run({receipts,goId:deliveryJob?.id,outboxId:item.id!,chatId,stage:"body",ordinals:new Map(),effectGuard:()=>{
           const meta=JSON.parse(item.deliveryMetaJson || '{}'),p=meta.provenance;
           if(!this.insertionNoticeCurrent(chatId,meta.insertionNotice))throw Object.assign(new Error('Insertion notice no longer current'),{deliveryStopped:true});
-          if((p?.final || item.sourceType==='run_error') &&
-            (typeof meta.deliveryStopEpoch==='number' && meta.deliveryStopEpoch!==this.stopGeneration(chatId) ||
+          if(p?.error){
+            const revoked=this.errorRouteRevocation(chatId,p.error);
+            if(revoked)throw Object.assign(new Error(`Original error delivery revoked: ${revoked}`),{deliveryStopped:true});
+          }
+          if((p?.final || p?.error || item.sourceType==='run_error') &&
+            (meta.botIdentity && meta.botIdentity!==this.config.appId || typeof meta.deliveryStopEpoch==='number' && meta.deliveryStopEpoch!==this.stopGeneration(chatId) ||
              p?.sessionKey && p.runId && this.store.isStoppedObservation(p.sessionKey,p.runId))) {
             throw Object.assign(new Error('Delivery revoked by explicit stop before platform attempt'),{deliveryStopped:true});
           }
@@ -4410,7 +4483,7 @@ export class FeishuBot {
       }
       if (pause) {
         discussionWaitPaused = true;
-        await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · ${pause.snapshot.status}`).catch(() => {});
+        await liveStatus?.pauseForUnconfirmedResult(pause.message, `${this.config.name} 等待暂停 · ${pause.snapshot.status}`,"paused").catch(() => {});
         await this.sendWaitPaused(chatId, 0, undefined, pause).catch(() => {});
       } else await liveStatus?.fail().catch(() => {});
       throw pause || err;
@@ -4451,7 +4524,7 @@ export class FeishuBot {
           this.config.model,
         );
         discussionDeliveryConfirmed=outcome.state==='delivered';
-        if(!discussionDeliveryConfirmed) await liveStatus?.pauseForUnconfirmedResult("飞书投递回执尚未确认；原投递仍受保管").catch(()=>{});
+        if(!discussionDeliveryConfirmed) await liveStatus?.pauseForUnconfirmedResult("飞书投递回执尚未确认；原投递仍受保管",undefined,"delivery_pending").catch(()=>{});
       } catch (err) {
         await liveStatus?.fail().catch(() => {});
         throw err;
@@ -4468,13 +4541,42 @@ export class FeishuBot {
     return { botName: this.config.name, text: cleanVisibleReply, visible: isVisible && discussionDeliveryConfirmed };
   }
 
-  private buildLiveStatusCard(view: LiveStatusView, chatId?: string): any {
+  private liveInputElements(view:LiveStatusView,chatId:string|undefined,limits:InputDisplayLimits):any[] {
+    const context=view.inputStatus;if(!context)return [];
+    const en=this.isEn(chatId);
+    const scoped=!!chatId && context.chatId===chatId && context.botName===this.config.name && context.appId===this.config.appId &&
+      context.stopEpoch===this.stopGeneration(chatId);
+    const preview=(hint:InputHint)=>{
+      const source=scoped && hint.rowId ? this.store.getMessageByRowId(hint.rowId) : undefined;
+      if(!source || source.chatId!==chatId || source.senderType!=='human' || !hint.messageId || source.messageId!==hint.messageId)
+        return en?'[Message body unavailable]':'[消息正文暂不可用]';
+      if(this.store.isMessageRecalled(source.messageId))return en?'[Message recalled]':'[消息已撤回]';
+      return hint.previewSource==='visible' ? visibleInputPreview(hint.preview ?? '',limits.preview,en) : inputPreview(hint.preview ?? source.content,limits.preview,en);
+    };
+    const selected=selectInputHints(context.items,limits.members);
+    const stamp=(at:number)=>{const sec=Number.isFinite(at)?Math.max(0,Math.floor(at)):0;return `${Math.floor(sec/60)}:${String(sec%60).padStart(2,'0')}`;};
+    const lines=selected.map(hint=>`${stamp(hint.at)} ${hintLabel(hint.kind,en)} ${inertInputText(preview(hint))}${hintDetail(hint.kind,en)?'\n  ↳ '+inertInputText(hintDetail(hint.kind,en)):''}`);
+    if(context.items.length>selected.length)lines.splice(Math.min(1,lines.length),0,en?`… ${context.items.length-selected.length} other inputs omitted; newest inputs retained`:`… 另有 ${context.items.length-selected.length} 条输入未展开，保留最新输入`);
+    if(context.note)lines.push(`${stamp(context.note.at)} ${hintLabel(context.note.kind,en)} ${selected.map(hint=>inertInputText(preview(hint))).join(' · ')}\n  ↳ ${inertInputText(hintDetail(context.note.kind,en))}`);
+    return lines.length?[{tag:'markdown',content:lines.join('\n')}]:[];
+  }
+
+  private liveStatusRequest(view:LiveStatusView,chatId:string|undefined,request:(card:any)=>any):any {
+    for(const limits of INPUT_DISPLAY_LIMITS){
+      const value=request(this.buildLiveStatusCard(view,chatId,limits));
+      if(Buffer.byteLength(JSON.stringify(value),'utf8')<=LIVE_CARD_BYTES-512)return value; // reserve SDK envelope overhead
+    }
+    throw new LiveStatusEffectSuppressedError('Live status request exceeds local outer JSON byte budget; no SDK call');
+  }
+
+  private buildLiveStatusCard(view: LiveStatusView, chatId?: string, limits=INPUT_DISPLAY_LIMITS[0]): any {
     const en = this.isEn(chatId);
+    const inputElements=this.liveInputElements(view,chatId,limits);
     if (view.state === "replied") {
       // Neutral UI-only closure, not a green business/input-completion claim.
       const summary = en ? `💬 Linked run replied · ⏱ ${view.elapsed}` : `💬 关联轮次已回复 · ⏱ 耗时${view.elapsed}`;
       return {schema: "2.0", config: {update_multi: true, width_mode: "fill"},
-        body: {elements: [{tag: "markdown", content: `<font color='grey'>${summary}</font>`}]}};
+        body: {elements: [...inputElements,{tag: "markdown", content: `<font color='grey'>${summary}</font>`}]}};
     }
     // Clean finish (done / NO_REPLY): keep it minimal — no header, no footer, just
     // one compact grey line (status emoji + tool-call count + total elapsed) so
@@ -4483,18 +4585,18 @@ export class FeishuBot {
       const statusEmoji = view.noReply ? "💤" : "✅";
       const summary = this.completionSummary({
         toolCalls: view.toolCalls,
-        elapsed: view.elapsed,
-        model: view.model,
-        thinkingLevel: view.thinkingLevel,
+        elapsed: displayClip(view.elapsed,32),
+        model: view.model ? displayClip(view.model,160) : undefined,
+        thinkingLevel: view.thinkingLevel ? displayClip(view.thinkingLevel,80) : undefined,
         locale: en ? "en" : "zh",
       }, statusEmoji);
       return {
         schema: "2.0",
         config: { update_multi: true, width_mode: "fill" },
-        body: { elements: [{ tag: "markdown", content: `<font color='grey'>${summary}</font>` }] },
+        body: { elements: [...inputElements,{ tag: "markdown", content: `<font color='grey'>${summary}</font>` }] },
       };
     }
-    const elements: any[] = [];
+    const elements: any[] = [...inputElements];
     // Running OR failed: show the recent activity window (each line prefixed with
     // the relative time mm:ss). On failure we deliberately KEEP the last lines so
     // the steps leading up to the error/kill/timeout are visible for debugging.
@@ -4508,23 +4610,24 @@ export class FeishuBot {
         : "•";
       const fmtAt = (sec: number): string => `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`;
       const content = view.lines
+        .filter(l=>!l.inputHint && !(view.inputStatus?.botName && l.kind==='lifecycle'))
         .map((l) => {
           const stamp = l.kind === "summary" ? "" : `\`${fmtAt(l.at)}\` `;
-          return `${stamp}${iconFor(l.kind)} ${this.escapeCardText(l.text)}`;
+          return `${stamp}${iconFor(l.kind)} ${this.escapeCardText(displayClip(l.text,limits.activity))}`;
         })
         .join("\n");
-      elements.push({ tag: "markdown", content });
-    } else {
+      if(content)elements.push({ tag: "markdown", content });
+    } else if(!inputElements.length) {
       elements.push({ tag: "markdown", content: view.state === "queued" ? (en ? "_Received locally; waiting for admission_" : "_本地已收件，等待提交确认_") : view.state === "admitted" ? (en ? "_Accepted; waiting for activity_" : "_已接收，等待活动_") : (en ? "_working…_" : "_正在启动…_") });
     }
     elements.push({ tag: "hr" });
     // Keep the active model visible while the run is in progress or failed.
     // The final reply also keeps model attribution so it remains self-contained.
-    const footerBits = [en ? `⏱ ${view.elapsed}` : `⏱ 已用 ${view.elapsed}`];
+    const footerBits = [en ? `⏱ ${displayClip(view.elapsed,32)}` : `⏱ 已用 ${displayClip(view.elapsed,32)}`];
     if (view.model?.trim()) {
       const modelBit = view.thinkingLevel?.trim()
-        ? `🧠 ${this.escapeCardText(view.model.trim())} · ${this.escapeCardText(view.thinkingLevel.trim())}`
-        : `🧠 ${this.escapeCardText(view.model.trim())}`;
+        ? `🧠 ${this.escapeCardText(displayClip(view.model.trim(),160))} · ${this.escapeCardText(displayClip(view.thinkingLevel.trim(),80))}`
+        : `🧠 ${this.escapeCardText(displayClip(view.model.trim(),160))}`;
       footerBits.push(modelBit);
     }
     elements.push({ tag: "markdown", content: `<font color='grey'>${footerBits.join("  ·  ")}</font>` });
@@ -4535,7 +4638,7 @@ export class FeishuBot {
       // rejects patches on cards that did not declare it before and after.
       config: { update_multi: true, width_mode: "fill" },
       header: {
-        title: { tag: "plain_text", content: view.title },
+        title: { tag: "plain_text", content: displayClip(view.title,160) },
         template,
       },
       body: { elements },
@@ -4571,14 +4674,8 @@ export class FeishuBot {
 
   private async sendLiveStatusCard(chatId: string, view: LiveStatusView): Promise<string | undefined> {
     try {
-      const res = await this.client.im.message.create({
-        params: { receive_id_type: "chat_id" },
-        data: {
-          receive_id: chatId,
-          content: JSON.stringify(this.buildLiveStatusCard(view, chatId)),
-          msg_type: "interactive",
-        },
-      });
+      const request=this.liveStatusRequest(view,chatId,card=>({params:{receive_id_type:"chat_id"},data:{receive_id:chatId,content:JSON.stringify(card),msg_type:"interactive"}}));
+      const res = await this.client.im.message.create(request);
       if (typeof res.code === "number" && res.code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${res.code}`);
       if (res.code !== 0) throw new LiveStatusEffectUnknownError(new Error("Feishu card receipt missing code"));
       this.store.clearBotUnavailableInChat(this.config.name, chatId);
@@ -4590,23 +4687,16 @@ export class FeishuBot {
   }
 
   private async replyLiveStatusCard(messageId: string, view: LiveStatusView, chatId?: string): Promise<string | undefined> {
-    const res = await this.client.im.message.reply({
-      path: { message_id: messageId },
-      data: {
-        content: JSON.stringify(this.buildLiveStatusCard(view, chatId)),
-        msg_type: "interactive",
-      },
-    } as any);
+    const request=this.liveStatusRequest(view,chatId,card=>({path:{message_id:messageId},data:{content:JSON.stringify(card),msg_type:"interactive"}}));
+    const res = await this.client.im.message.reply(request);
     if (typeof res.code === "number" && res.code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${res.code}`);
     if (res.code !== 0) throw new LiveStatusEffectUnknownError(new Error("Feishu card receipt missing code"));
     return (res as any)?.data?.message_id || (res as any)?.message_id;
   }
 
   private async patchLiveStatusCard(messageId: string, view: LiveStatusView, chatId?: string): Promise<void> {
-    const res = await this.client.im.message.patch({
-      path: { message_id: messageId },
-      data: { content: JSON.stringify(this.buildLiveStatusCard(view, chatId)) },
-    } as any);
+    const request=this.liveStatusRequest(view,chatId,card=>({path:{message_id:messageId},data:{content:JSON.stringify(card)}}));
+    const res = await this.client.im.message.patch(request);
     if (typeof res.code === "number" && res.code !== 0) throw new LiveStatusEffectRejectedError(`Feishu rejected card: ${res.code}`);
     if (res.code !== 0) throw new LiveStatusEffectUnknownError(new Error("Feishu card receipt missing code"));
   }
@@ -5826,29 +5916,17 @@ export class FeishuBot {
    * Called once per chat on first message.
    */
   private async fetchAndCacheChatInfo(chatId: string, chatType: string): Promise<void> {
+    if (chatType === "p2p") {
+      // Private ownership is not hourly metadata. Check/pin the stable SDK app
+      // identity even on a fresh cache; never replace an unknown legacy owner.
+      this.store.claimP2pOwner(chatId, this.config.name, this.config.appId);
+      return;
+    }
     const existing = this.store.getChatInfo(chatId);
     // Refresh at most once per hour
     if (existing && Date.now() - existing.updatedAt < 3600_000) return;
 
     try {
-      if (chatType === "p2p") {
-        // For p2p, we don't have a group name or member list from chat API
-        this.store.upsertChatInfo({
-          chatId,
-          chatType: "p2p",
-          chatName: "私聊",
-          members: "",
-          memberNames: "",
-          ownerBot: existing?.ownerBot || this.config.name,
-          freeDiscussion: this.store.getChatInfo(chatId)?.freeDiscussion || false,
-          verbose: this.store.getChatInfo(chatId)?.verbose || false,
-          discuss: this.store.getChatInfo(chatId)?.discuss || false,
-          discussMaxRounds: this.store.getChatInfo(chatId)?.discussMaxRounds || 10,
-          updatedAt: Date.now(),
-        });
-        return;
-      }
-
       // Fetch group info
       const chatResp = await this.client.im.chat.get({
         path: { chat_id: chatId },
@@ -6086,6 +6164,23 @@ export class FeishuBot {
   /**
    * Extract text content from a rich text (post) message.
    */
+  /** Visible rich-post fragments only. Text nodes remain literal; only actual
+   * media nodes become type markers, never a regex over the user's prose. */
+  private visiblePostInput(content:any,chatId:string):string {
+    const parts:string[]=[];
+    if(typeof content.title==='string')parts.push(content.title);
+    for(const paragraph of Array.isArray(content.content)?content.content:[]){
+      if(!Array.isArray(paragraph))continue;
+      for(const node of paragraph){
+        if(node?.tag==='text' && typeof node.text==='string')parts.push(node.text);
+        else if(node?.tag==='a' && typeof node.text==='string')parts.push(`${node.text}${typeof node.href==='string'?`(${node.href})`:''}`);
+        else if(node?.tag==='at' && typeof node.user_name==='string')parts.push(`@${node.user_name}`);
+        else if(node?.tag==='img')parts.push(this.isEn(chatId)?'[Image]':'[图片]');
+      }
+    }
+    return parts.join(' ');
+  }
+
   private extractPostText(content: any): string {
     const parts: string[] = [];
     const title = content.title;
