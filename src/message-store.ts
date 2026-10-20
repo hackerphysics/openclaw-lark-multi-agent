@@ -37,6 +37,17 @@ export interface ChatMessage {
   triggerKind?: "normal" | "native_command" | "bridge_command" | "bridge_control_reply";
 }
 
+/** Pre-routing custody only: never a pending trigger or admission receipt. */
+export interface IdentityIngress {
+  sequence: number;
+  chatId: string;
+  messageId: string;
+  stopEpoch: number;
+  expiresAt: number;
+  event: any;
+  target: { state?: "capturing" | "bound" | "unbound"; sessionKey?: string; sessionId?: string; expiresAt?:number };
+}
+
 export interface DeliveryOutboxItem {
   id?: number;
   sessionKey: string;
@@ -138,6 +149,10 @@ export class MessageStore {
       CREATE TABLE IF NOT EXISTS lma_database_identity (id INTEGER PRIMARY KEY CHECK(id=1),owner TEXT NOT NULL);
       INSERT OR IGNORE INTO lma_database_identity VALUES(1,'openclaw-lark-multi-agent:messages:v1');
       CREATE TABLE IF NOT EXISTS bridge_generations(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,stop_epoch INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(bot_name,chat_id));
+      CREATE TABLE IF NOT EXISTS identity_ingress (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,bot_name TEXT NOT NULL,app_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,message_id TEXT NOT NULL,stop_epoch INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,event_json TEXT NOT NULL,target_json TEXT NOT NULL DEFAULT '{}',UNIQUE(bot_name,app_id,message_id));
       CREATE TABLE IF NOT EXISTS reaction_custody(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,row_id INTEGER NOT NULL,record_json TEXT NOT NULL,
         PRIMARY KEY(bot_name,chat_id,row_id));
       CREATE TABLE IF NOT EXISTS run_delivery_targets(bot_name TEXT NOT NULL,chat_id TEXT NOT NULL,run_id TEXT NOT NULL,record_json TEXT NOT NULL,PRIMARY KEY(bot_name,chat_id,run_id));
@@ -172,6 +187,81 @@ export class MessageStore {
       UPDATE insertion_custody SET state='pending',next_check_at=0
         WHERE state='capability_blocked' AND json_extract(record_json,'$.attempted')=0;
     `);
+    if (!(this.db.prepare('PRAGMA table_info(identity_ingress)').all() as any[]).some(row => row.name === 'target_json')) {
+      // Older candidate holds have no original physical target; never infer one
+      // from the current Gateway after restart.
+      this.db.exec("ALTER TABLE identity_ingress ADD COLUMN target_json TEXT NOT NULL DEFAULT '{}'");
+    }
+  }
+
+  /** Hard bounds: 100 events / bot+app, 64KiB / event, 15 minute custody.
+   * Expired/stop-fenced rows become dedup tombstones, never business replay. */
+  retainIdentityIngress(bot:string,app:string,event:any,sessionKey?:string):'created'|'retained'|'duplicate'|'full' {
+    return this.db.transaction(() => {
+      this.pruneIdentityIngress(bot,app);
+      const message=event.message;
+      if(this.hasBotProcessed(bot,message.message_id) || this.isMessageRecalled(message.message_id)) return 'duplicate';
+      if(this.db.prepare('SELECT 1 FROM identity_ingress WHERE bot_name=? AND app_id=? AND message_id=?').get(bot,app,message.message_id)) return 'retained';
+      const json=JSON.stringify(event);
+      const count=(this.db.prepare('SELECT COUNT(*) AS count FROM identity_ingress WHERE bot_name=? AND app_id=?').get(bot,app) as any).count;
+      if(Buffer.byteLength(json)>64*1024 || count>=100) return 'full';
+      this.db.prepare('INSERT INTO identity_ingress(bot_name,app_id,chat_id,message_id,stop_epoch,expires_at,event_json,target_json) VALUES(?,?,?,?,?,?,?,?)')
+        .run(bot,app,message.chat_id,message.message_id,this.getStopGeneration(bot,message.chat_id),Date.now()+15*60_000,json,
+          JSON.stringify({state:sessionKey ? 'capturing' : 'unbound',sessionKey}));
+      return 'created';
+    })();
+  }
+
+  pruneIdentityIngress(bot:string,app:string):void {
+    this.db.transaction(() => {
+      const rows=this.db.prepare(`SELECT message_id FROM identity_ingress i WHERE bot_name=? AND app_id=? AND
+        (expires_at<=? OR stop_epoch!=COALESCE((SELECT stop_epoch FROM bridge_generations g WHERE g.bot_name=i.bot_name AND g.chat_id=i.chat_id),0)
+        OR EXISTS(SELECT 1 FROM recalled_messages r WHERE r.message_id=i.message_id))`).all(bot,app,Date.now()) as any[];
+      for(const row of rows) {
+        this.markBotProcessed(bot,row.message_id);
+        const message=this.getMessageByMessageId(row.message_id);
+        if(message?.id)this.clearPendingTrigger(bot,message.chatId,message.id);
+        this.clearIdentityIngress(bot,app,row.message_id);
+      }
+    })();
+  }
+
+  listIdentityIngress(bot:string,app:string):IdentityIngress[] {
+    this.pruneIdentityIngress(bot,app);
+    return (this.db.prepare(`SELECT * FROM identity_ingress i WHERE bot_name=? AND app_id=? AND NOT EXISTS
+      (SELECT 1 FROM processed_events p WHERE p.bot_name=i.bot_name AND p.message_id=i.message_id) ORDER BY sequence LIMIT 100`).all(bot,app) as any[])
+      .map(row=>({sequence:row.sequence,chatId:row.chat_id,messageId:row.message_id,stopEpoch:row.stop_epoch,expiresAt:row.expires_at,event:JSON.parse(row.event_json),target:JSON.parse(row.target_json)}));
+  }
+
+  finishIdentityTarget(bot:string,app:string,messageId:string,target:IdentityIngress['target']):void {
+    this.db.prepare(`UPDATE identity_ingress SET target_json=? WHERE bot_name=? AND app_id=? AND message_id=?
+      AND json_extract(target_json,'$.state')='capturing'`).run(JSON.stringify(target),bot,app,messageId);
+  }
+
+  getIdentityTarget(bot:string,app:string,messageId:string):IdentityIngress['target'] {
+    const row=this.db.prepare('SELECT target_json,expires_at FROM identity_ingress WHERE bot_name=? AND app_id=? AND message_id=?').get(bot,app,messageId) as any;
+    return row ? {...JSON.parse(row.target_json),expiresAt:row.expires_at} : {};
+  }
+
+  hasIdentityIngress(bot:string,app:string,messageId:string):boolean {
+    return !!this.db.prepare('SELECT 1 FROM identity_ingress WHERE bot_name=? AND app_id=? AND message_id=?').get(bot,app,messageId);
+  }
+
+  clearIdentityIngress(bot:string,app:string,messageId:string):void {
+    this.db.prepare('DELETE FROM identity_ingress WHERE bot_name=? AND app_id=? AND message_id=?').run(bot,app,messageId);
+  }
+
+  /** Atomic transfer into the existing dedup fence. A crash after transfer is
+   * NOT permission to replay a possibly attempted business submission. */
+  claimIdentityIngress(bot:string,app:string,item:IdentityIngress):boolean {
+    return this.db.transaction(() => {
+      const row=this.db.prepare('SELECT sequence FROM identity_ingress WHERE bot_name=? AND app_id=? AND message_id=?').get(bot,app,item.messageId) as any;
+      if(row?.sequence!==item.sequence) return false;
+      const fresh=item.expiresAt>Date.now() && item.stopEpoch===this.getStopGeneration(bot,item.chatId) && !this.isMessageRecalled(item.messageId);
+      const claimed=this.tryMarkBotProcessed(bot,item.messageId);
+      if(!fresh)this.clearIdentityIngress(bot,app,item.messageId);
+      return fresh && claimed;
+    })();
   }
 
   savePresentation(bot:string,app:string,chat:string,cohort:string,record:object):void {

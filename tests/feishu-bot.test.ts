@@ -73,6 +73,10 @@ function makeHarness(name = "GPT", opts: { configPath?: string } = {}) {
   const openclaw = new MockOpenClaw();
   const config: BotConfig = { name, appId: `app-${name}`, appSecret: "secret", model: `model-${name}` };
   const bot = new FeishuBot(config, openclaw as any, store, undefined, opts.configPath);
+  // General routing/queue cases model a normally discovered identity. The
+  // recovery integration suite separately starts unknown and exercises the API.
+  (bot as any).botOpenId = `${name.toLowerCase()}-open-id`;
+  (bot as any).requestIdentity = vi.fn(async () => { throw new Error("offline fixture: identity unresolved"); });
   (bot as any).fetchAndCacheChatInfo = async (chatId: string, chatType: string) => {
     store.upsertChatInfo({ chatId, chatType, chatName: chatType, members: "", memberNames: "", ownerBot: chatType === "p2p" ? name : "", freeDiscussion: false, verbose: false, discuss: false, discussMaxRounds: 10, updatedAt: Date.now() });
   };
@@ -3668,7 +3672,11 @@ describe("explicit group routing (2026-09-11)", () => {
           h.store.close();
           reopened = new MessageStore(h.dbPath);
           (h.bot as any).store = reopened;
-          if (g.second) (g.second.bot as any).store = reopened;
+          // This legacy fixture simulates a restart by swapping SQLite on the
+          // same object. Real startup creates a fresh bot; reset its close fence
+          // here as well, rather than weakening production close cancellation.
+          (h.bot as any).identityClosed = false;
+          if (g.second) { (g.second.bot as any).store = reopened; (g.second.bot as any).identityClosed = false; }
           (h.bot as any).fetchAndCacheChatInfo = async () => {};
           if (g.second) (g.second.bot as any).fetchAndCacheChatInfo = async () => {};
           expect(reopened.getChairmanBot("chat1")).toBe("");
@@ -3757,7 +3765,7 @@ describe("explicit group routing (2026-09-11)", () => {
     const g = group(1), { h } = g;
     try {
       (h.bot as any).botOpenId = null;
-      await (h.bot as any).handleMessage(event({ text: "hello", mentions: [self] }));
+      await (h.bot as any).handleMessage(event({ text: "hello", mentions: [{ name: "GPT", id: { app_id: "app-GPT" } }] }));
       expect(h.openclaw.chatCalls).toHaveLength(1);
       expect((h.bot as any).botOpenId).toBeNull();
       await (h.bot as any).handleMessage(event({ text: "hello", mentions: [{ name: "GPT", id: { open_id: "ou_gpt" } }] }));

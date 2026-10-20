@@ -20,6 +20,8 @@ import { basename, extname, join, resolve } from "path";
 import { getBridgeAttachmentsDir, getDataDir } from "./paths.js";
 import { buildFeishuCardElements } from "./markdown.js";
 import { discussionManager, type DiscussionParticipant, type ReplyResult } from "./discussion-manager.js";
+import { requestBotIdentity, trustedBotOpenId } from "./bot-identity.js";
+import type { IdentityIngress } from "./message-store.js";
 
 /** Observation deadline, never a claim that the underlying SDK was cancelled. */
 export class SendDeadlineError extends Error {
@@ -37,6 +39,9 @@ const require = createRequire(import.meta.url);
 const LMA_VERSION = require("../package.json").version as string;
 
 const MAX_BOT_STREAK = 10;
+const IDENTITY_DEADLINE_MS = 2_000;
+const IDENTITY_RETRY_BASE_MS = 5_000;
+const IDENTITY_RETRY_CAP_MS = 5 * 60_000;
 const MAX_MERGED_TRIGGER_MESSAGES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_MESSAGES || 100);
 const MAX_MERGED_TRIGGER_BYTES = Number(process.env.OPENCLAW_LARK_MULTI_AGENT_MAX_MERGED_TRIGGER_BYTES || 128 * 1024);
 const BRIDGE_ATTACHMENTS_DIR = getBridgeAttachmentsDir();
@@ -160,6 +165,21 @@ export class FeishuBot {
   private openclawClient: OpenClawClient;
   private store: MessageStore;
   private botOpenId: string | null = null;
+  private identityClosed = false;
+  private identityRetryTimer?: ReturnType<typeof setTimeout>;
+  private identityFlight?: Promise<void>;
+  private identityAbort?: () => void;
+  private identityNextProbeAt = 0;
+  private identityFailures = 0;
+  private identityDrain?: Promise<void>;
+  private identityDrainRetry = false;
+  private identityDrainNextAt = 0;
+  private identityDrainFailures = 0;
+  private identityCaptures = new Map<string, Promise<void>>();
+  private identityTargetRepairs = new Map<string, IdentityIngress['target']>();
+  private identitySessionWaiters = new Set<() => void>();
+  private readonly identityEffects = new AsyncLocalStorage<{item:IdentityIngress;epoch:number}>();
+  private requestIdentity = (signal: AbortSignal) => requestBotIdentity(this.config, signal, IDENTITY_DEADLINE_MS);
   /** Tracks which chatId sessions have been initialized */
   private initializedSessions: Set<string> = new Set();
   /** Per-chat busy lock: timestamp when became busy (0 = not busy) */
@@ -333,6 +353,14 @@ export class FeishuBot {
     this.config = config;
     this.openclawClient = openclawClient;
     this.store = store;
+    this.store.onClose(() => {
+      this.identityClosed = true;
+      clearTimeout(this.identityRetryTimer);
+      this.identityRetryTimer = undefined;
+      this.identityAbort?.();
+      for (const cancel of this.identitySessionWaiters) cancel();
+      this.identityTargetRepairs.clear();
+    });
     this.queuedPresentations = new QueuedPresentations(() => this.store, config.name, config.appId,
       (chat, replyTo) => ({ ...this.liveStatusCallbacks(chat, replyTo), warn: (message, err) => console.warn(`[${this.config.name}] ${message}:`, this.errorSummary(err)) }),
       chat => this.shouldUseLiveStatus(chat), chat => this.isEn(chat));
@@ -471,11 +499,20 @@ export class FeishuBot {
    * Ensure the session for a given chatId exists with the correct model.
    * Lazy: only creates on first message in that chat.
    */
-  private async ensureSession(chatId: string): Promise<string> {
+  private async ensureSession(chatId: string, setupFence?:{sessionId:string;guard:()=>void}): Promise<string> {
     const sessionKey = this.getSessionKey(chatId);
+    await this.assertIdentityEffect();
+    const held=this.identityEffects?.getStore();
+    const expectedSessionId=held?.item.target.sessionId || setupFence?.sessionId;
+    const setupGuard=()=>{this.assertIdentityCurrent();setupFence?.guard();};
+    if(setupFence) {
+      const info=await this.identitySessionInfo(sessionKey);setupGuard();
+      if(info?.session?.sessionId!==setupFence.sessionId || info.session.archived)throw new SupersededObservation('retained setup physical target changed');
+    }
     if (this.initializedSessions.has(sessionKey)) {
       // Already initialized this process lifetime, just ensure model
-      const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
+      const corrected = (expectedSessionId ? await this.openclawClient.ensureModel(sessionKey, this.config.model,{sessionId:expectedSessionId,guard:setupGuard}) : await this.openclawClient.ensureModel(sessionKey, this.config.model));
+      setupGuard();
       if (corrected) {
         console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
       }
@@ -485,11 +522,14 @@ export class FeishuBot {
     try {
       // Check if session already exists in OpenClaw
       const existing = await this.openclawClient.getSessionInfo(sessionKey).catch(() => null);
+      setupGuard();
+      if(expectedSessionId && (existing?.session?.sessionId!==expectedSessionId || existing.session.archived))throw new SupersededObservation('retained session setup changed');
 
       if (existing?.session) {
         // Session exists — preserve it, only ensure model is correct
         console.log(`[${this.config.name}] Session exists: ${sessionKey} (tokens: ${existing.session.totalTokens || 0})`);
-        const corrected = await this.openclawClient.ensureModel(sessionKey, this.config.model);
+        const corrected = (expectedSessionId ? await this.openclawClient.ensureModel(sessionKey, this.config.model,{sessionId:expectedSessionId,guard:setupGuard}) : await this.openclawClient.ensureModel(sessionKey, this.config.model));
+        setupGuard();
         if (corrected) {
           console.log(`[${this.config.name}] Model auto-corrected to ${this.config.model}`);
         }
@@ -512,6 +552,7 @@ export class FeishuBot {
       throw err;
     }
 
+    setupGuard();
     this.initializedSessions.add(sessionKey);
 
     // Subscribe to session events (proactive messages + tool calls)
@@ -617,34 +658,225 @@ export class FeishuBot {
    */
   async start() {
     await this.probeBotIdentity();
+    if (this.identityClosed) return;
     await this.wsClient.start({ eventDispatcher: this.eventDispatcher });
+    if (this.identityClosed) return;
     console.log(
       `[${this.config.name}] Bot started (model: ${this.config.model}, open_id: ${this.botOpenId || "unknown"})`
     );
 
     // Drain any unsynced messages left from previous run
     this.drainOnStartup();
+    void this.drainIdentityIngress().catch(err => console.warn(`[${this.config.name}] Identity ingress recovery failed:`, (err as Error).message));
   }
 
-  /** Resolve this bot's open_id at startup so direct @bot mentions work even
-   * when Feishu mention payloads omit app_id and only contain open_id/name. */
-  private async probeBotIdentity(): Promise<void> {
-    try {
-      const res: any = await this.client.request({
-        method: "POST",
-        url: "/open-apis/bot/v1/openclaw_bot/ping",
-        data: { needBotInfo: true },
-      } as any);
-      const botInfo = res?.data?.pingBotInfo;
-      if (botInfo?.botID) {
-        this.botOpenId = botInfo.botID;
-        console.log(`[${this.config.name}] Bot identity resolved: ${botInfo.botName || this.config.name} (${this.botOpenId})`);
-      } else {
-        console.warn(`[${this.config.name}] Bot identity probe returned no botID`);
-      }
-    } catch (err) {
-      console.warn(`[${this.config.name}] Bot identity probe failed:`, (err as Error).message);
+  /** Local custody repair only. This never authorizes replay of a claimed event
+   * or re-probes an already known identity. The journal remains the sole owner. */
+  private retryIdentityIngress(error: unknown): void {
+    if (this.identityClosed) return;
+    const code = (error as { code?: unknown } | null)?.code;
+    console.warn(`[${this.config.name}] Identity custody recovery deferred:`,
+      code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" ? code : safeErrorSummary(error));
+    this.identityDrainRetry = true;
+    this.identityDrainNextAt = Date.now() + Math.min(IDENTITY_RETRY_CAP_MS,
+      IDENTITY_RETRY_BASE_MS * 2 ** Math.min(this.identityDrainFailures++, 6));
+    this.scheduleIdentityProbe();
+  }
+
+  /** Bounded, read-only public metadata. Late responses never write custody. */
+  private identitySessionInfo(key:string):Promise<any|null> {
+    if(this.identityClosed)return Promise.resolve(null);
+    return new Promise(resolve=>{
+      let done=false;
+      const finish=(value:any)=>{if(done)return;done=true;clearTimeout(timer);this.identitySessionWaiters.delete(cancel);resolve(value);};
+      const cancel=()=>finish(null);
+      const timer=setTimeout(cancel,IDENTITY_DEADLINE_MS);timer.unref?.();
+      this.identitySessionWaiters.add(cancel);
+      void Promise.resolve().then(()=>this.identityClosed ? null : this.openclawClient.getSessionInfo(key,IDENTITY_DEADLINE_MS))
+        .then(finish,()=>finish(null));
+    });
+  }
+
+  private captureIdentityTarget(messageId:string,chatId:string):Promise<void> {
+    const key=this.getSessionKey(chatId);
+    const work=(async()=>{
+      const info=await this.identitySessionInfo(key);
+      if(this.identityClosed)return;
+      const session=info?.session;
+      const target:IdentityIngress['target']=typeof session?.sessionId==='string' && session.sessionId.trim() && session.sessionId.length<=256 && session.archived!==true
+        && (!session.key || typeof session.key==='string' && canonicalPhysicalSessionKey(session.key)===canonicalPhysicalSessionKey(key))
+        ? {state:'bound',sessionKey:key,sessionId:session.sessionId} : {state:'unbound',sessionKey:key};
+      if(target.state==='unbound')console.warn(`[${this.config.name}] Identity input ${messageId} has no proven original physical session; retained without retargeting`);
+      this.identityTargetRepairs.set(messageId,target);
+      this.store.finishIdentityTarget(this.config.name,this.config.appId,messageId,target);
+      this.identityTargetRepairs.delete(messageId);
+    })().catch(err=>this.retryIdentityIngress(err)).finally(()=>this.identityCaptures.delete(messageId));
+    this.identityCaptures.set(messageId,work);
+    return work;
+  }
+
+  private assertIdentityCurrent():void {
+    const fence=this.identityEffects?.getStore();
+    if(!fence)return;
+    if(this.identityClosed || this.stopGeneration(fence.item.chatId)!==fence.epoch || this.store.isMessageRecalled(fence.item.messageId))
+      throw new SupersededObservation('retained identity input cancelled');
+  }
+
+  private async assertIdentityEffect():Promise<void> {
+    const fence=this.identityEffects?.getStore();if(!fence)return;
+    this.assertIdentityCurrent();
+    const info=await this.identitySessionInfo(fence.item.target.sessionKey!);
+    this.assertIdentityCurrent();
+    if(info?.session?.archived===true || info?.session?.sessionId!==fence.item.target.sessionId)
+      throw new SupersededObservation('retained identity physical session unavailable or changed');
+  }
+
+  /** One background timer per bot covers both discovery and local journal
+   * repair; every asynchronous AND synchronous timer effect is owned. */
+  private scheduleIdentityProbe(): void {
+    if (this.identityClosed || (this.botOpenId && !this.identityDrainRetry) || this.identityRetryTimer) return;
+    this.identityRetryTimer = setTimeout(() => {
+      this.identityRetryTimer = undefined;
+      if (this.identityClosed) return;
+      void Promise.resolve().then(async () => {
+        if (this.identityClosed) return;
+        if (!this.botOpenId) {
+          this.store.pruneIdentityIngress(this.config.name, this.config.appId);
+          await this.probeBotIdentity();
+        }
+        await this.drainIdentityIngress();
+      }).catch(err => this.retryIdentityIngress(err))
+        .finally(() => this.scheduleIdentityProbe());
+    }, Math.max(IDENTITY_RETRY_BASE_MS,
+      Math.max(this.botOpenId ? 0 : this.identityNextProbeAt, this.identityDrainNextAt) - Date.now()));
+    this.identityRetryTimer.unref?.();
+  }
+
+  /** Bounded observation AND cancellable HTTP (including token discovery).
+   * Even a nonconforming transport ignoring abort retains single-flight custody
+   * until it settles; we never accumulate timed-out requests or trust late data. */
+  private probeBotIdentity(): Promise<void> {
+    if (this.identityClosed || this.botOpenId) return Promise.resolve();
+    if (this.identityFlight) {
+      // While the initial observation is active its completion owns scheduling.
+      // Only a timed-out, still-owned raw request needs another liveness check.
+      if (this.identityNextProbeAt) this.scheduleIdentityProbe();
+      return this.identityFlight;
     }
+    if (Date.now() < this.identityNextProbeAt) { this.scheduleIdentityProbe(); return Promise.resolve(); }
+    clearTimeout(this.identityRetryTimer);
+    this.identityRetryTimer = undefined;
+    this.identityNextProbeAt = 0;
+    const controller = new AbortController();
+    let live = true;
+    let finish!: () => void;
+    const observed = new Promise<void>(resolve => { finish = resolve; });
+    this.identityFlight = observed;
+    const expire = () => {
+      if (live && !this.identityClosed) console.warn(`[${this.config.name}] Bot identity probe exceeded ${IDENTITY_DEADLINE_MS}ms; retaining unresolved mentions`);
+      live = false; controller.abort(); finish();
+    };
+    this.identityAbort = expire;
+    const deadline = setTimeout(expire, IDENTITY_DEADLINE_MS);
+    deadline.unref?.();
+    const raw = Promise.resolve().then(() => {
+      if (this.identityClosed || controller.signal.aborted) throw new Error("identity probe cancelled");
+      return this.requestIdentity(controller.signal);
+    });
+    void raw.then(response => {
+      if (!live || this.identityClosed || this.botOpenId) return;
+      const openId = trustedBotOpenId(response, this.config.appId);
+      if (!openId) throw new Error("bot-info response contained no valid original-account identity");
+      this.botOpenId = openId;
+      console.log(`[${this.config.name}] Bot identity resolved: ${openId}`);
+    }).catch(err => {
+      if (live && !this.identityClosed) console.warn(`[${this.config.name}] Bot identity probe failed:`, (err as Error).message);
+    }).finally(() => {
+      clearTimeout(deadline);
+      live = false;
+      if (this.identityFlight === observed) this.identityFlight = undefined;
+      this.identityAbort = undefined;
+      finish();
+    });
+    void observed.then(() => {
+      clearTimeout(deadline);
+      if (this.identityClosed) return;
+      if (!this.botOpenId) {
+        this.identityNextProbeAt = Date.now() + Math.min(IDENTITY_RETRY_CAP_MS, IDENTITY_RETRY_BASE_MS * 2 ** Math.min(this.identityFailures++, 6));
+        this.scheduleIdentityProbe();
+      } else {
+        clearTimeout(this.identityRetryTimer);
+        this.identityRetryTimer = undefined;
+        void this.drainIdentityIngress().catch(err => console.warn(`[${this.config.name}] Identity ingress recovery failed:`, (err as Error).message));
+      }
+    }).catch(err => this.retryIdentityIngress(err));
+    return observed;
+  }
+
+  /** Metadata may say who was targeted, but can never say who THIS bot is. */
+  private needsIdentityRecovery(message: any): boolean {
+    if (message.chat_type === "p2p" || this.botOpenId) return false;
+    let mentions = Array.isArray(message.mentions) ? message.mentions : [];
+    if (!mentions.length && message.message_type === "post") {
+      try {
+        const content = JSON.parse(message.content);
+        const posts = content.content ? [content] : Object.values(content);
+        mentions = posts.flatMap((post: any) => (post?.content || []).flat())
+          .filter((node: any) => node?.tag === "at").map((node: any) => ({ id: { open_id: node.user_id } }));
+      } catch { return false; }
+    }
+    // An app-only self mention is already an independent proof, including a
+    // mixed self+human message. But if a self app_id also supplies an open_id,
+    // resolve first: an unknown identity must not hide a conflicting pair.
+    const selfPair = mentions.some((mention: any) => mention.id?.app_id === this.config.appId && mention.id?.open_id);
+    if (!selfPair && mentions.some((mention: any) => this.mentionedBotName(mention) === this.config.name)) return false;
+    return mentions.some((mention: any) => !this.isAllMentionItem(mention)
+      && typeof mention.id?.open_id === "string" && !!mention.id.open_id
+      && (!mention.id.app_id || mention.id.app_id === this.config.appId));
+  }
+
+  private drainIdentityIngress(): Promise<void> {
+    if (this.identityClosed || !this.botOpenId) return Promise.resolve();
+    if (this.identityDrain) return this.identityDrain;
+    if (this.identityDrainRetry && Date.now() < this.identityDrainNextAt) {
+      this.scheduleIdentityProbe();
+      return Promise.resolve();
+    }
+    this.identityDrain = (async () => {
+      for(const [messageId,target] of this.identityTargetRepairs) {
+        if(this.identityClosed)return;
+        this.store.finishIdentityTarget(this.config.name,this.config.appId,messageId,target);
+        this.identityTargetRepairs.delete(messageId);
+      }
+      for (const item of this.store.listIdentityIngress(this.config.name, this.config.appId)) {
+        if (this.identityClosed) return;
+        const capture=this.identityCaptures.get(item.messageId);
+        if(capture)await capture;
+        if(this.identityClosed)return;
+        // Capture owns a paced retry of its SAME proof. Do not clear that
+        // repair intent just because this drain began before capture settled.
+        if(this.identityTargetRepairs.has(item.messageId))return;
+        item.target=this.store.getIdentityTarget(this.config.name,this.config.appId,item.messageId);
+        if(item.target.state!=='bound' || !item.target.sessionId || item.target.sessionKey!==this.getSessionKey(item.chatId))continue;
+        const info=await this.identitySessionInfo(item.target.sessionKey);
+        if(this.identityClosed)return;
+        if(!info?.session?.sessionId)throw new Error('retained physical session check unavailable');
+        if(info.session.archived===true || info.session.sessionId!==item.target.sessionId) {
+          this.store.claimIdentityIngress(this.config.name,this.config.appId,item);
+          this.store.clearIdentityIngress(this.config.name,this.config.appId,item.messageId);
+          continue;
+        }
+        await this.identityEffects.run({item,epoch:item.stopEpoch},()=>this.handleResolvedMessage(item.event, item));
+      }
+      if(this.identityTargetRepairs.size)return;
+      this.identityDrainRetry = false;
+      this.identityDrainNextAt = 0;
+      this.identityDrainFailures = 0;
+      clearTimeout(this.identityRetryTimer);
+      this.identityRetryTimer = undefined;
+    })().catch(err => this.retryIdentityIngress(err))
+      .finally(() => { this.identityDrain = undefined; this.scheduleIdentityProbe(); });
+    return this.identityDrain;
   }
 
   /**
@@ -717,6 +949,44 @@ export class FeishuBot {
 
   private async handleMessage(data: any) {
     try {
+      if (this.identityClosed) return;
+      const message = data?.message;
+      if (!message?.chat_id || !message.message_id || !["text", "image", "file", "audio", "sticker", "post", "share_doc"].includes(message.message_type)) return;
+      if((message.mentions || []).some((mention:any)=>mention?.id && Object.hasOwn(mention.id,'open_id') &&
+        (typeof mention.id.open_id!=='string' || !mention.id.open_id.trim())))return;
+      if (this.store.hasBotProcessed(this.config.name, message.message_id)) return;
+      // A duplicate must honor the original journal owner, even if its envelope
+      // differs or identity has resolved since the first receipt.
+      if (this.store.hasIdentityIngress(this.config.name, this.config.appId, message.message_id) || this.needsIdentityRecovery(message)) {
+        const retained = this.store.retainIdentityIngress(this.config.name, this.config.appId, data,this.getSessionKey(message.chat_id));
+        if (retained !== "retained" && retained !== "created") {
+          if (retained === "full") console.warn(`[${this.config.name}] Identity ingress capacity exceeded; message ${message.message_id} was not admitted`);
+          return;
+        }
+        const capture=retained==='created' ? this.captureIdentityTarget(message.message_id,message.chat_id) : this.identityCaptures.get(message.message_id);
+        const discovery=this.probeBotIdentity();
+        if(capture)await capture;
+        await discovery;
+        if (!this.identityClosed) await this.drainIdentityIngress();
+        return;
+      }
+      await this.handleResolvedMessage(data);
+    } catch (err) {
+      // If journal preflight fails, only durable, still-unclaimed custody may
+      // be retried. Never recreate this event from an in-memory business promise.
+      this.retryIdentityIngress(err);
+    }
+  }
+
+  private async handleResolvedMessage(data: any, identityItem?: IdentityIngress) {
+    // Retained inputs may enter only through the drain's exact guarded owner,
+    // never through an unbound helper call or a reconstructed replay envelope.
+    if(identityItem && this.identityEffects?.getStore()?.item!==identityItem)return;
+    // Claim failures must reach the drain's repair owner. The SQLite transaction
+    // rolls back, preserving the original event. After a successful claim the
+    // ordinary handler's at-most-once failure behavior remains unchanged.
+    if (identityItem && (this.identityClosed || !this.store.claimIdentityIngress(this.config.name, this.config.appId, identityItem))) return;
+    try {
       const event = data as any;
       const message = event.message;
       const sender = event.sender;
@@ -728,7 +998,7 @@ export class FeishuBot {
       const messageId: string = message.message_id;
       const isBot = sender?.sender_type === "app";
 
-      // Identity comes from the startup probe, never from message mentions:
+      // Identity comes from original-account probes, never from message mentions:
       // a conflicting app_id/open_id pair must not overwrite a known identity.
 
       if (messageType !== "text" && messageType !== "image" && messageType !== "file" && messageType !== "audio" && messageType !== "sticker" && messageType !== "post" && messageType !== "share_doc") return;
@@ -737,10 +1007,17 @@ export class FeishuBot {
       // Feishu/WebSocket can deliver the same event more than once; a separate
       // has-then-mark sequence races and can send the same user message into
       // OpenClaw twice.
-      if (!this.store.tryMarkBotProcessed(this.config.name, messageId)) return;
+      if (this.identityClosed) return;
+      if (!identityItem && !this.store.tryMarkBotProcessed(this.config.name, messageId)) return;
+      const identityCurrent = () => {
+        if(this.identityClosed)return false;
+        if(identityItem){try{this.assertIdentityCurrent();}catch{return false;}}
+        return true;
+      };
 
       // --- Cache chat info (lazy, at most once per hour) ---
       await this.fetchAndCacheChatInfo(chatId, chatType);
+      if (!identityCurrent()) return;
 
       // --- P2P isolation: only the owning bot processes p2p messages ---
       if (chatType === "p2p") {
@@ -812,6 +1089,8 @@ export class FeishuBot {
       }
 
       cleanText = await this.hydrateFeishuDocsInMessage(cleanText, content, messageId);
+      if (!identityCurrent()) return;
+      if(identityItem)await this.assertIdentityEffect();
 
       if (!cleanText.trim()) return;
 
@@ -967,12 +1246,14 @@ export class FeishuBot {
         }
 
         const markCommandSynced = () => {
+          if(!identityCurrent())return;
           if (insertedId > 0) {
             this.store.markSynced(this.config.name, chatId, insertedId);
             // Bridge commands should only clear their own pending row. They
             // must not clear earlier human triggers that are waiting after a
             // failed/empty run; /status must be safe to use for debugging.
             this.store.clearPendingTrigger(this.config.name, chatId, insertedId);
+            if(identityItem)this.store.clearIdentityIngress(this.config.name,this.config.appId,messageId);
           }
         };
 
@@ -1023,12 +1304,16 @@ export class FeishuBot {
         }
         if (commandName === "/status") {
           await this.ensureSession(chatId);
+          if(!identityCurrent())return;
+          await this.assertIdentityEffect();
           await this.handleStatusCommand(chatId, chatType, messageId);
           markCommandSynced();
           return;
         }
         if (commandName === "/compact") {
           await this.ensureSession(chatId);
+          if(!identityCurrent())return;
+          await this.assertIdentityEffect();
           const compactArgs = cleanText.trim().split(/\s+/).slice(1).join(" ").trim();
           await this.handleCompactCommand(chatId, messageId, compactArgs);
           markCommandSynced();
@@ -1036,16 +1321,27 @@ export class FeishuBot {
         }
         if (commandName === "/reset") {
           await this.ensureSession(chatId);
+          if(!identityCurrent())return;
+          await this.assertIdentityEffect();
           await this.handleResetCommand(chatId, messageId);
           markCommandSynced();
           return;
         }
         if (commandName === "/stop") {
+          await this.assertIdentityEffect();
           await this.handleStopCommand(chatId, messageId);
           markCommandSynced();
           return;
         }
         if (commandName === "/go") {
+          // Go owns a separate multi-await supervisor/bootstrap protocol. Its
+          // public entry point cannot carry this hold's original executor CAS;
+          // never turn a delayed mutating command into a new supervisor target.
+          if(identityItem && !/^\/go(?:\s+status)?\s*$/i.test(cleanText.trim())) {
+            await this.replyMessage(messageId,"ℹ️ 这条 /go 在身份恢复前收到，未执行。监督初始化不能携带原会话的完整保护条件；请确认当前会话后重新发送。");
+            markCommandSynced();
+            return;
+          }
           // Go supervision targets one bot's executor session: groups require an
           // explicit mention (single-bot group is the implicit target), p2p always.
           const groupBotCount = Array.from(FeishuBot.allBots.values()).filter((bot) => bot.store === this.store).length;
@@ -1056,11 +1352,13 @@ export class FeishuBot {
             try {
               const control=/^(?:status|pause|resume|stop|model)(?:\s|$)/i.test(goArgs) || !goArgs;
               if(!control) await this.ensureSession(chatId);
+              if(!identityCurrent())return;
+              await this.assertIdentityEffect();
               await this.goController?.handleGoCommand(chatId, messageId, goArgs);
             }
             finally {
               markCommandSynced();
-              this.goController?.onCommandSettled(chatId);
+              if(identityCurrent())this.goController?.onCommandSettled(chatId);
             }
             return;
           }
@@ -1248,6 +1546,7 @@ export class FeishuBot {
 
       // --- Should this bot respond? ---
       if (!this.shouldRespond(chatType, message, isBot, chatId, routing)) return;
+      if(identityItem)await this.assertIdentityEffect();
       let reservedAtIngress=false;
       if (!isBot && insertedId > 0) {
         this.goController?.onHumanInput(chatId);
@@ -1263,7 +1562,7 @@ export class FeishuBot {
         if((this.queueRuns.has(chatId) || ingressOwner) && !ingressOwner?.triggerIds?.has(insertedId)) {
           this.store.saveInsertion(this.config.name,chatId,insertedId,JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
             messageId,text:cleanText,stopEpoch:this.stopGeneration(chatId),expectedRunId:ingressOwner?.runId || '',
-            ownerId:ingressOwner?.id,batchId:ingressOwner?.batchId,sessionId:ingressOwner?.sessionId,sessionKey:this.getSessionKey(chatId)});
+            ownerId:ingressOwner?.id,batchId:ingressOwner?.batchId,sessionId:identityItem?.target.sessionId || ingressOwner?.sessionId,sessionKey:this.getSessionKey(chatId)});
           reservedAtIngress=true;
         }
         // Received/queued is not accepted by Gateway. Keep Typing until an
@@ -1279,7 +1578,7 @@ export class FeishuBot {
 
       const inputStopEpoch=this.stopGeneration(chatId);
       const unhealthy = await this.getUnhealthySessionStatus(chatId);
-      if(this.stopGeneration(chatId)!==inputStopEpoch) return;
+      if(!identityCurrent() || this.stopGeneration(chatId)!==inputStopEpoch) return;
       if (unhealthy) {
         await this.warnUnhealthySessionAndContinue(chatId, messageId, unhealthy);
       }
@@ -1288,10 +1587,11 @@ export class FeishuBot {
       // positive idle, or bounded guarded-followup proof may hand off ONLY the
       // local scheduler; the original exact result observer/target survives.
       const dispatchReleased=await this.reconcileDispatchCustody(chatId);
-      if(this.stopGeneration(chatId)!==inputStopEpoch)return;
+      if(!identityCurrent() || this.stopGeneration(chatId)!==inputStopEpoch)return;
       if(!isBot && insertedId>0 && !dispatchReleased && !this.queueRuns.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId))
         await this.reconcileCurrentInputActivity(chatId,insertedId,messageId,cleanText);
-      if(this.stopGeneration(chatId)!==inputStopEpoch)return;
+      if(!identityCurrent() || this.stopGeneration(chatId)!==inputStopEpoch)return;
+      if(identityItem)await this.assertIdentityEffect();
       if(this.store.isInsertionReserved(this.config.name,chatId,insertedId))reservedAtIngress=true;
       if(reservedAtIngress && !this.store.isInsertionReserved(this.config.name,chatId,insertedId)) reservedAtIngress=false;
 
@@ -1319,7 +1619,7 @@ export class FeishuBot {
       if (isBusy) {
         const owner=this.queueOwners.get(chatId) || this.store.getDispatchCustody(this.config.name,chatId);
         const record={messageId,text:cleanText,stopEpoch:this.stopGeneration(chatId),
-          expectedRunId:owner?.runId || '',ownerId:owner?.id,batchId:owner?.batchId,sessionId:owner?.sessionId,sessionKey:this.getSessionKey(chatId)};
+          expectedRunId:owner?.runId || '',ownerId:owner?.id,batchId:owner?.batchId,sessionId:identityItem?.target.sessionId || owner?.sessionId,sessionKey:this.getSessionKey(chatId)};
         if(insertedId>0 && !this.store.getInsertion(this.config.name,chatId,insertedId)) this.store.saveInsertion(this.config.name,chatId,insertedId,
           JSON.stringify([this.config.appId,chatId,messageId]),'pending',record);
         // Reservation is durable BEFORE any RPC. Ordinary drain cannot race a
@@ -1330,7 +1630,15 @@ export class FeishuBot {
       }
 
       // Not busy: admission callback, not local queueing, flips Typing -> Get.
-      await this.processQueue(chatId,true);
+      const business = this.processQueue(chatId,true);
+      if (identityItem) {
+        // Existing pending-trigger/queue-owner custody now owns completion. Do
+        // not hold identity ingress (and following /help, /stop or other chats)
+        // behind the model's lifetime. No second queue or business replay path.
+        void business.catch(err => console.error(`[${this.config.name}] Recovered business owner failed:`, safeErrorSummary(err)));
+      } else {
+        await business;
+      }
     } catch (err) {
       console.error(`[${this.config.name}] Error:`, safeErrorSummary(err));
     }
@@ -1378,6 +1686,7 @@ export class FeishuBot {
    * Read public activity and pin its exact root before choosing insertion. Missing
    * identity is durable unbound custody, never a fabricated run or blind send. */
   private async reconcileCurrentInputActivity(chatId:string,rowId:number,messageId:string,text:string):Promise<void> {
+    const heldSessionId=this.store.getIdentityTarget?.(this.config.name,this.config.appId,messageId)?.sessionId;
     if(!this.openclawClient.getSessionRuntimeStatus || !this.openclawClient.getSessionDispatchStatus)return;
     const epoch=this.stopGeneration(chatId),admissionEpoch=this.queueAdmissionEpoch.get(chatId)||0;
     // A different ingress handler can ordinary-admit AND finish this row while
@@ -1393,12 +1702,14 @@ export class FeishuBot {
     // new chat before asking for its live activity; never infer idle from a
     // missing describe response. A failed setup is not dispatch-idle evidence;
     // retain this never-attempted input for paced reconciliation as well.
-    try {await this.ensureSession(chatId);} catch {
-      if(unsubmitted() && !this.queueRuns.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId)) {
+    try {await (heldSessionId ? this.ensureSession(chatId,{sessionId:heldSessionId,guard:()=>{
+      if(this.identityClosed || !unsubmitted())throw new SupersededObservation('retained activity setup cancelled');
+    }}) : this.ensureSession(chatId));} catch {
+      if(!this.identityClosed && unsubmitted() && !this.queueRuns.has(chatId) && !this.store.getDispatchCustody(this.config.name,chatId)) {
         const row=this.store.getInsertion(this.config.name,chatId,rowId);
         if(!row || row.state==='pending' && row.activityUnbound && !row.attempted && !row.expectedRunId)
           this.store.saveInsertion(this.config.name,chatId,rowId,row?.insertionId || JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
-            messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),activityUnbound:true,attempted:false,expectedRunId:'',
+            messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:heldSessionId,activityUnbound:true,attempted:false,expectedRunId:'',
             reason:'session setup unavailable; retained without dispatch-idle proof',
           },Date.now()+5000);
       }
@@ -1417,9 +1728,10 @@ export class FeishuBot {
     // never-attempted snapshot over an attempted/unknown/accepted journal.
     const fresh=this.store.getInsertion(this.config.name,chatId,rowId);
     if(current ? JSON.stringify(fresh)!==JSON.stringify(current) || fresh?.insertionId!==current.insertionId || fresh.state!=='pending' || fresh.attempted===true || !fresh.activityUnbound || !!fresh.expectedRunId : !!fresh)return;
-    const compatible=!!status.sessionId && status.sessionId===activity.sessionId && (!current?.sessionId || current.sessionId===status.sessionId);
+    const compatible=!!status.sessionId && status.sessionId===activity.sessionId && (!current?.sessionId || current.sessionId===status.sessionId)
+      && (!heldSessionId || status.sessionId===heldSessionId);
     const archived=!!status.archived || !!activity.archived;
-    const generationConflict=activity.identityConflict===true || !!activity.sessionId && !!status.sessionId && activity.sessionId!==status.sessionId ||
+    const generationConflict=!!heldSessionId && !!status.sessionId && status.sessionId!==heldSessionId || activity.identityConflict===true || !!activity.sessionId && !!status.sessionId && activity.sessionId!==status.sessionId ||
       !!current?.sessionId && !!status.sessionId && current.sessionId!==status.sessionId;
     const source=this.store.getMessageByMessageId(messageId);
     const ordinaryHuman=source?.id===rowId && source.chatId===chatId && source.senderType==='human' && source.triggerKind==='normal';
@@ -1463,7 +1775,7 @@ export class FeishuBot {
       : activity.busyConfirmed ? 'retained: positively-busy; guarded followup proof absent or observation window pending'
       : 'retained: genuinely unknown activity; fresh ordinary rescue observation pending';
     this.store.saveInsertion(this.config.name,chatId,rowId,current?.insertionId || JSON.stringify([this.config.appId,chatId,messageId]),'pending',{
-      ...current,messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:current?.sessionId || activity.sessionId || status.sessionId,
+      ...current,messageId,text,stopEpoch:epoch,sessionKey:this.getSessionKey(chatId),sessionId:heldSessionId || current?.sessionId || activity.sessionId || status.sessionId,
       expectedRunId:identified ? activity.activeRunId : '',ownerId:identified ? `external:${activity.activeRunId}` : undefined,
       batchId:identified ? activity.activeRunId : undefined,activityUnbound:!identified,attempted:false,
       ...(!identified ? {unboundSince:current?.unboundSince || Date.now()} : {}),
@@ -1933,6 +2245,10 @@ export class FeishuBot {
   }
 
   private async processQueue(chatId: string,activityChecked=false): Promise<void> {
+    // A queue owner spans several independent inputs. Never inherit one
+    // recovered ingress's ALS guard for later batches or delayed result sends;
+    // retained inputs carry their own durable target/recall/epoch guards below.
+    if (this.identityEffects.getStore()) return this.identityEffects.exit(() => this.processQueue(chatId, activityChecked));
     const existing = this.queueRuns.get(chatId);
     if (existing) {
       console.log(`[${this.config.name}] processQueue already running for ${chatId.slice(-8)}, joining existing run`);
@@ -2010,7 +2326,7 @@ export class FeishuBot {
   }
 
   private async processQueueInner(chatId: string, owner: QueueOwner): Promise<void> {
-    const current=()=>!owner.revoked && this.queueOwners.get(chatId)===owner && this.stopGeneration(chatId)===owner.stopEpoch;
+    const current=()=>!this.identityClosed && !owner.revoked && this.queueOwners.get(chatId)===owner && this.stopGeneration(chatId)===owner.stopEpoch;
     const guard=()=>{if(!current()) throw new SupersededObservation('queue owner revoked');};
     while (current()) {
       const batchToken={};
@@ -2200,13 +2516,27 @@ export class FeishuBot {
       if (!isNativeCommandTrigger) this.presentation(()=>this.queuedPresentations.receive(chatId,triggerId,lastHuman.messageId || "",false));
       const liveStatus = this.presentation(()=>this.queuedPresentations.claim(chatId,mergedTriggerIds,owner.id,owner.batchId!,isNativeCommandTrigger));
       let sessionKey: string;
+      const identityTargets=mergedTriggers.map(message=>({message,target:this.store.getIdentityTarget?.(this.config.name,this.config.appId,message.messageId) || {}}))
+        .filter(entry=>entry.target.expiresAt!==undefined);
+      const expectedIdentitySessionId=identityTargets[0]?.target.sessionId;
       try {
-        sessionKey = await this.ensureSession(chatId);
+        if(identityTargets.some(({target})=>target.state!=='bound' || !target.sessionId || target.sessionId!==expectedIdentitySessionId ||
+          target.sessionKey!==this.getSessionKey(chatId) || (target.expiresAt ?? 0)<=Date.now()))throw new SupersededObservation('retained original target unavailable');
+        sessionKey = await (expectedIdentitySessionId ? this.ensureSession(chatId,{sessionId:expectedIdentitySessionId,guard}) : this.ensureSession(chatId));
         guard();
         const generation=await this.openclawClient.getSessionInfo(sessionKey,1500).catch(()=>null);
         guard();owner.sessionId=generation?.session?.sessionId;
+        if(expectedIdentitySessionId && (generation?.session?.archived || owner.sessionId!==expectedIdentitySessionId))throw new SupersededObservation('retained original target changed before queue admission');
       } catch (err) {
         if(!current()) break;
+        if(identityTargets.length && err instanceof SupersededObservation) {
+          for(const {message} of identityTargets) {
+            if(message.id)this.store.clearPendingTrigger(this.config.name,chatId,message.id);
+            this.store.clearIdentityIngress(this.config.name,this.config.appId,message.messageId);
+          }
+          owner.continuePending=mergedTriggers.some(message=>!identityTargets.some(entry=>entry.message===message));
+          break;
+        }
         await liveStatus?.pauseForUnconfirmedResult(this.isEn(chatId) ? "Session setup failed before admission" : "会话准备失败，尚未提交 Gateway",
           this.isEn(chatId) ? `${this.config.name} setup unavailable` : `${this.config.name} 会话准备未完成`).catch(()=>{});
         if(batchProof) {
@@ -2287,8 +2617,10 @@ export class FeishuBot {
             includeContext: !isNativeCommandTrigger,
             includeBridgeAttachmentHint: !isNativeCommandTrigger,
             followupAdmissionGuard:batchProof,
+            ...(expectedIdentitySessionId ? {expectedSessionId:expectedIdentitySessionId} : {}),
             admissionGuard:()=>{
               guard();
+              if(identityTargets.some(({message})=>this.store.isMessageRecalled(message.messageId)))throw new SupersededObservation('retained input recalled before admission');
               if(owner.batch!==batchToken || owner.batchId!==batchId || this.queueAdmissionEpoch.get(chatId)!==admissionEpoch)throw new SupersededObservation('batch admission epoch changed');
               if(!batchProof)return;
               for(const id of mergedTriggerIds) {
@@ -2317,6 +2649,7 @@ export class FeishuBot {
                     {...row,attempted:true,admissionSubmissionId:submissionId,reason:'original guarded followup submission only; no new-ID replay'});
                 }
               } else markSubmittedBatch("send-attempt");
+              for(const {message} of identityTargets)this.store.clearIdentityIngress(this.config.name,this.config.appId,message.messageId);
             },
             onRunIdentified: (runId:string,identity?:{sessionId?:string})=>{guard();owner.runId=runId;owner.sessionId=identity?.sessionId || owner.sessionId;foregroundRunId=runId;},
             onSubmitted: async (runId: string) => {
@@ -2833,6 +3166,7 @@ export class FeishuBot {
   private mentionedBotName(mention: any): string | null {
     if (this.isAllMentionItem(mention)) return null;
     const id = mention.id || {};
+    if(Object.hasOwn(id,'open_id') && (typeof id.open_id!=='string' || !id.open_id.trim()))return null;
     const candidates = [this, ...Array.from(FeishuBot.allBots.values()).filter((bot) => bot !== this && bot.store === this.store)];
     const matches = candidates.filter((bot) => {
       // Known conflicting app/open credentials veto, regardless of order. An
@@ -4311,6 +4645,7 @@ export class FeishuBot {
   }
 
   private async replyCompactCard(messageId: string, view: CompactProgressView, chatId?: string): Promise<string | undefined> {
+    this.assertIdentityCurrent();
     const res = await this.client.im.message.reply({
       path: { message_id: messageId },
       data: {
@@ -4322,6 +4657,7 @@ export class FeishuBot {
   }
 
   private async patchCompactCard(messageId: string, view: CompactProgressView, chatId?: string): Promise<void> {
+    this.assertIdentityCurrent();
     await this.client.im.message.patch({
       path: { message_id: messageId },
       data: { content: JSON.stringify(this.buildCompactProgressCard(view, chatId)) },
@@ -4395,6 +4731,7 @@ export class FeishuBot {
   }
 
   private async replyMessage(messageId: string, text: string): Promise<string | undefined> {
+    this.assertIdentityCurrent();
     // Use Feishu CardKit v2 markdown component for full Markdown rendering.
     const model = this.replyModelFooters.get(messageId);
     const status = this.replyStatusFooters.get(messageId);
@@ -4824,6 +5161,7 @@ export class FeishuBot {
   }
 
   private async sendMessage(chatId: string, text: string): Promise<string | undefined> {
+    this.assertIdentityCurrent();
     const model = this.sendModelFooters.get(chatId);
     const status = this.sendStatusFooters.get(chatId);
     const card = this.buildMarkdownCard(text, model, status);
@@ -4889,7 +5227,7 @@ export class FeishuBot {
    */
   private sendOrdered<T = void>(chatId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.sendQueue.get(chatId) || Promise.resolve();
-    const run = () => this.withSendDeadline(fn, chatId);
+    const run = () => { this.assertIdentityCurrent(); return this.withSendDeadline(fn, chatId); };
     const next = prev.then(run, run); // run even if previous failed
     this.sendQueue.set(chatId, next.then(() => undefined, () => undefined));
     return next;
@@ -5124,15 +5462,20 @@ export class FeishuBot {
 
     const previous = this.config.model;
     const sessionKey = await this.ensureSession(chatId);
+    await this.assertIdentityEffect();
     try {
       // Validate/apply to the current session first. If OpenClaw rejects the
       // model, do not persist a bad config.
-      await this.openclawClient.patchSession({ key: sessionKey, model: nextModel });
+      await this.openclawClient.patchSession({ key: sessionKey, model: nextModel,
+        ...(this.identityEffects?.getStore() ? {expectedSessionId:this.identityEffects.getStore()!.item.target.sessionId} : {}) });
+      await this.assertIdentityEffect();
       persistBotModel(this.configPath, this.config.name, nextModel);
       this.config.model = nextModel;
       await this.replyMessage(messageId, `✅ ${this.config.name} 模型已切换并持久化\n之前：${previous}\n现在：${nextModel}`);
     } catch (err) {
-      await this.openclawClient.patchSession({ key: sessionKey, model: previous }).catch(() => {});
+      await this.assertIdentityEffect();
+      await this.openclawClient.patchSession({ key: sessionKey, model: previous,
+        ...(this.identityEffects?.getStore() ? {expectedSessionId:this.identityEffects.getStore()!.item.target.sessionId} : {}) }).catch(() => {});
       await this.replyMessage(messageId, `❌ 模型切换失败，配置未修改\n目标：${nextModel}\n原因：${(err as Error).message}`);
     }
   }
@@ -5153,6 +5496,7 @@ export class FeishuBot {
       // session may not exist yet
     }
 
+    this.assertIdentityCurrent();
     // Always show the configured model — session.model may show gateway-injected internal name
     const model = this.config.model;
     const totalTokens = session?.totalTokens || 0;
@@ -5229,7 +5573,7 @@ export class FeishuBot {
     if (mode === "tooltrim") {
       onPhase?.("tooltrim");
       try {
-        const res = await this.openclawClient.toolTrimCompact(sessionKey, 10);
+        const res = this.identityEffects?.getStore() ? await this.openclawClient.toolTrimCompact(sessionKey,10,()=>this.assertIdentityEffect()) : await this.openclawClient.toolTrimCompact(sessionKey, 10);
         if (res?.compacted === true) {
           return {
             compacted: true,
@@ -5251,7 +5595,7 @@ export class FeishuBot {
     if (mode === "trim") {
       onPhase?.("trim");
       try {
-        const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines: trimMaxLines });
+        const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines: trimMaxLines,...(this.identityEffects?.getStore()?{effectGuard:()=>this.assertIdentityEffect()}:{}) });
         if (trimmed?.compacted === true) {
           const kept = typeof trimmed?.kept === "number" ? trimmed.kept : trimMaxLines;
           return { compacted: true, method: "transcript-trim", detail: `kept ${kept} transcript events` };
@@ -5266,7 +5610,7 @@ export class FeishuBot {
     // semantic mode: LLM summarize first, trim as fallback.
     let nativeReason: string | undefined;
     try {
-      const res = await this.openclawClient.semanticCompact(sessionKey);
+      const res = this.identityEffects?.getStore() ? await this.openclawClient.semanticCompact(sessionKey,()=>this.assertIdentityEffect()) : await this.openclawClient.semanticCompact(sessionKey);
       if (res?.compacted === true) return { compacted: true, method: "native" };
       nativeReason = typeof res?.reason === "string" ? res.reason : undefined;
     } catch (err) {
@@ -5275,7 +5619,7 @@ export class FeishuBot {
 
     onPhase?.("transcript-trim");
     try {
-      const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines: trimMaxLines });
+      const trimmed = await this.openclawClient.compactSession(sessionKey, { maxLines: trimMaxLines,...(this.identityEffects?.getStore()?{effectGuard:()=>this.assertIdentityEffect()}:{}) });
       if (trimmed?.compacted === true) {
         const kept = typeof trimmed?.kept === "number" ? trimmed.kept : trimMaxLines;
         return {
@@ -5389,10 +5733,12 @@ export class FeishuBot {
   private async handleResetCommand(chatId: string, messageId: string): Promise<void> {
     const sessionKey = this.getSessionKey(chatId);
     try {
+      await this.assertIdentityEffect();
       // Go supervision: a reset replaces the executor session generation; pause
       // supervision instead of letting the checker judge a wiped transcript.
       void this.goController?.onExecutorSessionChanged(chatId, "执行会话被 /reset");
       this.stopEpoch.set(chatId,this.store.bumpStopGeneration(this.config.name,chatId));
+      const held=this.identityEffects?.getStore();if(held)held.epoch=this.stopGeneration(chatId);
       this.presentation(()=>this.queuedPresentations.retire(chatId));
       this.store.stopInsertions(this.config.name,chatId);
       this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
@@ -5404,9 +5750,10 @@ export class FeishuBot {
       this.openclawClient.resetSession(sessionKey).catch(() => {});
       // Wait a moment for it to take effect
       await new Promise((r) => setTimeout(r, 2000));
-      // Re-init session
+      this.assertIdentityCurrent();
+      // A held reset must not initialize an unobserved successor generation.
       this.initializedSessions.delete(sessionKey);
-      await this.ensureSession(chatId);
+      if(!held)await this.ensureSession(chatId);
       await this.replyMessage(messageId, `✅ Session 已重置\n模型: ${this.config.model}`);
     } catch (err) {
       await this.replyMessage(messageId, `❌ 重置失败: ${(err as Error).message}`);
@@ -5424,9 +5771,11 @@ export class FeishuBot {
     // cannot wake the just-stopped task back up with a follow-up.
     void this.goController?.pauseSilently(chatId, "用户执行了 /stop");
     try {
+      await this.assertIdentityEffect();
       // Bump the stop generation FIRST so any in-flight auto-retry loop sees the
       // cancellation on its next iteration and stops retrying immediately.
       this.stopEpoch.set(chatId,this.store.bumpStopGeneration(this.config.name,chatId));
+      const held=this.identityEffects?.getStore();if(held)held.epoch=this.stopGeneration(chatId);
       this.presentation(()=>this.queuedPresentations.retire(chatId));
       this.store.cancelReactionIntents(this.config.name,chatId,this.stopGeneration(chatId));
       void this.reconcileReactions(chatId).catch(()=>{});
@@ -5483,6 +5832,7 @@ export class FeishuBot {
       const chatResp = await this.client.im.chat.get({
         path: { chat_id: chatId },
       });
+      if (this.identityClosed) return;
       const chatName = (chatResp.data as any)?.name || "";
 
       // Fetch members
@@ -5502,6 +5852,7 @@ export class FeishuBot {
         // Some bots may lack permission to list members
       }
 
+      if (this.identityClosed) return;
       this.store.upsertChatInfo({
         chatId,
         chatType: "group",

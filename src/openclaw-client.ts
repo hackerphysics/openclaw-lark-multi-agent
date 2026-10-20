@@ -1780,7 +1780,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     return this.rpc("sessions.create", { ...params, key: this.canonicalSessionKey(params.key) });
   }
 
-  async patchSession(params: { key: string; model?: string; label?: string }): Promise<any> {
+  async patchSession(params: { key: string; model?: string; label?: string; expectedSessionId?:string }): Promise<any> {
     return this.rpc("sessions.patch", { ...params, key: this.canonicalSessionKey(params.key) }, 10000);
   }
 
@@ -2161,9 +2161,11 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    * Ensure session is using the expected model. If not, patch it back.
    * Returns true if a correction was made.
    */
-  async ensureModel(sessionKey: string, expectedModel: string): Promise<boolean> {
+  async ensureModel(sessionKey: string, expectedModel: string, held?:{sessionId:string;guard:()=>void}): Promise<boolean> {
     const info = await this.getSessionInfo(sessionKey).catch(() => null);
     const session = info?.session;
+    held?.guard();
+    if(held && (session?.sessionId!==held.sessionId || session?.archived))throw new SupersededObservation('held model target changed');
     const modelId = typeof session?.model === "string" ? session.model.trim() : "";
     const provider = typeof session?.modelProvider === "string"
       ? session.modelProvider.trim()
@@ -2172,7 +2174,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     if (currentModel === expectedModel) return false;
 
     try {
-      await this.patchSession({ key: sessionKey, model: expectedModel });
+      await this.patchSession({ key: sessionKey, model: expectedModel,...(held?{expectedSessionId:held.sessionId}:{}) });
     } catch (firstErr) {
       // Older gateways occasionally require the fully-qualified key. Do not hide
       // model-policy/capability errors: retry only when the key itself was not
@@ -2180,7 +2182,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       const message = (firstErr as Error).message || String(firstErr);
       if (!/session (?:not found|unknown)|unknown session|invalid session key/i.test(message)) throw firstErr;
       const fullKey = sessionKey.startsWith("agent:") ? sessionKey : `agent:main:${sessionKey}`;
-      await this.patchSession({ key: fullKey, model: expectedModel });
+      held?.guard();
+      await this.patchSession({ key: fullKey, model: expectedModel,...(held?{expectedSessionId:held.sessionId}:{}) });
     }
     console.log(`[OpenClaw] Model ensured: ${sessionKey} → ${expectedModel}`);
     return Boolean(currentModel && currentModel !== expectedModel);
@@ -2209,7 +2212,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
    *  the 10 most recent tool calls, drop the rest of the tool payload).
    *  Orchestration (validated E2E 2026-10-10): config.set {raw, baseHash} →
    *  sessions.compact → restore the original config (always). */
-  async toolTrimCompact(key: string, keepRecentToolCalls = 10): Promise<any> {
+  async toolTrimCompact(key: string, keepRecentToolCalls = 10, effectGuard?:()=>Promise<void>): Promise<any> {
     const release = await this.acquireMaintenanceSlot("tooltrim");
     const startedAt = Date.now();
     const PROVIDER = "lma-tooltrim";
@@ -2240,6 +2243,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         const defaultsNode = (agentsNode.defaults ??= {});
         const comp = (defaultsNode.compaction ??= {});
         comp.provider = PROVIDER;
+        await effectGuard?.();
         const setRes = await this.rpc("config.set", { raw: JSON.stringify(cfg), baseHash: hash }, 30000);
         if (setRes?.ok !== true || typeof setRes?.hash !== "string") {
           return { compacted: false, reason: `config.set 失败: ${JSON.stringify(setRes).slice(0, 160)}` };
@@ -2247,6 +2251,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         restoreInfo = { raw: originalRaw, baseHash: setRes.hash };
       }
       // 2. Native semantic compaction now routes through our provider.
+      await effectGuard?.();
       const result = await this.rpc("sessions.compact", { key: this.canonicalSessionKey(key) }, 10 * 60 * 1000);
       await restoreProvider();
       const ok = result?.compacted === true;
@@ -2270,7 +2275,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
   /** Explicit LLM-summarize compaction (/compact semantic). Since lma-tooltrim
    *  is the persistent default provider, temporarily unset it so the built-in
    *  summarization pipeline runs, then restore the original config (always). */
-  async semanticCompact(key: string): Promise<any> {
+  async semanticCompact(key: string, effectGuard?:()=>Promise<void>): Promise<any> {
     const release = await this.acquireMaintenanceSlot("semantic");
     const PROVIDER = "lma-tooltrim";
     let restoreInfo: { raw: string; baseHash: string } | null = null;
@@ -2291,6 +2296,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       if (typeof hash === "string" && cfg && typeof cfg === "object" && comp?.provider) {
         const originalRaw = typeof full?.raw === "string" ? full.raw : JSON.stringify(cfg);
         delete comp.provider;
+        await effectGuard?.();
         const setRes = await this.rpc("config.set", { raw: JSON.stringify(cfg), baseHash: hash }, 30000);
         if (setRes?.ok === true && typeof setRes?.hash === "string") {
           restoreInfo = { raw: originalRaw, baseHash: setRes.hash };
@@ -2298,6 +2304,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         // If the toggle failed we still compact below: routing through the
         // default provider is a degraded-but-useful outcome vs not compacting.
       }
+      await effectGuard?.();
       const result = await this.rpc("sessions.compact", { key: this.canonicalSessionKey(key) }, 10 * 60 * 1000);
       await restoreProvider();
       return result;
@@ -2309,22 +2316,22 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     }
   }
 
-  async compactSession(key: string, options: { maxLines?: number } = {}): Promise<any> {
+  async compactSession(key: string, options: { maxLines?: number; effectGuard?:()=>Promise<void> } = {}): Promise<any> {
     const release = await this.acquireMaintenanceSlot("sessions.compact");
     const startedAt = Date.now();
     const maxLines = Number.isFinite(options.maxLines)
       ? Math.max(1, Math.floor(options.maxLines!))
       : undefined;
-    const sendCompact = () => this.rpc(
+    const sendCompact = async () => { await options.effectGuard?.(); return this.rpc(
       "sessions.compact",
       { key: this.canonicalSessionKey(key), ...(maxLines !== undefined ? { maxLines } : {}) },
       10 * 60 * 1000,
-    );
+    ); };
     try {
       try {
         return await sendCompact();
       } catch (err) {
-        if (!this.isArchivedSessionError(err)) throw err;
+        if (options.effectGuard || !this.isArchivedSessionError(err)) throw err;
         console.warn(`[OpenClaw] sessions.compact hit archived session for ${key}; restoring and retrying once`);
         const restored = await this.unarchiveSession(key);
         if (!restored) throw err;
@@ -2755,6 +2762,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     emptyFinalAsNoReply?: boolean;
     /** Restricted busy/no-target admission. No archive restore or unguarded retry. */
     followupAdmissionGuard?: FollowupAdmissionGuard;
+    /** Original physical target of a retained identity input; never restore or retarget. */
+    expectedSessionId?: string;
     /** Local stop/owner/batch/admission CAS, checked around every async boundary. */
     admissionGuard?: () => void;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
@@ -2798,6 +2807,12 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       try {
         assertCurrent();
         const restricted=params.followupAdmissionGuard;
+        if(params.expectedSessionId && restricted && restricted.sessionId!==params.expectedSessionId)
+          throw new SupersededObservation('retained target conflicts with followup target');
+        if(params.expectedSessionId) {
+          const info=await this.getSessionInfo(fullSessionKey,2000);assertCurrent();
+          if(info?.session?.archived || info?.session?.sessionId!==params.expectedSessionId)throw new SupersededObservation("retained original physical target changed");
+        }
         if(restricted) {
           const refuse=(reason:string):never=>{throw new FollowupAdmissionRefused(reason,submissionId);};
           if(restricted.sessionKey!==fullSessionKey || !restricted.sessionId?.trim() || !restricted.expectedLeafEntryId?.trim())refuse('missing or incompatible observed generation/leaf');
@@ -2810,18 +2825,21 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
             activity.sessionId!==restricted.sessionId || runtime.sessionId!==restricted.sessionId)
             refuse('current session/leaf/archive/admission evidence changed');
         }
-        this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,'reserved',{generation,stopGeneration,...(restricted?{followupAdmissionGuard:restricted}:{})});
+        this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,'reserved',{generation,stopGeneration,
+          ...(params.expectedSessionId?{expectedSessionId:params.expectedSessionId}:{}),...(restricted?{followupAdmissionGuard:restricted}:{})});
         await params.onSendAttempt?.(submissionId);
         assertCurrent();
         const idempotencyKey=submissionId;
         const sendChat = () => { assertCurrent();
-          this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,'dispatching',{generation,stopGeneration,payloadDigest:createHash('sha256').update(params.message).digest('hex')});
-          this.recoveryStore?.saveRunObservation(fullSessionKey,submissionId,{admissionOnly:true},Date.now()+30_000);
+          this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,'dispatching',{generation,stopGeneration,
+            ...(params.expectedSessionId?{expectedSessionId:params.expectedSessionId}:{}),payloadDigest:createHash('sha256').update(params.message).digest('hex')});
+          this.recoveryStore?.saveRunObservation(fullSessionKey,submissionId,{admissionOnly:true,...(params.expectedSessionId?{sessionId:params.expectedSessionId}:{})},Date.now()+30_000);
           // Claim exact output custody synchronously in the WS ACK handler.
           // ws.Receiver can emit ACK + final before any await continuation runs.
           // Failed admission never runs this hook and cannot revoke the old owner.
           this.admissionResponseHooks.set(idempotencyKey,receipt=>{
-            if(isCurrent() && typeof receipt?.runId==='string' && receipt.runId && !this.isExplicitlyStoppedRun(fullSessionKey,receipt.runId)) {
+            if(isCurrent() && typeof receipt?.runId==='string' && receipt.runId &&
+              (!params.expectedSessionId || !receipt.sessionId || receipt.sessionId===params.expectedSessionId) && !this.isExplicitlyStoppedRun(fullSessionKey,receipt.runId)) {
               ownedRunId=receipt.runId;
               reserveEvents(ownedRunId);
               this.ownDeliveryRun(ownedRunId);
@@ -2834,6 +2852,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
           // Ordinary admission is a separate serialized turn, not a request to
           // inherit stored interrupt/steer policy or its commit-wait finalizer.
           queueMode: "followup",
+          ...(params.expectedSessionId ? {sessionId:params.expectedSessionId} : {}),
           ...(restricted ? {sessionId:restricted.sessionId,expectedLeafEntryId:restricted.expectedLeafEntryId,suppressCommandInterpretation:true} : {}),
           deliver: params.deliver ?? false,
           idempotencyKey,
@@ -2841,6 +2860,13 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         try {
           result = await sendChat();
         } catch (err) {
+          if(params.expectedSessionId && !restricted) {
+            const rejected=err instanceof Error && /^RPC error:/.test(err.message);
+            this.recoveryStore?.saveAdmission(fullSessionKey,idempotencyKey,rejected?'rejected':'unknown',
+              {generation,stopGeneration,expectedSessionId:params.expectedSessionId});
+            if(rejected){this.recoveryStore?.finishRunObservation(fullSessionKey,submissionId,'rejected');throw err;}
+            throw new AdmissionUnconfirmed(idempotencyKey,err);
+          }
           if(restricted) {
             // Only named public pre-effect guard refusals prove zero effect.
             // Other RPC errors/transport failures retain the ORIGINAL identity;
@@ -2876,9 +2902,12 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       }
       ownedRunId = typeof result?.runId === "string" ? result.runId : "";
       if(!ownedRunId) throw new AdmissionUnconfirmed('unidentified-receipt');
-      this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,['started','ok'].includes(result.status)?'accepted':'unconfirmed',{generation,stopGeneration,runId:ownedRunId});
+      if(params.expectedSessionId && result.sessionId && result.sessionId!==params.expectedSessionId)throw new AdmissionUnconfirmed(submissionId);
+      const resultSessionId=result.sessionId || params.expectedSessionId;
+      this.recoveryStore?.saveAdmission(fullSessionKey,submissionId,['started','ok'].includes(result.status)?'accepted':'unconfirmed',
+        {generation,stopGeneration,runId:ownedRunId,...(params.expectedSessionId?{expectedSessionId:params.expectedSessionId}:{})});
       if(ownedRunId!==submissionId) this.recoveryStore?.finishRunObservation(fullSessionKey,submissionId,'identified');
-      this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId});
+      this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:resultSessionId});
       if(this.isExplicitlyStoppedRun(fullSessionKey,ownedRunId) || (this.stopGenerations.get(fullSessionKey)||0)!==stopGeneration) {
         this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId,'stopped');
         throw new SupersededObservation('late stopped admission');
@@ -2891,7 +2920,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       reserveEvents(ownedRunId); // mocked/legacy transports may not use the WS ACK hook
       this.ownDeliveryRun(ownedRunId);
       console.log(`[OpenClaw] chat.send runId: ${result.runId} (rpc=${Date.now() - sendStartedAt}ms, attachments=${params.attachments?.length || 0})`);
-      await params.onRunIdentified?.(result.runId,{sessionId:result.sessionId});
+      await params.onRunIdentified?.(result.runId,{sessionId:resultSessionId});
       assertCurrent();
       // A reservation/in_flight reply is not confirmed acceptance. Keep UI
       // Typing while exact collection/read-only receipt reconciliation proceeds.
@@ -2905,14 +2934,14 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         this.progressGenerations.set(fullSessionKey,generation);
         void params.onProgress({ kind: "lifecycle", text: "等待 OpenClaw 回复" });
       }
-      const collecting=this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, expectedSessionId:result.sessionId, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
+      const collecting=this.collectReply(result.runId, params.timeoutMs || FOREGROUND_WAIT_MS, sk, { emptyFinalAsNoReply: params.emptyFinalAsNoReply, expectedUserText: params.message, expectedSessionId:resultSessionId, onWaitPaused: params.onWaitPaused, onYieldHandoff:params.onYieldHandoff });
       // Reader registration is synchronous inside collectReply. Only now may
       // the receiver's ACK reservation release its same-run terminal custody.
       releaseEventReservation();
       params.onCollectionStarted?.(result.runId);
       const reply=await collecting;
       if(reply.trim().toUpperCase()==='NO_REPLY') this.recoveryStore?.finishRunObservation(fullSessionKey,ownedRunId);
-      else this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:result.sessionId,terminalText:reply,terminalObserved:true},Date.now()+30_000);
+      else this.recoveryStore?.saveRunObservation(fullSessionKey,ownedRunId,{sessionId:resultSessionId,terminalText:reply,terminalObserved:true},Date.now()+30_000);
       // Do not retire on lifecycle/timeout/cleanup alone. Successful full result
       // custody (and synchronous durable save when bound) precedes retirement.
       const durable=this.recoveryStore?.getRunObservation(fullSessionKey,ownedRunId);
@@ -2990,6 +3019,8 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
     includeBridgeAttachmentHint?: boolean;
     /** Restricted busy/no-target admission. No archive restore or unguarded retry. */
     followupAdmissionGuard?: FollowupAdmissionGuard;
+    /** Original physical target of a retained identity input; never restore or retarget. */
+    expectedSessionId?: string;
     /** Local stop/owner/batch/admission CAS, checked around every async boundary. */
     admissionGuard?: () => void;
     /** Called immediately before issuing chat.send RPC; use for at-most-once bookkeeping. */
@@ -3023,6 +3054,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
         timeoutMs: params.timeoutMs,
         emptyFinalAsNoReply: params.emptyFinalAsNoReply,
         followupAdmissionGuard: params.followupAdmissionGuard,
+        expectedSessionId: params.expectedSessionId,
         admissionGuard: params.admissionGuard,
         onSendAttempt: params.onSendAttempt,
         onSubmitted: params.onSubmitted,
@@ -3067,6 +3099,7 @@ private collectReply(runId: string, timeoutMs = FOREGROUND_WAIT_MS, targetSessio
       timeoutMs: params.timeoutMs,
       emptyFinalAsNoReply: params.emptyFinalAsNoReply,
       followupAdmissionGuard: params.followupAdmissionGuard,
+      expectedSessionId: params.expectedSessionId,
       admissionGuard: params.admissionGuard,
       onSendAttempt: params.onSendAttempt,
       onSubmitted: params.onSubmitted,
